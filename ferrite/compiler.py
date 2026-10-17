@@ -390,7 +390,8 @@ def fused_kernel(expr, shapes):
   reduction can stay on chip; units run through the batch, matrix after matrix.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
-  its K pairs of tiles streamed through slots 0-3. A unary op runs on the SFPU over Dst: in place, on the result of the
+  its K pairs of tiles, B's streamed through slots 0-1 and A's row kept in L1 while the result tiles stay in its row
+  (if it fits below slot 256, else streamed through slots 2-3). A unary op runs on the SFPU over Dst: in place, on the result of the
   op below it if nothing else reads that, or else on its operand plus a zero tile. A row reduction folds each column
   tile of its operand into an accumulator in Dst, then across the row (see across_rows), and packs one tile.
   A row is done in passes: a pass is a sweep over its column tiles, and a reduction's result can only be read in the
@@ -452,12 +453,12 @@ def fused_kernel(expr, shapes):
   slots = allocate({"mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul"} |
                    {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE})
   frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
-  rows_at, end = [], FRAMES + 2 * frame + len(ops)  # each matmul's row of A in L1, while they fit; else A streams too
-  assert end <= UNPACKABLE and len(matmuls) <= 16, "too many tiles in a kernel"
+  rows_at, top = [], FRAMES + 2 * frame + len(ops)  # each matmul's row of A in L1, while they fit; else A streams too
+  assert top <= UNPACKABLE and len(matmuls) <= 16, "too many tiles in a kernel"
   for j in matmuls:
-    fits = end + ops[j]["kt"] <= UNPACKABLE
-    rows_at.append(end if fits else None)
-    end += ops[j]["kt"] if fits else 0
+    fits = top + ops[j]["kt"] <= UNPACKABLE
+    rows_at.append(top if fits else None)
+    top += ops[j]["kt"] if fits else 0
   def slot(f, r):  # an input or wide op lives in the frame, a narrow op in its own slot after both frames
     if r == "zero": return ZERO_SLOT
     if isinstance(r, int): return FRAMES + f * frame + r
@@ -473,7 +474,7 @@ def fused_kernel(expr, shapes):
   def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
     if j != root: return tt(MATH_END)
     edge = [f"if ({f'j == {w - 1}' if wide(('op', root)) else 1}) {{ {tt(mask_columns('rowsum', cols % 32, 0))} }}"] * (cols > 1 and cols % 32 > 0)
-    edge += [f"if (i_ == {-(-rows // 32) - 1}) {{ {tt(mask_rows(rows % 32))} }}"] * (rows > 1 and rows % 32 > 0)
+    edge += [f"if (i_ == {rt - 1}) {{ {tt(mask_rows(rows % 32))} }}"] * (rows > 1 and rows % 32 > 0)
     return " ".join(edge + [tt(MATH_END)])
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
     me = ("op", j)
