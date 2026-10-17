@@ -90,9 +90,10 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }
 UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets
-STALL_SYNC, STALL_PACK, STALL_UNPACK, STALL_CFG, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 3, 1 << 7, 1 << 8, 0x1FF  # STALLWAIT
-WAIT_UNPACK0, WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU, WAIT_CFG = 1 << 1, 0b110, 1 << 3, 1 << 4, 1 << 11, 1 << 12  # stall_res
-# blocks those units until (wait_res) this thread's unpackers/packer/FPU/SFPU, or the config unit, are idle
+# STALLWAIT/SEMWAIT stall_res blocks these units' instructions until (STALLWAIT wait_res) this thread's unpacker 0,
+# unpackers, packer, FPU or SFPU, or the config unit, are idle (ISA STALLWAIT.md: B and C bits)
+STALL_SYNC, STALL_PACK, STALL_UNPACK, STALL_CFG, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 3, 1 << 7, 1 << 8, 0x1FF
+WAIT_UNPACK0, WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU, WAIT_CFG = 1 << 1, 0b110, 1 << 3, 1 << 4, 1 << 11, 1 << 12
 BF16 = 5  # data format code (ISA Unpackers/FormatConversion.md)
 
 # Backend config: field -> (32-bit word index at TENSIX_CFG, first bit, width). The ISA docs defer these numbers to

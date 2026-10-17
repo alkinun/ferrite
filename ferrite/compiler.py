@@ -387,7 +387,8 @@ void kmain(volatile unsigned *a) {{
 
 def fused_kernel(expr, shapes):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
-  rowsum and rowmax, ("matmul", a, b) where a and b are inputs, and plain numbers for inputs. shapes: each input's
+  rowsum and rowmax, ("matmul", a, b) where a is an input and b an input or ("T", input), read transposed, and plain
+  numbers for inputs. shapes: each input's
   (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
   offset (Tensor's)]. A unit is a tile of the result, or a block of up to 4 x 4 of them (one matmul and nothing that
@@ -633,8 +634,9 @@ void kmain(volatile unsigned *a) {{
 def transpose_kernel(rows, cols):
   """x.T for x of (rows, cols), each matrix of a batch, args [first unit, units, out, x's address, tile strides for batch
   and row, tile offset]: result tile (i, j) is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal
-  faces swapped, and unpacker 0 transposes each face on its way into SrcA (Haloize_mode), so x + 0 through the FPU lands the transpose in Dst. Haloize_mode is
-  backend config, so it holds for every SrcA load in the kernel: a transpose is a kernel of its own."""
+  faces swapped, and unpacker 0 transposes each face on its way into SrcA (Haloize_mode, on in this kernel's config
+  throughout), so x + 0 through the FPU lands the transpose in Dst. (A matmul reading B transposed does the same with
+  the mode switched on around its K loop: haloize.)"""
   ct, frame = -(-rows // 32), lambda f: (FRAMES + 2 * f, FRAMES + 2 * f + 1)  # the result's tile columns; x's slot and the result's
   per = ct * -(-cols // 32)  # tiles a matrix
   def loop(*per_frame):  # the same loop over result tiles t for all four programs, frame f alternating
@@ -654,7 +656,7 @@ class Tensor:
   """batch x rows x cols of bf16 (batch 1 unless said): in DRAM as 32x32 tiles, matrix after matrix, each in row-major
   tile order, tile i in bank i % 8; or, until realized, an op on other tensors. Realizing compiles the whole tree of
   unrealized ops under it into one kernel; a matmul's own operands are realized first, since each of its output tiles
-  needs a whole row and column of them.
+  needs a whole row and column of them (a transposed B is read transposed rather than realized).
   Any shape: the last tile row and column are padded, with zeros, except that a dimension of 1 fills its tile with
   copies (a row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. Every kernel leaves
   its result that way too, so a matmul can sum over a padded K.
@@ -767,6 +769,7 @@ class Tensor:
     """Compute it now, into DRAM of its own, or into the view `into` (see merge). Returns it, now realized."""
     if self.op is None: return self
     if self.op == "T":
+      assert into is None, "a transpose writes a tensor of its own"
       x, self.op, self.srcs = self.srcs[0].realize(), None, ()
       self.addr = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
       kernel = _cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols))
