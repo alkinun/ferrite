@@ -41,6 +41,7 @@ TRISC_STACK_TOP = 0xFFB00000 + 4 * 1024  # each TRISC's is 4 KiB, at the same ad
 TRISC_RESET_PC = 0xFFB12228  # RISCV_DEBUG_REG_TRISC0_RESET_PC, then TRISC1's and TRISC2's
 TRISC_RESET_PC_OVERRIDE = 0xFFB12234  # bit i: TRISC i starts at its RESET_PC rather than 0x6000 / 0xA000 / 0xE000
 NIU = 0xFFB20000  # NoC 0 interface: request initiators at +0x800*i, counters at +0x200, translated id at +0x148
+NIU_READS = NIU + 0x208  # NIU_MST_RD_RESP_RECEIVED: read responses this tile has had (the one counter ttsim keeps)
 TENSIX_CFG = 0xFFEF0000  # Tensix backend config bank 0, one word per register; BRISC and TRISCs only, not the NoC
 CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: writing bit 0 (BRISC) .. bit 4 (NCRISC) drops that core's instruction cache
 
