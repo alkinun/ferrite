@@ -6,11 +6,11 @@ from ferrite import bh
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
 # (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for the kernel's cores to talk through), two buffers of kernel arguments
-# (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds,
-# then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle,
+# (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds, a
+# tile of zeros (2 KiB, for kernels to read and never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle,
 # how many], an outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the workers' reports, and
 # staging for one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
-MAILBOX, TRISCS, SYNC, ARGS, KERNELS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x80000
+MAILBOX, TRISCS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x7F800, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
@@ -71,7 +71,7 @@ def compile_rv32(src, base=0):
   image runs wherever it is put; base only matters to firmware, which is put at 0. Images are kept in CACHE, named by
   a hash of the compiler's version, its flags, the link script and the source."""
   link = (f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
-          "__bss_start = .; *(.sbss*) *(.bss*) __bss_end = .; } }")  # one output section, so .bss is zeros inside the image
+          ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one output section, so .bss is zeros inside the image
   cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
   if cached.exists(): return cached.read_bytes()
   if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")
@@ -88,10 +88,10 @@ def compile_rv32(src, base=0):
 # Each kernel program starts here. A kernel stays loaded between launches, so the statics it expects to start at zero
 # are zeroed again for each (statics with other starting values must be const).
 KENTRY = """
-extern char __bss_start[], __bss_end[];
+extern unsigned __bss_start[], __bss_end[];
 void kmain(volatile unsigned *args);
 __attribute__((section(".start"))) void kentry(volatile unsigned *args) {
-  for (volatile char *p = __bss_start; p < __bss_end; p++) *p = 0;
+  for (volatile unsigned *p = __bss_start; p < __bss_end; p++) *p = 0;
   kmain(args);
 }
 """
@@ -173,9 +173,9 @@ void trisc_loop(unsigned i) {{
 # A command is a 16-byte header [length, kernel address, argument bytes, workers], then the arguments; the whole is
 # 64-byte aligned. Length 0 means: the rest of the ring is unused. The kernel is already in every worker's L1
 # (Runtime.load). The arguments and the go are each one multicast to every worker, whether the launch is for all of
-# them or for the first `workers`, and the workers count themselves done in one word. A multicast's acknowledgements come one per
-# worker, so they are counted on the acknowledgement counter, and the request counter (up once, down once per worker)
-# is cleared after. One launch runs at a time, but the next one's command is read and its arguments written while it
+# them or for the first `workers`, and the workers count themselves done in one word. A multicast's acknowledgements
+# come one per worker, so they are counted on the acknowledgement counter, and the request counter (up once, down once
+# per worker) is cleared after. One launch runs at a time, but the next one's command is read and its arguments written while it
 # runs (into the other argument buffer), so it goes the moment the last worker reports.
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
@@ -250,6 +250,7 @@ class Runtime:
     (dx, dy), n = self.dispatcher, len(self.cores)
     chip.halt(*end, start)
     chip.write(*end, 0, worker, start)
+    chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
     for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done, all zero but whom to report to
       chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, dx | dy << 6, 0, i).ljust(SYNC - MAILBOX, b"\0"))
     chip.write(dx, dy, 0, dispatcher)
@@ -268,8 +269,8 @@ class Runtime:
     landed before any later doorbell."""
     if kernel not in self.loaded:
       size = -(-len(kernel) // 16) * 16
-      assert size <= DATA - KERNELS, f"kernel is {len(kernel)} bytes, room for {DATA - KERNELS}"
-      if self.room + size > DATA: self.evict()
+      assert size <= ZEROS - KERNELS, f"kernel is {len(kernel)} bytes, room for {ZEROS - KERNELS}"
+      if self.room + size > ZEROS: self.evict()
       self.chip.write(*self.end, self.room, kernel, self.start)
       self.loaded[kernel], self.room = self.room, self.room + size
     return self.loaded[kernel]

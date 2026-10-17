@@ -11,10 +11,10 @@
 # so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
 import array, math, struct
 from ferrite import bh
-from ferrite.runtime import DATA, SYNC, compile_kernel
+from ferrite.runtime import DATA, SYNC, ZEROS, compile_kernel
 
 TILE = 32 * 32 * 2  # bytes in a bf16 tile: one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
-SLOTS = DATA  # L1 tile slots: slot i at SLOTS + i * TILE, picked by the unpackers' Z and the packer's channel 1 Y counters
+SLOTS = ZEROS  # L1 tile slots: slot i at SLOTS + i * TILE (slot 0 is the runtime's zeros), picked by the unpackers' Z and the packer's channel 1 Y counters
 DST_HALF = 64  # Dst rows of one result in fp32; Dst holds two, so math fills one half while pack drains the other
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2  # results in Dst to pack, outputs packed but not reported, and
                                                        # intermediates packed into L1 but not yet waited for
@@ -267,7 +267,7 @@ def tt(words):
     if w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
   return " ".join(c)
 
-ZERO_SLOT, FRAMES = 4, 5  # slots 0-3 stream a matmul's B and A, 4 holds a zero tile, then two frames, row values, A's rows
+ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, row values, A's rows
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
 
 # SYNC (zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
@@ -288,7 +288,7 @@ static void push(const unsigned *p, unsigned n) {{ for (unsigned i = 0; i < n; i
 static void push_word(unsigned w) {{ push(&w, 1); }}  // one instruction worked out at run time
 """
 
-def _brisc(zero, total, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
+def _brisc(total, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
   return SYNC_WORDS + f"""
 #define SLOT(i) ({SLOTS:#x} + (i) * {TILE})
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
@@ -330,7 +330,6 @@ static unsigned fresh(unsigned q, unsigned i) {{
 }}
 void kmain(volatile unsigned *a) {{
   out = a[2];
-  {f"for (unsigned i = 0; i < {TILE // 4}; i++) ((volatile unsigned *)SLOT({ZERO_SLOT}))[i] = 0; l1_settle(SLOT({ZERO_SLOT}));" if zero else ""}
   unsigned tiles = 0;
 {body}
   while (sent < {total}) send();
@@ -528,14 +527,14 @@ def fused_kernel(expr, shapes):
             c[U].append(f"{cond}{{ push_word({setadc(bh.UNPACK1, 0):#x} + {rows_at[q]} + i_ % {bp} * {kt}); {tt([setadc(bh.UNPACK0, kept_b)])} "
                         f"for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
-            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{y}], {b_tile}, steps & 1, a[{x}], {a_tile}, 2 + (steps & 1));")
+            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
             c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(unpack(1, 3) + REPORT)} }} else {{ {tt(unpack(0, 2) + REPORT)} }} }}{posted} }}")
+                        f"if (steps++ & 1) {{ {tt(unpack(2, 4) + REPORT)} }} else {{ {tt(unpack(1, 3) + REPORT)} }} }}{posted} }}")
           else:
             c[B].append(f"{cond}{{ unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step(a[{y}], {b_tile}, steps & 1, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
+                        f"step(a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(step_unpack(1))} }} else {{ {tt(step_unpack(0))} }} }}{posted} }}")
+                        f"if (steps++ & 1) {{ {tt(step_unpack(2))} }} else {{ {tt(step_unpack(1))} }} }}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
           continue
@@ -585,8 +584,7 @@ def fused_kernel(expr, shapes):
 {sweeps}
   }}"""
   total = f"a[1] * {w if wide(('op', root)) else 1}" if rowwise else "tiles"  # results this worker sends home
-  zero = rowwise or any(op.get("y") == "zero" for op in ops)
-  image = compile_kernel(_brisc(zero, total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
+  image = compile_kernel(_brisc(total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
   return image, (rt if rowwise else br * bc)  # and how many units a matrix of the result is
 
 
@@ -596,8 +594,8 @@ def gather_kernel():
   and right face) come from wherever that row sits in the tensor's tiles. A NoC read from DRAM must keep its address's
   low 6 bits, so each run comes in as the 64-byte block holding it and is copied into place from there."""
   return compile_kernel(f"""
-#define SLOT {SLOTS:#x}
-#define BLOCK {SLOTS + TILE:#x}
+#define SLOT {DATA:#x}
+#define BLOCK {DATA + TILE:#x}
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
@@ -631,7 +629,7 @@ def transpose_kernel(rows, cols):
     if (u & 1) {{ {per_frame[1]} }} else {{ {per_frame[0]} }}
   }}"""
   return compile_kernel(
-    _brisc(True, "a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} * a[5] + t % {per} / {ct} + a[6], {frame(f)[0]}); ready(); "
+    _brisc("a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} * a[5] + t % {per} / {ct} + a[6], {frame(f)[0]}); ready(); "
                                 f"frame_done[{f}] = ++events;" for f in (0, 1)])),
     _unpacker(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]), TRANSPOSING),
     _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)]) + " h ^= 1;"] * 2)),  # padding stays 0
