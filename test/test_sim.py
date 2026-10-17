@@ -428,8 +428,9 @@ def test_fuzz(chip, monkeypatch):
     return t
   monkeypatch.setattr(Tensor, "realize", checked_realize)
   rng = np.random.default_rng(5)
-  def leaf(shape):
-    a = bf16(rng.uniform(-2, 2, shape))
+  def leaf(shape):  # some all negative, so an unmasked 0 in the padding would win a max
+    lo = rng.choice([-2.0, -4.0])
+    a = bf16(rng.uniform(lo, lo + 4 if lo == -2 else lo + 3, shape))
     return Tensor.of(rt, a.tolist() if shape[0] > 1 else a[0].tolist())
   def gen(shape, depth):
     b, r, c = shape
@@ -442,14 +443,14 @@ def test_fuzz(chip, monkeypatch):
       x = gen(shape, depth - 1)
       return rng.choice([x.relu, (x * 0.25).exp, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt])()
     if kind == "red" and c == 1:
-      x = gen((b, r, int(rng.choice([20, 32, 70, 96]))), depth - 1)
+      x = gen((b, r, int(rng.choice([20, 32, 70, 96, 192]))), depth - 1)
       return x.rowsum() if rng.random() < 0.5 else x.rowmax()
     if kind == "mm" and r > 1 and c > 1:
       k = int(rng.choice([32, 50, 64]))
       return leaf((b, r, k)) @ leaf((b if rng.random() < 0.5 else 1, k, c))
     return leaf(shape)
-  for _ in range(25):
-    shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64])), int(rng.choice([1, 20, 32, 70, 96])))
+  for _ in range(30):  # sizes past 4 tiles make part-blocks of matmul results
+    shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
     gen(shape, 4).realize()
   assert len(checked) >= 25 and any(e[0] == "matmul" or "rowsum" in str(e) for e in checked)
 
