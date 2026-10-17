@@ -399,6 +399,60 @@ def test_batch(chip):
   one, a = Runtime(chip, chip.tensix[0], chip.tensix[1]), a[:, :20]  # last: it takes two of rt's cores. One worker, and one
   close(Tensor.of(one, a.tolist()) @ Tensor.of(one, b.tolist()), a @ b, 2**-6)  # tile row a matrix: A's row in L1 changes with the matrix
 
+def test_fuzz(chip, monkeypatch):
+  # random expressions (elementwise ops with broadcasting, unary ops, row reductions, matmuls; odd shapes, batches), and
+  # every kernel they turn into checked against numpy on the same inputs, read back from the chip: whatever bf16 rounding
+  # piles up through a tree, each kernel must be right about its own inputs
+  rt, checked = Runtime(chip, chip.tensix[0], chip.tensix[-1]), []
+  def value(t): return np.array(t.tolist()).reshape(t.shape)
+  def numpy(e, xs):
+    if isinstance(e, int): return xs[e]
+    v = [numpy(s, xs) for s in e[1:]]
+    return {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "relu": lambda a: np.maximum(a, 0),
+            "exp": np.exp, "recip": lambda a: 1 / a, "rsqrt": lambda a: 1 / np.sqrt(a),
+            "rowsum": lambda a: a.sum(-1, keepdims=True), "rowmax": lambda a: a.max(-1, keepdims=True)}[e[0]](*v)
+  realize = Tensor.realize
+  def checked_realize(t):
+    if t.op is None: return t
+    while compiler._ops(t, set()) > 15:  # too big for one kernel: its parts first, as realize does, each checked too
+      u = t
+      while compiler._ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: compiler._ops(s, set()))
+      u.realize()
+    inputs = []
+    e = compiler._expr(t, (t.batch, t.rows), inputs)
+    xs = [value(u) for u in inputs]
+    realize(t)
+    want, got = numpy(e, xs), value(t)
+    assert np.abs(got - want).max() <= 0.03 * (np.abs(want).max() + 1), (e, np.abs(got - want).max())
+    checked.append(e)
+    return t
+  monkeypatch.setattr(Tensor, "realize", checked_realize)
+  rng = np.random.default_rng(5)
+  def leaf(shape):
+    a = bf16(rng.uniform(-2, 2, shape))
+    return Tensor.of(rt, a.tolist() if shape[0] > 1 else a[0].tolist())
+  def gen(shape, depth):
+    b, r, c = shape
+    kind = "leaf" if depth == 0 or rng.random() < 0.2 else rng.choice(["bin", "bin", "unary", "red", "mm"])
+    if kind == "bin":  # each operand keeps a dimension, or has 1 there (not both)
+      s1 = tuple(1 if rng.random() < 0.2 else d for d in shape)
+      s2 = tuple(d if s1[i] == 1 else (1 if rng.random() < 0.2 else d) for i, d in enumerate(shape))
+      return getattr(gen(s1, depth - 1), rng.choice(["__add__", "__sub__", "__mul__"]))(gen(s2, depth - 1))
+    if kind == "unary":
+      x = gen(shape, depth - 1)
+      return rng.choice([x.relu, (x * 0.25).exp, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt])()
+    if kind == "red" and c == 1:
+      x = gen((b, r, int(rng.choice([20, 32, 70, 96]))), depth - 1)
+      return x.rowsum() if rng.random() < 0.5 else x.rowmax()
+    if kind == "mm" and r > 1 and c > 1:
+      k = int(rng.choice([32, 50, 64]))
+      return leaf((b, r, k)) @ leaf((b if rng.random() < 0.5 else 1, k, c))
+    return leaf(shape)
+  for _ in range(25):
+    shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64])), int(rng.choice([1, 20, 32, 70, 96])))
+    gen(shape, 4).realize()
+  assert len(checked) >= 25 and any(e[0] == "matmul" or "rowsum" in str(e) for e in checked)
+
 def test_mnist_mlp(chip):
   # goal 1's halfway mark: an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
   # numpy in float64. Two launches: matmul + bias + relu, then matmul + bias. Random weights (no dataset here); the
