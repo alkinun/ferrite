@@ -203,6 +203,18 @@ def test_matmul_random(chip):
       terms = [a[i][x] * b[x][j] for x in range(k)]
       assert abs(got[i][j] - sum(terms)) <= 2**-8 * sum(map(abs, terms)), (i, j, got[i][j], sum(terms))
 
+def test_matmul_blocks(chip):
+  # result tiles go in blocks of up to 4 x 4, with the block's rows of A and column of B kept in L1. 5 x 6 tiles cut
+  # into blocks leaves part-blocks at the edges, whose missing tiles must not be computed: they would land past the
+  # result in DRAM, on the tensor allocated after it (the canary, written before the queued kernel runs)
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  a = [[float((r * 7 + c * 3) % 5 - 2) for c in range(96)] for r in range(160)]
+  b = [[float((r + 2 * c) % 3 - 1) for c in range(192)] for r in range(96)]
+  y = (Tensor.of(rt, a) @ Tensor.of(rt, b)).realize()  # queued
+  canary = Tensor.of(rt, [[1.0] * 192] * 160)
+  assert y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(96)) for j in range(192)] for i in range(160)]
+  assert canary.tolist() == [[1.0] * 192] * 160
+
 def test_stream_on_one_worker(chip):
   # one worker gets every tile, so the pipeline really cycles: L1 slots and Dst halves alternate, the threads hand
   # tiles along by semaphore, and BRISC fetches and writes back around them. 32 elementwise tiles, then a 128x96 @ 96x128
