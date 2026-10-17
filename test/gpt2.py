@@ -16,10 +16,10 @@ def fns(x):  # what numpy and ferrite spell differently
     softmax = lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True)
     layernorm = lambda a: (a - a.mean(-1, keepdims=True)) / np.sqrt(a.var(-1, keepdims=True) + 1e-5)
     return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split, softmax=softmax, layernorm=layernorm,
-                           merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1),
+                           merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))))
   return SimpleNamespace(rows=Tensor.gather, width=lambda a: a.cols, split=Tensor.split, softmax=Tensor.softmax,
-                         layernorm=Tensor.layernorm, merge=Tensor.merge, gelu=Tensor.gelu)
+                         layernorm=Tensor.layernorm, merge=Tensor.merge, t=lambda a: a.T, gelu=Tensor.gelu)
 
 def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 
@@ -30,9 +30,8 @@ def layer(x, p, mask, heads=HEADS):
   d = f.width(x)
   hd = d // heads
   qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
-  # the heads as a batch: queries and values split by columns, the keys transposed and split by rows
-  q, kt, v = f.split(qkv[:, :d], heads), f.split(qkv[:, d:2 * d].T, heads, 0), f.split(qkv[:, 2 * d:], heads)
-  s = q @ kt * (1 / math.sqrt(hd)) + mask
+  q, k, v = (f.split(qkv[:, i * d:(i + 1) * d], heads) for i in range(3))  # the heads as a batch
+  s = q @ f.t(k) * (1 / math.sqrt(hd)) + mask
   y = f.merge(f.softmax(s) @ v) @ p["attn.c_proj.weight"]  # the heads side by side, then c_proj
   x = x + (y + p["attn.c_proj.bias"])  # x last: it is the large one, so it is rounded once
   h = layernorm(x, p["ln_2.weight"], p["ln_2.bias"]) @ p["mlp.c_fc.weight"] + p["mlp.c_fc.bias"]
@@ -63,7 +62,7 @@ def load(path):
 
 def upload(rt, weights):  # the weights as ferrite Tensors, the output layer's transposed on the chip
   t = {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
-  t["wte.T"] = t["wte.weight"].T
+  t["wte.T"] = t["wte.weight"].T.realize()  # once, rather than read transposed every token
   return t
 
 def arrays(weights):  # the same as numpy arrays

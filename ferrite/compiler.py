@@ -94,6 +94,10 @@ def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then hande
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
 REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
+def haloize(on):  # unpacker 0 transposes each 16x16 face into SrcA from its next unpack on (or stops): the config write
+  word, bit, _ = bh.TENSIX_CFG_FIELDS["SEC0_Haloize_mode"]  # waits for unpacker 0's unpacks, the next unpack for the write
+  return [ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_UNPACK0),
+          ins(f"RMWCIB{bit // 8}", cfg_reg_addr=word, data=on << bit % 8, mask=1 << bit % 8), ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)]
 def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and A's next tile in its row into SrcB
   return [ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=2, value=s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
@@ -313,9 +317,9 @@ static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
 // A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot (B 1-2, A 3-4) or its place in
 // the row or column kept in L1, unless it is there already (KEPT)
 #define KEPT 0xFFFFFFFF
-static void step(unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
+static void step(unsigned bt, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
   reached(stream_done[steps & 1]);
-  if (b_slot != KEPT) get(b, b_tile, b_slot);
+  if (b_slot != KEPT) {{ if (bt) flipped(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}  // bt: B is read transposed
   if (a_slot != KEPT) get(a, a_tile, a_slot);
   ready();
   stream_done[steps++ & 1] = ++events;
@@ -418,8 +422,9 @@ def fused_kernel(expr, shapes):
   def visit(e):
     if isinstance(e, int): return e
     if e in refs: return refs[e]
-    if e[0] == "matmul":
-      op = dict(kind="matmul", x=e[1], y=e[2], kt=tiles[e[1]][1], shape=(shapes[e[1]][0], shapes[e[2]][1]), width=tiles[e[2]][1])
+    if e[0] == "matmul":  # B is an input, or ("T", input): that input transposed
+      bt, y = (True, e[2][1]) if isinstance(e[2], tuple) else (False, e[2])
+      op = dict(kind="matmul", x=e[1], y=y, bt=bt, kt=tiles[e[1]][1], shape=(shapes[e[1]][0], shapes[y][0 if bt else 1]), width=tiles[y][0 if bt else 1])
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=(size(x)[0], 1), width=1)
@@ -511,27 +516,29 @@ def fused_kernel(expr, shapes):
         pk = halves([pack(DST_HALF * h, slot(f, me), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])
         c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= 1; }}")
         if op["kind"] == "matmul":
-          kt, bw, q = op["kt"], tiles[op["y"]][1], matmuls.index(j)  # B's width in tiles; which matmul
+          kt, bw, q, bt = op["kt"], op["width"], matmuls.index(j), int(op["bt"])  # B's width in tiles; which matmul
           x, y = arg(op["x"]), arg(op["y"])
-          b_tile = f"{in_batch(op['y'])}m * a[{y + 2}] + {'j' if bw > 1 else 0} + a[{y + 3}]"
+          bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
+          b_tile = f"{in_batch(op['y'])}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch(op['y'])}m * a[{y + 2}] + {bj} + a[{y + 3}]"
+          on, off = (tt(haloize(1)), tt(haloize(0))) if bt else ("", "")
           a_tile = f"{in_batch(op['x'])}i_ * a[{x + 2}] + m + a[{x + 3}]"
           setadc = lambda unpacker, slot: ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=slot)
           if kept_b is not None:  # A's bp rows and B's column in L1: unpacker 0 walks the column, 1 the row of A
             c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step(a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
+                        f"step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
             walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
                     ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
             c[U].append(f"{cond}{{ push_word({setadc(bh.UNPACK1, 0):#x} + {rows_at[q]} + i_ % {bp} * {kt}); {tt([setadc(bh.UNPACK0, kept_b)])} "
-                        f"for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }}{posted} }}")
+                        f"{on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
-            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
-            c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(unpack(2, 4) + REPORT)} }} else {{ {tt(unpack(1, 3) + REPORT)} }} }}{posted} }}")
+            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step({bt}, a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
+            c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
+                        f"if (steps++ & 1) {{ {tt(unpack(2, 4) + REPORT)} }} else {{ {tt(unpack(1, 3) + REPORT)} }} }} {off}{posted} }}")
           else:
             c[B].append(f"{cond}{{ unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step(a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
-            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(step_unpack(2))} }} else {{ {tt(step_unpack(1))} }} }}{posted} }}")
+                        f"step({bt}, a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
+            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
+                        f"if (steps++ & 1) {{ {tt(step_unpack(2))} }} else {{ {tt(step_unpack(1))} }} }} {off}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
           continue
@@ -747,19 +754,23 @@ class Tensor:
     """The batch side by side as one matrix, the inverse of split: x.split(n).merge() is x. The kernel computing it
     writes each matrix into its columns (realize into a view); one already computed is copied there."""
     out = Tensor(self.rt, self.rows, self.batch * self.cols)
-    (self if self.op else self + 0.0).realize(out.split(self.batch))
+    (self if self.op not in (None, "T") else self + 0.0).realize(out.split(self.batch))  # a transpose cannot write a view
     return out
 
   @property
   def T(self):
-    """The transpose (of each matrix of a batch), computed now, in a kernel of its own (see transpose_kernel)."""
-    out = Tensor(self.rt, self.cols, self.rows, batch=self.batch)
-    kernel = _cached(("transpose", self.rows, self.cols), lambda: transpose_kernel(self.rows, self.cols))
-    return out._run(kernel, out.addr, self.realize().addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset)
+    """The transpose (of each matrix of a batch). A matmul reads it as its B straight from this tensor, transposing
+    tiles as they come in; anything else realizes it in a kernel of its own (transpose_kernel)."""
+    return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch)
 
   def realize(self, into=None):
     """Compute it now, into DRAM of its own, or into the view `into` (see merge). Returns it, now realized."""
     if self.op is None: return self
+    if self.op == "T":
+      x, self.op, self.srcs = self.srcs[0].realize(), None, ()
+      self.addr = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
+      kernel = _cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols))
+      return self._run(kernel, self.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset)
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
       for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
       # and an elementwise value that a reduction and something else both read: once, on as many workers as it has tiles
@@ -831,16 +842,16 @@ class Tensor:
       return sum((parts[i] for i in range(1, s)), parts[0])
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other), max(self.batch, other.batch))
 
-def _lazy(t, seen):  # the unrealized ops under t, t first
+def _lazy(t, seen):  # the unrealized ops under t, t first (a matmul's operands and a transpose's are whole tensors)
   if t.op is None or id(t) in seen: return
   seen.add(id(t))
   yield t
-  for s in () if t.op == "matmul" else t.srcs: yield from _lazy(s, seen)
+  for s in () if t.op in ("matmul", "T") else t.srcs: yield from _lazy(s, seen)
 
 def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
   if t.op is None or id(t) in seen: return 0
   seen.add(id(t))
-  return 1 + (0 if t.op == "matmul" else sum(_ops(s, seen) for s in t.srcs))
+  return 1 + (0 if t.op in ("matmul", "T") else sum(_ops(s, seen) for s in t.srcs))
 
 def _expr(t, shape, inputs, kernel):
   """The tree of unrealized ops under t, realized tensors as numbers into inputs. A kernel sweeps its rows at one width
@@ -856,9 +867,11 @@ def _expr(t, shape, inputs, kernel):
     if w > 1 and kernel[0] is None: kernel[0] = w
     if (w > 1 and w != kernel[0]) or (id(t) not in kernel[1] and len(kernel[1]) == len(ACCS)): return _expr(t.realize(), shape, inputs, kernel)
     kernel[1].add(id(t))
+  if t.op == "T": return _expr(t.realize(), shape, inputs, kernel)  # a kernel of its own, unless a matmul's B (below)
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
-    a, b = (s.realize() for s in t.srcs)
-    return ("matmul", _expr(a, shape, inputs, kernel), _expr(b, shape, inputs, kernel))
+    a, b = t.srcs
+    b = ("T", _expr(b.srcs[0].realize(), shape, inputs, kernel)) if b.op == "T" else _expr(b.realize(), shape, inputs, kernel)
+    return ("matmul", _expr(a.realize(), shape, inputs, kernel), b)
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
 kernels = {}  # (expression, input shapes) -> (image, units a matrix), or a kernel's name and shape -> image

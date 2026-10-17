@@ -407,6 +407,10 @@ def test_batch(chip):
   assert np.array(keys.tolist()).tolist() == kt.reshape(3, 64, 40).tolist()
   close(heads @ keys, qkv.reshape(40, 3, 64).transpose(1, 0, 2) @ kt.reshape(3, 64, 40), 2**-6)
   assert np.array(heads.T.tolist()).tolist() == qkv.reshape(40, 3, 64).transpose(1, 2, 0).tolist()  # each matrix, transposed
+  h = qkv.reshape(40, 3, 64).transpose(1, 0, 2)
+  close(heads @ heads.T, h @ h.transpose(0, 2, 1), 2**-6)  # B transposed as the matmul reads it, no transpose kernel
+  (c, tc), (d, td) = make(96, 64), make(160, 64)
+  close(tc @ td.T, c @ d.T, 2**-6)  # and in blocks, with B's column kept in L1
   assert heads.merge().tolist() == qkv.tolist()  # side by side again: a copy, and a kernel's result written into its columns
   (m, tm) = make(64, 64)
   close((heads @ tm).merge(), (qkv.reshape(40, 3, 64) @ m).reshape(40, 192), 2**-6)

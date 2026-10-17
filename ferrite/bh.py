@@ -71,6 +71,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SEMPOST": (0xA4, {"sem_sel": (2, 8)}), "SEMGET": (0xA5, {"sem_sel": (2, 8)}),
   "SEMWAIT": (0xA6, {"wait_sem_cond": (0, 2), "sem_sel": (2, 8), "stall_res": (15, 9)}),  # cond 1: while 0, 2: while at max
   "SETC16": (0xB2, {"setc16_value": (0, 16), "setc16_reg": (16, 8)}),
+  **{f"RMWCIB{i}": (0xB3 + i, {"cfg_reg_addr": (0, 8), "data": (8, 8), "mask": (16, 8)}) for i in range(4)},  # byte i of a config word
   # SFPU, the 32-lane vector unit working on Dst (ISA VectorUnit.md; field names as on the ISA pages). vd/vc/vb/va are
   # LRegs: 0-7 are writable, 8 = 0.8373, 9 = 0.0, 10 = 1.0, 11 = -1.0, 15 = 2 * lane (writing 12-15 does something else).
   "SFPLOAD": (0x70, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
@@ -89,9 +90,9 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }
 UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets
-STALL_SYNC, STALL_PACK, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 8, 0x1FF  # STALLWAIT/SEMWAIT
-WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU = 0b110, 1 << 3, 1 << 4, 1 << 11  # stall_res: blocks those units until
-# (wait_res) the unpackers/packer/FPU/SFPU of this thread are idle
+STALL_SYNC, STALL_PACK, STALL_UNPACK, STALL_CFG, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 3, 1 << 7, 1 << 8, 0x1FF  # STALLWAIT
+WAIT_UNPACK0, WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU, WAIT_CFG = 1 << 1, 0b110, 1 << 3, 1 << 4, 1 << 11, 1 << 12  # stall_res
+# blocks those units until (wait_res) this thread's unpackers/packer/FPU/SFPU, or the config unit, are idle
 BF16 = 5  # data format code (ISA Unpackers/FormatConversion.md)
 
 # Backend config: field -> (32-bit word index at TENSIX_CFG, first bit, width). The ISA docs defer these numbers to
