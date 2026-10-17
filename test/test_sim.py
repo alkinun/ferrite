@@ -1,4 +1,5 @@
-# Milestone 1 on ttsim, one test per step. TTSIM=/path/to/libttsim.so python3 -m pytest test
+# Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
+# first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
 import math, os, random, struct, pytest
 import numpy as np
 from trickle import bh, pci
@@ -18,9 +19,7 @@ def close(t, want, tol):  # a tensor's values within tol (relative, and absolute
   assert got.shape == want.shape and np.allclose(got, want, rtol=tol, atol=tol), f"off by up to {np.abs(got - want).max()}"
 
 @pytest.fixture(scope="session")
-def chip():
-  assert "TTSIM" in os.environ, "set TTSIM=/path/to/libttsim.so (ttsim built for Blackhole)"
-  return Chip(pci.Sim(os.environ["TTSIM"]))  # libttsim can only be initialized once per process
+def chip(): return Chip(pci.open_device())  # one per process: libttsim can only be initialized once
 
 def test_config_space(chip):
   assert chip.pci.cfg_read(0x00) == bh.VENDOR | bh.DEVICE << 16
@@ -30,7 +29,7 @@ def test_config_space(chip):
 def test_arc(chip):
   chip.arc_msg(0x90)  # TEST
   t = chip.telemetry()
-  assert len(chip.tensix) == 120 and t[bh.TAG_AICLK] > 0, "ttsim models a p150: 12 of 14 Tensix columns"
+  assert len(chip.tensix) == 120 and t[bh.TAG_AICLK] > 0, "a p150 has 12 of 14 Tensix columns working, as ttsim models"
 
 def test_dma(chip):
   # the PCIe tile forwards NoC addresses below 2**58 to the host as bus addresses: point the TLB there and the

@@ -15,7 +15,9 @@ Each has a finish line we can check. Ticked when a test shows it.
    - [x] halfway: a small MNIST network (matmuls, bias, relu) matches (`test_mnist_mlp`)
    - [x] a GPT-2 layer (layer norm, attention, MLP) matches (`test_gpt2_layer`)
    - [x] beyond it: GPT-2 small's real weights generate text, token for token the same as numpy and Hugging Face (`test/gpt2.py`, `test_gpt2_model`)
-2. **First light on silicon.** Finish line: `hello` on every core of a p150, then every test passing on the card. Before the card arrives: tests that can run on `Card`, and a bring-up checklist of everything only ttsim has confirmed.
+2. **First light on silicon.** Finish line: `hello` on every core of a p150, then every test passing on the card. Before the card arrives:
+   - [x] the tests run on a card when `TTSIM` is not set
+   - [x] a bring-up checklist, step by step ("Bring-up on a p150")
 3. **Fast.** Finish line: a matmul benchmark with a number, measured against the chip's peak and improved over time (tile reuse, deeper pipelines, the MOP expander).
 
 ## Address map
@@ -370,6 +372,26 @@ What is left is per-tile control (slots, Dst half, semaphores). `test_replay_kee
 3. Matmul reuse: each step refetches both tiles from DRAM. Keep a row of left tiles in L1 across j, and fetch the next pair while the FPU runs (two L1 slots, two Src banks).
 4. Row passes recompute: softmax computes exp twice and reads x three times. Keeping a row's tiles in L1 between passes (when they fit) would trade L1 for that. Column reductions. With few rows, row ownership leaves workers idle; splitting a row across workers would need a cross-worker reduction. Fusion beyond this: a matmul epilogue could stay in Dst (`(a @ b) + c` by unpacking c and adding into the same half, no pack/unpack of the product), prologues (`(a + b) @ c`, per K step), unary ops, broadcasts. Keeping intermediates in fp32 (an fp32 pack, or moving Dst back into SrcA/SrcB) instead of rounding each to bf16.
 5. The SFPU, for fp32, exp, recip, and the rest.
+
+## Bring-up on a p150
+
+Everything so far ran on ttsim, which models the chip from Tenstorrent's own knowledge but runs each instruction at once, ignores most busy conditions, and completes NoC requests instantly. The day the card arrives, go in this order; each step only needs the ones before it. The tests open the card themselves when `TTSIM` is not set (`pci.open_device`), so the commands are the simulator's without it, as root.
+
+Before: `lspci -d 1e52:b140` shows the card; the IOMMU is off or in passthrough (`iommu=pt`), since `pci.Card` hands the device physical addresses; one 2 MiB hugepage is free (`echo 4 > /proc/sys/vm/nr_hugepages`). `pci.Card` unbinds tt-kmd itself.
+
+| step | command | what it confirms (and what to suspect if it fails) |
+|---|---|---|
+| 1 | `pytest test -k "config_space or arc"` | BARs, the TLB config registers (`bh.TLB_CONFIG`, `TLB_FIELDS`), the NoC coordinates of ARC, ARC's boot status, message queue and telemetry tags, and that `POWER_ON` wakes Tensix (else try AICLK go busy, `0x52`) |
+| 2 | `-k "dma or l1 or dram"` | the PCIe tile's loopback into host memory (`bh.PCIE`, bus addresses below 2^58), multicast and unicast L1 writes, DRAM bank coordinates and GDDR training |
+| 3 | `python3 -m trickle.hello` | soft reset bits, reset PCs and their override (`bh.TRISC_RESET_PC`), the firmware's jump table, the NIU's request registers, device writes into host memory, and the dispatcher |
+| 4 | `-k "every_core or relaunch or moves_data or queue or hung"` | the launch path end to end; instruction cache invalidation (`bh.CFG_IC_INVALIDATE`, a no-op in ttsim, so only here can a stale kernel show) |
+| 5 | `-k "tile_math or tensor_math"` | the backend config indices (`bh.TENSIX_CFG_FIELDS`, from ttsim's `tensix_regs.json`, not the ISA), instruction encodings, `.ttinsn`, semaphores from the TRISCs, unpack and pack of bf16 |
+| 6 | `-k "matmul or stream"` | MVMUL, the 3-bit address modes (from ttsim's `tensix_isa.json`; the ISA pages are Wormhole's), fidelity phases, the replay buffer |
+| 7 | `-k "sfpu or reductions or any_shape or views"` | SFPU encodings, LReg 15 as 2 x lane, lane flags, `SFPARECIP`, `Haloize_mode` |
+| 8 | the whole suite, a few times over | the waits ttsim never makes happen: the `STALLWAIT`s before reports and packs, TRISC2's wait for `READY`, `tensix_idle` before setting it (NOTES above: "What ttsim can and cannot check here"). A failure that comes and goes points here |
+| 9 | `GPT2=... pytest test -k gpt2`, then `test/gpt2.py` | everything at once, and the first real timings |
+
+For a hang, `Runtime.wait` names the stuck workers; read their PC snapshots (`0xFFB1_3138`, five words) with `chip.read32` to see where each core sits (ttsim does not model them, so this is untested too).
 
 ## Still unknown or untested
 
