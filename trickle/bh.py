@@ -69,7 +69,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SEMWAIT": (0xA6, {"wait_sem_cond": (0, 2), "sem_sel": (2, 8), "stall_res": (15, 9)}),  # cond 1: while 0, 2: while at max
   "SETC16": (0xB2, {"setc16_value": (0, 16), "setc16_reg": (16, 8)}),
   # SFPU, the 32-lane vector unit working on Dst (ISA VectorUnit.md; field names as on the ISA pages). vd/vc/vb/va are
-  # LRegs: 0-7 are writable, 8 = 0.8373, 9 = 0.0, 10 = 1.0, 11 = -1.0 (writing 12-15 does something else entirely).
+  # LRegs: 0-7 are writable, 8 = 0.8373, 9 = 0.0, 10 = 1.0, 11 = -1.0, 15 = 2 * lane (writing 12-15 does something else).
   "SFPLOAD": (0x70, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPLOADI": (0x71, {"imm16": (0, 16), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPSTORE": (0x72, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
@@ -77,6 +77,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPIADD": (0x79, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
   "SFPSHFT": (0x7A, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
   "SFPMOV": (0x7C, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
+  "SFPAND": (0x7E, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # vd &= vc
   "SFPMAD": (0x84, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4), "va": (16, 4)}),  # vd = va * vb + vc
   "SFPMUL": (0x86, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4), "va": (16, 4)}),  # vc must be LReg 9
   "SFPENCC": (0x8A, {"mod1": (0, 4), "vd": (4, 4), "imm2": (12, 2)}),

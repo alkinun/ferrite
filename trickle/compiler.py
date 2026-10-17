@@ -8,7 +8,7 @@
 # Tile layout: four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face
 # row-major. The ISA has no notion of a tile; this is the layout the FPU's 16x16 matrix multiply wants. An unpacker
 # reads a whole tile into a SrcA/SrcB bank, so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
-import struct
+import math, struct
 from trickle import bh
 from trickle.runtime import DATA, SYNC, compile_kernel
 
@@ -125,9 +125,8 @@ def from_bf16(b): return struct.unpack("<f", struct.pack("<I", b << 16))[0]
 # columns) into LReg 0 and stores the result back, the store stepping Dst by 2 (address modes 2 and 3; fp32 Dst, mod0 3).
 def sfp_load(): return ins("SFPLOAD", vd=0, mod0=3, addr_mode=2)
 def sfp_store(r): return ins("SFPSTORE", vd=r, mod0=3, addr_mode=3)
-def sfp_const(r, x):  # a full fp32 constant into LReg r: high half, then low half
-  bits = struct.unpack("<I", struct.pack("<f", x))[0]
-  return [ins("SFPLOADI", vd=r, mod0=8, imm16=bits >> 16), ins("SFPLOADI", vd=r, mod0=10, imm16=bits & 0xFFFF)]
+def sfp_bits(r, bits): return [ins("SFPLOADI", vd=r, mod0=8, imm16=bits >> 16), ins("SFPLOADI", vd=r, mod0=10, imm16=bits & 0xFFFF)]
+def sfp_const(r, x): return sfp_bits(r, struct.unpack("<I", struct.pack("<f", x))[0])  # a full fp32 constant into LReg r
 def mad(d, a, b, c, negate_a=0): return ins("SFPMAD", vd=d, va=a, vb=b, vc=c, mod1=negate_a)  # d = (-)a * b + c
 def mul(d, a, b): return ins("SFPMUL", vd=d, va=a, vb=b, vc=9)
 ZERO, ONE = 9, 10  # constant LRegs
@@ -178,6 +177,19 @@ def across_rows(kind):
     p += [rot(1, 0), fold(kind, 0, 1), rot(1, 0), rot(1, 1), fold(kind, 0, 1), rot(1, 0), rot(1, 1), rot(1, 1), rot(1, 1), fold(kind, 0, 1)]
     p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
   return p
+def mask_columns(kind, n, d):
+  """Columns n and on of the tile at Dst row d to the reduction's identity (0, or -inf for max), so the padding past a
+  tensor's last column does not count. An SFPSTORE writes 4 rows of 8 even or odd columns, lane l at column 2 (l % 8)
+  (+ 1 if odd); LReg 15 holds 2l, so LReg 7 = LReg 15 & 14 is twice the lane's place in its row, and each store goes to
+  the lanes whose column is n or more."""
+  fill = ZERO if kind == "rowsum" else 5
+  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+  p += ([] if kind == "rowsum" else sfp_const(5, -math.inf)) + sfp_bits(7, 14) + [ins("SFPAND", vd=7, vc=15)]
+  for base, right, odd in [(b, r, o) for b in (0, 4, 8, 12, 32, 36, 40, 44) for r in (0, 1) for o in (0, 1)]:
+    t = max(0, min(8, -(-(n - 16 * right - odd) // 2)))  # the first lane (of 8) at column n or more
+    if t < 8: p += [ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=7, mod1=9, imm12=-2 * t & 0xFFF),  # lanes t+
+                    ins("SFPSTORE", vd=fill, mod0=3, addr_mode=2, imm10=d + base + 16 * right + 2 * odd)]  # right faces: 16 rows on
+  return p + [ins("SFPENCC", mod1=10, imm2=2)]
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
@@ -206,13 +218,15 @@ def elementwise(op, slots, dst=0):
   return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [last(ins(fpu, dst=dst))]
 
 def at(row): return ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=row)  # aim FPU and SFPU at row
-def reduce_step(kind, slots, acc, first):
+def reduce_step(kind, slots, acc, first, edge=0):
   """One column tile of a row reduction, which has SrcA = the tile and SrcB = zeros: the first lands in the
-  accumulator once it is free; later ones land in scratch and the SFPU folds them in."""
+  accumulator once it is free; later ones land in scratch and the SFPU folds them in. edge: how many of the tile's
+  columns are the tensor's, if it is the row's last and cut short."""
   row, sem = ACCS[acc]
-  if first: return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem), at(row)] + elementwise("add", slots)
-  return ([at(row)] + elementwise("add", slots, dst=128) + [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
-          runs(slots, kind, 32))
+  if first: return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem), at(row)] +
+                    elementwise("add", slots) + (mask_columns(kind, edge, 0) if edge else []))
+  return ([at(row)] + elementwise("add", slots, dst=128) + (mask_columns(kind, edge, 128) if edge else []) +
+          [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] + runs(slots, kind, 32))
 def reduce_finish(kind, slots, acc, posts):  # fold each row across, run the SFPU ops on the result, hand it to pack
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), at(ACCS[acc][0])] + across_rows(kind) + sfpu(posts, slots) + MATH_END
 
@@ -255,9 +269,16 @@ static void push(const unsigned *p, unsigned n) {{ for (unsigned i = 0; i < n; i
 #define PUSH(p) push(p, sizeof p / 4)
 """
 
-def _brisc(zero, total, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
+def _brisc(zero, total, shape, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
+  (rows, cols), (rt, ct) = shape, (-(-shape[0] // 32), -(-shape[1] // 32))
+  pad = [f"if (t % {ct} == {ct - 1}) for (unsigned r = 0; r < 32; r++) for (unsigned c = {cols % 32}; c < 32; c++) d[AT(r, c)] = 0;"] * (cols > 1 and cols % 32 > 0)
+  pad += [f"if (t / {ct} == {rt - 1}) for (unsigned r = {rows % 32}; r < 32; r++) for (unsigned c = 0; c < 32; c++) d[AT(r, c)] = 0;"] * (rows > 1 and rows % 32 > 0)
   return SYNC_WORDS + f"""
 #define SLOT(i) ({SLOTS:#x} + (i) * {TILE})
+#define AT(r, c) (((r) / 16 * 2 + (c) / 16) * 256 + (r) % 16 * 16 + (c) % 16)  // datum (r, c) of a tile (see tile_index)
+// The result's padding, past its last row and column, goes home as zeros, which is what lets a later matmul add up a
+// padded K. Tile t of the result, in slot.
+static void tidy(unsigned slot, unsigned t) {{ volatile unsigned short *d = (volatile unsigned short *)SLOT(slot); (void)d; (void)t; {" ".join(pad)} }}
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
 static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out;
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
@@ -266,6 +287,7 @@ static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
 static void send(void) {{  // the results packed so far go home, in the order they were packed
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1);
+    tidy(slot, t);
     noc_write(SLOT(slot), bank[t % 8] & 63, bank[t % 8] >> 6, out + t / 8 * {TILE}, {TILE}); noc_wait();
   }}
 }}
@@ -337,8 +359,8 @@ void kmain(volatile unsigned *a) {{
 
 def fused_kernel(expr, shapes):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
-  rowsum and rowmax, ("matmul", a, b, K tiles) where a and b are inputs, and plain numbers for inputs. shapes: each
-  input's (rows, columns) in tiles; one tile tall or wide repeats across the others (broadcasting).
+  rowsum and rowmax, ("matmul", a, b) where a and b are inputs, and plain numbers for inputs. shapes: each input's
+  (rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
   args: [first unit, units, out, input 0, input 1, ...]. A unit is a tile of the result, or, if the expression reduces
   rows, a whole row of tiles, so the reduction can stay on chip.
 
@@ -361,29 +383,35 @@ def fused_kernel(expr, shapes):
       uses[c] = uses.get(c, 0) + 1
       count(c)
   count(expr)
-  ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, width; refs: expr -> input number or ("op", j)
-  width = lambda r: shapes[r][1] if isinstance(r, int) else ops[r[1]]["width"]
+  tiles = [(-(-r // 32), -(-c // 32)) for r, c in shapes]
+  ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, shape, width; refs: expr -> input number or ("op", j)
+  size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (rows, columns)
+  width = lambda r: tiles[r][1] if isinstance(r, int) else ops[r[1]]["width"]  # in tiles
   def visit(e):
     if isinstance(e, int): return e
     if e in refs: return refs[e]
-    if e[0] == "matmul": op = dict(kind="matmul", x=e[1], y=e[2], kt=e[3], width=shapes[e[2]][1])
-    elif e[0] in COMBINE: op = dict(kind=e[0], x=visit(e[1]), width=1)
+    if e[0] == "matmul":
+      op = dict(kind="matmul", x=e[1], y=e[2], kt=tiles[e[1]][1], shape=(shapes[e[1]][0], shapes[e[2]][1]), width=tiles[e[2]][1])
+    elif e[0] in COMBINE:
+      x = visit(e[1])
+      op = dict(kind=e[0], x=x, shape=(size(x)[0], 1), width=1)
     elif e[0] in SFPU:
       x = visit(e[1])
       if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below
         ops[x[1]]["posts"].append(e[0])
         refs[e] = x
         return x
-      op = dict(kind="add", x=x, y="zero", width=width(x), posts=[e[0]])  # operand + 0 into Dst, then the SFPU
+      op = dict(kind="add", x=x, y="zero", shape=size(x), width=width(x), posts=[e[0]])  # operand + 0 into Dst, then the SFPU
     else:
       x, y = visit(e[1]), visit(e[2])
-      op = dict(kind=e[0], x=x, y=y, width=max(width(x), width(y)))
+      op = dict(kind=e[0], x=x, y=y, shape=tuple(map(max, size(x), size(y))), width=max(width(x), width(y)))
     ops.append({"posts": [], **op})
     refs[e] = ("op", len(ops) - 1)
     return refs[e]
   root = visit(expr)[1]
-  inputs, w = len(shapes), max([op["width"] for op in ops] + [c for _, c in shapes])
-  wide = lambda r: r != "zero" and width(r) == w  # varies along the row; otherwise one tile a row
+  inputs, w = len(shapes), max([op["width"] for op in ops] + [c for _, c in tiles])
+  reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
+  wide = lambda r: r != "zero" and width(r) == w and not reduced(r)  # varies along the row; otherwise one tile a row
   operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
   rowwise = any(op["kind"] in COMBINE for op in ops)
   assert len(ops) <= 15, "SEM_L1 counts at most 15 intermediates"
@@ -402,7 +430,7 @@ def fused_kernel(expr, shapes):
     if isinstance(r, int): return FRAMES + f * frame + r
     return FRAMES + (f * frame + inputs + r[1] if wide(r) else 2 * frame + r[1])
   def tile(i):  # which tile of input i goes with this unit's row i_ and column j
-    rows, cols = shapes[i]
+    rows, cols = tiles[i]
     return f"{'i_' if rows > 1 else 0} * {cols} + {'j' if cols > 1 else 0}"
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
   def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }}"  # one per Dst half
@@ -431,7 +459,7 @@ def fused_kernel(expr, shapes):
         cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
         c[P].append(f"{cond}{{ {output(j, f)}{halves([pack(DST_HALF * h, slot(f, me), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])} h ^= 1; }}")
         if op["kind"] == "matmul":
-          kt, bw = op["kt"], shapes[op["y"]][1]  # B's width in tiles
+          kt, bw = op["kt"], tiles[op["y"]][1]  # B's width in tiles
           c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{3 + op['x']}], i_ * {kt} + m, a[{3 + op['y']}], m * {bw} + {'j' if bw > 1 else 0});")
           c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
                       f"if (steps++ & 1) {{ {tt(unpack(1, 3) + REPORT)} }} else {{ {tt(unpack(0, 2) + REPORT)} }} }}{posted} }}")
@@ -443,12 +471,22 @@ def fused_kernel(expr, shapes):
         c[M].append(f"{cond}{{ {halves([math_begin(h, op['kind'] == 'mul') + elementwise(op['kind'], slots) + sfpu(op['posts'], slots) + MATH_END for h in (0, 1)])} h ^= 1; }}")
       for acc, j in enumerate(reductions):
         assert acc < len(ACCS), "two reductions a pass"
-        op, me = ops[j], ("op", j)
-        drain = "drain(); " if isinstance(op["x"], tuple) else ""
-        c[U].append(f"{drain}{tt(unpack(slot(f, op['x']), ZERO_SLOT))}{'' if j == root else ' if (j == j1 - 1) posted++;'}")
-        c[M].append(f"if (k == 0) {{ {tt(reduce_step(op['kind'], slots, acc, True))} }} else {{ {tt(reduce_step(op['kind'], slots, acc, False))} }} "
-                    f"if (j == j1 - 1) {{ {tt(reduce_finish(op['kind'], slots, acc, op['posts']))} }}")
-        c[P].append(f"if (j == j1 - 1) {{ {output(j, f)}{tt(pack(ACCS[acc][0], slot(f, me), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))} }}")
+        op, me, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
+        drain = "drain(); " if isinstance(x, tuple) else ""
+        edge = size(x)[1] % 32 if size(x)[1] > 1 else 0  # the operand's columns in its last tile, if that is cut short
+        end = "j == j1 - 1" if wide(x) else "k == 0"  # the row's last tile (a narrow operand is one tile a row)
+        def step(first):  # the last tile's padding must not count
+          plain, cut = tt(reduce_step(kind, slots, acc, first)), tt(reduce_step(kind, slots, acc, first, edge))
+          return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
+        finish, posted = tt(reduce_finish(kind, slots, acc, op["posts"])), "" if j == root else " posted++;"
+        pk = tt(pack(ACCS[acc][0], slot(f, me), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
+        if wide(x):  # swept over the row
+          c[U].append(f"{drain}{tt(unpack(slot(f, x), ZERO_SLOT))} if ({end}) {{{posted} }}")
+          c[M].append(f"if (k == 0) {{ {step(True)} }} else {{ {step(False)} }} if ({end}) {{ {finish} }}")
+        else:  # reduced in the pass's first tile
+          c[U].append(f"if ({end}) {{ {drain}{tt(unpack(slot(f, x), ZERO_SLOT))}{posted} }}")
+          c[M].append(f"if ({end}) {{ {step(True)} {finish} }}")
+        c[P].append(f"if ({end}) {{ {output(j, f)}{pk} }}")
       c[U].append(tt(REPORT))
       c[B].append(f"frame_done[{f}] = ++events;")
       bodies.append(c)
@@ -463,7 +501,7 @@ def fused_kernel(expr, shapes):
   }}"""
   total = f"a[1] * {w if rowwise and wide(('op', root)) else 1}"  # results this worker sends home
   zero = rowwise or any(op.get("y") == "zero" for op in ops)
-  return compile_kernel(_brisc(zero, total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
+  return compile_kernel(_brisc(zero, total, size(("op", root)), program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
 
 
 def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16  # where (r, c) of a tile sits in it
@@ -471,10 +509,13 @@ def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 1
 class Tensor:
   """rows x cols of bf16: in DRAM as 32x32 tiles in row-major tile order, tile i in bank i % 8; or, until realized, an
   op on other tensors. Realizing compiles the whole tree of unrealized ops under it into one kernel; a matmul's own
-  operands are realized first, since each of its output tiles needs a whole row and column of them."""
+  operands are realized first, since each of its output tiles needs a whole row and column of them.
+  Any shape: the last tile row and column are padded, with zeros, except that a dimension of 1 fills its tile with
+  copies (a row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. Every kernel leaves
+  its result that way too, so a matmul can sum over a padded K."""
   def __init__(self, rt, rows, cols, op=None, srcs=()):
-    assert rows % 32 == 0 and cols % 32 == 0, "tensors are whole tiles"
-    self.rt, self.rows, self.cols, self.tiles, self.op, self.srcs = rt, rows, cols, rows * cols // 1024, op, srcs
+    self.rt, self.rows, self.cols, self.op, self.srcs = rt, rows, cols, op, srcs
+    self.tiles = -(-rows // 32) * -(-cols // 32)
     self.addr = None if op else rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
 
   def __del__(self):  # its DRAM goes back once nothing refers to it (launches are waited for, so none still reads it)
@@ -485,33 +526,35 @@ class Tensor:
 
   @classmethod
   def of(cls, rt, rows):
-    t = cls(rt, len(rows), len(rows[0]))
+    t, ct = cls(rt, len(rows), len(rows[0])), -(-len(rows[0]) // 32)
     for i in range(t.tiles):
-      r0, c0, tile = i // (t.cols // 32) * 32, i % (t.cols // 32) * 32, [0] * 1024
+      r0, c0, tile = i // ct * 32, i % ct * 32, [0] * 1024
       for r in range(32):
-        for c in range(32): tile[tile_index(r, c)] = to_bf16(rows[r0 + r][c0 + c])
+        for c in range(32):
+          y, x = r0 + r if t.rows > 1 else 0, c0 + c if t.cols > 1 else 0  # a dimension of 1 fills the tile
+          if y < t.rows and x < t.cols: tile[tile_index(r, c)] = to_bf16(rows[y][x])
       t.rt.chip.write(*bh.DRAM[i % 8], t.addr + i // 8 * TILE, struct.pack("<1024H", *tile))
     return t
 
   def tolist(self):
     self.realize()
-    out = [[0.0] * self.cols for _ in range(self.rows)]
+    out, ct = [[0.0] * self.cols for _ in range(self.rows)], -(-self.cols // 32)
     for i in range(self.tiles):
-      r0, c0 = i // (self.cols // 32) * 32, i % (self.cols // 32) * 32
+      r0, c0 = i // ct * 32, i % ct * 32
       tile = struct.unpack("<1024H", self.rt.chip.read(*bh.DRAM[i % 8], self.addr + i // 8 * TILE, TILE))
-      for r in range(32):
-        for c in range(32): out[r0 + r][c0 + c] = from_bf16(tile[tile_index(r, c)])
+      for r in range(min(32, self.rows - r0)):
+        for c in range(min(32, self.cols - c0)): out[r0 + r][c0 + c] = from_bf16(tile[tile_index(r, c)])
     return out
 
   def realize(self):
     if self.op is None: return self
     inputs = []
     e = _expr(self, self.rows, inputs)
-    key = (e, tuple((u.rows // 32, u.cols // 32) for u in inputs))
+    key = (e, tuple((u.rows, u.cols) for u in inputs))
     kernel = kernels.get(key) or kernels.setdefault(key, fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
     rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
-    return self._run(kernel, self.addr, *[t.addr for t in inputs], units=self.rows // 32 if rowwise else None)
+    return self._run(kernel, self.addr, *[t.addr for t in inputs], units=-(-self.rows // 32) if rowwise else None)
 
   def _run(self, kernel, *args, units=None):  # this tensor's tiles, or rows, split evenly over the workers
     cores, units = self.rt.cores, units or self.tiles
@@ -521,36 +564,40 @@ class Tensor:
     return self
 
   def _elementwise(self, op, other):
-    """Shapes match, or one side is one tile (32) tall or wide and repeats that tile across the other's rows or
-    columns. Row reductions give tiles that hold each row's value in all 32 columns, so with them this is numpy's
-    broadcasting of a column vector."""
+    """numpy's broadcasting: shapes match, or one side has 1 where the other does not. A number is a 1 x 1 tensor."""
+    if not isinstance(other, Tensor): other = Tensor.full(self.rt, 1, 1, other)
     shape = []
     for a, b in ((self.rows, other.rows), (self.cols, other.cols)):
-      assert a == b or 32 in (a, b), f"cannot broadcast ({self.rows}, {self.cols}) with ({other.rows}, {other.cols})"
+      assert a == b or 1 in (a, b), f"cannot broadcast ({self.rows}, {self.cols}) with ({other.rows}, {other.cols})"
       shape.append(max(a, b))
     return Tensor(self.rt, *shape, op, (self, other))
   def relu(self): return Tensor(self.rt, self.rows, self.cols, "relu", (self,))
   def exp(self): return Tensor(self.rt, self.rows, self.cols, "exp", (self,))
   def reciprocal(self): return Tensor(self.rt, self.rows, self.cols, "recip", (self,))
   def rsqrt(self): return Tensor(self.rt, self.rows, self.cols, "rsqrt", (self,))
-  def rowsum(self): return Tensor(self.rt, self.rows, 32, "rowsum", (self,))  # each row's sum, in all 32 columns
-  def rowmax(self): return Tensor(self.rt, self.rows, 32, "rowmax", (self,))
+  def rowsum(self): return self if self.cols == 1 else Tensor(self.rt, self.rows, 1, "rowsum", (self,))
+  def rowmax(self): return self if self.cols == 1 else Tensor(self.rt, self.rows, 1, "rowmax", (self,))
   def __add__(self, other): return self._elementwise("add", other)
   def __sub__(self, other): return self._elementwise("sub", other)
   def __mul__(self, other): return self._elementwise("mul", other)
+  def __truediv__(self, other): return self * (1 / other if isinstance(other, (int, float)) else other.reciprocal())
+  __radd__, __rmul__ = __add__, __mul__
+  def __rsub__(self, other): return Tensor.full(self.rt, 1, 1, other) - self
+  def __neg__(self): return self * -1.0
 
   def __matmul__(self, other):
     assert self.cols == other.rows, f"({self.rows}, {self.cols}) @ ({other.rows}, {other.cols})"
+    if self.cols == 1: return self * other  # (R, 1) @ (1, C) is broadcasting
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other))
 
 def _expr(t, rows, inputs):  # the tree of unrealized ops under t, realized tensors as numbers into inputs
   if t.op is None:
     if all(t is not u for u in inputs): inputs.append(t)
     return next(i for i, u in enumerate(inputs) if u is t)
-  if t.rows != rows: return _expr(t.realize(), rows, inputs)  # one tile tall, repeated down: compute it once
+  if t.rows != rows: return _expr(t.realize(), rows, inputs)  # one row, repeated down: compute it once
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = (s.realize() for s in t.srcs)
-    return ("matmul", _expr(a, rows, inputs), _expr(b, rows, inputs), a.cols // 32)
+    return ("matmul", _expr(a, rows, inputs), _expr(b, rows, inputs))
   return (t.op, *(_expr(s, rows, inputs) for s in t.srcs))
 
 def _subexprs(e):

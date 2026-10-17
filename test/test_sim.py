@@ -1,11 +1,20 @@
 # Milestone 1 on ttsim, one test per step. TTSIM=/path/to/libttsim.so python3 -m pytest test
 import math, os, random, struct, pytest
+import numpy as np
 from trickle import bh, pci
 from trickle.chip import Chip
 from trickle import compiler
 from trickle.compiler import Tensor, from_bf16, to_bf16
 from trickle.hello import hello
 from trickle.runtime import ARGS, DATA, Runtime, compile_kernel
+
+def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
+  b = np.asarray(a, np.float32).view(np.uint32)
+  return ((b + (0x8000 if packer else 0x7FFF + (b >> 16 & 1))) & 0xFFFF0000).view(np.float32).astype(np.float64)
+
+def close(t, want, tol):  # a tensor's values within tol (relative, and absolute near 0) of numpy's
+  got = np.array(t.tolist())
+  assert got.shape == want.shape and np.allclose(got, want, rtol=tol, atol=tol), f"off by up to {np.abs(got - want).max()}"
 
 @pytest.fixture(scope="session")
 def chip():
@@ -280,23 +289,46 @@ def test_sfpu(chip):
       assert abs(gv - (e + r)) <= 2**-6 * max(abs(e), abs(r)), (uv, wv, gv, e + r)
 
 def test_reductions(chip):
-  # row max exactly, row sum to a bf16 step of the sum of magnitudes, both written to all 32 columns of the row;
-  # then broadcast back: x - rowmax(x), and a 32x32 constant times a column, all against Python
+  # row max exactly, row sum to a bf16 step of the sum of magnitudes, each a column; then broadcast back:
+  # x - rowmax(x), and a column times a number, all against Python
   rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 96
   bf = lambda v: from_bf16(to_bf16(v))
   x = [[bf(random.uniform(-4, 4)) for _ in range(cols)] for _ in range(rows)]
   tx = Tensor.of(rt, x)
-  assert tx.rowmax().tolist() == [[max(row)] * 32 for row in x]
-  for got, row in zip(tx.rowsum().tolist(), x):
-    assert len(set(got)) == 1 and abs(got[0] - sum(row)) <= 2**-8 * sum(map(abs, row)), (got[0], sum(row))
+  assert tx.rowmax().tolist() == [[max(row)] for row in x]
+  for (got,), row in zip(tx.rowsum().tolist(), x):
+    assert abs(got - sum(row)) <= 2**-8 * sum(map(abs, row)), (got, sum(row))
   for got, row in zip((tx - tx.rowmax()).tolist(), x):
     assert all(abs(g - (v - max(row))) <= 2**-7 * max(abs(v), abs(max(row))) for g, v in zip(got, row))
-  assert (tx.rowmax() * Tensor.full(rt, 32, 32, 0.5)).tolist() == [[max(row) / 2] * 32 for row in x]
+  assert (tx.rowmax() * 0.5).tolist() == [[max(row) / 2] for row in x]
+
+def test_any_shape(chip):
+  # 45 x 70 is two tile rows by three tile columns, the last of each cut short; a dimension of 1 broadcasts. Results go
+  # home with zero padding (a matmul of two results needs that, or the padding of K adds in), and row reductions mask
+  # their last tile's padding (with every value negative, an unmasked 0 would be the max and add up in softmax)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(0)
+  def make(rows, cols, lo=-2.0, hi=2.0):
+    a = bf16(rng.uniform(lo, hi, (rows, cols)))
+    return a, Tensor.of(rt, a.tolist())
+  (x, tx), (y, ty), (col, tcol), (row, trow) = make(45, 70), make(45, 70), make(45, 1), make(1, 70)
+  assert (tx * ty).tolist() == bf16(x * y, True).tolist() and (tcol @ trow).tolist() == bf16(col * row, True).tolist()
+  close(tx + ty, x + y, 2**-7)
+  close(tx * trow + tcol - 2.5, x * row + col - 2.5, 2**-6)
+  neg, tneg = make(45, 70, -6, -1)
+  assert tneg.rowmax().tolist() == neg.max(1, keepdims=True).tolist()
+  close(tneg.rowsum(), neg.sum(1, keepdims=True), 2**-8)
+  e = np.exp(neg - neg.max(1, keepdims=True))
+  close((tneg - tneg.rowmax()).exp() / (tneg - tneg.rowmax()).exp().rowsum(), e / e.sum(1, keepdims=True), 0.02)
+  narrow, tnarrow = make(45, 20, -3, -1)  # one tile wide: reduced on its own, and inside a three-tile-wide kernel
+  assert tnarrow.rowmax().tolist() == narrow.max(1, keepdims=True).tolist()
+  close(tnarrow.rowsum() + tx, narrow.sum(1, keepdims=True) + x, 2**-6)
+  (a, ta), (b, tb) = make(45, 50, -1, 1), make(50, 70, -1, 1)
+  close(ta.exp() @ tb.exp(), bf16(np.exp(a)) @ bf16(np.exp(b)), 2**-6)
 
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
   # staying in Dst and their results in L1. softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)), three passes;
-  # layernorm(x) = (x - mean) * rsqrt(var + eps) * gamma + beta, gamma and beta one tile tall, repeated down the rows.
+  # layernorm(x) = (x - mean) * rsqrt(var + eps) * gamma + beta, gamma and beta rows, repeated down.
   # On one worker (3 rows in a row, slots and accumulators reused) and on many
   bf = lambda v: from_bf16(to_bf16(v))
   for workers, rows, cols in ((chip.tensix[1], 96, 128), (chip.tensix[-1], 64, 160)):
@@ -310,9 +342,9 @@ def test_softmax_and_layernorm(chip):
       want = [math.exp(v - max(row)) for v in row]
       assert all(abs(gv - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for gv, w in zip(g, want))
     gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
-    inv_n, eps, tg, tb = Tensor.full(rt, 32, 32, 1 / cols), Tensor.full(rt, 32, 32, 1e-5), Tensor.of(rt, [gamma] * 32), Tensor.of(rt, [beta] * 32)
-    d = tx - tx.rowsum() * inv_n
-    launches, got = rt.launches, (d * ((d * d).rowsum() * inv_n + eps).rsqrt() * tg + tb).tolist()
+    tg, tb = Tensor.of(rt, [gamma]), Tensor.of(rt, [beta])
+    d = tx - tx.rowsum() * (1 / cols)
+    launches, got = rt.launches, (d * ((d * d).rowsum() * (1 / cols) + 1e-5).rsqrt() * tg + tb).tolist()
     assert rt.launches == launches + 1
     for g, row in zip(got, x):
       mean = sum(row) / cols
