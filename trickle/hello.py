@@ -12,12 +12,14 @@ void kmain(volatile unsigned *args) {  // args: [n, fib(n)]
 }
 """
 
-def hello(chip, cores, n):
-  rt = Runtime(chip, cores)
+def hello(chip, start, end, n):
+  """fib(n) on every Tensix from start to end: {core: answer}."""
+  rt = Runtime(chip, start, end)
   rt.launch(compile_rv32(FIB, KERNEL), lambda x, y: (n, 0))
   rt.wait()
-  return [chip.read32(x, y, ARGS + 4) for x, y in cores]
+  return {(x, y): chip.read32(x, y, ARGS + 4) for x, y in rt.cores}
 
 if __name__ == "__main__":
   chip = Chip(pci.open_device())
-  print(f"BRISC on Tensix {chip.tensix[0]} says fib(30) = {hello(chip, chip.tensix[:1], 30)[0]}")
+  answers = hello(chip, chip.tensix[0], chip.tensix[-1], 30)
+  print(f"{len(answers)} Tensix cores say fib(30) = {set(answers.values())}")

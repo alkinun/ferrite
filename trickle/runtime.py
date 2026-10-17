@@ -72,28 +72,30 @@ void loop(void) {{
 """
 
 class Runtime:
-  """Firmware on the BRISC of each of cores, then any number of launches of `void kmain(volatile unsigned *args)`.
+  """Firmware on the BRISC of every Tensix in the rectangle from start to end, then any number of launches of
+  `void kmain(volatile unsigned *args)`. What every core gets is multicast: one write over PCIe, whatever the count.
   Each core reports a finished launch by writing its count into its own 16-byte slot of a host buffer."""
-  def __init__(self, chip, cores):
-    self.chip, self.cores, self.launches = chip, cores, 0
-    self.done, bus = chip.pci.alloc(16 * len(cores))
+  def __init__(self, chip, start, end):
+    self.chip, self.start, self.end, self.launches = chip, start, end, 0
+    self.cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
+    self.done, bus = chip.pci.alloc(16 * len(self.cores))
     fw = compile_rv32(FIRMWARE)
     assert len(fw) <= MAILBOX, "firmware overlaps the mailbox"
-    for i, (x, y) in enumerate(cores):
-      chip.halt(x, y)
-      chip.write(x, y, 0, fw)
+    chip.halt(*end, start)
+    chip.write(*end, 0, fw, start)
+    for i, (x, y) in enumerate(self.cores):
       chip.write(x, y, MAILBOX, struct.pack("<5I", 0, bh.PCIE[0] | bh.PCIE[1] << 6, (bus + 16 * i) & 0xFFFFFFFF, (bus + 16 * i) >> 32, 0))
-      chip.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES & ~bh.BRISC)
+    chip.write32(*end, bh.SOFT_RESET, bh.ALL_CORES & ~bh.BRISC, start)
 
   def launch(self, kernel, args=lambda x, y: ()):
     """Start kernel, an image from compile_rv32(src, KERNEL), on every core with args(x, y) as its arguments."""
     assert len(kernel) <= DATA - KERNEL, f"kernel is {len(kernel)} bytes, room for {DATA - KERNEL}"
     self.launches += 1
+    self.chip.write(*self.end, KERNEL, kernel, self.start)
     for x, y in self.cores:
-      self.chip.write(x, y, KERNEL, kernel)
       a = args(x, y)
       self.chip.write(x, y, ARGS, struct.pack(f"<{len(a)}I", *a))
-      self.chip.write32(x, y, MAILBOX, self.launches)
+    self.chip.write32(*self.end, MAILBOX, self.launches, self.start)
 
   def wait(self, timeout=2.0):
     """Until every core has reported the last launch: polls host memory, not the chip."""

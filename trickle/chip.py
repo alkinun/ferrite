@@ -21,29 +21,32 @@ class Chip:
     banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]
     self.wait(lambda: all(self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 1 for b in banks), "finish GDDR training", 60)
 
-  def window(self, x, y, addr):
-    """Point the TLB at the 2 MiB block holding NoC address (x, y, addr); return the BAR0 offset that reaches addr."""
+  def window(self, x, y, addr, start=None):
+    """Point the TLB at the 2 MiB block holding NoC address (x, y, addr), or for writes at the same block in every
+    Tensix of the rectangle from start to (x, y); return the BAR0 offset that reaches addr."""
     base = addr & ~(bh.TLB_WINDOW - 1)
-    if self.target != (x, y, base):
-      cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT)
+    if self.target != (x, y, base, start):
+      mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
+      cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast)
       for i in range(3): self.pci.write(0, bh.TLB_CONFIG + 12 * self.tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
-      self.target = (x, y, base)
+      self.target = (x, y, base, start)
     return self.tlb * bh.TLB_WINDOW + addr - base
 
-  def chunks(self, x, y, addr, n):  # (BAR0 offset, size) pieces of [addr, addr+n), split where the window must move
+  def chunks(self, x, y, addr, n, start=None):  # (BAR0 offset, size) pieces of [addr, addr+n), split where the window moves
     while n:
       size = min(n, bh.TLB_WINDOW - addr % bh.TLB_WINDOW)
-      yield self.window(x, y, addr), size
+      yield self.window(x, y, addr, start), size
       addr, n = addr + size, n - size
 
   def read(self, x, y, addr, n): return b"".join(self.pci.read(0, off, size) for off, size in self.chunks(x, y, addr, n))
-  def write(self, x, y, addr, data):
+  def write(self, x, y, addr, data, start=None):
+    """Write data at NoC address (x, y, addr); with start, to every Tensix in the rectangle from start to (x, y)."""
     done = 0
-    for off, size in self.chunks(x, y, addr, len(data)):
+    for off, size in self.chunks(x, y, addr, len(data), start):
       self.pci.write(0, off, data[done:done + size])
       done += size
   def read32(self, x, y, addr): return int.from_bytes(self.read(x, y, addr, 4), "little")
-  def write32(self, x, y, addr, val): self.write(x, y, addr, val.to_bytes(4, "little"))
+  def write32(self, x, y, addr, val, start=None): self.write(x, y, addr, val.to_bytes(4, "little"), start)
 
   def wait(self, cond, what, timeout=2.0):
     deadline = time.monotonic() + timeout
@@ -77,4 +80,4 @@ class Chip:
     vals = struct.unpack(f"<{n}I", self.read(x, y, values, 4 * n))
     return {t & 0xFFFF: vals[t >> 16] for t in tags}
 
-  def halt(self, x, y): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES)  # hold all five cores of Tensix (x, y) in reset
+  def halt(self, x, y, start=None): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES, start)  # hold all five cores in reset

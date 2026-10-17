@@ -6,8 +6,10 @@ VENDOR, DEVICE = 0x1E52, 0xB140
 TLB_WINDOW = 1 << 21
 TLB_CONFIG = 0x1FC00000  # BAR0 offset of the TLB config registers: 3 dwords per TLB, the 2 MiB ones first
 # 2 MiB TLB config, a 96-bit little-endian value: field -> (first bit, width). The rest of the fields are in NOTES.md.
-TLB_FIELDS = {"addr": (0, 43), "x_end": (43, 6), "y_end": (49, 6), "ordering": (70, 2)}
+TLB_FIELDS = {"addr": (0, 43), "x_end": (43, 6), "y_end": (49, 6), "x_start": (55, 6), "y_start": (61, 6),
+              "mcast": (69, 1), "ordering": (70, 2), "static_vc": (73, 1), "vc_class": (76, 2)}
 STRICT = 1  # ordering: each write is acknowledged before the next one starts
+MCAST_VC = 2  # multicast on a static VC must use class 2 (umd does, ISA NoC/MemoryMap.md NOC_CTRL)
 
 # NoC endpoints in translated coordinates, which firmware sets up at boot so that harvesting is invisible:
 # Tensix columns with the good ones first (a p150 has 12, telemetry says how many), rows 2..11.
