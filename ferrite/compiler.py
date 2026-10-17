@@ -619,18 +619,19 @@ void kmain(volatile unsigned *a) {{
 }}""")
 
 def transpose_kernel(rows, cols):
-  """x.T for x of (rows, cols), args [first unit, units, out, x's address, tile stride, tile offset]: result tile (i, j)
-  is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal faces swapped, and unpacker 0 transposes
+  """x.T for x of (rows, cols), each matrix of a batch, args [first unit, units, out, x's address, tile strides for batch
+  and row, tile offset]: result tile (i, j) is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal faces swapped, and unpacker 0 transposes
   each face on its way into SrcA (Haloize_mode), so x + 0 through the FPU lands the transpose in Dst. Haloize_mode is
   backend config, so it holds for every SrcA load in the kernel: a transpose is a kernel of its own."""
   ct, frame = -(-rows // 32), lambda f: (FRAMES + 2 * f, FRAMES + 2 * f + 1)  # the result's tile columns; x's slot and the result's
+  per = ct * -(-cols // 32)  # tiles a matrix
   def loop(*per_frame):  # the same loop over result tiles t for all four programs, frame f alternating
     return f"""  for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u;
     if (u & 1) {{ {per_frame[1]} }} else {{ {per_frame[0]} }}
   }}"""
   return compile_kernel(
-    _brisc(True, "a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t % {ct} * a[4] + t / {ct} + a[5], {frame(f)[0]}); ready(); "
+    _brisc(True, "a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} * a[5] + t % {per} / {ct} + a[6], {frame(f)[0]}); ready(); "
                                 f"frame_done[{f}] = ++events;" for f in (0, 1)])),
     _unpacker(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]), TRANSPOSING),
     _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)]) + " h ^= 1;"] * 2)),  # padding stays 0
@@ -739,11 +740,10 @@ class Tensor:
 
   @property
   def T(self):
-    """The transpose, computed now, in a kernel of its own (see transpose_kernel)."""
-    assert self.batch == 1
-    out = Tensor(self.rt, self.cols, self.rows)
+    """The transpose (of each matrix of a batch), computed now, in a kernel of its own (see transpose_kernel)."""
+    out = Tensor(self.rt, self.cols, self.rows, batch=self.batch)
     kernel = _cached(("transpose", self.rows, self.cols), lambda: transpose_kernel(self.rows, self.cols))
-    return out._run(kernel, out.addr, self.realize().addr, self.stride, self.offset)
+    return out._run(kernel, out.addr, self.realize().addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset)
 
   def realize(self):
     if self.op is None: return self
