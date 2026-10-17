@@ -4,17 +4,16 @@ import functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile
 from ferrite import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
-# 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, report x | y << 6, report address, index] (the
-# first half multicast by the dispatcher; done 16-byte aligned like the slot it is copied to), the TRISCs' [go, done 0,
-# 1, 2], SYNC (zeroed before each launch, for the kernel's cores to talk through), two buffers of kernel arguments
+# 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
+# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for the kernel's cores to talk through), two buffers of kernel arguments
 # (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds,
 # then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle,
-# how many], an outbox [go, kernel, arguments, workers] [rptr, launches done], a done slot per worker, and staging for
-# one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
+# how many], an outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the workers' reports, and
+# staging for one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, ARGS, KERNELS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
-DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 0x1000
+DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
 STAGING_ROOM = bh.L1_SIZE - STAGING
 
 # Prepended to every device program: NoC transfers through request initiator 0 of NIU 0 (ISA NoC/MemoryMap.md).
@@ -117,11 +116,13 @@ def start(brisc, trisc0, trisc1, trisc2):  # firmware's first words: BRISC start
 # BRISC turns into this worker's [first unit, how many]. It zeroes SYNC, drops the cached instructions of all four
 # cores (the kernel may sit where another was), and tells the TRISCs to go; each core runs its program from the
 # kernel's header, and a TRISC then waits for its Tensix thread to finish everything it pushed. Once all four are done
-# BRISC reports.
+# BRISC reports: it notes the launch in its own mailbox (for the host, should one hang) and adds 1 to the dispatcher's
+# count with a NoC atomic, posted (its old value lands in the scratch word).
 FIRMWARE = f"""
 #define MAILBOX ((volatile unsigned *){MAILBOX:#x})
 #define TRISCS ((volatile unsigned *){TRISCS:#x})
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
+enum {{ AT_DATA = 0x28, ATOMIC = 1, INCREMENT = 1 << 12 | 31 << 2 }};  // NOC_AT_LEN_BE: add NOC_AT_DATA to all 32 bits of word 0
 {start("brisc", "trisc0", "trisc1", "trisc2")}
 __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\n j brisc_loop"); }}
 __attribute__((naked)) void trisc0(void) {{ asm("li sp, {bh.TRISC_STACK_TOP:#x}\\n li a0, 0\\n j trisc_loop"); }}
@@ -152,8 +153,9 @@ void brisc_loop(void) {{
     noc_wait();  // whatever the kernel sent is in place before we say it is done
     for (unsigned i = 1; i <= 3; i++) while (TRISCS[i] != seen) asm volatile("fence" ::: "memory");
     MAILBOX[4] = seen;
-    noc_write({MAILBOX + 16:#x}, MAILBOX[5] & 63, MAILBOX[5] >> 6, MAILBOX[6], 4);
-    noc_wait();
+    while (NIU(CMD) & 1) {{}}
+    NIU(AT_DATA) = 1;
+    noc_issue({DONE:#x}, MAILBOX[5], {MAILBOX + 24:#x}, noc_me(), ATOMIC, INCREMENT);
   }}
 }}
 void trisc_loop(unsigned i) {{
@@ -171,7 +173,7 @@ void trisc_loop(unsigned i) {{
 # A command is a 16-byte header [length, kernel address, argument bytes, workers], then the arguments; the whole is
 # 64-byte aligned. Length 0 means: the rest of the ring is unused. The kernel is already in every worker's L1
 # (Runtime.load). The arguments and the go are each one multicast to every worker, whether the launch is for all of
-# them or for the first `workers`; only the done slots are one per worker. A multicast's acknowledgements come one per
+# them or for the first `workers`, and the workers count themselves done in one word. A multicast's acknowledgements come one per
 # worker, so they are counted on the acknowledgement counter, and the request counter (up once, down once per worker)
 # is cleared after. One launch runs at a time, but the next one's command is read and its arguments written while it
 # runs (into the other argument buffer), so it goes the moment the last worker reports.
@@ -179,7 +181,6 @@ DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
 enum {{ WR_ACKS = 0x204, CLEAR_OUTSTANDING = 0x60, MULTICAST = WRITE | 1 << 5 | 1 << 7 | 1 << 8 | {bh.MCAST_VC} << 14 }};
 #define OUT ((volatile unsigned *){OUTBOX:#x})
-#define DONE ((volatile unsigned *){DONE:#x})
 {start("brisc", "park", "park", "park")}  // its TRISCs have nothing to do
 __attribute__((naked)) void park(void) {{ asm("1: j 1b"); }}
 __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\n j loop"); }}
@@ -190,16 +191,11 @@ static void multicast(unsigned l1, unsigned addr, unsigned n) {{  // n bytes fro
   while (NIU(WR_ACKS) != acks) {{}}
   NIU(CLEAR_OUTSTANDING) = 0xFFFF;  // nothing else is in flight
 }}
-static unsigned finished(unsigned launch, unsigned n) {{  // have the first n workers reported this launch?
-  asm volatile("fence" ::: "memory");
-  for (unsigned i = 0; i < n; i++) if (DONE[4 * i] != launch) return 0;
-  return 1;
-}}
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0;
   unsigned ready = 0, ready_n = 0, ready_kernel = 0, ready_end = 0;  // a launch whose arguments are in place (0: none)
-  unsigned running = 0, running_n = 0, running_end = 0;  // the launch the workers are on
+  unsigned running = 0, running_end = 0, reports = 0;  // the launch the workers are on; the count once it is done
   volatile unsigned *cmd = (volatile unsigned *){STAGING:#x};
   for (;;) {{
     asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
@@ -214,12 +210,13 @@ void loop(void) {{
       multicast({STAGING + 16:#x}, {ARGS:#x} + ready % 2 * {ARGS_SIZE}, cmd[2]);
       ready_n = cmd[3]; ready_kernel = cmd[1]; ready_end = rptr += cmd[0];
     }}
-    unsigned done = running && finished(running, running_n) ? running : 0, end = running_end;
+    asm volatile("fence" ::: "memory");
+    unsigned done = running && *(volatile unsigned *){DONE:#x} == reports ? running : 0, end = running_end;
     if (done) running = 0;
     if (ready && !running) {{  // a worker is idle here: it finished its last launch
       OUT[0] = ready; OUT[1] = ready_kernel; OUT[2] = {ARGS:#x} + ready % 2 * {ARGS_SIZE}; OUT[3] = ready_n;
       multicast({OUTBOX:#x}, {MAILBOX:#x}, 16);
-      running = ready; running_n = ready_n; running_end = ready_end; ready = 0;
+      running = ready; running_end = ready_end; reports += ready_n; ready = 0;
     }}
     if (done) {{  // only now, so the host hears late rather than the next launch going late
       OUT[4] = end;
@@ -253,12 +250,12 @@ class Runtime:
     (dx, dy), n = self.dispatcher, len(self.cores)
     chip.halt(*end, start)
     chip.write(*end, 0, worker, start)
-    for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done, all zero but where to report
-      chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, dx | dy << 6, DONE + 16 * i, i).ljust(SYNC - MAILBOX, b"\0"))
+    for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done, all zero but whom to report to
+      chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, dx | dy << 6, 0, i).ljust(SYNC - MAILBOX, b"\0"))
     chip.write(dx, dy, 0, dispatcher)
     rect = end[0] | end[1] << 6 | (start[0] | start[1] << 6) << 12  # a multicast's NOC_RET_ADDR_HI
     chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
-    chip.write(dx, dy, DONE, bytes(16 * n))
+    chip.write(dx, dy, DONE, bytes(4))
     self.doorbell = chip.map(dx, dy, DISPATCH)  # a TLB of its own, so ringing never has to move a window first
     for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
     chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
@@ -345,11 +342,10 @@ class Runtime:
 
   def wait(self, timeout=60):
     """Until every queued launch has finished on every worker: polls host memory, not the chip. On timeout, asks the
-    dispatcher which launch it is on and which workers have not reported it. Then frees what was waiting for them."""
+    dispatcher which launch it is on and the workers which have not finished it. Then frees what was waiting for them."""
     try: self.until(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
     except TimeoutError as e:
-      current, done = self.chip.read32(*self.dispatcher, OUTBOX), self.chip.read(*self.dispatcher, DONE, 16 * len(self.cores))
-      cores = self.cores[:self.workers[current - 1] if current else 0]
-      stuck = [c for i, c in enumerate(cores) if int.from_bytes(done[16 * i:16 * i + 4], "little") != current]
+      current = self.chip.read32(*self.dispatcher, OUTBOX)
+      stuck = [c for c in self.cores[:self.workers[current - 1] if current else 0] if self.chip.read32(*c, MAILBOX + 16) != current]
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}") from None
     self.reclaim()
