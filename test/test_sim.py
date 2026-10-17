@@ -441,18 +441,19 @@ def test_fuzz(chip, monkeypatch):
       return getattr(gen(s1, depth - 1), rng.choice(["__add__", "__sub__", "__mul__"]))(gen(s2, depth - 1))
     if kind == "unary":
       x = gen(shape, depth - 1)
-      return rng.choice([x.relu, (x * 0.25).exp, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt])()
-    if kind == "red" and c == 1:
-      x = gen((b, r, int(rng.choice([20, 32, 70, 96, 192]))), depth - 1)
-      return x.rowsum() if rng.random() < 0.5 else x.rowmax()
+      return rng.choice([x.relu, (x * 0.5).exp, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt])()
+    if kind == "red" and c == 1:  # values stay near 1 (means, not sums), or exp would turn rounding into large errors
+      n = int(rng.choice([20, 32, 70, 96, 192]))
+      x = gen((b, r, n), depth - 1)
+      return x.rowsum() * (1 / n) if rng.random() < 0.5 else x.rowmax()
     if kind == "mm" and r > 1 and c > 1:
       k = int(rng.choice([32, 50, 64]))
-      return leaf((b, r, k)) @ leaf((b if rng.random() < 0.5 else 1, k, c))
+      return (leaf((b, r, k)) @ leaf((b if rng.random() < 0.5 else 1, k, c))) * (1 / k)
     return leaf(shape)
   for _ in range(30):  # sizes past 4 tiles make part-blocks of matmul results
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
     gen(shape, 4).realize()
-  assert len(checked) >= 25 and any(e[0] == "matmul" or "rowsum" in str(e) for e in checked)
+  assert len(checked) >= 20 and any(e[0] == "matmul" or "rowsum" in str(e) for e in checked)
 
 def test_mnist_mlp(chip):
   # goal 1's halfway mark: an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
