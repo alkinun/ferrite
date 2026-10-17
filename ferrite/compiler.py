@@ -285,6 +285,7 @@ TRISC = SYNC_WORDS + f"""
 // Setup goes through stores, not .ttinsn: fused .ttinsn instructions can corrupt what REPLAY records
 static void push(const unsigned *p, unsigned n) {{ for (unsigned i = 0; i < n; i++) *(volatile unsigned *){bh.TENSIX_PUSH:#x} = p[i]; }}
 #define PUSH(p) push(p, sizeof p / 4)
+static void push_word(unsigned w) {{ push(&w, 1); }}  // one instruction worked out at run time
 """
 
 def _brisc(zero, total, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
@@ -310,14 +311,18 @@ static void send(void) {{  // the results packed so far go home, in the order th
 // A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, B's slot two steps
 // back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
-// A matmul step: B's tile into a stream slot (for SrcA), and A's, unless its row is in L1 already, into a_slot: its
-// row's slot, or a stream slot of its own (2-3) when the row does not fit
-static void step(unsigned b, unsigned b_tile, unsigned a, unsigned a_tile, unsigned a_slot) {{
+// A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot (B 0-1, A 2-3) or its place in
+// the row or column kept in L1, unless it is there already (KEPT)
+#define KEPT 0xFFFFFFFF
+static void step(unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
   reached(stream_done[steps & 1]);
-  get(b, b_tile, steps & 1); if (a_slot) get(a, a_tile, a_slot); ready();
+  if (b_slot != KEPT) get(b, b_tile, b_slot);
+  if (a_slot != KEPT) get(a, a_tile, a_slot);
+  ready();
   stream_done[steps++ & 1] = ++events;
 }}
-// A matmul's row i of A stays in L1 while the result tiles stay in row i; a new row waits for the old to be unpacked
+// A row of A (or column of B) stays in L1, in place q, while the result tiles use it; when tag i, which row, changes,
+// the new one comes in once the old is unpacked
 static unsigned fresh(unsigned q, unsigned i) {{
   if (rows[q] == i + 1) return 0;
   reached(events);
@@ -459,6 +464,15 @@ def fused_kernel(expr, shapes):
     fits = top + ops[j]["kt"] <= UNPACKABLE
     rows_at.append(top if fits else None)
     top += ops[j]["kt"] if fits else 0
+  rows, cols = size(("op", root))
+  rt = -(-rows // 32)  # the result's tile rows (in each matrix of the batch)
+  # With one matmul and no row passes, a unit is a block of bp x bq result tiles, column by column: the block's bp rows of
+  # A and its current column of B stay in L1, so each is read from DRAM once a block, not once a tile
+  bp = min(4, rt) if len(matmuls) == 1 and not rowwise else 1
+  while bp > 1 and FRAMES + 2 * frame + len(ops) + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE: bp -= 1
+  bq = min(4, w) if bp > 1 else 1
+  if bp > 1: rows_at = [FRAMES + 2 * frame + len(ops)]  # A's bp rows, then B's column
+  kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 else None
   def slot(f, r):  # an input or wide op lives in the frame, a narrow op in its own slot after both frames
     if r == "zero": return ZERO_SLOT
     if isinstance(r, int): return FRAMES + f * frame + r
@@ -469,8 +483,6 @@ def fused_kernel(expr, shapes):
     rows, cols = tiles[i]
     return f"{in_batch(i)}{'i_' if rows > 1 else 0} * a[{arg(i) + 2}] + {'j' if cols > 1 else 0} + a[{arg(i) + 3}]"
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
-  rows, cols = size(("op", root))
-  rt = -(-rows // 32)  # the result's tile rows (in each matrix of the batch)
   def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
     if j != root: return tt(MATH_END)
     edge = [f"if ({f'j == {w - 1}' if wide(('op', root)) else 1}) {{ {tt(mask_columns('rowsum', cols % 32, 0))} }}"] * (cols > 1 and cols % 32 > 0)
@@ -506,15 +518,22 @@ def fused_kernel(expr, shapes):
           x, y = arg(op["x"]), arg(op["y"])
           b_tile = f"{in_batch(op['y'])}m * a[{y + 2}] + {'j' if bw > 1 else 0} + a[{y + 3}]"
           a_tile = f"{in_batch(op['x'])}i_ * a[{x + 2}] + m + a[{x + 3}]"
-          if rows_at[q] is None:  # A's tile streams in beside B's, each step
-            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{y}], {b_tile}, a[{x}], {a_tile}, 2 + (steps & 1));")
+          setadc = lambda unpacker, slot: ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=slot)
+          if kept_b is not None:  # A's bp rows and B's column in L1: unpacker 0 walks the column, 1 the row of A
+            c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); for (unsigned m = 0; m < {kt}; m++) "
+                        f"step(a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
+            walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
+                    ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
+            c[U].append(f"{cond}{{ push_word({setadc(bh.UNPACK1, 0):#x} + {rows_at[q]} + i_ % {bp} * {kt}); {tt([setadc(bh.UNPACK0, kept_b)])} "
+                        f"for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }}{posted} }}")
+          elif rows_at[q] is None:  # A's tile streams in beside B's, each step
+            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{y}], {b_tile}, steps & 1, a[{x}], {a_tile}, 2 + (steps & 1));")
             c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
                         f"if (steps++ & 1) {{ {tt(unpack(1, 3) + REPORT)} }} else {{ {tt(unpack(0, 2) + REPORT)} }} }}{posted} }}")
           else:
             c[B].append(f"{cond}{{ unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step(a[{y}], {b_tile}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : 0); }}")
-            row_start = tt([ins("SETADC", cnt_set_mask=bh.UNPACK1, dimension_index=2, value=rows_at[q])])
-            c[U].append(f"{cond}{{ {row_start} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
+                        f"step(a[{y}], {b_tile}, steps & 1, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
+            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
                         f"if (steps++ & 1) {{ {tt(step_unpack(1))} }} else {{ {tt(step_unpack(0))} }} }}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
@@ -545,19 +564,29 @@ def fused_kernel(expr, shapes):
       c[B].append(f"frame_done[{f}] = ++events;")
       bodies.append(c)
     passes.append((bool(swept or reductions), bodies))
+  br, bc = -(-rt // bp), -(-w // bq)  # blocks down and across a matrix
   def program(c):  # the loops all four programs share, around each one's part of a tile
-    sweeps = "\n".join(f"""    for (unsigned j = j0, k = 0; j < {'j1' if full else 'j0 + 1'}; j++, k++) {{
-      if (tiles++ & 1) {{ {" ".join(b[1][c])} }} else {{ {" ".join(b[0][c])} }}
+    tile_c = lambda b: f"if (tiles++ & 1) {{ {' '.join(b[1][c])} }} else {{ {' '.join(b[0][c])} }}"
+    if not rowwise:  # a unit is a block: its tiles column by column, those past the matrix's edge left out
+      return f"""  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned unit = a[0] + u, b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = unit % {bc} * {bq};
+    for (unsigned jj = 0; jj < {bq}; jj++) for (unsigned ii = 0; ii < {bp}; ii++) {{
+      unsigned i_ = i0 + ii, j = j0 + jj, k = 0;
+      if (i_ >= {rt} || j >= {w}) continue;
+      {tile_c(passes[0][1])}
+    }}
+  }}"""
+    sweeps = "\n".join(f"""    for (unsigned j = 0, k = 0; j < {w if full else 1}; j++, k++) {{
+      {tile_c(b)}
     }}""" for full, b in passes)
     return f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, b = unit / {rt if rowwise else rt * w}, i_ = unit % {rt if rowwise else f'{rt * w} / {w}'};
-    unsigned j0 = {'0' if rowwise else f'unit % {w}'};
-    unsigned j1 = {w if rowwise else 'j0 + 1'};
+    unsigned unit = a[0] + u, b = unit / {rt}, i_ = unit % {rt}, j1 = {w};
 {sweeps}
   }}"""
-  total = f"a[1] * {w if rowwise and wide(('op', root)) else 1}"  # results this worker sends home
+  total = f"a[1] * {w if wide(('op', root)) else 1}" if rowwise else "tiles"  # results this worker sends home
   zero = rowwise or any(op.get("y") == "zero" for op in ops)
-  return compile_kernel(_brisc(zero, total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
+  image = compile_kernel(_brisc(zero, total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
+  return image, (rt if rowwise else br * bc)  # and how many units a matrix of the result is
 
 
 def gather_kernel():
@@ -726,11 +755,10 @@ class Tensor:
     inputs = []
     e = _expr(self, (self.batch, self.rows), inputs)
     key = (e, tuple((u.batch, u.rows, u.cols) for u in inputs))
-    kernel = _cached(key, lambda: fused_kernel(*key))
+    kernel, units = _cached(key, lambda: fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
     args = [v for t in inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
-    rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
-    return self._run(kernel, self.addr, *args, units=self.batch * -(-self.rows // 32) if rowwise else None)
+    return self._run(kernel, self.addr, *args, units=self.batch * units)
 
   def _run(self, kernel, *args, units=None):
     """Queue kernel over this tensor's tiles, or rows, split evenly over as many workers as have any. Nothing waits for
