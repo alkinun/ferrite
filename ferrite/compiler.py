@@ -804,6 +804,12 @@ class Tensor:
   def __matmul__(self, other):  # matrix by matrix through a batch; a batch of 1 repeats
     assert self.cols == other.rows and (self.batch == other.batch or 1 in (self.batch, other.batch)), f"{self.shape} @ {other.shape}"
     if self.cols == 1: return self * other  # (R, 1) @ (1, C) is broadcasting
+    kt, tiles = self.cols // 32, -(-self.rows // 32) * -(-other.cols // 32)
+    s = max([s for s in (2, 4, 8) if self.batch == other.batch == 1 and self.cols % (32 * s) == 0 and kt // s >= 8 and
+             s * tiles <= len(self.rt.cores)], default=1)
+    if s > 1:  # too few result tiles to keep the workers busy (a token's MLP): K cut in s, a batch, and the parts summed
+      parts = self.split(s) @ other.split(s, 0)
+      return sum((parts[i] for i in range(1, s)), parts[0])
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other), max(self.batch, other.batch))
 
 def _lazy(t, seen):  # the unrealized ops under t, t first

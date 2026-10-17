@@ -213,6 +213,11 @@ def test_matmul_blocks(chip):
   canary = Tensor.of(rt, [[1.0] * 192] * 160)
   assert y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(96)) for j in range(192)] for i in range(160)]
   assert canary.tolist() == [[1.0] * 192] * 160
+  # one row of result tiles and a long K, as a token's MLP: K is cut into 4 parts on 4 times the workers, and summed
+  # (sums under 256, so every partial and total is exact in bf16)
+  a, b = [[float((r + c) % 3 - 1) for c in range(1024)] for r in range(5)], [[float(r % 16 == c % 16) for c in range(64)] for r in range(1024)]
+  y = Tensor.of(rt, a) @ Tensor.of(rt, b)
+  assert y.op == "add" and y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(1024)) for j in range(64)] for i in range(5)]
 
 def test_stream_on_one_worker(chip):
   # one worker gets every tile, so the pipeline really cycles: L1 slots and Dst halves alternate, the threads hand
