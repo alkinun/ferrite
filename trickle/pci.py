@@ -54,7 +54,7 @@ class Card:
     _write(f"{self.sys}/enable", "1")
     self.cfg = os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC)
     self.cfg_write(0x04, self.cfg_read(0x04) | 0x6)  # memory decode, and bus mastering so the device can reach host memory
-    self.bars, self.dma = {}, []
+    self.bars = {}
     for i in (0, 2, 4):
       fd = os.open(f"{self.sys}/resource{i}", os.O_RDWR | os.O_SYNC)
       self.bars[i] = (m := mmap.mmap(fd, os.fstat(fd).st_size), ctypes.addressof(ctypes.c_char.from_buffer(m)))
@@ -73,7 +73,8 @@ class Card:
     else: ctypes.memmove(addr, bytes(data), len(data))
 
   def alloc(self, size):
-    """One 2 MiB hugepage, physically contiguous and locked: (memoryview, bus address)."""
+    """One 2 MiB hugepage, physically contiguous and locked: (memoryview, bus address). The memoryview holds the page:
+    it goes back to the kernel's pool once nothing refers to it (a Runtime's ring and status live as long as it does)."""
     assert size <= 1 << 21, "one hugepage at a time"
     MAP_HUGETLB, MAP_LOCKED = 0x40000, 0x2000
     buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED)
@@ -81,7 +82,6 @@ class Card:
       f.seek(ctypes.addressof(ctypes.c_char.from_buffer(buf)) // mmap.PAGESIZE * 8)
       pfn = int.from_bytes(f.read(8), "little") & ((1 << 55) - 1)
     assert pfn, "pagemap hides physical addresses without CAP_SYS_ADMIN"
-    self.dma.append(buf)
     return memoryview(buf)[:size], pfn * mmap.PAGESIZE
 
   def tick(self): pass  # real hardware runs on its own
