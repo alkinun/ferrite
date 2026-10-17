@@ -391,7 +391,8 @@ def test_gpt2_layer(chip):
             "mlp.c_fc.weight": (d, 4 * d, 0), "mlp.c_fc.bias": (1, 4 * d, 0), "mlp.c_proj.weight": (4 * d, d, 0), "mlp.c_proj.bias": (1, d, 0)}
   p = {k: bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, c))) for k, (r, c, mean) in shapes.items()}
   x = bf16(rng.normal(0, 1, (n, d)))
-  got = np.array(gpt2.layer(Tensor.of(rt, x.tolist()), {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}, Tensor.of(rt, gpt2.mask(n).tolist())).tolist())
+  got = gpt2.layer(Tensor.of(rt, x.tolist()), {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}, Tensor.of(rt, gpt2.mask(n).tolist()))
+  got = np.array(got.tolist())
   want = gpt2.layer(x, p, gpt2.mask(n))
   change = np.abs(want - x).max()
   assert change > 1 and np.abs(got - want).max() < 0.03 * change, (np.abs(got - want).max(), change)

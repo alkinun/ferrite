@@ -7,9 +7,10 @@ from trickle import bh
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments] [done, report x | y << 6, report address] (done is 16-byte
 # aligned like the slot it is copied to), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for the
 # kernel's cores to talk through), two buffers of kernel arguments (launches alternate between them, so the next
-# launch's go in while this one runs), the kernels it holds, then free space. The dispatcher: its config [doorbell, ring lo,
-# hi, ring size, status lo, hi] and the workers' x | y << 6 after it, an outbox [go, kernel, arguments] [rptr, launches done], a
-# done slot per worker, and staging for one command, both above the kernels (loading one writes the dispatcher's too).
+# launch's arguments go in while this one runs), the kernels it holds, then free space. The dispatcher: its config
+# [doorbell, ring lo, hi, ring size, status lo, hi] and the workers' x | y << 6 after it, an outbox [go, kernel,
+# arguments] [rptr, launches done], a done slot per worker, and staging for one command, both above the kernels
+# (loading a kernel writes the dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, ARGS, KERNELS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
@@ -33,7 +34,11 @@ static inline void noc_issue(unsigned long long targ, unsigned targ_xy, unsigned
   NIU(CMD) = 1;
 }}
 // until this core's earlier stores to L1 are processed: they are out, a load behind them is answered
-static inline void l1_settle(unsigned addr) {{ asm volatile("fence" ::: "memory"); (void)*(volatile unsigned *)addr; asm volatile("fence" ::: "memory"); }}
+static inline void l1_settle(unsigned addr) {{
+  asm volatile("fence" ::: "memory");
+  (void)*(volatile unsigned *)addr;
+  asm volatile("fence" ::: "memory");
+}}
 // Copy n bytes between (x, y, addr) and this tile's L1. The low 4 bits of the two addresses must match (6 for DRAM).
 static inline void noc_read(unsigned x, unsigned y, unsigned long long addr, unsigned l1, unsigned n) {{
   for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(addr, x | y << 6, l1, noc_me(), READ, k = n < MAX_PACKET ? n : MAX_PACKET);
@@ -59,12 +64,14 @@ def compile_rv32(src, base=0):
   reaches its own functions and data by PC-relative addresses (medany, no linker relaxation, no jump tables), so the
   image runs wherever it is put; base only matters to firmware, which is put at 0."""
   if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")
-  link = f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) __bss_start = .; *(.sbss*) *(.bss*) __bss_end = .; }} }}"
+  link = (f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
+          "__bss_start = .; *(.sbss*) *(.bss*) __bss_end = .; } }")
   with tempfile.TemporaryDirectory() as d:  # one output section, so .bss is zeros inside the image
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
     out = pathlib.Path(d, "prog.bin")
     subprocess.run(["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax",
-                    "-fno-jump-tables", "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld", f"-Wl,-T,{ld},--oformat=binary", "-x", "c", "-", "-o", str(out)],
+                    "-fno-jump-tables", "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld",
+                    f"-Wl,-T,{ld},--oformat=binary", "-x", "c", "-", "-o", str(out)],
                    input=(DEVICE + src).encode(), check=True)
     return out.read_bytes()
 
@@ -94,10 +101,10 @@ def compile_kernel(*programs):
 def start(brisc, trisc0, trisc1, trisc2):  # firmware's first words: BRISC starts at 0, TRISC i at 4 + 4i (its reset PC)
   return f'__attribute__((naked, section(".start"))) void _start(void) {{ asm("j {brisc}\\n j {trisc0}\\n j {trisc1}\\n j {trisc2}"); }}'
 
-# A launch: BRISC sees go in its mailbox, with the addresses of the kernel to run and of its arguments, zeroes SYNC, drops the cached
-# instructions of all four cores (the kernel may sit where another was), and tells the TRISCs to go; each core runs its
-# program from the kernel's header, and a TRISC then waits for its Tensix thread to finish everything it pushed. Once
-# all four are done BRISC reports.
+# A launch: BRISC sees go in its mailbox, with the addresses of the kernel to run and of its arguments, zeroes SYNC,
+# drops the cached instructions of all four cores (the kernel may sit where another was), and tells the TRISCs to go;
+# each core runs its program from the kernel's header, and a TRISC then waits for its Tensix thread to finish
+# everything it pushed. Once all four are done BRISC reports.
 FIRMWARE = f"""
 #define MAILBOX ((volatile unsigned *){MAILBOX:#x})
 #define TRISCS ((volatile unsigned *){TRISCS:#x})
@@ -177,7 +184,8 @@ void loop(void) {{
       noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at + 16, {STAGING + 16:#x}, cmd[0] - 16);
       noc_wait();
       ready = ++launches;  // its arguments go into the buffer the running launch is not using
-      for (unsigned i = 0; i < n; i++) noc_write({STAGING + 16:#x} + i * args, WORKER[i] & 63, WORKER[i] >> 6, {ARGS:#x} + ready % 2 * {ARGS_SIZE}, args);
+      unsigned buffer = {ARGS:#x} + ready % 2 * {ARGS_SIZE};
+      for (unsigned i = 0; i < n; i++) noc_write({STAGING + 16:#x} + i * args, WORKER[i] & 63, WORKER[i] >> 6, buffer, args);
       noc_wait();  // every argument has landed before any go
       ready_n = n; ready_kernel = cmd[1]; ready_end = rptr += cmd[0];
     }}
@@ -252,13 +260,13 @@ class Runtime:
   def launch(self, kernel, args=lambda x, y: (), workers=None):
     """Queue kernel, an image from compile_kernel, for the first `workers` workers (all by default), with args(x, y) as
     each one's arguments. Loads it first if need be."""
-    at, cores = self.load(kernel), self.cores[:workers]
+    kernel, cores = self.load(kernel), self.cores[:workers]
     a = [struct.pack(f"<{len(v)}I", *v) for v in (args(x, y) for x, y in cores)]
     stride = -(-max(map(len, a)) // 16) * 16
     assert stride <= ARGS_SIZE, f"{stride} bytes of arguments, room for {ARGS_SIZE}"
     body = b"".join(v.ljust(stride, b"\0") for v in a)
     length = -(-(16 + len(body)) // 64) * 64
-    cmd = struct.pack("<4I", length, at, stride, len(cores)) + body.ljust(length - 16, b"\0")
+    cmd = struct.pack("<4I", length, kernel, stride, len(cores)) + body.ljust(length - 16, b"\0")
     size, at = len(self.ring), self.wptr % len(self.ring)
     skip = size - at if at + length > size else 0  # commands never wrap: mark the tail unused and start over
     assert length <= STAGING_ROOM and length + skip <= size, f"a {length}-byte command does not fit"
@@ -318,6 +326,7 @@ class Runtime:
     try: self.until(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
     except TimeoutError as e:
       current, done = self.chip.read32(*self.dispatcher, OUTBOX), self.chip.read(*self.dispatcher, DONE, 16 * len(self.cores))
-      stuck = [c for i, c in enumerate(self.cores[:self.workers[current - 1]]) if int.from_bytes(done[16 * i:16 * i + 4], "little") != current]
+      cores = self.cores[:self.workers[current - 1] if current else 0]
+      stuck = [c for i, c in enumerate(cores) if int.from_bytes(done[16 * i:16 * i + 4], "little") != current]
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}") from None
     self.reclaim()
