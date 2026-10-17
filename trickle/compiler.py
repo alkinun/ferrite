@@ -1,22 +1,23 @@
 # The compiler: tensor ops emitted as Tensix instructions straight from the ISA, no LLK. A tensor lives in DRAM as
 # bf16 32x32 tiles, tile i in bank i % 8. Ops are lazy: a tree of elementwise ops, matmuls and SFPU ops (relu, exp,
 # reciprocal) becomes one fused kernel, which fetches each input tile once, keeps every intermediate in L1 and writes
-# only the result to DRAM. Each worker's BRISC runs a generated kernel: it pulls operand tiles into L1 over the NoC and streams them through the three Tensix
-# threads, unpack, math and pack running at the same time on different tiles, then writes results back.
+# only the result to DRAM. A kernel is four programs for each worker tile: BRISC fetches operand tiles into L1 over the
+# NoC and sends results home, and each TRISC feeds one Tensix thread its instructions (unpack, math, pack), the three
+# running at the same time on different tiles.
 #
 # Tile layout: four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face
 # row-major. The ISA has no notion of a tile; this is the layout the FPU's 16x16 matrix multiply wants. An unpacker
 # reads a whole tile into a SrcA/SrcB bank, so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
 import struct
 from trickle import bh
-from trickle.runtime import DATA, KERNEL, compile_rv32
+from trickle.runtime import DATA, SYNC, compile_kernel
 
 TILE = 32 * 32 * 2  # bytes in a bf16 tile: one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
 SLOTS = DATA  # L1 tile slots: slot i at SLOTS + i * TILE, picked by the unpackers' Z and the packer's channel 1 Y counters
-UNPACKED, PACKED = 63, 62  # thread 0 GPRs BRISC polls: tiles and matmul steps unpacked, output tiles packed
 DST_HALF = 64  # Dst rows of one result in fp32; Dst holds two, so math fills one half while pack drains the other
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2  # results in Dst to pack, outputs packed but not reported, and
                                                        # intermediates packed into L1 but not yet waited for
+SEM_UNPACKED = 1 << 5  # frames (and matmul steps) unpacked but not reported
 ACCS = ((256, 1 << 3), (320, 1 << 4))  # row reductions accumulate here in Dst (scratch 128 rows on), each with a
                                        # semaphore that is 1 while it is free: taken by the first step, given back by the pack
 
@@ -61,24 +62,26 @@ THREAD = [ins("SETC16", setc16_reg=r, setc16_value=v) for r, v in  # every threa
            {bh.ADDR_MOD_DST + m: d | f << bh.FIDELITY_INCR for m, (_, (d, f)) in ADDR_MODES.items()}).items()]
 
 # Each thread has a 32-entry replay buffer: REPLAY with load records the next instructions, without it plays them
-# back, so a run that repeats costs BRISC one word. The pack thread's always holds 15 PACRs; the math thread's is
+# back, so a run that repeats costs its TRISC one word. The pack thread's always holds 15 PACRs; the math thread's is
 # shared out per kernel between the sequences that kernel uses, those replayed most first.
 def replay(index, count): return ins("REPLAY", index=index, count=count)
 def record(index, words): return [ins("REPLAY", load=1, index=index, count=len(words))] + words
 PACRS = 0
+class Loop(list):  # words a TRISC pushes `times` times over, in a loop rather than written out
+  def __init__(self, times, words): super().__init__(words); self.times = times
 
-# The three threads. Thread 0 unpacks and reports, thread 1 does the math, thread 2 packs. Between them:
+# The three threads, each fed by its own TRISC: thread 0 unpacks, thread 1 does the math, thread 2 packs. Between them:
 #   unpack -> math: SrcA/SrcB each have two banks; UNPACR waits for a free bank, the FPU for a full one, by hardware.
 #   math -> pack: SEM_DST counts results in Dst waiting to be packed; math waits while both halves are full, pack while
 #     there is none.
 #   pack -> unpack, inside a fused kernel: an intermediate is packed into L1 and unpacked again by a later op. Pack
 #     posts SEM_L1 for each; unpack takes one per op packed since it last looked, before it reads any intermediate.
-#   pack -> BRISC: BRISC can only read thread 0's GPRs, so pack posts SEM_PACKED and thread 0 relays it into a GPR.
-# BRISC queues work for a thread only behind what unblocks it: unpack, then math, then pack. Its path into a thread
-# is a few entries deep, and a full FIFO stalls BRISC.
+#   unpack, pack -> BRISC: thread 0 posts SEM_UNPACKED once it has unpacked a frame's tiles (or a matmul step's pair),
+#     the pack thread SEM_PACKED once it has packed a result; their TRISCs count those into SYNC, where BRISC looks.
 UNPACKERS = bh.UNPACK0 | bh.UNPACK1
 SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem_sel=SEM_PACKED, max_value=15),
-                ins("SEMINIT", sem_sel=SEM_L1, max_value=15), *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS],
+                ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SEMINIT", sem_sel=SEM_UNPACKED, max_value=15),
+                *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS],
                 ins("SETADCXY", cnt_set_mask=UNPACKERS, bit_mask=0b1111),
                 ins("SETADCZW", cnt_set_mask=UNPACKERS, bit_mask=0b1111), ins("SETADCXX", cnt_set_mask=UNPACKERS, x_end2=1023)]
 SETUP_PACK = [ins("SETADCXY", cnt_set_mask=bh.PACK, bit_mask=0b1111), ins("SETADCZW", cnt_set_mask=bh.PACK, bit_mask=0b1111),
@@ -86,6 +89,7 @@ SETUP_PACK = [ins("SETADCXY", cnt_set_mask=bh.PACK, bit_mask=0b1111), ins("SETAD
 def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then handed to the FPU
   return [ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=2, value=a), ins("SETADC", cnt_set_mask=bh.UNPACK1, dimension_index=2, value=b),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
+REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
 def math_begin(half, zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
   return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2),
            ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=DST_HALF * half)] +
@@ -98,8 +102,6 @@ def pack(row, slot, *done):  # 64 Dst rows from row into an L1 slot, then free t
           ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
           ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + [ins("SEMPOST", sem_sel=d) for d in done]
-RELAY = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_PACKED, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_PACKED)]
-UNPACKED_REPORT = [ins("STALLWAIT", stall_res=bh.STALL_THCON, wait_res=bh.WAIT_UNPACK)]  # then BRISC's SETGPR(UNPACKED)
 TAKE_L1 = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)]
 
 def matmul_phase():
@@ -189,6 +191,7 @@ def allocate(names):
 def run(slots, name, count=None):  # the first count words of a run: one REPLAY if it was recorded, else the words
   words = MATH_RUNS[name][:count]
   return [replay(slots[name], len(words))] if name in slots else words
+def runs(slots, name, times): return run(slots, name) * times if name in slots else [Loop(times, MATH_RUNS[name])]
 def setup_math(slots): return [ins("SFPENCC", mod1=10, imm2=2)] + [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]
 
 def last(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
@@ -209,87 +212,130 @@ def reduce_step(kind, slots, acc, first):
   row, sem = ACCS[acc]
   if first: return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem), at(row)] + elementwise("add", slots)
   return ([at(row)] + elementwise("add", slots, dst=128) + [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
-          run(slots, kind) * 32)
+          runs(slots, kind, 32))
 def reduce_finish(kind, slots, acc, posts):  # fold each row across, run the SFPU ops on the result, hand it to pack
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), at(ACCS[acc][0])] + across_rows(kind) + sfpu(posts, slots) + MATH_END
 
 def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU just wrote
   return [w for u in posts for w in [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
-          SFPU[u][0] + run(slots, u) * 32]
+          SFPU[u][0] + runs(slots, u, 32)]
 
-def _array(name, words, t="unsigned"): return f"static const {t} {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
-def _arrays(name, programs): return f"static const unsigned {name}[{len(programs)}][{len(programs[0])}] = {{{', '.join('{' + ', '.join(f'{w:#x}' for w in p) + '}' for p in programs)}}};"
+def _array(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
+
+def tt(words):
+  """C for a TRISC to push words to its thread as .ttinsn instructions: each word rotated left by 2 and written into
+  the code, so the TRISC stalls while the thread's FIFO is full. A Loop becomes a C loop."""
+  c, run = [], []
+  for w in list(words) + [None]:
+    if isinstance(w, int):
+      assert w < 0xC0000000, f"{w:#x} is no Tensix instruction"
+      run.append(f"{(w << 2 | w >> 30) & 0xFFFFFFFF:#x}")
+      continue
+    if run: c.append(f'asm volatile(".word {", ".join(run)}" ::: "memory");')
+    run = []
+    if w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
+  return " ".join(c)
 
 ZERO_SLOT, FRAMES = 4, 5  # slots 0-3 stream matmul tiles, 4 holds a zero tile, then two frames, then row values
 
-def _kernel(slots, zero, arrays, body):
-  """A BRISC kernel: backend config, the semaphores and every thread's setup, then body, which runs with these:
-  push(t, p) a program to thread t; step() a matmul step; tile_begin(f) / tile_end(f) around a tile that uses frame f;
-  drain() before unpacking anything packed earlier; output(slot, base, tile) once a result tile's pack is pushed."""
-  setgpr = ins("SETGPR", reg_index_16b=0)
-  return compile_rv32(f"""
-{_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", THREAD)} {_array("relay", RELAY)}
-{_array("setup_unpack", SETUP_UNPACK)} {_array("setup_math", setup_math(slots))} {_array("setup_pack", SETUP_PACK)}
-{_array("bank", [x | y << 6 for x, y in bh.DRAM])} {_array("report", UNPACKED_REPORT)} {_array("take_l1", TAKE_L1)}
-{_arrays("mm_unpack", [unpack(s, 2 + s) + UNPACKED_REPORT for s in (0, 1)])} {_array("mm", matmul(slots))}
-{arrays}
-#define PUSH(t) (*(volatile unsigned *)({bh.TENSIX_PUSH:#x} + 0x10000 * (t)))
-#define GPR(r) (((volatile unsigned *){bh.TENSIX_GPR:#x})[r])
-#define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
+# SYNC (zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
+# one of them: FETCHED, how many times BRISC has fetched tiles into L1 (a frame, or a matmul step's pair); UNPACKED, how
+# many of those thread 0 has unpacked, from TRISC0; READY, set by TRISC0 once the backend config and semaphores are
+# set up; PACKED, how many results the pack thread has packed, from TRISC2, with where each goes in RING (four
+# entries [slot, tile]); SENT, how many of those BRISC has sent home.
+SYNC_WORDS = f"""
+enum {{ FETCHED, UNPACKED, READY, PACKED, SENT, RING = 8 }};
+#define SYNC ((volatile unsigned *){SYNC:#x})
+static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return SYNC[i]; }}  // fresh: the L0 cache sees no other core's writes
+"""
+TRISC = SYNC_WORDS + f"""
+#define SEM(s) (((volatile unsigned *){bh.TENSIX_SEM:#x})[__builtin_ctz(s)])  // read: its value; write 0: post, 1: take one
+// Setup goes through stores, not .ttinsn: fused .ttinsn instructions can corrupt what REPLAY records
+static void push(const unsigned *p, unsigned n) {{ for (unsigned i = 0; i < n; i++) *(volatile unsigned *){bh.TENSIX_PUSH:#x} = p[i]; }}
+#define PUSH(p) push(p, sizeof p / 4)
+"""
+
+def _brisc(zero, total, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
+  return SYNC_WORDS + f"""
 #define SLOT(i) ({SLOTS:#x} + (i) * {TILE})
-#define push(t, p) for (unsigned i_ = 0; i_ < sizeof p / 4; i_++) issue(t, p[i_])
-#define setgpr(r, v) PUSH(0) = {setgpr:#x} | 2 * (r) | ((v) & 0xFFFF) << 8
-#define reached(r, v) while ((GPR(r) & 0xFFFF) < (v)) {{}}  // 16-bit counts: a launch handles under 65536 of each
-static void issue(unsigned t, unsigned w) {{
-  PUSH(t) = w;
-  // a REPLAY expands into its count of instructions, issued one a cycle: give the thread that long before the next push.
-  // Silicon would stall BRISC until then anyway; ttsim has no backpressure here, and its FIFO would overflow
-  if (w >> 24 == {bh.TENSIX_OPS["REPLAY"][0]:#x}) for (volatile unsigned d = (w >> 4 & 63) / 4; d; d--) {{}}
-}}
+{_array("bank", [x | y << 6 for x, y in bh.DRAM])}
+static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out;
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, SLOT(slot), {TILE}); }}
-// Thread 0 counts what it has unpacked into GPR {UNPACKED}: BRISC refills a frame or stream slot only once the tiles in it
-// two uses ago are unpacked. Results BRISC sends home are counted by the pack thread, relayed through thread 0.
-static unsigned unpacked, frame_done[2], stream_done[2], steps, posted, drained, outputs;
-static unsigned out[2][4];  // results to send home: [0] from the tile before this one, [1] from this one: {{set, slot, base, tile}}
-static void counted(void) {{ setgpr({UNPACKED}, ++unpacked); }}
+static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
+static void send(void) {{  // the results packed so far go home, in the order they were packed
+  for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
+    unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1);
+    noc_write(SLOT(slot), bank[t % 8] & 63, bank[t % 8] >> 6, out + t / 8 * {TILE}, {TILE}); noc_wait();
+  }}
+}}
+// A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, the matmul pair two
+// steps back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
+static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
 static void step(unsigned a, unsigned a_tile, unsigned b, unsigned b_tile) {{  // A's tile goes to SrcB, B's to SrcA
-  reached({UNPACKED}, stream_done[steps & 1]);
-  get(b, b_tile, steps & 1); get(a, a_tile, 2 + (steps & 1)); noc_wait();
-  push(0, mm_unpack[steps & 1]); counted(); stream_done[steps++ & 1] = unpacked;
-}}
-static void drain(void) {{ for (; drained < posted; drained++) push(0, take_l1); }}  // everything packed so far has landed
-static void send(unsigned *o) {{  // once the pack thread has packed it, a result tile goes home
-  if (!o[0]) return;
-  push(0, relay); setgpr({PACKED}, ++outputs);
-  reached({PACKED}, outputs);
-  noc_write(SLOT(o[1]), bank[o[3] % 8] & 63, bank[o[3] % 8] >> 6, o[2] + o[3] / 8 * {TILE}, {TILE}); noc_wait();
-  o[0] = 0;
-}}
-static void output(unsigned slot, unsigned base, unsigned t) {{ out[1][0] = 1; out[1][1] = slot; out[1][2] = base; out[1][3] = t; }}
-static void tile_begin(unsigned f) {{ reached({UNPACKED}, frame_done[f]); }}
-static void tile_end(unsigned f) {{  // a result goes home one tile late, so waiting for it does not stall the pipeline,
-  push(0, report); counted(); frame_done[f] = unpacked;  // and before its slot is packed into again two tiles on
-  send(out[0]);
-  for (unsigned i = 0; i < 4; i++) {{ out[0][i] = out[1][i]; out[1][i] = 0; }}
+  reached(stream_done[steps & 1]);
+  get(b, b_tile, steps & 1); get(a, a_tile, 2 + (steps & 1)); ready();
+  stream_done[steps++ & 1] = ++events;
 }}
 void kmain(volatile unsigned *a) {{
-  for (unsigned i = 0; i < sizeof cfg_index / 4; i++) CFG[cfg_index[i]] = cfg_value[i];
-  GPR({UNPACKED}) = GPR({PACKED}) = 0;
-  {f"for (unsigned i = 0; i < {TILE // 4}; i++) ((volatile unsigned *)SLOT({ZERO_SLOT}))[i] = 0;" if zero else ""}
-  asm volatile("fence" ::: "memory");  // config, GPR and L1 writes are out; reading back from each region lands after them
-  (void)CFG[cfg_index[0]]; (void)GPR({PACKED}); (void)*(volatile unsigned *)SLOT({ZERO_SLOT});
-  asm volatile("fence" ::: "memory");  // and has answered, so nothing pushed below can see them stale
-  push(0, thread); push(0, setup_unpack); setgpr({PACKED}, 0xFFFF);
-  reached({PACKED}, 0xFFFF);  // semaphores are initialised before the other threads can touch them
-  setgpr({PACKED}, 0);
-  push(1, thread); push(1, setup_math); push(2, thread); push(2, setup_pack);
+  out = a[2];
+  {f"for (unsigned i = 0; i < {TILE // 4}; i++) ((volatile unsigned *)SLOT({ZERO_SLOT}))[i] = 0; l1_settle(SLOT({ZERO_SLOT}));" if zero else ""}
+  unsigned tiles = 0;
 {body}
-  send(out[0]); send(out[1]);
-}}
-""", KERNEL)
+  while (sent < {total}) send();
+}}"""
 
-def fused_kernel(expr, shapes, order="op"):
+def _unpacker(body):  # TRISC0: the backend config and semaphores, then unpacking, each tile once BRISC has fetched it
+  return TRISC + f"""
+#define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
+{_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", THREAD)} {_array("setup", SETUP_UNPACK)}
+static unsigned needed, relayed, posted, drained, steps;
+static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // thread 0's reports, for BRISC
+static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next tiles
+static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} }} }}  // until everything packed so far has landed
+void kmain(volatile unsigned *a) {{
+  for (unsigned i = 0; i < sizeof cfg_index / 4; i++) CFG[cfg_index[i]] = cfg_value[i];
+  asm volatile("fence" ::: "memory");  // the config writes are out; a read from the same block is processed after them
+  (void)CFG[cfg_index[0]];
+  asm volatile("fence" ::: "memory");  // and has answered, so no instruction pushed below can see them stale
+  PUSH(thread); PUSH(setup);
+  tensix_idle();  // the semaphores are set before the other threads can touch them
+  SYNC[READY] = 1;
+  unsigned tiles = 0;
+{body}
+}}"""
+
+def _math(slots, body):  # TRISC1
+  return TRISC + f"""
+{_array("thread", THREAD)} {_array("setup", setup_math(slots))}
+void kmain(volatile unsigned *a) {{
+  while (!peek(READY)) {{}}
+  PUSH(thread); PUSH(setup);
+  unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
+{body}
+}}"""
+
+def _packer(body):  # TRISC2
+  return TRISC + f"""
+{_array("thread", THREAD)} {_array("setup", SETUP_PACK)}
+static unsigned outputs, relayed, used[2];
+static void relay(void) {{ for (; SEM({SEM_PACKED}); SYNC[PACKED] = ++relayed) SEM({SEM_PACKED}) = 1; }}  // packed results, for BRISC
+// The next result is packed into slot (output slot s: one per frame, or one for all) and goes home as tile t. Once the
+// last result packed there has gone home, tell BRISC in RING; at most two wait to go home, one per output slot.
+static void output(unsigned s, unsigned slot, unsigned t) {{
+  while (peek(SENT) < used[s]) relay();
+  SYNC[RING + outputs % 4 * 2] = slot; SYNC[RING + outputs % 4 * 2 + 1] = t;
+  used[s] = ++outputs;
+}}
+void kmain(volatile unsigned *a) {{
+  while (!peek(READY)) {{}}
+  PUSH(thread); PUSH(setup);
+  unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
+{body}
+  while (relayed < outputs) relay();
+}}"""
+
+def fused_kernel(expr, shapes):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
   rowsum and rowmax, ("matmul", a, b, K tiles) where a and b are inputs, and plain numbers for inputs. shapes: each
   input's (rows, columns) in tiles; one tile tall or wide repeats across the others (broadcasting).
@@ -306,10 +352,7 @@ def fused_kernel(expr, shapes, order="op"):
   first tile of the pass that needs them, into slots of their own.
   Two frames of slots alternate between tiles: inputs, then one slot per op. Every intermediate is rounded to bf16 on
   its way to L1, exactly as if each op ran on its own; in-place SFPU ops see the fp32 result.
-  order is how BRISC queues the work: "op" (unpack, math, pack, op by op) is the only one safe on silicon. The others
-  make a thread wait for real on ttsim, which otherwise runs every instruction the moment it can: "pack_first" queues
-  each pack before its math, "thread" queues a whole tile for thread 0, then 1, then 2 (no matmuls or reductions). On
-  silicon they would stall BRISC on a full FIFO before it pushes what unblocks it; ttsim's FIFOs are deep enough."""
+  The four programs run the same loops over units, passes and tiles, each doing its own part of every tile."""
   uses, seen_exprs = {}, set()
   def count(e):  # how many ops read each subexpression
     if isinstance(e, int) or e in seen_exprs: return
@@ -361,10 +404,11 @@ def fused_kernel(expr, shapes, order="op"):
   def tile(i):  # which tile of input i goes with this unit's row i_ and column j
     rows, cols = shapes[i]
     return f"{'i_' if rows > 1 else 0} * {cols} + {'j' if cols > 1 else 0}"
-  arrays = []
-  def words(*variants):  # a program, or one per Dst half, as a C array; returns how to name it
-    arrays.append(_arrays(f"w{len(arrays)}", variants) if len(variants) > 1 else _array(f"w{len(arrays)}", variants[0]))
-    return f"w{len(arrays) - 1}" + ("[h]" if len(variants) > 1 else "")
+  B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
+  def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }}"  # one per Dst half
+  def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
+    me = ("op", j)
+    return f"output({f if wide(me) else 0}, {slot(f, me)}, {f'i_ * {w} + j' if wide(me) else 'i_'}); " if j == root else ""
   passes = []
   for p in range(last + 1):
     reductions = [j for j in sweep if sweep[j] == p]
@@ -378,54 +422,48 @@ def fused_kernel(expr, shapes, order="op"):
     once = [j for j, op in enumerate(ops) if not wide(("op", j)) and op["kind"] not in COMBINE and ready[j] == p]
     bodies = []
     for f in (0, 1):
-      stmts = []  # (thread, C): thread decides only the "thread" order; bookkeeping rides on thread 0's statements
+      c = [[], [], [], []]  # each program's C for this tile
       fetch = sorted({r for j in once + swept + reductions for r in operands(ops[j]) if isinstance(r, int)})
-      stmts.append((0, " ".join(f"get(a[{3 + r}], {tile(r)}, {slot(f, r)});" for r in fetch) + " noc_wait();"))
+      c[B] += [f"reached(frame_done[{f}]);"] + [f"get(a[{3 + r}], {tile(r)}, {slot(f, r)});" for r in fetch] + ["ready();"]
+      c[U].append("fetched();")
       for j in once + swept:
         op, me = ops[j], ("op", j)
-        cond = "if (k == 0) " if j in once else ""
-        done = [SEM_PACKED if j == root else SEM_L1]
-        target = slot(f, me)
-        result = f" output({target}, a[2], {'i_ * ' + str(w) + ' + j' if wide(me) else 'i_'});" if j == root else ""
-        bump = "" if j == root else " posted++;"
-        pk = words(*[pack(DST_HALF * h, target, *done) for h in (0, 1)])
+        cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
+        c[P].append(f"{cond}{{ {output(j, f)}{halves([pack(DST_HALF * h, slot(f, me), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])} h ^= 1; }}")
         if op["kind"] == "matmul":
-          assert order == "op", "only op order can interleave a matmul's fetches"
-          begin, end = words(*[math_begin(h, True) for h in (0, 1)]), words(sfpu(op["posts"], slots) + MATH_END)
-          bw = shapes[op["y"]][1]  # B's width in tiles
-          stmts.append((0, f"{cond}{{ for (unsigned m = 0; m < {op['kt']}; m++) {{ step(a[{3 + op['x']}], i_ * {op['kt']} + m, a[{3 + op['y']}], m * {bw} + {'j' if bw > 1 else 0});"
-                           f" if (m == 0) push(1, {begin}); push(1, mm); }} push(1, {end}); push(2, {pk});{bump}{result} h ^= 1; }}"))
+          kt, bw = op["kt"], shapes[op["y"]][1]  # B's width in tiles
+          c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{3 + op['x']}], i_ * {kt} + m, a[{3 + op['y']}], m * {bw} + {'j' if bw > 1 else 0});")
+          c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
+                      f"if (steps++ & 1) {{ {tt(unpack(1, 3) + REPORT)} }} else {{ {tt(unpack(0, 2) + REPORT)} }} }}{posted} }}")
+          c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
+                      f"{tt(sfpu(op['posts'], slots) + MATH_END)} h ^= 1; }}")
           continue
         drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
-        math = words(*[math_begin(h, op["kind"] == "mul") + elementwise(op["kind"], slots) + sfpu(op["posts"], slots) + MATH_END for h in (0, 1)])
-        group = [(0, f"{cond}{{ {drain}push(0, {words(unpack(slot(f, op['x']), slot(f, op['y'])))});{bump} }}"),
-                 (1, f"{cond}{{ unsigned h = hs[{j}]; push(1, {math}); }}"), (2, f"{cond}{{ unsigned h = hs[{j}]; push(2, {pk});{result} }}")]
-        stmts += [(0, f"{cond}{{ hs[{j}] = h; h ^= 1; }}")] + (group[2:] + group[:2] if order == "pack_first" else group)  # its Dst half first
+        c[U].append(f"{cond}{{ {drain}{tt(unpack(slot(f, op['x']), slot(f, op['y'])))}{posted} }}")
+        c[M].append(f"{cond}{{ {halves([math_begin(h, op['kind'] == 'mul') + elementwise(op['kind'], slots) + sfpu(op['posts'], slots) + MATH_END for h in (0, 1)])} h ^= 1; }}")
       for acc, j in enumerate(reductions):
-        assert acc < len(ACCS) and order == "op", "two reductions a pass, in op order"
+        assert acc < len(ACCS), "two reductions a pass"
         op, me = ops[j], ("op", j)
         drain = "drain(); " if isinstance(op["x"], tuple) else ""
-        first, rest = words(reduce_step(op["kind"], slots, acc, True)), words(reduce_step(op["kind"], slots, acc, False))
-        result = f" output({slot(f, me)}, a[2], i_);" if j == root else ""
-        pk = words(pack(ACCS[acc][0], slot(f, me), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
-        stmts.append((0, f"{drain}push(0, {words(unpack(slot(f, op['x']), ZERO_SLOT))}); if (k == 0) push(1, {first}); else push(1, {rest});"
-                         f" if (j == j1 - 1) {{ push(1, {words(reduce_finish(op['kind'], slots, acc, op['posts']))}); push(2, {pk});"
-                         f"{'' if j == root else ' posted++;'}{result} }}"))
-      if order == "thread": stmts.sort(key=lambda s: s[0])
-      bodies.append(" ".join(c for _, c in stmts))
+        c[U].append(f"{drain}{tt(unpack(slot(f, op['x']), ZERO_SLOT))}{'' if j == root else ' if (j == j1 - 1) posted++;'}")
+        c[M].append(f"if (k == 0) {{ {tt(reduce_step(op['kind'], slots, acc, True))} }} else {{ {tt(reduce_step(op['kind'], slots, acc, False))} }} "
+                    f"if (j == j1 - 1) {{ {tt(reduce_finish(op['kind'], slots, acc, op['posts']))} }}")
+        c[P].append(f"if (j == j1 - 1) {{ {output(j, f)}{tt(pack(ACCS[acc][0], slot(f, me), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))} }}")
+      c[U].append(tt(REPORT))
+      c[B].append(f"frame_done[{f}] = ++events;")
+      bodies.append(c)
     passes.append((bool(swept or reductions), bodies))
-  sweeps = "\n".join(f"""    for (unsigned j = j0, k = 0; j < {'j1' if full else 'j0 + 1'}; j++, k++) {{
-      unsigned f = tiles++ & 1;
-      tile_begin(f);
-      if (f) {{ {b[1]} }} else {{ {b[0]} }}
-      tile_end(f);
+  def program(c):  # the loops all four programs share, around each one's part of a tile
+    sweeps = "\n".join(f"""    for (unsigned j = j0, k = 0; j < {'j1' if full else 'j0 + 1'}; j++, k++) {{
+      if (tiles++ & 1) {{ {" ".join(b[1][c])} }} else {{ {" ".join(b[0][c])} }}
     }}""" for full, b in passes)
-  return _kernel(slots, rowwise or any(op.get("y") == "zero" for op in ops), "\n".join(arrays), f"""
-  static unsigned tiles, h, hs[{len(ops)}];  // tiles pushed, the Dst half the next op gets, and the one each op got
-  for (unsigned u = 0; u < a[1]; u++) {{
+    return f"""  for (unsigned u = 0; u < a[1]; u++) {{
     unsigned unit = a[0] + u, i_ = {'unit' if rowwise else f'unit / {w}'}, j0 = {'0' if rowwise else f'unit % {w}'}, j1 = {w if rowwise else 'j0 + 1'};
 {sweeps}
-  }}""")
+  }}"""
+  total = f"a[1] * {w if rowwise and wide(('op', root)) else 1}"  # results this worker sends home
+  zero = rowwise or any(op.get("y") == "zero" for op in ops)
+  return compile_kernel(_brisc(zero, total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
 
 
 def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16  # where (r, c) of a tile sits in it

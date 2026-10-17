@@ -150,15 +150,15 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 **Cores.** `Runtime(chip, start, end)` takes a rectangle of Tensix in translated coordinates. Its last core runs the **dispatcher**; the rest are **workers**. A rectangle of good columns in translated space covers exactly those cores: harvested and non-Tensix columns in between opt out of multicast.
 
-**L1 layout** (ours). Workers: firmware at `0x0` (BRISC's reset PC), mailbox at `0x1000` (`[go, report x|y, report address lo, hi, done]`), arguments at `0x1100`, one kernel at `0x2000`, kernel data from `0x10000` (`L1_DATA`). Dispatcher: firmware at `0x0`, config at `0x1000` (`[doorbell, ring lo, hi, ring size, status lo, hi, workers]`), worker coordinates at `0x1040`, outbox at `0x1400`, one 16-byte done slot per worker at `0x2000`, command staging from `0x10000`.
+**L1 layout** (ours). Workers: firmware at `0x0`, starting with one jump per core (BRISC at `0x0`, its reset PC; TRISC i at `0x4 + 4i`, set as its reset PC), mailbox at `0x1000` (`[go, report x|y, report address lo, hi, done]`), the TRISCs' `[go, done 0, done 1, done 2]` at `0x1020`, `SYNC` at `0x1040` (64 bytes, zeroed before each launch, for the kernel's cores to talk through), arguments at `0x1100`, one kernel at `0x2000` (a header of four entry points, then a program per core), kernel data from `0x10000` (`L1_DATA`). Dispatcher: firmware at `0x0`, config at `0x1000` (`[doorbell, ring lo, hi, ring size, status lo, hi, workers]`), worker coordinates at `0x1040`, outbox at `0x1400`, one 16-byte done slot per worker at `0x2000`, command staging from `0x10000`.
 
-**Boot** (host, once): multicast reset and worker firmware over the rectangle, a unicast mailbox per worker pointing its done report at its slot in the dispatcher, the dispatcher firmware and config over the top of the dispatcher's tile, a TLB of its own aimed at the doorbell, then multicast release of every BRISC.
+**Boot** (host, once): multicast reset and worker firmware over the rectangle, a unicast mailbox per worker pointing its done report at its slot in the dispatcher, the dispatcher firmware and config over the top of the dispatcher's tile (its TRISC jumps park them), a TLB of its own aimed at the doorbell, the TRISC reset PCs and their override bits, then multicast release of every BRISC and TRISC.
 
 **A launch** (host): build one command (a 16-byte header `[length, kernel bytes, argument bytes per worker, 0]`, the kernel, each worker's arguments, 64-byte aligned), copy it into the ring in host memory, and write the new write pointer to the dispatcher's doorbell. That doorbell is the launch's only PCIe access (`test_queue` counts). Commands never straddle the ring's end: a header of length 0 marks the tail unused. Pointers are free-running 32-bit byte counts, so the ring size is a power of two. Before writing, the host waits (with a timeout) for the space the dispatcher has freed.
 
 **The dispatcher** (BRISC firmware, ~1.2 KB): poll the doorbell; read the command's header and then its body from host memory with NoC reads to the PCIe tile (19, 24); write the kernel and each worker's arguments to the worker, wait for every acknowledgement; write the launch number into each worker's `go`; poll the done slots until every worker reports; write `[read pointer, launches done]` into host memory. One launch at a time: the next kernel never overwrites one that is still running.
 
-**A worker** (BRISC firmware, 300 bytes): poll `go` with a `fence` in the loop; invalidate the instruction cache (Tensix config 185), then `fence`, read config back, `fence`, so the invalidate has landed before the jump; call `kmain(args)` at `0x2000`; `noc_wait` for the kernel's own transfers; send its done to its slot at the dispatcher.
+**A worker** (firmware for all four cores, 640 bytes). BRISC: poll `go` with a `fence` in the loop; zero `SYNC`; invalidate the instruction caches of BRISC and the TRISCs (Tensix config 185, bits 0-3), then `fence`, read config back, `fence`, so the invalidate has landed before anyone jumps; write the TRISCs' go; call its program; `noc_wait` for the kernel's own transfers; wait for the three TRISCs' done; send its done to its slot at the dispatcher. A TRISC: poll its go, call its program (if the kernel has one for it), wait until its Tensix thread has run everything it pushed (`tensix_idle`, the Manual TTSync load), write its done.
 
 **Waiting** (`Runtime.wait`) polls the status words in host memory, never the chip. On timeout it reads the dispatcher's current launch and done slots and names the workers that have not finished.
 
@@ -175,17 +175,17 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 1. **Overlap.** The dispatcher waits for one launch to finish before loading the next. Double-buffered kernel slots would let it load launch n+1 while n runs.
 2. **Multicast from the dispatcher.** It writes the kernel to each worker in turn. A NoC multicast (path reserve, static VC class 2, `BRCST_SRC_INCLUDE` off so it skips its own tile) would send it once. Acknowledged multicast leaves `REQS_OUTSTANDING_ID` off by the destination count, so it needs `NIU_MST_WR_ACK_RECEIVED` counting instead.
 3. **Commands other than "launch":** host-to-DRAM copies, events, waiting on another queue.
-4. **The other four cores.** TRISC0-2 drive the Tensix coprocessor, NCRISC is a second data mover. They start from their reset PCs (`0x6000`/`0xA000`/`0xE000`/`0x12000`, overridable); firmware for them, and a BRISC-to-TRISC handoff, comes with the compiler.
+4. **NCRISC**, a second data mover, stays in reset. It could take the sends home off BRISC, or fetch for a second NoC.
 5. **Hang reports from silicon.** The host should also read each stuck core's PC snapshot (`0xFFB1_3138`...); ttsim does not model those registers.
 6. **Ordering of the host's ring writes before the doorbell** relies on x86 ordering cached stores before an uncached MMIO write. Fine on x86, and needs a barrier anywhere else.
 
 ## The Tensix coprocessor, and the first compiler
 
-`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`, `test_matmul_fusion`, `test_sfpu`, `test_reductions`, `test_softmax_and_layernorm`.
+`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_fusion`, `test_threads_wait`, `test_matmul_fusion`, `test_sfpu`, `test_reductions`, `test_softmax_and_layernorm`.
 
-**Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). BRISC can push into all three: a store of the instruction word to `0xFFE4_0000` (thread 0), `0xFFE5_0000`, `0xFFE6_0000`. Its pushes skip the MOP expander (MOP from BRISC is an error; REPLAY works), and a full FIFO stalls BRISC. TRISCs push only to their own thread. trickle: BRISC alone drives all three threads, TRISCs stay in reset (a BRISC push and a TRISC push in the same cycle drop the TRISC's). BRISC can read only thread 0's GPRs in ttsim (ISA: all three at `0xFFE0_0000 + 4*(64t + r)`), which decides who reports what.
+**Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). TRISC t pushes to thread t, through that thread's MOP expander; BRISC can push to all three (`0xFFE4_0000 + 0x10000 t`, skipping the MOP expander), but a BRISC push and a TRISC push in the same cycle drop the TRISC's, so only one of them may feed a thread. trickle: each TRISC feeds its own thread and BRISC only moves data (ISA `BabyRISCV/PushTensixInstruction.md`).
 
-**Instruction words.** `opcode << 24 | fields` (ISA `Diagrams/Src/Bits32.lua`; ttsim `data/bh/tensix_isa.json` agrees and names the fields). `.ttinsn` is the same word rotated left by 2, so it only covers opcodes below `0xC0`.
+**Instruction words.** `opcode << 24 | fields` (ISA `Diagrams/Src/Bits32.lua`; ttsim `data/bh/tensix_isa.json` agrees and names the fields). A TRISC pushes one by storing it to `0xFFE4_0000`, or by executing it: `.ttinsn` is the word rotated left by 2, written straight into the code (opcodes are below `0xC0`, so the low bits are never `0b11` and it cannot be read as RISC-V). Either way a full FIFO stalls the TRISC. The generated programs are mostly `.ttinsn` words (`compiler.tt`, as `.word`s, since clang has no `.ttinsn`); runs that differ per Dst half or frame are branches between two copies. Setup goes through stores instead: a TRISC fuses up to four `.ttinsn`s in a row, and fused ones must not be what a `REPLAY` records.
 
 **Configuration.** Three kinds, all needed:
 
@@ -193,13 +193,13 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 - *Thread config*: 16-bit registers per thread, written only by `SETC16` from that thread, so they are set in-band at the start of the kernel. Reset values are undocumented, so every one we depend on is written.
 - *ADCs and RWCs*: per-thread address counters (`SETADC*`) for unpackers and packer, and register-window counters (`SETRWC`) for the FPU.
 
-BRISC's config stores are not ordered with its instruction pushes (Auto TTSync covers TRISCs only), so the kernel writes config, then `fence`, reads back a config word, `fence`, and only then pushes.
+TRISC0 writes the backend config, then `fence`, reads back a config word, `fence`, and only then pushes; it initialises the semaphores, waits for its thread to run all that (`tensix_idle`), and sets `READY` in `SYNC`. TRISC1 and TRISC2 wait for `READY` before pushing anything: the semaphores' power-on values are not documented.
 
-**The pipeline** (`compiler._kernel`, `fused_kernel`). Each thread has one job, so unpack, math and pack work on different tiles at the same time. L1 holds an array of tile slots; the unpackers' Z counter (Z stride: one tile) and the packer's channel-1 Y counter (that Y stride: one tile) pick the slot, so moving between slots never touches config:
+**The pipeline** (`fused_kernel`). Each thread has one job, so unpack, math and pack work on different tiles at the same time. L1 holds an array of tile slots; the unpackers' Z counter (Z stride: one tile) and the packer's channel-1 Y counter (that Y stride: one tile) pick the slot, so moving between slots never touches config:
 
 | Thread | Job | Per tile (or matmul step) |
 |---|---|---|
-| 0 | unpack, and report to BRISC | `SETADC` each unpacker's Z to its slot, `UNPACR` into SrcA and SrcB; in matmul, wait for the unpackers and BRISC's `SETGPR` 63 = steps unpacked |
+| 0 | unpack, and report | `SETADC` each unpacker's Z to its slot, `UNPACR` into SrcA and SrcB; after a frame or a matmul step, wait for the unpackers and `SEMPOST` SEM_UNPACKED |
 | 1 | math | per result: set the address modes for its kind (elementwise or matmul; one kernel can mix them), `SEMWAIT` for a free Dst half, aim at it (`SETC16 MATH_Offset` = 0 or 64), zero it if the op accumulates (`ZEROACC` four 16-row blocks); the FPU program (one per matmul step); at the end: wait for the FPU, `SEMPOST` SEM_DST |
 | 2 | pack | `SEMWAIT` SEM_DST, aim the packer at the Dst half (ADC ch0 Y) and the L1 slot (ADC ch1 Y), 16 `PACR`, wait for the packer, `SEMGET` SEM_DST, `SEMPOST` SEM_L1 (an intermediate) or SEM_PACKED (an output) |
 
@@ -208,17 +208,26 @@ Handoffs:
 - **Unpack to math**: SrcA and SrcB have two banks each, and the hardware does the rest (`UNPACR` waits for a bank the FPU has released, the FPU for one the unpacker has filled).
 - **Math to pack**: SEM_DST counts results in Dst waiting to be packed (max 2, one per half). Math waits while both halves are full, pack while none is.
 - **Pack to unpack** (fused chains): an intermediate is packed into L1 and unpacked by a later op. Pack posts SEM_L1 for each; before an op that reads an intermediate, unpack takes one for every op packed since it last looked. Packs happen in op order, so that covers whichever earlier op it reads (a plain count would not: the op might read an older intermediate than the one just posted).
-- **Pack to BRISC**: BRISC cannot read the semaphores, nor (on ttsim) thread 2's GPRs. So BRISC pushes a relay into thread 0 (`SEMWAIT` SEM_PACKED, `SEMGET`, `SETGPR` 62) and polls GPR 62.
+- **Between BRISC and the TRISCs**: words in `SYNC`, each written by one core and read with a `fence` first (the L0 data cache never sees another core's writes). BRISC cannot read semaphores, so TRISC0 and TRISC2 relay theirs: they read SEM_UNPACKED or SEM_PACKED (TRISCs see the semaphores at `0xFFE8_0020 + 4i`), take one with a store of 1, and bump a count in `SYNC`.
 
-**BRISC's loop**:
+| word | written by | means |
+|---|---|---|
+| `FETCHED` | BRISC | fetches done (a frame, or a matmul step's pair); TRISC0 waits for the next before unpacking it |
+| `UNPACKED` | TRISC0 | SEM_UNPACKED posts relayed; BRISC refills a slot once the tiles in it two uses ago are unpacked |
+| `READY` | TRISC0 | config and semaphores set up |
+| `PACKED`, `RING` | TRISC2 | results packed, and where each is (slot) and goes (tile), four entries |
+| `SENT` | BRISC | results sent home; TRISC2 packs into an output slot only after its last result there is sent |
 
-1. For each step, wait until the L1 slot's previous tiles (two steps back) are unpacked, then fetch the step's tiles from DRAM into that slot.
-2. Push the unpack to thread 0, the math to thread 1, and after the last step of an output tile its pack to thread 2.
-3. Then wait for the previous output tile to be packed and write it home, which frees its L1 slot before the next pack can reuse it.
+**Four programs, one schedule.** A kernel is a program per core, all four running the same loops over units, passes and tiles, each doing its own part of every tile:
 
-Thread setup goes to all three threads; thread 0 initialises the semaphores, and BRISC waits for that before pushing anything to the others.
+- BRISC: wait until the frame's slots are free (`UNPACKED`), fetch the tile's inputs, bump `FETCHED`; for a matmul, the same per step through the stream slots. While it waits, it sends home whatever `PACKED` says is ready, in order, and bumps `SENT`. At the end, until all its results are sent.
+- TRISC0: wait for `FETCHED` (relaying SEM_UNPACKED meanwhile), then the unpacks, `drain` before an op that reads an intermediate, and the report.
+- TRISC1: the math, alternating Dst halves (it tracks `h` itself).
+- TRISC2: the packs, tracking `h` the same way; for the result, first claim its output slot (`output`), then relay SEM_PACKED until every result is counted.
 
-**Fusion** (`fused_kernel`, `Tensor` is lazy). `+`, `-`, `*` and `@` build a tree; `realize` (or `tolist`) compiles the whole tree into one kernel, so `(a @ b) * d - c` or `(a @ b) + (e @ f)` is one launch. A matmul's own operands are realized first: each of its output tiles needs a whole row and column of them. Equal subtrees become one op. Slots 0-3 stream matmul tiles; per output tile, a frame of slots holds the elementwise inputs, then one slot per op in post order; the last is the result. BRISC fetches the inputs into the frame and pushes, op by op: an elementwise op's unpack (from its operands' slots), math (into the next Dst half) and pack (into its own slot); or a matmul's K steps (each: wait until the stream slots from two steps back are unpacked, fetch A(i, k) and B(k, j), unpack, MVMULs) and its pack. Intermediates live in L1 only, and only the result goes to DRAM. Two frames alternate, so tile n + 1 is fetched while tile n computes, and BRISC writes tile n - 1 back. Every intermediate is rounded to bf16 on its way to L1, exactly as it would be on its way to DRAM, so a fused chain is bit for bit the same as one launch per op (`test_fusion` checks). A single op is just a one-op chain. Limits: binary ops on equal shapes, matmuls only over realized tensors (no fused prologue), at most 15 ops (SEM_L1 is 4 bits).
+A result goes home as soon as it is packed, and the only waits between the cores are on data: a slot to be refilled, a tile to be unpacked, a result to be sent. No core waits for one that is waiting for it: every wait loop on BRISC also sends, and every one on TRISC0 or TRISC2 also relays.
+
+**Fusion** (`fused_kernel`, `Tensor` is lazy). `+`, `-`, `*` and `@` build a tree; `realize` (or `tolist`) compiles the whole tree into one kernel, so `(a @ b) * d - c` or `(a @ b) + (e @ f)` is one launch. A matmul's own operands are realized first: each of its output tiles needs a whole row and column of them. Equal subtrees become one op. Slots 0-3 stream matmul tiles; per output tile, a frame of slots holds the elementwise inputs, then one slot per op in post order; the last is the result. BRISC fetches the inputs into the frame; then, op by op, an elementwise op is unpacked from its operands' slots, computed into the next Dst half and packed into its own slot, or a matmul runs its K steps (each: BRISC waits until the stream slots from two steps back are unpacked and fetches A(i, k) and B(k, j); unpack; MVMULs) and is packed. Intermediates live in L1 only, and only the result goes to DRAM. Two frames alternate, so tile n + 1 is fetched while tile n computes, and results go home while both happen. Every intermediate is rounded to bf16 on its way to L1, exactly as it would be on its way to DRAM, so a fused chain is bit for bit the same as one launch per op (`test_fusion` checks). A single op is just a one-op chain. Limits: binary ops on equal shapes, matmuls only over realized tensors (no fused prologue), at most 15 ops (SEM_L1 is 4 bits).
 
 **The SFPU: relu, exp, reciprocal** (`compiler.SFPU`). A 32-lane fp32 vector unit that works on Dst, issued from the math thread right after the FPU, over the same Dst half. Facts (ISA `VectorUnit.md`, `SFPLOAD.md` and the per-instruction pages; ttsim `tensix.cpp`):
 
@@ -239,9 +248,9 @@ Packing to bf16 turns NaN into inf, so a missing guard shows only for an inf inp
 
 **Where a unary op runs.** In place, on the Dst result of the op below it, if nothing else reads that result (`relu(a @ b + c)` is one op with two SFPU programs after it). Otherwise its operand goes through `x + 0` (slot 4 is a zero tile, zeroed by BRISC at kernel start) into Dst first. In place it sees the fp32 result, not one rounded to bf16, so it can be more accurate than op by op: `exp(x + y)` fused is `exp` of the fp32 sum.
 
-**ttsim and REPLAY.** ttsim executes one instruction per pipe per clock, and BRISC's MMIO pushes have no backpressure. A `REPLAY` word expands to up to 21 instructions, so 32 back to back overflow its 512-entry FIFO. BRISC therefore waits about the replay's length after each `REPLAY` it pushes; on silicon BRISC would stall that long anyway.
+**ttsim's FIFOs.** ttsim executes one instruction per pipe per clock. A TRISC's `.ttinsn` stalls while its thread's FIFO holds more than 52 entries, like silicon's stall on a full FIFO; stores to `0xFFE4_0000` have no such check there (only the short setup uses them), and a 512-entry overflow kills the process. (When BRISC pushed everything, it had to pause after each `REPLAY` for this reason.)
 
-**Replay budget.** The math thread's 32 entries are shared out per kernel: SFPU bodies first (32 replays a tile, longest first), then the matmul and mul phases (4). A run that does not fit is pushed word by word, still correct, just more BRISC words. exp (21) and reciprocal (12) do not fit together.
+**Replay budget.** The math thread's 32 entries are shared out per kernel: SFPU bodies first (32 replays a tile, longest first), then the matmul and mul phases (4). A run that does not fit is pushed by a loop on TRISC1 (`compiler.Loop`), still correct, just more pushes. exp (21) and reciprocal (12) do not fit together.
 
 **Row reductions** (`rowsum`, `rowmax`; `reduce_step`, `across_rows`, `COMBINE`). Each column tile of the operand is unpacked beside the zero tile and added to zero into Dst. The first goes into an accumulator (Dst rows 256-319, or 320-383 for a second reduction in the same pass). Each later one goes 128 rows further on, where an SFPU pass folds it in: load both, `SFPSWAP` for max or a multiply-add by 1.0 for sum, store; 32 passes of 4 words, replayed.
 
@@ -263,13 +272,11 @@ softmax `e * e.rowsum().reciprocal()` with `e = (x - x.rowmax()).exp()` is three
 
 Values one tile wide (reduction results, ops on them like `rowsum(x) * (1/n)`, narrow inputs) are computed once per row, in the first tile of the pass that needs them, into slots of their own after the two frames.
 
-Book-keeping moved to BRISC at run time, because what a tile pushes now depends on whether it is a pass's first or last:
+Book-keeping happens at run time, in each program, because what a tile does depends on whether it is a pass's first or last:
 
-- Which Dst half each op gets.
-- How many `SEM_L1` posts an unpack must take before reading an intermediate (it takes all packed so far: `drain`).
-- Which frame or stream slot is free again: thread 0 reports a count after every tile and every matmul step, and BRISC refills a slot only once the tiles in it two uses ago are unpacked.
-
-A result tile goes home one tile after its pack is pushed, so waiting for it does not stall the pipeline, and before its slot is packed into again.
+- Which Dst half each op gets (TRISC1 and TRISC2, each counting the same way).
+- How many `SEM_L1` posts an unpack must take before reading an intermediate (TRISC0 takes all packed so far: `drain`).
+- Which frame or stream slot is free again (BRISC, counting thread 0's reports the way TRISC0 pushes them).
 
 **Broadcasting** (`Tensor._elementwise`, `fused_kernel(shapes=...)`). Shapes must match, or one side is one tile (32) tall or wide and that tile row or column is reused across the other's. This is tile reuse, not a hardware broadcast: the fetch for output tile (i, j) takes the narrow input's tile (i, 0), (0, j) or (0, 0). Because reductions fill all 32 columns, `x - x.rowmax()` is numpy's column-vector broadcast. A 32 x 32 `Tensor.full` is a scalar, and a 32-row tensor of copies of one row is a row vector (gamma, beta). A computed operand one tile wide stays in the expression and is worked out once per row; one that is one tile tall (repeated down the rows) is realized first in its own kernel.
 
@@ -282,9 +289,9 @@ A result tile goes home one tile after its pack is pushed, so waiting for it doe
 
 Each is one launch; they match float64 to about 2% (softmax) and 0.05 + 2% (layer norm), the bf16 rounding of each intermediate.
 
-**Replay buffers and address modes keep BRISC's share small.** BRISC pushes every Tensix instruction, so words per tile are BRISC's time per tile. Each thread has a 32-entry replay buffer (`REPLAY` with `load` records the next N instructions; without it, plays them back; it works from BRISC because it sits after the MOP expander). Each kernel's setup records the runs that repeat: one 16-`MVMUL` fidelity phase and one 9-word `ELWMUL` phase in the math thread, 15 `PACR`s in the pack thread. The last instruction of a sequence that also has to release the Src banks is pushed by itself with `clear_dvalid`. Elementwise ops use address modes 0-1 and matmul 4-7, all set once at setup, so a kernel can mix them with no per-op rewrites. Blackhole's `addr_mode` field is 3 bits (bits 16:14 in ttsim's `tensix_isa.json`; the ISA pages are Wormhole's, with 2 bits plus an `ADDR_MOD_SET_Base` that Blackhole dropped). This needs confirming on silicon.
+**Replay buffers and address modes keep the pushes small.** Each TRISC pushes one instruction a cycle (four if they come in a row), so words per tile are its code and time per tile. Each thread has a 32-entry replay buffer (`REPLAY` with `load` records the next N instructions; without it, plays them back; it sits after the MOP expander, so it worked from BRISC too). Each kernel's setup records the runs that repeat: one 16-`MVMUL` fidelity phase and one 9-word `ELWMUL` phase in the math thread, 15 `PACR`s in the pack thread. The last instruction of a sequence that also has to release the Src banks is pushed by itself with `clear_dvalid`. Elementwise ops use address modes 0-1 and matmul 4-7, all set once at setup, so a kernel can mix them with no per-op rewrites. Blackhole's `addr_mode` field is 3 bits (bits 16:14 in ttsim's `tensix_isa.json`; the ISA pages are Wormhole's, with 2 bits plus an `ADDR_MOD_SET_Base` that Blackhole dropped). This needs confirming on silicon.
 
-| words BRISC pushes | before | now |
+| words pushed, all three threads | before | now |
 |---|---|---|
 | add or sub tile | 48 | 26 |
 | mul tile | 80 | 27 |
@@ -293,9 +300,9 @@ Each is one launch; they match float64 to about 2% (softmax) and 0.05 + 2% (laye
 
 What is left is per-tile control (slots, Dst half, semaphores). `test_replay_keeps_pushes_small` holds these numbers. A matmul test multiplies by a diagonal of full-mantissa values, so every output is one product that is exact only if all four fidelity phases ran; it catches a replay one instruction short.
 
-**Push order matters on silicon.** BRISC's path into a thread is a few entries deep and a full FIFO stalls BRISC. So BRISC must never queue work a thread will block on, unless what unblocks it has already been pushed: unpack, then math, then pack, op by op. `fused_kernel(order=...)` breaks that rule on purpose for tests, which only ttsim (512-entry FIFOs) survives: `pack_first` queues each pack before its math, `thread` queues a whole tile for thread 0, then 1, then 2.
+**No push order to get right.** When BRISC fed all three threads through one stream of stores, a full FIFO stalled BRISC, so it could never queue work a thread would block on before pushing what unblocks it. With a TRISC per thread, a stalled TRISC holds up only its own thread, whose work waits on the others anyway.
 
-**What ttsim can and cannot check here.** ttsim runs each Tensix instruction the moment it can, in zero time, and ignores the busy conditions of `STALLWAIT`. In the normal push order every handoff has already happened by the time its wait runs, so a missing wait would pass. Hence the test-only orders: without the pack's `SEMWAIT`, `test_pack_waits_for_math` dies on `SEMGET` of an empty semaphore; without the SEM_L1 wait or the math's Dst-half wait, `test_fusion_waits` fails. The accumulator semaphores and the waits inside row passes have no such test: the test orders do not support streamed ops, so on ttsim those waits are never needed and a missing one would pass. Speed-up from the overlap cannot be measured on ttsim at all; that waits for silicon.
+**What ttsim can and cannot check here.** ttsim runs each Tensix instruction the moment it can, in zero time, and ignores the busy conditions of `STALLWAIT`. Each TRISC now pushes as fast as it can, and TRISC2, with the least to push, runs ahead, so the waits really happen there. Breaking each one on purpose (and running the tests) shows: without the pack's `SEMWAIT`, the math's Dst-half wait or the SEM_L1 wait, ttsim stops on a semaphore taken while empty or posted while full (`test_threads_wait` alone hits all three); without BRISC's wait for `UNPACKED` or TRISC2's wait for `SENT`, results are wrong; without TRISC0's wait for `FETCHED` or the math's wait for `READY`, a test fails or hangs. Not caught on ttsim: the `STALLWAIT` before thread 0's report (unpacks are instant there), TRISC2's wait for `READY` and TRISC0's `tensix_idle` before setting it (ttsim's semaphores start at 0 and its thread 0 is always done by then), and the accumulator semaphores. Speed-up from the overlap cannot be measured on ttsim at all; that waits for silicon.
 
 **Tile layout** (ours; the ISA has no notion of a tile). A 32x32 tile is four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face row-major: element (r, c) is at `(r//16*2 + c//16)*256 + r%16*16 + c%16`. An unpacker copies the 1024 datums linearly into Src rows, so face f is Src rows 16f..16f+15, which is what `MVMUL` wants; Dst and the packer keep the same order. Elementwise ops do not care. Tensors are tiles in row-major tile order, tile i in DRAM bank i % 8 at `base + i//8 * 2048`.
 
@@ -311,7 +318,7 @@ What is left is per-tile control (slots, Dst half, semaphores). `test_replay_kee
 
 **Next for the compiler:**
 
-1. BRISC still pushes ~12-27 words a tile. TRISC firmware driving each thread locally (with MOP loops, which BRISC cannot use) would leave BRISC only the data movement and a per-tile signal.
+1. The TRISCs push every instruction themselves. The MOP expander (which BRISC could not use) would turn a whole tile's math into one word, and the loops over units and tiles could run in it.
 2. Deeper pipelines: more L1 slots, so DRAM latency hides behind more than one step.
 3. Matmul reuse: each step refetches both tiles from DRAM. Keep a row of left tiles in L1 across j, and fetch the next pair while the FPU runs (two L1 slots, two Src banks).
 4. Row passes recompute: softmax computes exp twice and reads x three times. Keeping a row's tiles in L1 between passes (when they fit) would trade L1 for that. Column reductions. With few rows, row ownership leaves workers idle; splitting a row across workers would need a cross-worker reduction. Fusion beyond this: a matmul epilogue could stay in Dst (`(a @ b) + c` by unpacking c and adding into the same half, no pack/unpack of the product), prologues (`(a + b) @ c`, per K step), unary ops, broadcasts. Keeping intermediates in fp32 (an fp32 pack, or moving Dst back into SrcA/SrcB) instead of rounding each to bf16.

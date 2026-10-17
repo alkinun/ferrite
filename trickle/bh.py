@@ -34,14 +34,21 @@ SOFT_RESET = 0xFFB121B0  # RISCV_DEBUG_REG_SOFT_RESET_0: a set bit holds that co
 BRISC, TRISC0, TRISC1, TRISC2, NCRISC = 1 << 11, 1 << 12, 1 << 13, 1 << 14, 1 << 18
 ALL_CORES = BRISC | TRISC0 | TRISC1 | TRISC2 | NCRISC  # power-on value
 BRISC_STACK_TOP = 0xFFB00000 + 8 * 1024  # end of BRISC's private data RAM; BRISC starts at PC 0 in L1
+TRISC_STACK_TOP = 0xFFB00000 + 4 * 1024  # each TRISC's is 4 KiB, at the same address
+TRISC_RESET_PC = 0xFFB12228  # RISCV_DEBUG_REG_TRISC0_RESET_PC, then TRISC1's and TRISC2's
+TRISC_RESET_PC_OVERRIDE = 0xFFB12234  # bit i: TRISC i starts at its RESET_PC rather than 0x6000 / 0xA000 / 0xE000
 NIU = 0xFFB20000  # NoC 0 interface: request initiators at +0x800*i, counters at +0x200, translated id at +0x148
 TENSIX_CFG = 0xFFEF0000  # Tensix backend config bank 0, one word per register; BRISC and TRISCs only, not the NoC
 CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: writing bit 0 (BRISC) .. bit 4 (NCRISC) drops that core's instruction cache
 
 # Tensix coprocessor. Encodings: ISA TensixCoprocessor/ and Diagrams/Src/Bits32.lua, field names as in ttsim's
-# data/bh/tensix_isa.json. A word is opcode << 24 | fields. BRISC pushes thread t's instructions by storing the word at
-# TENSIX_PUSH + 0x10000*t (they skip the MOP expander), and sees thread 0's 64 GPRs at TENSIX_GPR.
-TENSIX_PUSH, TENSIX_GPR = 0xFFE40000, 0xFFE00000
+# data/bh/tensix_isa.json. A word is opcode << 24 | fields. TRISC t feeds thread t: it stores the word at TENSIX_PUSH,
+# or executes it as an instruction rotated left by 2 bits (.ttinsn; opcodes are below 0xC0, so the low bits are never
+# 0b11 and it cannot be mistaken for RISC-V). A full FIFO stalls the TRISC either way. (BRISC can push to every
+# thread, at TENSIX_PUSH + 0x10000*t; we leave that to the TRISCs.) TRISCs also see their thread through these:
+TENSIX_PUSH = 0xFFE40000
+TENSIX_DONE = 0xFFE80004  # CoprocessorDoneCheck: a load answers once every instruction this thread was given has run
+TENSIX_SEM = 0xFFE80020  # semaphore i at +4i: a load reads its value, storing 0 posts it and storing 1 takes one
 _ELW = {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 2), "dest_accum_en": (21, 1), "clear_dvalid": (22, 2)}
 _ADC = {"bit_mask": (0, 4), "ch0_x": (6, 3), "ch0_y": (9, 3), "ch1_x": (12, 3), "ch1_y": (15, 3), "cnt_set_mask": (21, 3)}
 TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
@@ -52,7 +59,6 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SETRWC": (0x37, {"bit_mask": (0, 4), "rwc_a": (6, 4), "rwc_b": (10, 4), "rwc_d": (14, 4), "rwc_cr": (18, 4), "clear_ab_vld": (22, 2)}),
   "PACR": (0x41, {"last": (0, 1), "read_intf_sel": (8, 4), "addr_mode": (15, 2)}),
   "UNPACR": (0x42, {"last": (0, 1), "set_dat_valid": (6, 1), "ovrd_thread_id": (7, 1), "addr_mode": (15, 8), "unpack_block_selection": (23, 1)}),
-  "SETGPR": (0x45, {"reg_index_16b": (0, 7), "value": (8, 16)}),  # SETDMAREG: 16 bits into half a GPR (index = 2*gpr + hi)
   "SETADC": (0x50, {"value": (0, 18), "dimension_index": (18, 2), "channel_index": (20, 1), "cnt_set_mask": (21, 3)}),
   "SETADCXY": (0x51, _ADC), "SETADCZW": (0x54, _ADC),  # in ZW, x means z and y means w
   "SETADCXX": (0x5E, {"x_start": (0, 10), "x_end2": (10, 10), "cnt_set_mask": (21, 3)}),
@@ -78,7 +84,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }
 UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets
-STALL_SYNC, STALL_PACK, STALL_THCON, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 5, 1 << 8, 0x1FF  # STALLWAIT/SEMWAIT
+STALL_SYNC, STALL_PACK, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 8, 0x1FF  # STALLWAIT/SEMWAIT
 WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU = 0b110, 1 << 3, 1 << 4, 1 << 11  # stall_res: blocks those units until
 # (wait_res) the unpackers/packer/FPU/SFPU of this thread are idle
 BF16 = 5  # data format code (ISA Unpackers/FormatConversion.md)

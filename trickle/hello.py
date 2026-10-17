@@ -2,7 +2,7 @@
 # clang and lld, and read back what it wrote.   TTSIM=/path/to/libttsim.so python3 -m trickle.hello
 from trickle import pci
 from trickle.chip import Chip
-from trickle.runtime import ARGS, KERNEL, Runtime, compile_rv32
+from trickle.runtime import ARGS, Runtime, compile_kernel
 
 FIB = """
 void kmain(volatile unsigned *args) {  // args: [n, fib(n)]
@@ -15,7 +15,7 @@ void kmain(volatile unsigned *args) {  // args: [n, fib(n)]
 def hello(chip, start, end, n):
   """fib(n) on every worker in the rectangle from start to end: {core: answer}."""
   rt = Runtime(chip, start, end)
-  rt.launch(compile_rv32(FIB, KERNEL), lambda x, y: (n, 0))
+  rt.launch(compile_kernel(FIB), lambda x, y: (n, 0))
   rt.wait()
   return {(x, y): chip.read32(x, y, ARGS + 4) for x, y in rt.cores}
 

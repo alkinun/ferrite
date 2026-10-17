@@ -5,7 +5,7 @@ from trickle.chip import Chip
 from trickle import compiler
 from trickle.compiler import Tensor, from_bf16, to_bf16
 from trickle.hello import hello
-from trickle.runtime import ARGS, DATA, KERNEL, Runtime, compile_rv32
+from trickle.runtime import ARGS, DATA, Runtime, compile_kernel
 
 @pytest.fixture(scope="session")
 def chip():
@@ -49,7 +49,7 @@ def test_hello(chip):
 def test_every_core(chip):
   # every core but the dispatcher; each answers with its own coordinates, read from its NIU
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
-  rt.launch(compile_rv32("void kmain(volatile unsigned *a) { a[0] = noc_me(); }", KERNEL))
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) { a[0] = noc_me(); }"))
   rt.wait()
   assert len(rt.cores) == len(chip.tensix) - 1 == 119  # and one dispatcher
   for x, y in rt.cores: assert chip.read32(x, y, ARGS) == x | y << 6
@@ -59,7 +59,7 @@ def test_relaunch_without_reset(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[2])
   cores = rt.cores
   for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 2):
-    rt.launch(compile_rv32(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] {op} 3; }}", KERNEL), lambda x, y: (x * 100 + y + i, 0))
+    rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] {op} 3; }}"), lambda x, y: (x * 100 + y + i, 0))
     rt.wait()
     for x, y in cores: assert chip.read32(x, y, ARGS + 4) == f(x * 100 + y + i, 3), f"launch {i} on {x},{y}"
 
@@ -71,7 +71,7 @@ def test_kernel_moves_data(chip):
   data = [random.randbytes(n) for _ in cores]
   for i, d in enumerate(data): chip.write(bx, by, src + i * n, d)
   args = {xy: (i, bx, by, src + i * n, dst + i * n, n, *cores[(i + 1) % len(cores)]) for i, xy in enumerate(cores)}
-  rt.launch(compile_rv32("""
+  rt.launch(compile_kernel("""
 void kmain(volatile unsigned *a) {  // a: [index, bank x, bank y, src, dst, n, next x, next y]
   unsigned *buf = (unsigned *)L1_DATA;
   noc_read(a[1], a[2], a[3], L1_DATA, a[5]);
@@ -79,7 +79,7 @@ void kmain(volatile unsigned *a) {  // a: [index, bank x, bank y, src, dst, n, n
   for (unsigned i = 0; i < a[5] / 4; i++) buf[i] += a[0];
   noc_write(L1_DATA, a[1], a[2], a[4], a[5]);
   noc_write(L1_DATA, a[6], a[7], L1_DATA + a[5], 64);
-}""", KERNEL), lambda x, y: args[x, y])
+}"""), lambda x, y: args[x, y])
   rt.wait()
   out = [struct.pack(f"<{n // 4}I", *[(w + i) & 0xFFFFFFFF for w in struct.unpack(f"<{n // 4}I", d)]) for i, d in enumerate(data)]
   for i, ((x, y), o) in enumerate(zip(cores, out)):
@@ -91,7 +91,7 @@ def test_queue(chip):
   # dispatcher wraps around it six times. Each launch adds its index to a word in every worker's L1.
   rt = Runtime(chip, chip.tensix[0], chip.tensix[2], ring=2048)
   for x, y in rt.cores: chip.write32(x, y, DATA, 0)
-  add = compile_rv32("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[0]; }", KERNEL)
+  add = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[0]; }")
   writes, write = [], chip.pci.write
   chip.pci.write = lambda *a: (writes.append(a), write(*a))
   try:
@@ -105,7 +105,7 @@ def test_queue(chip):
 
 def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
-  rt.launch(compile_rv32("void kmain(volatile unsigned *a) { for (;;); }", KERNEL))
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]"): rt.wait(timeout=0.2)
 
 def test_tile_math(chip):
@@ -171,17 +171,6 @@ def test_stream_on_one_worker(chip):
   y = [[float((3 * r + c) % 3 - 1) for c in range(128)] for r in range(96)]
   assert (Tensor.of(rt, x) @ Tensor.of(rt, y)).tolist() == [[sum(x[i][k] * y[k][j] for k in range(96)) for j in range(128)] for i in range(128)]
 
-def test_pack_waits_for_math(chip):
-  # ttsim runs each instruction the moment it can, so in the normal push order the math is always done before the pack
-  # arrives. Queue each pack before its math instead: only the pack thread's semaphore wait keeps it from packing Dst
-  # before the result is there
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
-  a, b = ([[float((r * c + k) % 9 - 4) for c in range(64)] for r in range(128)] for k in (1, 2))
-  ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
-  out = Tensor(rt, 128, 64)
-  out._run(compiler.fused_kernel(("add", 0, 1), [(4, 2), (4, 2)], order="pack_first"), out.addr, ta.addr, tb.addr)
-  assert out.tolist() == [[x + y for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
-
 def unfused(t):  # the same tree of ops, realized one launch per op
   if t.op is None: return t
   srcs = [unfused(s) for s in t.srcs]
@@ -201,15 +190,15 @@ def test_fusion(chip):
       assert rt.launches == launches + 1 and all(t.addr is None for t in lazy[1:]), "one kernel, intermediates stay on chip"
       assert got == unfused(build(a, b, c, d)).tolist()
 
-def test_fusion_waits(chip):
-  # (a+b) + ((c-d) + a*b), queued thread by thread so the threads really wait on ttsim: thread 0 reaches the ops that
-  # read intermediates before the pack thread has written them (SEM_L1), and the math thread gets three ops that read
-  # only inputs in a row, so the third must wait for the pack thread to drain a Dst half (SEM_DST)
+def test_threads_wait(chip):
+  # each TRISC feeds its thread as fast as it can and ttsim runs every instruction the moment it can, so only the waits
+  # hold a thread back. The pack TRISC, with the least to push, has each pack queued before its math is done (SEM_DST);
+  # thread 0 reaches the ops that read intermediates before the pack thread has written them (SEM_L1); the math thread
+  # gets three ops in a row that read only inputs, so the third waits for the pack thread to drain a Dst half (SEM_DST).
+  # On one worker, so slots and halves are reused
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
-  a, b, c, d = (Tensor.of(rt, [[float((r * 3 + c * k) % 7 - 3) for c in range(64)] for r in range(64)]) for k in (1, 2, 5, 6))
-  out = Tensor(rt, 64, 64)
-  out._run(compiler.fused_kernel(("add", ("add", 0, 1), ("add", ("sub", 2, 3), ("mul", 0, 1))), [(2, 2)] * 4, order="thread"), out.addr, a.addr, b.addr, c.addr, d.addr)
-  assert out.tolist() == unfused((a + b) + ((c - d) + a * b)).tolist()
+  a, b, c, d = (Tensor.of(rt, [[float((r * 3 + c * k) % 7 - 3) for c in range(64)] for r in range(128)]) for k in (1, 2, 5, 6))
+  assert ((a + b) + ((c - d) + a * b)).tolist() == unfused((a + b) + ((c - d) + a * b)).tolist()
 
 def test_matmul_fusion(chip):
   # matmuls inside elementwise trees, as one kernel: the matmul's result tile is packed into L1 and read from there.
@@ -224,12 +213,13 @@ def test_matmul_fusion(chip):
       assert got == unfused(build()).tolist()
 
 def test_replay_keeps_pushes_small():
-  # BRISC pushes every Tensix instruction, so its time per tile is mostly this. The repeating runs (a matmul phase, a
-  # mul phase, 15 PACRs) are recorded in the threads' replay buffers once per kernel and replayed by one word each
+  # the TRISCs push one Tensix instruction a cycle (four when they come in a row), so what they push per tile is code
+  # they fetch and time they take. The repeating runs (a matmul phase, a mul phase, 15 PACRs) are recorded in the
+  # threads' replay buffers once per kernel and replayed by one word each
   c, slots = compiler, compiler.allocate({"mm", "mul"})
   tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(0, op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
   assert tile("add") <= 26 and tile("mul") <= 27, "was 48 and 80 before replay"
-  assert len(c.unpack(0, 2) + c.UNPACKED_REPORT) + 1 + len(c.matmul(slots)) <= 12, "a matmul step was 71"
+  assert len(c.unpack(0, 2) + c.REPORT + c.matmul(slots)) <= 12, "a matmul step was 71"
   assert len(c.sfpu(["exp"], c.allocate({"exp"}))) <= 45, "32 passes of 19 words, replayed"
   for names in ({"mm", "mul"}, {"exp", "recip", "relu", "mm", "mul"}):  # what is recorded fits the 32-entry buffer
     assert sum(len(c.MATH_RUNS[n]) for n in c.allocate(names)) <= 32
