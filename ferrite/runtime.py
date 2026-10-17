@@ -1,6 +1,6 @@
 # The runtime: resident firmware on each Tensix tile's BRISC and TRISCs, kernels launched on them without resetting
 # anything, and a command ring in host memory that one tile's BRISC, the dispatcher, reads by itself.
-import pathlib, shutil, struct, subprocess, tempfile
+import functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile
 from ferrite import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
@@ -59,21 +59,32 @@ static inline void tensix_idle(void) {{
 }}
 """
 
+CLANG = ["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax", "-fno-jump-tables",
+         "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld"]
+CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"), "ferrite")  # compiled images, by what made them
+
+@functools.cache
+def _clang_version(): return subprocess.run(["clang", "--version"], capture_output=True, check=True).stdout
+
 def compile_rv32(src, base=0):
   """C source, after DEVICE, to a flat rv32 image linked at base: `.start` first, else `kmain`, then the rest. The code
   reaches its own functions and data by PC-relative addresses (medany, no linker relaxation, no jump tables), so the
-  image runs wherever it is put; base only matters to firmware, which is put at 0."""
-  if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")
+  image runs wherever it is put; base only matters to firmware, which is put at 0. Images are kept in CACHE, named by
+  a hash of the compiler's version, its flags, the link script and the source."""
   link = (f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
-          "__bss_start = .; *(.sbss*) *(.bss*) __bss_end = .; } }")
-  with tempfile.TemporaryDirectory() as d:  # one output section, so .bss is zeros inside the image
+          "__bss_start = .; *(.sbss*) *(.bss*) __bss_end = .; } }")  # one output section, so .bss is zeros inside the image
+  cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
+  if cached.exists(): return cached.read_bytes()
+  if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")
+  with tempfile.TemporaryDirectory() as d:
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
     out = pathlib.Path(d, "prog.bin")
-    subprocess.run(["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax",
-                    "-fno-jump-tables", "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld",
-                    f"-Wl,-T,{ld},--oformat=binary", "-x", "c", "-", "-o", str(out)],
-                   input=(DEVICE + src).encode(), check=True)
-    return out.read_bytes()
+    subprocess.run(CLANG + [f"-Wl,-T,{ld},--oformat=binary", "-x", "c", "-", "-o", str(out)], input=(DEVICE + src).encode(), check=True)
+    image = out.read_bytes()
+  CACHE.mkdir(parents=True, exist_ok=True)
+  (part := cached.with_suffix(f".{os.getpid()}")).write_bytes(image)
+  os.replace(part, cached)  # whole or not at all, if two runs compile it at once
+  return image
 
 # Each kernel program starts here. A kernel stays loaded between launches, so the statics it expects to start at zero
 # are zeroed again for each (statics with other starting values must be const).
