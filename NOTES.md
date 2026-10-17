@@ -181,7 +181,7 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 ## The Tensix coprocessor, and the first compiler
 
-`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`, `test_matmul_fusion`, `test_sfpu`.
+`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`, `test_matmul_fusion`, `test_sfpu`, `test_reductions`, `test_softmax_and_layernorm`.
 
 **Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). BRISC can push into all three: a store of the instruction word to `0xFFE4_0000` (thread 0), `0xFFE5_0000`, `0xFFE6_0000`. Its pushes skip the MOP expander (MOP from BRISC is an error; REPLAY works), and a full FIFO stalls BRISC. TRISCs push only to their own thread. trickle: BRISC alone drives all three threads, TRISCs stay in reset (a BRISC push and a TRISC push in the same cycle drop the TRISC's). BRISC can read only thread 0's GPRs in ttsim (ISA: all three at `0xFFE0_0000 + 4*(64t + r)`), which decides who reports what.
 
@@ -243,6 +243,25 @@ Packing to bf16 turns NaN into inf, so a missing guard shows only for an inf inp
 
 **Replay budget.** The math thread's 32 entries are shared out per kernel: SFPU bodies first (32 replays a tile, longest first), then the matmul and mul phases (4). A run that does not fit is pushed word by word, still correct, just more BRISC words. exp (21) and reciprocal (12) do not fit together.
 
+**Row reductions** (`rowsum`, `rowmax`; `across_rows`, `COMBINE`). An op like a matmul: it streams the K column tiles of its row of input through slots 0-1 (beside the zero tile) and computes into a Dst half:
+
+1. The first tile goes in as `x + 0`. Each later one goes 128 Dst rows further on (rows 128-255 are free; we use 0-127), and an SFPU pass folds it in: load both, `SFPSWAP` for max or a multiply-add by 1.0 for sum, store. That is 32 passes of 4 words, replayed.
+2. Then `across_rows` folds each tile row over its 32 columns. Row r sits in Dst rows `(r // 16) * 32 + r % 16` (columns 0-15) and 16 rows on (16-31), so four `SFPLOAD`s (even and odd columns, both faces) hold 4 rows at a time, a row per 8-lane group.
+3. After folding those four, `SFPSHFT2` mod 3 rotates each 8-lane group by one lane. Rotating by 1, 2 and 4 and folding each time leaves the row's result in all 8 lanes, which is stored back to all four places. That is 8 groups of 21 words, pushed directly since the addresses differ.
+
+The result is M x 32 with each row's value in every column. Sums are fp32 throughout, then rounded once.
+
+**Broadcasting** (`Tensor._elementwise`, `fused_kernel(shapes=...)`). Shapes must match, or one side is one tile (32) tall or wide and that tile row or column is reused across the other's. This is tile reuse, not a hardware broadcast: the fetch for output tile (i, j) takes the narrow input's tile (i, 0), (0, j) or (0, 0). Because reductions fill all 32 columns, `x - x.rowmax()` is numpy's column-vector broadcast. A 32 x 32 `Tensor.full` is a scalar, and a 32-row tensor of copies of one row is a row vector (gamma, beta). A broadcast operand that is itself unrealized is realized first in its own kernel, so it is computed once, not once per output tile.
+
+**rsqrt** (SFPU, x > 0): the bit trick `0x5F3759DF - bits(x) / 2` (`SFPSHFT` by -1 from vc, `SFPIADD` vc - vd with no flag update) within 3.5%, then two Newton steps `y *= 1.5 - x/2 * y^2`. 0 and negatives are not handled.
+
+**Softmax and layer norm** are built from these in `test_softmax_and_layernorm`:
+
+- softmax: `e = (x - x.rowmax()).exp(); e * e.rowsum().reciprocal()`
+- layer norm: `d = x - x.rowsum() * (1/n); d * ((d * d).rowsum() * (1/n) + eps).rsqrt() * gamma + beta`
+
+They take several launches each (every reduction and every broadcast operand is its own kernel). They match float64 to about 2% (softmax) and 0.05 + 2% (layer norm), the bf16 rounding of each intermediate.
+
 **Replay buffers and address modes keep BRISC's share small.** BRISC pushes every Tensix instruction, so words per tile are BRISC's time per tile. Each thread has a 32-entry replay buffer (`REPLAY` with `load` records the next N instructions; without it, plays them back; it works from BRISC because it sits after the MOP expander). Each kernel's setup records the runs that repeat: one 16-`MVMUL` fidelity phase and one 9-word `ELWMUL` phase in the math thread, 15 `PACR`s in the pack thread. The last instruction of a sequence that also has to release the Src banks is pushed by itself with `clear_dvalid`. Elementwise ops use address modes 0-1 and matmul 4-7, all set once at setup, so a kernel can mix them with no per-op rewrites. Blackhole's `addr_mode` field is 3 bits (bits 16:14 in ttsim's `tensix_isa.json`; the ISA pages are Wormhole's, with 2 bits plus an `ADDR_MOD_SET_Base` that Blackhole dropped). This needs confirming on silicon.
 
 | words BRISC pushes | before | now |
@@ -275,7 +294,7 @@ What is left is per-tile control (slots, Dst half, semaphores). `test_replay_kee
 1. BRISC still pushes ~12-27 words a tile. TRISC firmware driving each thread locally (with MOP loops, which BRISC cannot use) would leave BRISC only the data movement and a per-tile signal.
 2. Deeper pipelines: more L1 slots, so DRAM latency hides behind more than one step.
 3. Matmul reuse: each step refetches both tiles from DRAM. Keep a row of left tiles in L1 across j, and fetch the next pair while the FPU runs (two L1 slots, two Src banks).
-4. Fusion beyond this: a matmul epilogue could stay in Dst (`(a @ b) + c` by unpacking c and adding into the same half, no pack/unpack of the product), prologues (`(a + b) @ c`, per K step), unary ops, broadcasts. Keeping intermediates in fp32 (an fp32 pack, or moving Dst back into SrcA/SrcB) instead of rounding each to bf16.
+4. Fewer launches for softmax and layer norm: a reduction feeding a broadcast could stay on chip if a worker owns whole rows (all of a row's output tiles), computing the reduction once into a slot. Column reductions. Fusion beyond this: a matmul epilogue could stay in Dst (`(a @ b) + c` by unpacking c and adding into the same half, no pack/unpack of the product), prologues (`(a + b) @ c`, per K step), unary ops, broadcasts. Keeping intermediates in fp32 (an fp32 pack, or moving Dst back into SrcA/SrcB) instead of rounding each to bf16.
 5. The SFPU, for fp32, exp, recip, and the rest.
 
 ## Still unknown or untested

@@ -269,3 +269,37 @@ def test_sfpu(chip):
     for gv, uv, wv in zip(g, ru, rw):
       e, r = exp(uv), recip(wv)
       assert abs(gv - (e + r)) <= 2**-6 * max(abs(e), abs(r)), (uv, wv, gv, e + r)
+
+def test_reductions(chip):
+  # row max exactly, row sum to a bf16 step of the sum of magnitudes, both written to all 32 columns of the row;
+  # then broadcast back: x - rowmax(x), and a 32x32 constant times a column, all against Python
+  rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 96
+  bf = lambda v: from_bf16(to_bf16(v))
+  x = [[bf(random.uniform(-4, 4)) for _ in range(cols)] for _ in range(rows)]
+  tx = Tensor.of(rt, x)
+  assert tx.rowmax().tolist() == [[max(row)] * 32 for row in x]
+  for got, row in zip(tx.rowsum().tolist(), x):
+    assert len(set(got)) == 1 and abs(got[0] - sum(row)) <= 2**-8 * sum(map(abs, row)), (got[0], sum(row))
+  for got, row in zip((tx - tx.rowmax()).tolist(), x):
+    assert all(abs(g - (v - max(row))) <= 2**-7 * max(abs(v), abs(max(row))) for g, v in zip(got, row))
+  assert (tx.rowmax() * Tensor.full(rt, 32, 32, 0.5)).tolist() == [[max(row) / 2] * 32 for row in x]
+
+def test_softmax_and_layernorm(chip):
+  # built from the primitives: softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)); layernorm(x) = (x - mean)
+  # * rsqrt(var + eps) * gamma + beta with gamma and beta one tile tall, repeated down the rows
+  rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 128
+  bf = lambda v: from_bf16(to_bf16(v))
+  x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
+  tx = Tensor.of(rt, x)
+  e = (tx - tx.rowmax()).exp()
+  for got, row in zip((e * e.rowsum().reciprocal()).tolist(), x):
+    want = [math.exp(v - max(row)) for v in row]
+    assert all(abs(g - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for g, w in zip(got, want))
+  gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
+  inv_n, eps = Tensor.full(rt, 32, 32, 1 / cols), Tensor.full(rt, 32, 32, 1e-5)
+  d = tx - tx.rowsum() * inv_n
+  y = d * ((d * d).rowsum() * inv_n + eps).rsqrt() * Tensor.of(rt, [gamma] * 32) + Tensor.of(rt, [beta] * 32)
+  for got, row in zip(y.tolist(), x):
+    mean = sum(row) / cols
+    sd = math.sqrt(sum((v - mean) ** 2 for v in row) / cols + 1e-5)
+    assert all(abs(g - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for g, v, gm, bt in zip(got, row, gamma, beta))

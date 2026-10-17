@@ -144,9 +144,36 @@ SFPU = {
                  ins("SFPIADD", vd=4, vc=3, mod1=9, imm12=126),  # ... and >= -126
                  mad(2, 0, 1, ONE, negate_a=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, negate_a=1), mad(1, 1, 2, 1),
                  ins("SFPENCC", mod1=10, imm2=2), sfp_store(1)]),  # every lane again
+  # 1/sqrt(x) for x > 0: the bit trick (0x5F3759DF - bits / 2, within 3.5%), then two Newton steps y *= 1.5 - x/2 y^2
+  "rsqrt": (sfp_const(2, struct.unpack("<f", struct.pack("<I", 0x5F3759DF))[0]) + sfp_const(3, 1.5) + sfp_const(4, 0.5),
+            [sfp_load(), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF),  # LReg 1 = bits of x >> 1
+             ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +  # LReg 1 = magic - LReg 1 as integers; LReg 5 = x/2
+            [w for _ in range(2) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, negate_a=1), mul(1, 1, 6))] + [sfp_store(1)]),
 }
+# Reductions along rows: x + 0 lands in Dst (the first column tile in the result's half, the rest 128 rows further
+# on, where the SFPU folds them in). Then each row is folded across its 32 columns and the result written to all of
+# them, so the tile broadcasts along rows as is.
+STREAMED = ("matmul", "rowsum", "rowmax")  # ops that stream their own operand tiles instead of reading a frame slot
+def fold(kind, d, t):  # LReg d = d op t (for max, t is left with the min)
+  return ins("SFPSWAP", vd=t, vc=d, mod1=1) if kind == "rowmax" else mad(d, t, ONE, d)
+COMBINE = {k: [ins("SFPLOAD", vd=0, mod0=3, addr_mode=2), ins("SFPLOAD", vd=1, mod0=3, addr_mode=2, imm10=128), fold(k, 0, 1), sfp_store(0)]
+           for k in ("rowsum", "rowmax")}
+def across_rows(kind):
+  """Fold every tile row across its 32 columns. Row r of a tile is Dst row (r // 16) * 32 + r % 16 (columns 0-15)
+  and 16 rows on (16-31); an SFPLOAD takes 4 such rows' even or odd columns, one row per 8-lane group. Folding the
+  four loads leaves 8 lanes a row, and rotating the group by 1, 2 and 4 lanes and folding each time leaves the
+  row's result in every lane, which goes back to all four places."""
+  rot = lambda d, s: ins("SFPSHFT2", vd=d, vc=s, mod1=3)
+  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+  for base in (0, 4, 8, 12, 32, 36, 40, 44):
+    at = [base, base + 2, base + 16, base + 18]  # even and odd columns, left and right face
+    p += [ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=a) for r, a in enumerate(at)]
+    p += [fold(kind, 0, 1), fold(kind, 2, 3), fold(kind, 0, 2)]
+    p += [rot(1, 0), fold(kind, 0, 1), rot(1, 0), rot(1, 1), fold(kind, 0, 1), rot(1, 0), rot(1, 1), rot(1, 1), rot(1, 1), fold(kind, 0, 1)]
+    p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
+  return p
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
-MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()}
+MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
 def allocate(names):
   """{run: replay index} for the math thread: SFPU bodies (32 replays a tile, longest first), then matmul and mul
@@ -164,12 +191,17 @@ def last(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: 
 def matmul(slots):  # one matmul step: four phases (SrcA gives 5 mantissa bits a phase, SrcB 7: four make the whole product)
   return [ins("SETRWC", bit_mask=0b1111)] + run(slots, "mm") * 3 + run(slots, "mm", 15) + [last(matmul_phase()[-1])]
 
-def elementwise(op, slots):
-  """Math for one tile of SrcA op SrcB: 8 rows of 16 per instruction, address mode 0 steps 8 rows. ELWMUL always
-  accumulates and multiplies a slice of the mantissas per fidelity phase: on a zeroed Dst, all 4 phases."""
+def elementwise(op, slots, dst=0):
+  """Math for one tile of SrcA op SrcB at Dst row dst: 8 rows of 16 per instruction, address mode 0 steps 8 rows.
+  ELWMUL always accumulates and multiplies a slice of the mantissas per fidelity phase: on a zeroed Dst, 4 phases."""
   if op == "mul": return [ins("SETRWC", bit_mask=0b1111)] + run(slots, "mul") * 3 + run(slots, "mul", 8) + [last(MUL_PHASE[-1])]
   fpu = {"add": "ELWADD", "sub": "ELWSUB"}[op]
-  return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu) for _ in range(7)] + [last(ins(fpu))]
+  return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [last(ins(fpu, dst=dst))]
+
+def reduce_step(kind, slots, first):  # one column tile of a reduction: into the result's half, or into scratch and folded in
+  if first: return elementwise("add", slots)
+  return (elementwise("add", slots, dst=128) + [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
+          run(slots, kind) * 32)
 
 def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU just wrote
   return [w for u in posts for w in [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
@@ -182,13 +214,14 @@ ZERO_SLOT, FRAMES = 4, 5  # slots 0-3 stream matmul tiles, 4 holds a zero tile, 
 
 def _kernel(slots, zero, arrays, body):
   """A BRISC kernel: backend config, the semaphores and every thread's setup, then body. body can push(t, p) a program
-  to thread t, step() a matmul, and writeback(n, slot, base, tile) the n-th output (1-based)."""
+  to thread t, step() a matmul, reduce() a row, and writeback(n, slot, base, tile) the n-th output (1-based)."""
   setgpr = ins("SETGPR", reg_index_16b=0)
   return compile_rv32(f"""
 {_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", THREAD)} {_array("relay", RELAY)}
 {_array("setup_unpack", SETUP_UNPACK)} {_array("setup_math", setup_math(slots))} {_array("setup_pack", SETUP_PACK)}
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
 {_arrays("mm_unpack", [unpack(s, 2 + s) + UNPACKED_REPORT for s in (0, 1)])} {_array("mm", matmul(slots))}
+{_arrays("r_unpack", [unpack(s, ZERO_SLOT) + UNPACKED_REPORT for s in (0, 1)])}
 {arrays}
 #define PUSH(t) (*(volatile unsigned *)({bh.TENSIX_PUSH:#x} + 0x10000 * (t)))
 #define GPR(r) (((volatile unsigned *){bh.TENSIX_GPR:#x})[r])
@@ -216,6 +249,11 @@ static void step(unsigned a, unsigned a_tile, unsigned b, unsigned b_tile) {{  /
   get(b, b_tile, steps & 1); get(a, a_tile, 2 + (steps & 1)); noc_wait();
   push(0, mm_unpack[steps & 1]); steps++; setgpr({UNPACKED}, steps);
 }}
+static void reduce(unsigned x, unsigned tile) {{  // a reduction's next tile: into SrcA, the zero tile into SrcB
+  if (steps >= 2) reached({UNPACKED}, steps - 1);
+  get(x, tile, steps & 1); noc_wait();
+  push(0, r_unpack[steps & 1]); steps++; setgpr({UNPACKED}, steps);
+}}
 void kmain(volatile unsigned *a) {{
   for (unsigned i = 0; i < sizeof cfg_index / 4; i++) CFG[cfg_index[i]] = cfg_value[i];
   GPR({UNPACKED}) = GPR({PACKED}) = 0;
@@ -231,12 +269,13 @@ void kmain(volatile unsigned *a) {{
 }}
 """, KERNEL)
 
-def fused_kernel(expr, nt, order="op"):
-  """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp and recip,
-  ("matmul", a, b, K tiles) where a and b are inputs, and plain numbers for inputs. nt: the result's width in tiles.
-  args: [first tile, tiles, out, input 0, input 1, ...].
+def fused_kernel(expr, nt, shapes=(), order="op"):
+  """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip and
+  rsqrt, ("matmul", a, b, K tiles) and (rowsum or rowmax, a, K tiles) where a and b are inputs, and plain numbers for
+  inputs. nt: the result's width in tiles; shapes: the inputs' (rows, columns) in tiles, where a 1 repeats that one
+  tile row or column across the result (broadcasting). args: [first tile, tiles, out, input 0, input 1, ...].
   Ops: an elementwise op unpacks its operands from their L1 slots and computes into a Dst half; a matmul streams its K
-  pairs of tiles through slots 0-3 into a Dst half. A unary op runs on the SFPU over a Dst half: in place, on the
+  pairs of tiles through slots 0-3 into a Dst half, a reduction its K tiles of a row. A unary op runs on the SFPU over a Dst half: in place, on the
   result of the op below it if nothing else reads that, or else on its operand plus a zero tile. Each op then packs
   its Dst half into its own slot, so intermediates never leave L1. Slots: 0-3 stream matmul tiles, 4 is zero, then a
   frame per output tile holds the inputs, then one slot per op in post order (equal subexpressions are one op), the
@@ -250,7 +289,7 @@ def fused_kernel(expr, nt, order="op"):
   def count(e):  # how many ops read each subexpression
     if isinstance(e, int) or e in seen_exprs: return
     seen_exprs.add(e)
-    for c in (() if e[0] == "matmul" else e[1:]):
+    for c in (() if e[0] in STREAMED else e[1:]):
       uses[c] = uses.get(c, 0) + 1
       count(c)
   count(expr)
@@ -264,6 +303,10 @@ def fused_kernel(expr, nt, order="op"):
     if e[0] == "matmul":
       inputs = max(inputs, e[1] + 1, e[2] + 1)
       ops.append(["matmul", e[1], e[2], e[3], []])
+    elif e[0] in COMBINE:
+      assert nt == 1, "a reduction's result is one tile wide"
+      inputs = max(inputs, e[1] + 1)
+      ops.append([e[0], e[1], None, e[2], []])
     elif e[0] in SFPU:
       x = visit(e[1])
       if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below
@@ -276,8 +319,13 @@ def fused_kernel(expr, nt, order="op"):
     return refs[e]
   visit(expr)
   assert len(ops) <= 15, "SEM_L1 counts at most 15 intermediates"
-  slots = allocate({"mm" for op in ops if op[0] == "matmul"} | {"mul" for op in ops if op[0] == "mul"} | {u for op in ops for u in op[4]})
+  slots = allocate({"mm" for op in ops if op[0] == "matmul"} | {"mul" for op in ops if op[0] == "mul"} | {u for op in ops for u in op[4]} |
+                   {op[0] for op in ops if op[0] in COMBINE})
   frame = inputs + len(ops)
+  def tile(i):  # which tile of input i goes with output tile t: a one-tile-tall or -wide input repeats that tile
+    rows, cols = shapes[i] if shapes else (None, nt)
+    if rows != 1 and cols == nt: return "t"
+    return f"{f't / {nt}' if rows > 1 else 0} * {cols} + {f't % {nt}' if cols > 1 else 0}"
   def slot(f, x): return ZERO_SLOT if x == "zero" else FRAMES + f * frame + (x if isinstance(x, int) else inputs + x[1])
   arrays, bodies = [], []
   def words(ws): arrays.append(_array(f"w{len(arrays)}", ws)); return f"w{len(arrays) - 1}"
@@ -291,6 +339,12 @@ def fused_kernel(expr, nt, order="op"):
         stmts += [(0, f"for (unsigned k = 0; k < {kt}; k++) {{ step(a[{3 + x}], t / {nt} * {kt} + k, a[{3 + y}], k * {nt} + t % {nt});"
                       f" if (k == 0) push(1, {begin}); push(1, mm); }} push(1, {end});"), pack_stmt]
         continue
+      if kind in COMBINE:
+        first, rest = words(math_begin(half, False) + reduce_step(kind, slots, True)), words(reduce_step(kind, slots, False))
+        end = words(across_rows(kind) + sfpu(posts, slots) + MATH_END)
+        stmts += [(0, f"for (unsigned k = 0; k < {kt}; k++) {{ reduce(a[{3 + x}], t * {kt} + k); if (k) push(1, {rest}); else push(1, {first}); }}"
+                      f" push(1, {end});"), pack_stmt]
+        continue
       wait = []
       if isinstance(x, tuple) or isinstance(y, tuple):  # reads an intermediate: wait for every op packed before it
         wait, seen = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)] * (j - seen), j
@@ -298,11 +352,11 @@ def fused_kernel(expr, nt, order="op"):
                (1, f"push(1, {words(math_begin(half, kind == 'mul') + elementwise(kind, slots) + sfpu(posts, slots) + MATH_END)});"), pack_stmt]
       stmts += steps[2:] + steps[:2] if order == "pack_first" else steps
     if order == "thread":
-      assert all(op[0] != "matmul" for op in ops), "thread order cannot interleave a matmul's fetches"
+      assert all(op[0] not in STREAMED for op in ops), "thread order cannot interleave a streamed op's fetches"
       stmts.sort(key=lambda s: s[0])
-    bodies.append(" ".join([f"get(a[{3 + i}], t, {slot(f, i)});" for i in sorted(fetched)] + ["noc_wait();"] + [c for _, c in stmts]))
+    bodies.append(" ".join([f"get(a[{3 + i}], {tile(i)}, {slot(f, i)});" for i in sorted(fetched)] + ["noc_wait();"] + [c for _, c in stmts]))
   out = lambda f: slot(f, ("op", len(ops) - 1))
-  return _kernel(slots, any(op[2] == "zero" for op in ops), "\n".join(arrays), f"""
+  return _kernel(slots, any(op[2] == "zero" or op[0] in COMBINE for op in ops), "\n".join(arrays), f"""
   for (unsigned n = 0; n < a[1]; n++) {{
     unsigned t = a[0] + n;
     if (n & 1) {{ {bodies[1]} }}
@@ -321,6 +375,9 @@ class Tensor:
     assert rows % 32 == 0 and cols % 32 == 0, "tensors are whole tiles"
     self.rt, self.rows, self.cols, self.tiles, self.op, self.srcs = rt, rows, cols, rows * cols // 1024, op, srcs
     self.addr = None if op else rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
+
+  @classmethod
+  def full(cls, rt, rows, cols, value): return cls.of(rt, [[value] * cols for _ in range(rows)])
 
   @classmethod
   def of(cls, rt, rows):
@@ -349,11 +406,15 @@ class Tensor:
       if t.op is None:
         if all(t is not u for u in inputs): inputs.append(t)
         return next(i for i, u in enumerate(inputs) if u is t)
+      if t is not self and (t.rows, t.cols) != (self.rows, self.cols): return expr(t.realize())  # broadcast: compute it once
       if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
         a, b = (s.realize() for s in t.srcs)
         return ("matmul", expr(a), expr(b), a.cols // 32)
+      if t.op in ("rowsum", "rowmax"):  # likewise, a whole row
+        a = t.srcs[0].realize()
+        return (t.op, expr(a), a.cols // 32)
       return (t.op, *map(expr, t.srcs))
-    key = (expr(self), self.cols // 32)
+    key = (expr(self), self.cols // 32, tuple((u.rows // 32, u.cols // 32) for u in inputs))
     kernel = kernels.get(key) or kernels.setdefault(key, fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
     return self._run(kernel, self.addr, *[t.addr for t in inputs])
@@ -366,11 +427,20 @@ class Tensor:
     return self
 
   def _elementwise(self, op, other):
-    assert (self.rows, self.cols) == (other.rows, other.cols), "shapes must match"
-    return Tensor(self.rt, self.rows, self.cols, op, (self, other))
+    """Shapes match, or one side is one tile (32) tall or wide and repeats that tile across the other's rows or
+    columns. Row reductions give tiles that hold each row's value in all 32 columns, so with them this is numpy's
+    broadcasting of a column vector."""
+    shape = []
+    for a, b in ((self.rows, other.rows), (self.cols, other.cols)):
+      assert a == b or 32 in (a, b), f"cannot broadcast ({self.rows}, {self.cols}) with ({other.rows}, {other.cols})"
+      shape.append(max(a, b))
+    return Tensor(self.rt, *shape, op, (self, other))
   def relu(self): return Tensor(self.rt, self.rows, self.cols, "relu", (self,))
   def exp(self): return Tensor(self.rt, self.rows, self.cols, "exp", (self,))
   def reciprocal(self): return Tensor(self.rt, self.rows, self.cols, "recip", (self,))
+  def rsqrt(self): return Tensor(self.rt, self.rows, self.cols, "rsqrt", (self,))
+  def rowsum(self): return Tensor(self.rt, self.rows, 32, "rowsum", (self,))  # each row's sum, in all 32 columns
+  def rowmax(self): return Tensor(self.rt, self.rows, 32, "rowmax", (self,))
   def __add__(self, other): return self._elementwise("add", other)
   def __sub__(self, other): return self._elementwise("sub", other)
   def __mul__(self, other): return self._elementwise("mul", other)
