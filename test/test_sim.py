@@ -325,6 +325,24 @@ def test_any_shape(chip):
   (a, ta), (b, tb) = make(45, 50, -1, 1), make(50, 70, -1, 1)
   close(ta.exp() @ tb.exp(), bf16(np.exp(a)) @ bf16(np.exp(b)), 2**-6)
 
+def test_views_transpose_gelu(chip):
+  # views are read in place: tile-aligned slices as inputs to elementwise ops and to matmuls, like a GPT-2 layer's
+  # 64-column attention heads. Transpose is exact, of odd shapes and of views, and turns a filled row into a filled
+  # column. gelu against numpy, within the bf16 rounding of its steps
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(1)
+  def make(rows, cols, lo=-2.0, hi=2.0):
+    a = bf16(rng.uniform(lo, hi, (rows, cols)))
+    return a, Tensor.of(rt, a.tolist())
+  (x, tx), (y, ty), (row, trow) = make(70, 100), make(70, 192), make(1, 100)
+  v = tx[32:70, 64:100]
+  assert v.tolist() == x[32:70, 64:100].tolist() and (v * 2.0).tolist() == (x[32:70, 64:100] * 2).tolist()
+  assert tx.T.tolist() == x.T.tolist() and v.T.tolist() == x[32:70, 64:100].T.tolist()
+  close(tx.T + trow.T, x.T + row.T, 2**-7)
+  q, k = ty[:, 64:128], ty[:, 128:192]  # one head's query and key
+  close(q @ k.T, y[:, 64:128] @ y[:, 128:192].T, 2**-6)
+  gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
+  close(tx.gelu(), gelu(x), 0.02)
+
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
   # staying in Dst and their results in L1. softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)), three passes;

@@ -11,7 +11,7 @@ Each has a finish line we can check. Ticked when a test shows it.
 1. **A real model runs on the simulator.** Finish line: one GPT-2 transformer layer matches a CPU reference.
    - [x] DRAM is freed when a tensor goes away (`test_dram_is_freed`)
    - [x] any tensor shape, not just multiples of 32 (`test_any_shape`)
-   - [ ] transpose, gelu
+   - [x] views, transpose, gelu (`test_views_transpose_gelu`)
    - [ ] halfway: a small MNIST network (matmuls, bias, relu) matches
    - [ ] a GPT-2 layer (layer norm, attention, MLP) matches
 2. **First light on silicon.** Finish line: `hello` on every core of a p150, then every test passing on the card. Before the card arrives: tests that can run on `Card`, and a bring-up checklist of everything only ttsim has confirmed.
@@ -298,6 +298,14 @@ Book-keeping happens at run time, in each program, because what a tile does depe
 - **Results go home tidy.** Before BRISC sends a result tile that is the last in its row or column of tiles, it zeroes the padding past the edge (`tidy`). Inside a kernel the padding is whatever the ops made of it (`exp(0)` is 1); in DRAM it is zero, so a matmul can sum over a padded K: zero columns of A meet zero rows of B. (Multiplying by a 0/1 mask instead would not do: an inf in the padding times 0 is NaN.) A dimension of 1 stays filled by itself: an op on filled tiles gives filled tiles, a row reduction writes all 32 columns, and a matmul with a filled B gives a filled result.
 - **Row reductions mask their last tile.** Padding columns would count in a sum, and with all values negative a padding 0 would win a max. After the last column tile of a row lands in Dst, an SFPU pass (`mask_columns`) stores the identity (0, or -inf for max) into the columns past the edge. Which columns an `SFPSTORE` lane holds is fixed (lane l of a store at an even or odd address: column 2 (l % 8) or one more, plus 16 in the right faces), and `LReg[15]` holds 2l in every lane (ISA `LReg.md`; ttsim agrees), so `LReg[15] & 14` compared with the first padded column (`SFPIADD` with an immediate, flags on) enables exactly the padded lanes, and the store only writes enabled lanes. 32 stores at most, only in a row's last tile.
 - **Broadcasting is numpy's**: shapes match, or one side has 1 where the other does not; a number is a 1 x 1 tensor. It is tile reuse, not a hardware broadcast: the fetch for output tile (i, j) takes the 1-wide input's tile (i, 0), (0, j) or (0, 0), and the filling makes that tile right everywhere. A computed operand one tile wide stays in the expression and is worked out once per row; one with a single row (repeated down) is realized first in its own kernel. `rowsum` and `rowmax` give a column (rows x 1); of a column they are the column itself (32 copies would add up). `(R, 1) @ (1, C)` is broadcasting, not a matmul (a filled K would add up 32 times).
+
+**Views** (`x[r0:r1, c0:c1]`). A slice on tile boundaries shares its owner's DRAM: tile (i, j) of the view is tile `i * stride + j + offset` of the owner's, and every kernel takes each input as (address, stride, offset), so views go straight into kernels with no copy. The view keeps its owner alive, and only the owner frees. A view ends on a tile boundary or at the tensor's end, so its padding follows the rule too. GPT-2's attention heads are 64-column views.
+
+**Transpose** (`x.T`, `transpose_kernel`). Result tile (i, j) is input tile (j, i) transposed. BRISC fetches the tile face by face with the two off-diagonal faces swapped (four 512-byte NoC reads), and unpacker 0 transposes each 16x16 face on its way into SrcA (`Haloize_mode`, backend config word 72 bit 8; ISA `UNPACR_Regular.md` swaps the row's low 4 bits with the column; unpacker 1 ignores it). Then `x + 0` through the FPU, which is exact. Since `Haloize_mode` applies to every SrcA load in the kernel, a transpose is a kernel of its own, run when `.T` is asked for rather than fused.
+
+**gelu** is GPT-2's tanh form, built from what is there: `0.5 x (1 + tanh(z))` is `x / (1 + e^(-2z))`, so `x * (1 + exp(x (-k c x^2 - k))).reciprocal()` with `k = 2 sqrt(2/pi)`, `c = 0.044715`. One kernel; within 2% of numpy after the bf16 rounding of each step.
+
+**Upload and download** go a tile at a time through the `array` module (floats to fp32 bytes, then bf16 bits with one list comprehension), about 10x faster than a struct call per value, which matters at GPT-2's 768 x 3072.
 
 Bug found on the way: a row reduction whose operand is one tile wide inside a wider kernel was swept like a wide one, adding the same tile once per column tile. It is now reduced in the pass's first tile; `test_any_shape` covers it (and caught the old code).
 

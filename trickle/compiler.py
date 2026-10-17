@@ -8,7 +8,7 @@
 # Tile layout: four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face
 # row-major. The ISA has no notion of a tile; this is the layout the FPU's 16x16 matrix multiply wants. An unpacker
 # reads a whole tile into a SrcA/SrcB bank, so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
-import math, struct
+import array, math, struct
 from trickle import bh
 from trickle.runtime import DATA, SYNC, compile_kernel
 
@@ -41,7 +41,7 @@ def config(**fields):  # backend config {word index: value}, every bit of a touc
 # Unpackers read one whole tile each (1024 datums) into a SrcA/SrcB bank; Z picks the slot (the Z stride is one tile).
 # The FPU writes Dst in fp32. The packer reads 4 Dst rows per PACR and rounds to bf16 on the way to L1; its channel 1
 # Y picks the slot (that Y stride is one tile). Base addresses are in 16-byte units, minus 1.
-CONFIG = config(
+CONFIG_FIELDS = dict(
   Dstacc=bh.BF16, Fp32_enabled=1, Zero_Flag_disabled_src=0,
   PCK0_Ystride=32, PCK0_ZW=0, PCK0_Ystride_1=TILE, PCK0_ZW_1=0, PCK0_Base_1=0, Read_32b_data=1, Edge_mask=0xFFFF,
   pack_reads_per_xy_plane=16, UNP0_add_dest_addr_cntr=0, UNP0_Ystride_1=0, UNP0_ZW_1=0, UNP1_ZW_1=0,
@@ -50,6 +50,8 @@ CONFIG = config(
   SEC1_format=bh.BF16, SEC1_x_dim=1024, SEC1_y_dim=1, SEC1_z_dim=1, SEC1_out_format=bh.BF16, SEC1_uncompressed=1,
   SEC1_base=SLOTS // 16 - 1, L1_Dest_addr=SLOTS // 16 - 1, Disable_zero_compress=1, Pack_out_format=bh.BF16,
   Pack_in_format=bh.BF16, PCK_dest_offset=0)
+CONFIG = config(**CONFIG_FIELDS)
+TRANSPOSING = config(**CONFIG_FIELDS, SEC0_Haloize_mode=1)  # unpacker 0 transposes each 16x16 face into SrcA
 
 # The math thread's address modes, as (SrcA step, SrcB step) and (Dst step, fidelity step): 0-1 for elementwise ops,
 # 2-3 for SFPU loads and stores (the store steps Dst by 2), 4-7 for matmul, so ops mix with no rewrites between them.
@@ -283,6 +285,10 @@ static void tidy(unsigned slot, unsigned t) {{ volatile unsigned short *d = (vol
 static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out;
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, SLOT(slot), {TILE}); }}
+// the same with its two off-diagonal faces swapped, half of transposing it (unpacker 0 does the rest)
+static void flipped(unsigned base, unsigned t, unsigned slot) {{
+  for (unsigned f = 0; f < 4; f++) noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE} + f * {TILE // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {TILE // 4}, {TILE // 4});
+}}
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
 static void send(void) {{  // the results packed so far go home, in the order they were packed
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
@@ -307,10 +313,10 @@ void kmain(volatile unsigned *a) {{
   while (sent < {total}) send();
 }}"""
 
-def _unpacker(body):  # TRISC0: the backend config and semaphores, then unpacking, each tile once BRISC has fetched it
+def _unpacker(body, cfg=CONFIG):  # TRISC0: the backend config and semaphores, then unpacking, each tile once BRISC has fetched it
   return TRISC + f"""
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
-{_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", THREAD)} {_array("setup", SETUP_UNPACK)}
+{_array("cfg_index", cfg)} {_array("cfg_value", cfg.values())} {_array("thread", THREAD)} {_array("setup", SETUP_UNPACK)}
 static unsigned needed, relayed, posted, drained, steps;
 static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // thread 0's reports, for BRISC
 static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next tiles
@@ -361,8 +367,8 @@ def fused_kernel(expr, shapes):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
   rowsum and rowmax, ("matmul", a, b) where a and b are inputs, and plain numbers for inputs. shapes: each input's
   (rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
-  args: [first unit, units, out, input 0, input 1, ...]. A unit is a tile of the result, or, if the expression reduces
-  rows, a whole row of tiles, so the reduction can stay on chip.
+  args: [first unit, units, out, then for each input its DRAM address, tile stride and tile offset (Tensor's)]. A unit
+  is a tile of the result, or, if the expression reduces rows, a whole row of tiles, so the reduction can stay on chip.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
   its K pairs of tiles streamed through slots 0-3. A unary op runs on the SFPU over Dst: in place, on the result of the
@@ -431,7 +437,7 @@ def fused_kernel(expr, shapes):
     return FRAMES + (f * frame + inputs + r[1] if wide(r) else 2 * frame + r[1])
   def tile(i):  # which tile of input i goes with this unit's row i_ and column j
     rows, cols = tiles[i]
-    return f"{'i_' if rows > 1 else 0} * {cols} + {'j' if cols > 1 else 0}"
+    return f"{'i_' if rows > 1 else 0} * a[{4 + 3 * i}] + {'j' if cols > 1 else 0} + a[{5 + 3 * i}]"
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
   def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }}"  # one per Dst half
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
@@ -452,7 +458,7 @@ def fused_kernel(expr, shapes):
     for f in (0, 1):
       c = [[], [], [], []]  # each program's C for this tile
       fetch = sorted({r for j in once + swept + reductions for r in operands(ops[j]) if isinstance(r, int)})
-      c[B] += [f"reached(frame_done[{f}]);"] + [f"get(a[{3 + r}], {tile(r)}, {slot(f, r)});" for r in fetch] + ["ready();"]
+      c[B] += [f"reached(frame_done[{f}]);"] + [f"get(a[{3 + 3 * r}], {tile(r)}, {slot(f, r)});" for r in fetch] + ["ready();"]
       c[U].append("fetched();")
       for j in once + swept:
         op, me = ops[j], ("op", j)
@@ -460,7 +466,8 @@ def fused_kernel(expr, shapes):
         c[P].append(f"{cond}{{ {output(j, f)}{halves([pack(DST_HALF * h, slot(f, me), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])} h ^= 1; }}")
         if op["kind"] == "matmul":
           kt, bw = op["kt"], tiles[op["y"]][1]  # B's width in tiles
-          c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{3 + op['x']}], i_ * {kt} + m, a[{3 + op['y']}], m * {bw} + {'j' if bw > 1 else 0});")
+          x, y = 3 + 3 * op["x"], 3 + 3 * op["y"]  # A's and B's address, stride, offset in a
+          c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{x}], i_ * a[{x + 1}] + m + a[{x + 2}], a[{y}], m * a[{y + 1}] + {'j' if bw > 1 else 0} + a[{y + 2}]);")
           c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
                       f"if (steps++ & 1) {{ {tt(unpack(1, 3) + REPORT)} }} else {{ {tt(unpack(0, 2) + REPORT)} }} }}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
@@ -504,6 +511,24 @@ def fused_kernel(expr, shapes):
   return compile_kernel(_brisc(zero, total, size(("op", root)), program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
 
 
+def transpose_kernel(rows, cols):
+  """x.T for x of (rows, cols), args [first unit, units, out, x's address, tile stride, tile offset]: result tile (i, j)
+  is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal faces swapped, and unpacker 0 transposes
+  each face on its way into SrcA (Haloize_mode), so x + 0 through the FPU lands the transpose in Dst. Haloize_mode is
+  backend config, so it holds for every SrcA load in the kernel: a transpose is a kernel of its own."""
+  ct, frame = -(-rows // 32), lambda f: (FRAMES + 2 * f, FRAMES + 2 * f + 1)  # the result's tile columns; x's slot and the result's
+  def loop(*per_frame):  # the same loop over result tiles t for all four programs, frame f alternating
+    return f"""  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned t = a[0] + u;
+    if (u & 1) {{ {per_frame[1]} }} else {{ {per_frame[0]} }}
+  }}"""
+  halves = lambda programs: f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }} h ^= 1;"
+  return compile_kernel(
+    _brisc(True, "a[1]", (cols, rows), loop(*[f"reached(frame_done[{f}]); flipped(a[3], t % {ct} * a[4] + t / {ct} + a[5], {frame(f)[0]}); ready(); frame_done[{f}] = ++events;" for f in (0, 1)])),
+    _unpacker(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]), TRANSPOSING),
+    _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)])] * 2)),
+    _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + halves([pack(DST_HALF * h, frame(f)[1], SEM_PACKED) for h in (0, 1)]) for f in (0, 1)])))
+
 def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16  # where (r, c) of a tile sits in it
 
 class Tensor:
@@ -512,28 +537,37 @@ class Tensor:
   operands are realized first, since each of its output tiles needs a whole row and column of them.
   Any shape: the last tile row and column are padded, with zeros, except that a dimension of 1 fills its tile with
   copies (a row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. Every kernel leaves
-  its result that way too, so a matmul can sum over a padded K."""
+  its result that way too, so a matmul can sum over a padded K.
+  A view (x[r0:r1, c0:c1] on tile boundaries) shares its owner's DRAM: its tile (i, j) is tile i * stride + j + offset."""
   def __init__(self, rt, rows, cols, op=None, srcs=()):
     self.rt, self.rows, self.cols, self.op, self.srcs = rt, rows, cols, op, srcs
-    self.tiles = -(-rows // 32) * -(-cols // 32)
+    self.tiles, self.stride, self.offset, self.owner = -(-rows // 32) * -(-cols // 32), -(-cols // 32), 0, None
     self.addr = None if op else rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
 
   def __del__(self):  # its DRAM goes back once nothing refers to it (launches are waited for, so none still reads it)
-    if self.addr is not None: self.rt.dram_free(self.addr)
+    if self.addr is not None and self.owner is None: self.rt.dram_free(self.addr)
+
+  def _where(self, i, j):  # tile (i, j) in DRAM: (x, y, address)
+    t = i * self.stride + j + self.offset
+    return (*bh.DRAM[t % 8], self.addr + t // 8 * TILE)
 
   @classmethod
   def full(cls, rt, rows, cols, value): return cls.of(rt, [[value] * cols for _ in range(rows)])
 
   @classmethod
   def of(cls, rt, rows):
+    """From a list of rows of numbers, rounded to bf16 (to nearest even)."""
     t, ct = cls(rt, len(rows), len(rows[0])), -(-len(rows[0]) // 32)
     for i in range(t.tiles):
-      r0, c0, tile = i // ct * 32, i % ct * 32, [0] * 1024
-      for r in range(32):
-        for c in range(32):
-          y, x = r0 + r if t.rows > 1 else 0, c0 + c if t.cols > 1 else 0  # a dimension of 1 fills the tile
-          if y < t.rows and x < t.cols: tile[tile_index(r, c)] = to_bf16(rows[y][x])
-      t.rt.chip.write(*bh.DRAM[i % 8], t.addr + i // 8 * TILE, struct.pack("<1024H", *tile))
+      r0, c0, tile = i // ct * 32, i % ct * 32, []
+      for face in range(4):  # 16 rows of 16, face by face (see tile_index)
+        c = c0 + face % 2 * 16
+        for r in range(r0 + face // 2 * 16, r0 + face // 2 * 16 + 16):
+          row = rows[0] if t.rows == 1 else rows[r] if r < t.rows else []
+          run = row[:1] * 16 if t.cols == 1 else row[c:c + 16]  # a dimension of 1 fills the tile; the rest pads with 0
+          tile += [*run, *[0.0] * (16 - len(run))]
+      bits = array.array("I", array.array("f", tile).tobytes())
+      t.rt.chip.write(*t._where(i // ct, i % ct), array.array("H", [(b + 0x7FFF + (b >> 16 & 1)) >> 16 for b in bits]).tobytes())
     return t
 
   def tolist(self):
@@ -541,10 +575,32 @@ class Tensor:
     out, ct = [[0.0] * self.cols for _ in range(self.rows)], -(-self.cols // 32)
     for i in range(self.tiles):
       r0, c0 = i // ct * 32, i % ct * 32
-      tile = struct.unpack("<1024H", self.rt.chip.read(*bh.DRAM[i % 8], self.addr + i // 8 * TILE, TILE))
-      for r in range(min(32, self.rows - r0)):
-        for c in range(min(32, self.cols - c0)): out[r0 + r][c0 + c] = from_bf16(tile[tile_index(r, c)])
+      bits = array.array("I", [b << 16 for b in array.array("H", self.rt.chip.read(*self._where(i // ct, i % ct), TILE))])
+      tile = array.array("f", bits.tobytes()).tolist()
+      for face in range(4):
+        c, n = c0 + face % 2 * 16, min(16, self.cols - c0 - face % 2 * 16)
+        for k, r in enumerate(range(r0 + face // 2 * 16, min(r0 + face // 2 * 16 + 16, self.rows))):
+          if n > 0: out[r][c:c + n] = tile[face * 256 + k * 16:face * 256 + k * 16 + n]
     return out
+
+  def __getitem__(self, key):
+    """x[r0:r1, c0:c1], a view of whole tiles: starts on tile boundaries, and ends too unless at the tensor's end. No
+    copy; kernels read it in place."""
+    (r0, r1, _), (c0, c1, _) = (k.indices(n) for k, n in zip(key, (self.rows, self.cols)))
+    assert r0 % 32 == c0 % 32 == 0 and (r1 % 32 == 0 or r1 == self.rows) and (c1 % 32 == 0 or c1 == self.cols), "views are whole tiles"
+    assert (r1 - r0 > 1 or self.rows == 1) and (c1 - c0 > 1 or self.cols == 1), "a dimension of 1 must fill its tile"
+    v = Tensor(self.rt, r1 - r0, c1 - c0, "view")
+    v.op, v.addr, v.owner, v.stride = None, self.realize().addr, self.owner or self, self.stride
+    v.offset = self.offset + r0 // 32 * self.stride + c0 // 32
+    return v
+
+  @property
+  def T(self):
+    """The transpose, computed now, in a kernel of its own (see transpose_kernel)."""
+    key = ("transpose", self.rows, self.cols)
+    kernel = kernels.get(key) or kernels.setdefault(key, transpose_kernel(self.rows, self.cols))
+    out = Tensor(self.rt, self.cols, self.rows)
+    return out._run(kernel, out.addr, self.realize().addr, self.stride, self.offset)
 
   def realize(self):
     if self.op is None: return self
@@ -554,7 +610,7 @@ class Tensor:
     kernel = kernels.get(key) or kernels.setdefault(key, fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
     rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
-    return self._run(kernel, self.addr, *[t.addr for t in inputs], units=-(-self.rows // 32) if rowwise else None)
+    return self._run(kernel, self.addr, *[v for t in inputs for v in (t.addr, t.stride, t.offset)], units=-(-self.rows // 32) if rowwise else None)
 
   def _run(self, kernel, *args, units=None):  # this tensor's tiles, or rows, split evenly over the workers
     cores, units = self.rt.cores, units or self.tiles
@@ -575,6 +631,9 @@ class Tensor:
   def exp(self): return Tensor(self.rt, self.rows, self.cols, "exp", (self,))
   def reciprocal(self): return Tensor(self.rt, self.rows, self.cols, "recip", (self,))
   def rsqrt(self): return Tensor(self.rt, self.rows, self.cols, "rsqrt", (self,))
+  def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
+    k = 2 * math.sqrt(2 / math.pi)
+    return self * (1 + (self * (self * self * (-0.044715 * k) - k)).exp()).reciprocal()
   def rowsum(self): return self if self.cols == 1 else Tensor(self.rt, self.rows, 1, "rowsum", (self,))
   def rowmax(self): return self if self.cols == 1 else Tensor(self.rt, self.rows, 1, "rowmax", (self,))
   def __add__(self, other): return self._elementwise("add", other)
