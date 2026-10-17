@@ -283,10 +283,9 @@ static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return S
 TRISC = SYNC_WORDS + f"""
 #define SEM(s) (((volatile unsigned *){bh.TENSIX_SEM:#x})[__builtin_ctz(s)])  // read: its value; write 0: post, 1: take one
 // Setup goes through stores, not .ttinsn: fused .ttinsn instructions can corrupt what REPLAY records
-static void push(const unsigned *p, unsigned n) {{ for (unsigned i = 0; i < n; i++) *(volatile unsigned *){bh.TENSIX_PUSH:#x} = p[i]; }}
-#define PUSH(p) push(p, sizeof p / 4)
-static void push_word(unsigned w) {{ push(&w, 1); }}  // one instruction worked out at run time
+static inline void push_word(unsigned w) {{ *(volatile unsigned *){bh.TENSIX_PUSH:#x} = w; }}
 """
+def _pushes(words): return " ".join(f"push_word({w:#x});" for w in words)  # straight-line, with no table to load from
 
 def _brisc(total, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
   return SYNC_WORDS + f"""
@@ -338,17 +337,16 @@ void kmain(volatile unsigned *a) {{
 def _unpacker(body, cfg=CONFIG):  # TRISC0: the backend config and semaphores, then unpacking, each tile once BRISC has fetched it
   return TRISC + f"""
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
-{_array("cfg_index", cfg)} {_array("cfg_value", cfg.values())} {_array("thread", THREAD)} {_array("setup", SETUP_UNPACK)}
 static unsigned needed, relayed, posted, drained, steps;
 static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // thread 0's reports, for BRISC
 static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next tiles
 static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} }} }}  // until everything packed so far has landed
 void kmain(volatile unsigned *a) {{
-  for (unsigned i = 0; i < sizeof cfg_index / 4; i++) CFG[cfg_index[i]] = cfg_value[i];
+  {" ".join(f"CFG[{i}] = {v:#x};" for i, v in cfg.items())}
   asm volatile("fence" ::: "memory");  // the config writes are out; a read from the same block is processed after them
-  (void)CFG[cfg_index[0]];
+  (void)CFG[{next(iter(cfg))}];
   asm volatile("fence" ::: "memory");  // and has answered, so no instruction pushed below can see them stale
-  PUSH(thread); PUSH(setup);
+  {_pushes(THREAD + SETUP_UNPACK)}
   tensix_idle();  // the semaphores are set before the other threads can touch them
   SYNC[READY] = 1;
   unsigned tiles = 0;
@@ -357,17 +355,15 @@ void kmain(volatile unsigned *a) {{
 
 def _math(slots, body):  # TRISC1
   return TRISC + f"""
-{_array("thread", THREAD)} {_array("setup", setup_math(slots))}
 void kmain(volatile unsigned *a) {{
-  while (!peek(READY)) {{}}
-  PUSH(thread); PUSH(setup);
+  {_pushes(THREAD + setup_math(slots))}
+  while (!peek(READY)) {{}}  // the backend config and the semaphores
   unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
 {body}
 }}"""
 
 def _packer(body):  # TRISC2
   return TRISC + f"""
-{_array("thread", THREAD)} {_array("setup", SETUP_PACK)}
 static unsigned outputs, relayed, used[2];
 static void relay(void) {{ for (; SEM({SEM_PACKED}); SYNC[PACKED] = ++relayed) SEM({SEM_PACKED}) = 1; }}  // packed results, for BRISC
 // The next result is packed into slot (output slot s: one per frame, or one for all) and goes home as tile t. Once the
@@ -378,8 +374,8 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
   used[s] = ++outputs;
 }}
 void kmain(volatile unsigned *a) {{
+  {_pushes(THREAD + SETUP_PACK)}
   while (!peek(READY)) {{}}
-  PUSH(thread); PUSH(setup);
   unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
 {body}
   while (relayed < outputs) relay();
