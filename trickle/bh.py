@@ -15,6 +15,7 @@ MCAST_VC = 2  # multicast on a static VC must use class 2 (umd does, ISA NoC/Mem
 # Tensix columns with the good ones first (a p150 has 12, telemetry says how many), rows 2..11.
 TENSIX_X, TENSIX_Y = (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16), range(2, 12)
 DRAM = [(17 + b // 4, 12 + 3 * (b % 4)) for b in range(8)]  # bank b; each bank also answers at y+1 and y+2
+DRAM_BANK_SIZE = 0xFF000000  # what ttsim models (4080 MiB); a p150 has 4 GiB a bank, whether firmware keeps any is unknown
 PCIE = (19, 24)
 ARC = (8, 0)  # rows 0 and 1 are not translated
 

@@ -477,6 +477,9 @@ class Tensor:
     self.rt, self.rows, self.cols, self.tiles, self.op, self.srcs = rt, rows, cols, rows * cols // 1024, op, srcs
     self.addr = None if op else rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
 
+  def __del__(self):  # its DRAM goes back once nothing refers to it (launches are waited for, so none still reads it)
+    if self.addr is not None: self.rt.dram_free(self.addr)
+
   @classmethod
   def full(cls, rt, rows, cols, value): return cls.of(rt, [[value] * cols for _ in range(rows)])
 
@@ -503,16 +506,7 @@ class Tensor:
   def realize(self):
     if self.op is None: return self
     inputs = []
-    def expr(t):  # the tree of unrealized ops under t, realized tensors as numbers into inputs
-      if t.op is None:
-        if all(t is not u for u in inputs): inputs.append(t)
-        return next(i for i, u in enumerate(inputs) if u is t)
-      if t.rows != self.rows: return expr(t.realize())  # one tile tall, repeated down: compute it once
-      if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
-        a, b = (s.realize() for s in t.srcs)
-        return ("matmul", expr(a), expr(b), a.cols // 32)
-      return (t.op, *map(expr, t.srcs))
-    e = expr(self)
+    e = _expr(self, self.rows, inputs)
     key = (e, tuple((u.rows // 32, u.cols // 32) for u in inputs))
     kernel = kernels.get(key) or kernels.setdefault(key, fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
@@ -548,6 +542,16 @@ class Tensor:
   def __matmul__(self, other):
     assert self.cols == other.rows, f"({self.rows}, {self.cols}) @ ({other.rows}, {other.cols})"
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other))
+
+def _expr(t, rows, inputs):  # the tree of unrealized ops under t, realized tensors as numbers into inputs
+  if t.op is None:
+    if all(t is not u for u in inputs): inputs.append(t)
+    return next(i for i, u in enumerate(inputs) if u is t)
+  if t.rows != rows: return _expr(t.realize(), rows, inputs)  # one tile tall, repeated down: compute it once
+  if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
+    a, b = (s.realize() for s in t.srcs)
+    return ("matmul", _expr(a, rows, inputs), _expr(b, rows, inputs), a.cols // 32)
+  return (t.op, *(_expr(s, rows, inputs) for s in t.srcs))
 
 def _subexprs(e):
   yield e

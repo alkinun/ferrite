@@ -4,6 +4,19 @@ What the milestones so far learned about the chip, where each fact comes from, a
 Sources: **ISA** = tt-isa-documentation/BlackholeA0, **sim** = ttsim `src/`, **kmd** = tt-kmd, **umd** = tt-umd.
 Facts the code uses live in `trickle/bh.py`.
 
+## Goals
+
+Each has a finish line we can check. Ticked when a test shows it.
+
+1. **A real model runs on the simulator.** Finish line: one GPT-2 transformer layer matches a CPU reference.
+   - [x] DRAM is freed when a tensor goes away (`test_dram_is_freed`)
+   - [ ] any tensor shape, not just multiples of 32
+   - [ ] transpose, gelu
+   - [ ] halfway: a small MNIST network (matmuls, bias, relu) matches
+   - [ ] a GPT-2 layer (layer norm, attention, MLP) matches
+2. **First light on silicon.** Finish line: `hello` on every core of a p150, then every test passing on the card. Before the card arrives: tests that can run on `Card`, and a bring-up checklist of everything only ttsim has confirmed.
+3. **Fast.** Finish line: a matmul benchmark with a number, measured against the chip's peak and improved over time (tile reuse, deeper pipelines, the MOP expander).
+
 ## Address map
 
 ### PCIe function
@@ -161,6 +174,8 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 **A worker** (firmware for all four cores, 640 bytes). BRISC: poll `go` with a `fence` in the loop; zero `SYNC`; invalidate the instruction caches of BRISC and the TRISCs (Tensix config 185, bits 0-3), then `fence`, read config back, `fence`, so the invalidate has landed before anyone jumps; write the TRISCs' go; call its program; `noc_wait` for the kernel's own transfers; wait for the three TRISCs' done; send its done to its slot at the dispatcher. A TRISC: poll its go, call its program (if the kernel has one for it), wait until its Tensix thread has run everything it pushed (`tensix_idle`, the Manual TTSync load), write its done.
 
 **Waiting** (`Runtime.wait`) polls the status words in host memory, never the chip. On timeout it reads the dispatcher's current launch and done slots and names the workers that have not finished.
+
+**DRAM** (`Runtime.dram_alloc`, `dram_free`). A tensor takes the same address range in all 8 banks (tile i in bank i % 8). First fit over a sorted list of holes, 64-byte aligned; a freed block merges with the holes beside it. A `Tensor` frees its DRAM in `__del__`, which CPython runs as soon as the last reference goes, so intermediates and old results go back right away (a reference cycle would hold them until the garbage collector runs: `realize`'s walk is a plain function, not a closure, for that reason). Freeing is safe because every launch is waited for; queued launches will need frees deferred until they finish. ttsim models 4080 MiB a bank.
 
 **Device API**, prepended to every program (`DEVICE`): `noc_me()` (own translated coordinates, `NOC_ID_LOGICAL`), `noc_read`, `noc_write`, `noc_wait`, `l1_settle`. All requests go through NIU 0, request initiator 0, transaction ID 0. They are acknowledged (`RESP_MARKED`), so `NIU_MST_REQS_OUTSTANDING_ID(0)` counts them, on a dynamic VC. Rules (ISA `NoC/MemoryMap.md`, `NoC/Counters.md`, enforced by ttsim):
 

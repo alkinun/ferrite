@@ -174,7 +174,8 @@ class Runtime:
     assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
-    self.chip, self.launches, self.wptr, self.dram = chip, 0, 0, 0
+    self.chip, self.launches, self.wptr = chip, 0, 0
+    self.holes, self.used = [(0, bh.DRAM_BANK_SIZE)], {}  # DRAM: free (address, size) in order, and address -> size
     *self.cores, self.dispatcher = cores
     buf, bus = chip.pci.alloc(64 + ring)
     self.status, self.ring = buf[:64], buf[64:]
@@ -217,9 +218,22 @@ class Runtime:
     self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))  # the launch's one PCIe write
 
   def dram_alloc(self, size):
-    """size bytes at the same address in every DRAM bank; a bump allocator, nothing is freed yet."""
-    addr, self.dram = self.dram, self.dram + -(-size // 64) * 64
-    return addr
+    """size bytes at the same address in every DRAM bank, from the first free hole big enough."""
+    size = max(64, -(-size // 64) * 64)  # 64-byte aligned, as NoC transfers to DRAM want
+    for i, (addr, room) in enumerate(self.holes):
+      if room >= size:
+        self.holes[i:i + 1] = [(addr + size, room - size)] if room > size else []
+        self.used[addr] = size
+        return addr
+    raise MemoryError(f"no {size} bytes free in DRAM")
+
+  def dram_free(self, addr):
+    """Give back what dram_alloc returned; it merges with the holes on either side. Nothing may still be using it: launches
+    are waited for, so that holds."""
+    self.holes = sorted(self.holes + [(addr, self.used.pop(addr))])
+    for i in range(len(self.holes) - 1, 0, -1):
+      (a, n), (b, m) = self.holes[i - 1], self.holes[i]
+      if a + n == b: self.holes[i - 1:i + 1] = [(a, n + m)]
 
   def read_status(self, i): return int.from_bytes(self.status[4 * i:4 * i + 4], "little")
 

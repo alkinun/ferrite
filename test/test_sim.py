@@ -108,6 +108,25 @@ def test_hung_kernel_times_out(chip):
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]"): rt.wait(timeout=0.2)
 
+def test_dram_is_freed(chip):
+  # first fit, 64-byte aligned; a freed block merges with the holes on both sides; a tensor gives its DRAM back once
+  # nothing refers to it, intermediates included, so a loop of launches leaves DRAM as it found it
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  a, b, c = (rt.dram_alloc(n) for n in (100, 4096, 1))
+  assert (a, b, c) == (0, 128, 128 + 4096)
+  rt.dram_free(b)
+  assert rt.dram_alloc(1000) == 128 and rt.dram_alloc(4096) == 128 + 4096 + 64, "first fit"
+  for addr in (128, a, c, 128 + 4096 + 64): rt.dram_free(addr)
+  assert rt.holes == [(0, bh.DRAM_BANK_SIZE)] and not rt.used
+  with pytest.raises(MemoryError): rt.dram_alloc(bh.DRAM_BANK_SIZE + 1)
+  x = Tensor.of(rt, [[float(r - c) for c in range(64)] for r in range(64)])
+  for _ in range(3):
+    y = (x + x) * x
+    assert y.tolist()[1][0] == 2.0
+  assert len(rt.used) == 2, "x and the last y"
+  del x, y
+  assert rt.holes == [(0, bh.DRAM_BANK_SIZE)] and not rt.used
+
 def test_tile_math(chip):
   # one tile of small integers through unpack -> FPU -> pack: add, sub and mul must be exact
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
