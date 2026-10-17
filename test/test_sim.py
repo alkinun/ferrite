@@ -379,13 +379,13 @@ def test_batch(chip):
   (a, ta), (b, tb), (w, tw) = make(3, 40, 96), make(3, 96, 70), make(96, 70)
   close(ta @ tb, a @ b, 2**-6)
   close(ta @ tw + trow, a @ w + row, 2**-6)
-  one = Runtime(chip, chip.tensix[0], chip.tensix[1])  # one worker: A's row in L1 must change with the matrix, not just the row
-  close(Tensor.of(one, a.tolist()) @ Tensor.of(one, b.tolist()), a @ b, 2**-6)
   (qkv, tqkv), (kt, tkt) = make(40, 192), make(192, 40)  # 3 heads of 64: split columns, split rows
   heads, keys = tqkv.split(3), tkt.split(3, axis=0)
   assert heads.shape == (3, 40, 64) and np.array(heads.tolist()).tolist() == qkv.reshape(40, 3, 64).transpose(1, 0, 2).tolist()
   assert np.array(keys.tolist()).tolist() == kt.reshape(3, 64, 40).tolist()
   close(heads @ keys, qkv.reshape(40, 3, 64).transpose(1, 0, 2) @ kt.reshape(3, 64, 40), 2**-6)
+  one = Runtime(chip, chip.tensix[0], chip.tensix[1])  # one worker: A's row in L1 must change with the matrix, not just the row
+  close(Tensor.of(one, a.tolist()) @ Tensor.of(one, b.tolist()), a @ b, 2**-6)  # (last: this takes two of rt's cores)
 
 def test_mnist_mlp(chip):
   # goal 1's halfway mark: an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
