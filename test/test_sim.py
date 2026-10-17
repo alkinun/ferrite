@@ -2,7 +2,8 @@
 import os, random, pytest
 from trickle import bh, pci
 from trickle.chip import Chip
-from trickle.hello import compile_rv32, hello
+from trickle.hello import hello
+from trickle.runtime import ARGS, KERNEL, Runtime, compile_rv32
 
 @pytest.fixture(scope="session")
 def chip():
@@ -41,12 +42,18 @@ def test_dram(chip):
     for port in range(3): assert chip.read(x, y + port, addr, len(d)) == d, f"bank {bank} port {port}"
 
 def test_hello(chip):
-  for x, y in (chip.tensix[0], chip.tensix[-1]):
-    assert hello(chip, x, y, 30) == 832040
+  assert hello(chip, [chip.tensix[0], chip.tensix[-1]], 30) == [832040, 832040]
 
-def test_hung_core_times_out(chip):
-  x, y = chip.tensix[0]
-  chip.write32(x, y, 0x10000, 0)
-  chip.run(x, y, compile_rv32('__attribute__((section(".start"))) void _start(void) { for (;;); }'))
-  with pytest.raises(TimeoutError): chip.wait(lambda: chip.read32(x, y, 0x10000) == 1, "write 1", timeout=0.2)
-  chip.halt(x, y)
+def test_relaunch_without_reset(chip):
+  # different kernels at the same address, back to back: each must run, not a stale copy of the one before
+  cores = chip.tensix[:2]
+  rt = Runtime(chip, cores)
+  for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 2):
+    rt.launch(compile_rv32(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] {op} 3; }}", KERNEL), lambda x, y: (x * 100 + y + i, 0))
+    rt.wait()
+    for x, y in cores: assert chip.read32(x, y, ARGS + 4) == f(x * 100 + y + i, 3), f"launch {i} on {x},{y}"
+
+def test_hung_kernel_times_out(chip):
+  rt = Runtime(chip, chip.tensix[:1])
+  rt.launch(compile_rv32("void kmain(volatile unsigned *a) { for (;;); }", KERNEL))
+  with pytest.raises(TimeoutError, match="launch 1 on Tensix"): rt.wait(timeout=0.2)

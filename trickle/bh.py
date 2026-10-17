@@ -32,3 +32,5 @@ SOFT_RESET = 0xFFB121B0  # RISCV_DEBUG_REG_SOFT_RESET_0: a set bit holds that co
 BRISC, TRISC0, TRISC1, TRISC2, NCRISC = 1 << 11, 1 << 12, 1 << 13, 1 << 14, 1 << 18
 ALL_CORES = BRISC | TRISC0 | TRISC1 | TRISC2 | NCRISC  # power-on value
 BRISC_STACK_TOP = 0xFFB00000 + 8 * 1024  # end of BRISC's private data RAM; BRISC starts at PC 0 in L1
+TENSIX_CFG = 0xFFEF0000  # Tensix backend config, one word per register; BRISC and TRISCs only, not the NoC
+CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: writing bit 0 (BRISC) .. bit 4 (NCRISC) drops that core's instruction cache

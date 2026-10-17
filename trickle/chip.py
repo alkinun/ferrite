@@ -77,9 +77,4 @@ class Chip:
     vals = struct.unpack(f"<{n}I", self.read(x, y, values, 4 * n))
     return {t & 0xFFFF: vals[t >> 16] for t in tags}
 
-  def run(self, x, y, prog):
-    """Load prog at L1 address 0 of Tensix (x, y) and release its BRISC, which starts there. The other four stay in reset."""
-    self.halt(x, y)
-    self.write(x, y, 0, prog)
-    self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES & ~bh.BRISC)
-  def halt(self, x, y): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES)
+  def halt(self, x, y): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES)  # hold all five cores of Tensix (x, y) in reset
