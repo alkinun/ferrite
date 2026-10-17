@@ -45,16 +45,16 @@ def test_hello(chip):
   assert set(hello(chip, chip.tensix[0], chip.tensix[-1], 30).values()) == {832040}
 
 def test_every_core(chip):
-  # one multicast load and go for all 120 cores; each answers with its own coordinates, read from its NIU
+  # every core but the dispatcher; each answers with its own coordinates, read from its NIU
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   rt.launch(compile_rv32("void kmain(volatile unsigned *a) { a[0] = noc_me(); }", KERNEL))
   rt.wait()
-  assert len(rt.cores) == len(chip.tensix) == 120
+  assert len(rt.cores) == len(chip.tensix) - 1 == 119  # and one dispatcher
   for x, y in rt.cores: assert chip.read32(x, y, ARGS) == x | y << 6
 
 def test_relaunch_without_reset(chip):
   # different kernels at the same address, back to back: each must run, not a stale copy of the one before
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[2])
   cores = rt.cores
   for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 2):
     rt.launch(compile_rv32(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] {op} 3; }}", KERNEL), lambda x, y: (x * 100 + y + i, 0))
@@ -64,12 +64,11 @@ def test_relaunch_without_reset(chip):
 def test_kernel_moves_data(chip):
   # each core pulls its own 40 KiB slice of DRAM into L1 (3 NoC packets), adds its index to every word, writes it
   # back elsewhere in DRAM, then sends its first 64 bytes to the next core's L1
-  cores, n = chip.tensix[:4], 40 * 1024  # the first four columns of the first row
-  (bx, by), src, dst = bh.DRAM[3], 1 << 20, 2 << 20
+  rt, n = Runtime(chip, chip.tensix[0], chip.tensix[4]), 40 * 1024  # four workers in the first row
+  cores, (bx, by), src, dst = rt.cores, bh.DRAM[3], 1 << 20, 2 << 20
   data = [random.randbytes(n) for _ in cores]
   for i, d in enumerate(data): chip.write(bx, by, src + i * n, d)
   args = {xy: (i, bx, by, src + i * n, dst + i * n, n, *cores[(i + 1) % len(cores)]) for i, xy in enumerate(cores)}
-  rt = Runtime(chip, cores[0], cores[-1])
   rt.launch(compile_rv32("""
 void kmain(volatile unsigned *a) {  // a: [index, bank x, bank y, src, dst, n, next x, next y]
   unsigned *buf = (unsigned *)L1_DATA;
@@ -85,7 +84,24 @@ void kmain(volatile unsigned *a) {  // a: [index, bank x, bank y, src, dst, n, n
     assert chip.read(bx, by, dst + i * n, n) == o, f"DRAM slice {i}"
     assert chip.read(*cores[(i + 1) % len(cores)], DATA + n, 64) == o[:64], f"L1 of the core after {i}"
 
+def test_queue(chip):
+  # 100 launches queued back to back through a ring that holds 16 of them: it fills, the host waits for space, the
+  # dispatcher wraps around it six times. Each launch adds its index to a word in every worker's L1.
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[2], ring=2048)
+  for x, y in rt.cores: chip.write32(x, y, DATA, 0)
+  add = compile_rv32("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[0]; }", KERNEL)
+  writes, write = [], chip.pci.write
+  chip.pci.write = lambda *a: (writes.append(a), write(*a))
+  try:
+    for i in range(100):
+      before = len(writes)
+      rt.launch(add, lambda x, y: (i,))
+      assert len(writes) - before == 1, "a launch is one PCIe write: the doorbell"
+  finally: chip.pci.write = write
+  rt.wait()
+  for x, y in rt.cores: assert chip.read32(x, y, DATA) == sum(range(100))
+
 def test_hung_kernel_times_out(chip):
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[0])
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
   rt.launch(compile_rv32("void kmain(volatile unsigned *a) { for (;;); }", KERNEL))
-  with pytest.raises(TimeoutError, match="launch 1 on Tensix"): rt.wait(timeout=0.2)
+  with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]"): rt.wait(timeout=0.2)

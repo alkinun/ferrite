@@ -1,6 +1,6 @@
 # Notes: talking to a Blackhole
 
-What milestones 1 and 2 learned about the chip, where each fact comes from, and what is still unknown.
+What the milestones so far learned about the chip, where each fact comes from, and what is still unknown.
 Sources: **ISA** = tt-isa-documentation/BlackholeA0, **sim** = ttsim `src/`, **kmd** = tt-kmd, **umd** = tt-umd.
 Facts the code uses live in `trickle/bh.py`.
 
@@ -144,33 +144,40 @@ What kmd does for a Blackhole at probe, open, reset and remove (kmd `enumerate.c
 
 ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003042C` (SCRATCH_RAM[11]) points at a control block whose word 0 is the base of 4 queues and word 1 is `entries | queues << 8`. Queue i (0 = kmd, 3 = applications) is a 32-byte header (`+0` request wptr, `+4` response rptr, `+0x10` request rptr, `+0x14` response wptr; pointers wrap at 2N) followed by N request slots and N response slots of 32 bytes (`u32 header, u32 payload[7]`). Write the slot, bump the request wptr, poke the ARC (kmd: write 0 to `0x800B0000`; umd: write `0x10000` to `0x80030100`), poll the response wptr for up to 1 s. Status is the low byte of the response header, below 240 means OK. trickle uses queue 3 and umd's poke (ARC_MISC_CNTL IRQ0); ttsim models both pokes and answers kmd's and umd's messages, but kills the process on an unknown code, and returns all-zero responses (so `0x57` "get harvesting" is not usable there; telemetry is).
 
-## The launch loop
+## The launch loop and the command queue
 
-`trickle/runtime.py`. Built and tested on ttsim; the shape follows the plan from milestone 1.
+`trickle/runtime.py`. Built and tested on ttsim.
 
-**L1 layout** (ours): firmware at `0x0` (BRISC's reset PC), mailbox at `0x1000`, kernel arguments at `0x1100`, one kernel at `0x2000`, kernel data from `0x10000` (`L1_DATA`).
+**Cores.** `Runtime(chip, start, end)` takes a rectangle of Tensix in translated coordinates. Its last core runs the **dispatcher**; the rest are **workers**. A rectangle of good columns in translated space covers exactly those cores: harvested and non-Tensix columns in between opt out of multicast.
 
-**Boot** (`Runtime(chip, start, end)`, a rectangle of Tensix in translated coordinates): multicast reset of all five cores, multicast firmware image, a unicast mailbox per core (its slot in a host buffer), multicast release of BRISC. A rectangle of good columns in translated space covers exactly those cores: harvested and non-Tensix columns in between opt out of multicast.
+**L1 layout** (ours). Workers: firmware at `0x0` (BRISC's reset PC), mailbox at `0x1000` (`[go, report x|y, report address lo, hi, done]`), arguments at `0x1100`, one kernel at `0x2000`, kernel data from `0x10000` (`L1_DATA`). Dispatcher: firmware at `0x0`, config at `0x1000` (`[doorbell, ring lo, hi, ring size, status lo, hi, workers]`), worker coordinates at `0x1040`, outbox at `0x1400`, one 16-byte done slot per worker at `0x2000`, command staging from `0x10000`.
 
-**Firmware** (300 bytes): poll `go` with a `fence` in the loop; invalidate the instruction cache (Tensix config 185) then `fence`, read config back, `fence` so the invalidate has landed before the jump; call `kmain(args)` at `0x2000`; `noc_wait` for the kernel's transfers; write the launch count to `done` in L1 and send it with a NoC write to the core's 16-byte slot in host memory through the PCIe tile.
+**Boot** (host, once): multicast reset and worker firmware over the rectangle, a unicast mailbox per worker pointing its done report at its slot in the dispatcher, the dispatcher firmware and config over the top of the dispatcher's tile, a TLB of its own aimed at the doorbell, then multicast release of every BRISC.
 
-**Launch** (`Runtime.launch(kernel, args)`): multicast the kernel image, unicast each core's arguments, multicast the new `go`. **Wait** (`Runtime.wait`) polls the host buffer, not the chip, with a timeout per core.
+**A launch** (host): build one command (a 16-byte header `[length, kernel bytes, argument bytes per worker, 0]`, the kernel, each worker's arguments, 64-byte aligned), copy it into the ring in host memory, and write the new write pointer to the dispatcher's doorbell. That doorbell is the launch's only PCIe access (`test_queue` counts). Commands never straddle the ring's end: a header of length 0 marks the tail unused. Pointers are free-running 32-bit byte counts, so the ring size is a power of two. Before writing, the host waits (with a timeout) for the space the dispatcher has freed.
 
-**Device API**, prepended to every program (`DEVICE`): `noc_me()` (own translated coordinates, `NOC_ID_LOGICAL`), `noc_read`, `noc_write`, `noc_wait`, `l1_settle`. All requests go through NIU 0, request initiator 0, transaction ID 0, acknowledged (`RESP_MARKED`) so `NIU_MST_REQS_OUTSTANDING_ID(0)` counts them, dynamic VC. Rules (ISA `NoC/MemoryMap.md`, `NoC/Counters.md`, enforced by ttsim):
+**The dispatcher** (BRISC firmware, ~1.2 KB): poll the doorbell; read the command's header and then its body from host memory with NoC reads to the PCIe tile (19, 24); write the kernel and each worker's arguments to the worker, wait for every acknowledgement; write the launch number into each worker's `go`; poll the done slots until every worker reports; write `[read pointer, launches done]` into host memory. One launch at a time: the next kernel never overwrites one that is still running.
+
+**A worker** (BRISC firmware, 300 bytes): poll `go` with a `fence` in the loop; invalidate the instruction cache (Tensix config 185), then `fence`, read config back, `fence`, so the invalidate has landed before the jump; call `kmain(args)` at `0x2000`; `noc_wait` for the kernel's own transfers; send its done to its slot at the dispatcher.
+
+**Waiting** (`Runtime.wait`) polls the status words in host memory, never the chip. On timeout it reads the dispatcher's current launch and done slots and names the workers that have not finished.
+
+**Device API**, prepended to every program (`DEVICE`): `noc_me()` (own translated coordinates, `NOC_ID_LOGICAL`), `noc_read`, `noc_write`, `noc_wait`, `l1_settle`. All requests go through NIU 0, request initiator 0, transaction ID 0. They are acknowledged (`RESP_MARKED`), so `NIU_MST_REQS_OUTSTANDING_ID(0)` counts them, on a dynamic VC. Rules (ISA `NoC/MemoryMap.md`, `NoC/Counters.md`, enforced by ttsim):
 
 - At most 16 KiB per request (`noc_read`/`noc_write` split; ttsim does not model hardware splitting).
 - Source and destination agree in their low 4 bits for L1, low 6 bits when DRAM is involved.
 - Reads must be acknowledged. Inline writes to L1 are broken on Blackhole; we never use inline writes.
 - Wait for `NOC_CMD_CTRL` bit 0 to clear before touching an initiator; read `NOC_CMD_CTRL` back before reading counters.
-- Before the NIU reads data a core just stored: `fence`, load from L1, `fence` (`l1_settle`). After data lands: `fence` before reading it (the L0 data cache).
+- Before the NIU reads data a core just stored: `fence`, load from L1, `fence` (`l1_settle`). After data lands: `fence` before reading it (the L0 data cache). Every `fence` is also a compiler barrier (`"memory"` clobber), or the compiler can cache L1 across it.
 
 **Not built yet:**
 
-1. **Queues.** Each launch is several PCIe writes from the host. Next: a command ring in host memory or DRAM that a dispatcher core reads, so a launch is one write.
-2. **The other four cores.** TRISC0-2 drive the Tensix coprocessor, NCRISC is a second data mover. They start from their reset PCs (`0x6000`/`0xA000`/`0xE000`/`0x12000`, overridable); firmware for them, and a BRISC-to-TRISC handoff, comes with the compiler.
-3. **Per-core arguments** are one unicast write per core; fine for 120 cores, a table in DRAM would be one write.
-4. **Hang reports.** On timeout the host should read each core's PC snapshot (`0xFFB1_3138`...); ttsim does not model those registers, so it is not done.
-5. **Ordering of multicast-then-go** relies on the TLB's strict ordering. ttsim cannot tell posted from strict, so silicon must confirm it.
+1. **Overlap.** The dispatcher waits for one launch to finish before loading the next. Double-buffered kernel slots would let it load launch n+1 while n runs.
+2. **Multicast from the dispatcher.** It writes the kernel to each worker in turn. A NoC multicast (path reserve, static VC class 2, `BRCST_SRC_INCLUDE` off so it skips its own tile) would send it once. Acknowledged multicast leaves `REQS_OUTSTANDING_ID` off by the destination count, so it needs `NIU_MST_WR_ACK_RECEIVED` counting instead.
+3. **Commands other than "launch":** host-to-DRAM copies, events, waiting on another queue.
+4. **The other four cores.** TRISC0-2 drive the Tensix coprocessor, NCRISC is a second data mover. They start from their reset PCs (`0x6000`/`0xA000`/`0xE000`/`0x12000`, overridable); firmware for them, and a BRISC-to-TRISC handoff, comes with the compiler.
+5. **Hang reports from silicon.** The host should also read each stuck core's PC snapshot (`0xFFB1_3138`...); ttsim does not model those registers.
+6. **Ordering of the host's ring writes before the doorbell** relies on x86 ordering cached stores before an uncached MMIO write. Fine on x86, and needs a barrier anywhere else.
 
 ## Still unknown or untested
 

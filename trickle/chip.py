@@ -14,6 +14,7 @@ class Chip:
   def __init__(self, pci, tlb=0):
     assert (ids := pci.cfg_read(0)) == bh.VENDOR | bh.DEVICE << 16, f"not a Blackhole: {ids:#x}"
     self.pci, self.tlb, self.target = pci, tlb, None
+    self.free_tlbs = iter(range(tlb + 1, bh.TLB_COUNT))
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == 5, "report ARC firmware ready")
     self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
     t = self.telemetry()
@@ -21,15 +22,20 @@ class Chip:
     banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]
     self.wait(lambda: all(self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 1 for b in banks), "finish GDDR training", 60)
 
-  def window(self, x, y, addr, start=None):
-    """Point the TLB at the 2 MiB block holding NoC address (x, y, addr), or for writes at the same block in every
-    Tensix of the rectangle from start to (x, y); return the BAR0 offset that reaches addr."""
+  def map(self, x, y, addr, start=None, tlb=None):
+    """Point a TLB (by default a fresh one, kept for good) at the 2 MiB block holding NoC address (x, y, addr), or for
+    writes at that block in every Tensix of the rectangle from start to (x, y); return the BAR0 offset that reaches addr."""
+    if tlb is None: tlb = next(self.free_tlbs)
     base = addr & ~(bh.TLB_WINDOW - 1)
-    if self.target != (x, y, base, start):
-      mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
-      cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast)
-      for i in range(3): self.pci.write(0, bh.TLB_CONFIG + 12 * self.tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
-      self.target = (x, y, base, start)
+    mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
+    cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast)
+    for i in range(3): self.pci.write(0, bh.TLB_CONFIG + 12 * tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
+    return tlb * bh.TLB_WINDOW + addr - base
+
+  def window(self, x, y, addr, start=None):  # the shared TLB, moved only when an access needs another block
+    base = addr & ~(bh.TLB_WINDOW - 1)
+    if self.target != (x, y, base, start): self.map(x, y, base, start, self.tlb)
+    self.target = (x, y, base, start)
     return self.tlb * bh.TLB_WINDOW + addr - base
 
   def chunks(self, x, y, addr, n, start=None):  # (BAR0 offset, size) pieces of [addr, addr+n), split where the window moves

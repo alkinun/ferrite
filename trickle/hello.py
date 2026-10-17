@@ -13,7 +13,7 @@ void kmain(volatile unsigned *args) {  // args: [n, fib(n)]
 """
 
 def hello(chip, start, end, n):
-  """fib(n) on every Tensix from start to end: {core: answer}."""
+  """fib(n) on every worker in the rectangle from start to end: {core: answer}."""
   rt = Runtime(chip, start, end)
   rt.launch(compile_rv32(FIB, KERNEL), lambda x, y: (n, 0))
   rt.wait()
@@ -22,4 +22,4 @@ def hello(chip, start, end, n):
 if __name__ == "__main__":
   chip = Chip(pci.open_device())
   answers = hello(chip, chip.tensix[0], chip.tensix[-1], 30)
-  print(f"{len(answers)} Tensix cores say fib(30) = {set(answers.values())}")
+  print(f"{len(answers)} Tensix cores say fib(30) = {set(answers.values())}, and one more dispatched their work")

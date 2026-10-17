@@ -3,7 +3,7 @@
 VENDOR, DEVICE = 0x1E52, 0xB140
 
 # BAR0 (512 MiB): 202 TLB windows of 2 MiB from offset 0, then registers. BAR4 (32 GiB): 8 TLB windows of 4 GiB.
-TLB_WINDOW = 1 << 21
+TLB_WINDOW, TLB_COUNT = 1 << 21, 201  # TLB 201, the last 2 MiB one, is tt-kmd's; we leave it alone
 TLB_CONFIG = 0x1FC00000  # BAR0 offset of the TLB config registers: 3 dwords per TLB, the 2 MiB ones first
 # 2 MiB TLB config, a 96-bit little-endian value: field -> (first bit, width). The rest of the fields are in NOTES.md.
 TLB_FIELDS = {"addr": (0, 43), "x_end": (43, 6), "y_end": (49, 6), "x_start": (55, 6), "y_start": (61, 6),
