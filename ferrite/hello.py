@@ -1,5 +1,6 @@
-# Milestone 1 end to end, now on the runtime: boot firmware on one Tensix BRISC, launch a kernel compiled with plain
-# clang and lld, and read back what it wrote.   TTSIM=/path/to/libttsim.so python3 -m ferrite.hello
+# Milestone 1 end to end, now on the runtime: boot firmware on every Tensix in a rectangle, launch a kernel compiled
+# with plain clang and lld on all its workers, and read back what each wrote.
+#   TTSIM=/path/to/libttsim.so python3 -m ferrite.hello
 from ferrite import pci
 from ferrite.chip import Chip
 from ferrite.runtime import Runtime, compile_kernel

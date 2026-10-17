@@ -1,9 +1,9 @@
 # The compiler: tensor ops emitted as Tensix instructions straight from the ISA, no LLK. A tensor lives in DRAM as
 # bf16 32x32 tiles, tile i in bank i % 8. Ops are lazy: a tree of elementwise ops, matmuls, SFPU ops (relu, exp,
 # reciprocal, rsqrt) and row reductions becomes one fused kernel, which fetches each input tile once, keeps every
-# intermediate in L1 and writes only the result to DRAM. A kernel is four programs for each worker tile: BRISC fetches operand tiles into L1 over the
-# NoC and sends results home, and each TRISC feeds one Tensix thread its instructions (unpack, math, pack), the three
-# running at the same time on different tiles.
+# intermediate in L1 and writes only the result to DRAM. A kernel is four programs for each worker tile: BRISC fetches
+# operand tiles into L1 over the NoC and sends results home, and each TRISC feeds one Tensix thread its instructions
+# (unpack, math, pack), the three running at the same time on different tiles.
 #
 # Tile layout: four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face
 # row-major, so datum (r, c) is at (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16. The ISA has no notion of a
@@ -291,7 +291,7 @@ def _brisc(total, body):  # moves tiles: inputs into L1 ahead of thread 0, resul
   return SYNC_WORDS + f"""
 #define SLOT(i) ({SLOTS:#x} + (i) * {TILE})
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
-static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out, rows[16];  // rows: i + 1 of each matmul's A row in L1
+static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out, rows[16];  // rows: i + 1 of what each place in L1 holds (fresh)
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
 #define BANK(t) bank[(t) % 8] & 63, bank[(t) % 8] >> 6  // the NoC x, y of tile t's bank
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_read(BANK(t), base + t / 8 * {TILE}, SLOT(slot), {TILE}); }}
@@ -310,7 +310,7 @@ static void send(void) {{  // the results packed so far go home, in the order th
 // A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, B's slot two steps
 // back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
-// A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot (B 0-1, A 2-3) or its place in
+// A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot (B 1-2, A 3-4) or its place in
 // the row or column kept in L1, unless it is there already (KEPT)
 #define KEPT 0xFFFFFFFF
 static void step(unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
@@ -386,13 +386,14 @@ def fused_kernel(expr, shapes):
   rowsum and rowmax, ("matmul", a, b) where a and b are inputs, and plain numbers for inputs. shapes: each input's
   (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
   args: [first unit, units, out, then for each input its DRAM address and tile strides for batch and row, and tile
-  offset (Tensor's)]. A unit is a tile of the result, or, if the expression reduces rows, a whole row of tiles, so the
-  reduction can stay on chip; units run through the batch, matrix after matrix.
+  offset (Tensor's)]. A unit is a tile of the result, or a block of up to 4 x 4 of them (one matmul and nothing that
+  reduces rows), or, if the expression reduces rows, a whole row of tiles, so the reduction can stay on chip; units run
+  through the batch, matrix after matrix.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
-  its K pairs of tiles, B's streamed through slots 0-1 and A's row kept in L1 while the result tiles stay in its row
-  (if it fits below slot 256, else streamed through slots 2-3). A unary op runs on the SFPU over Dst: in place, on the result of the
-  op below it if nothing else reads that, or else on its operand plus a zero tile. A row reduction folds each column
+  its K pairs of tiles, B's streamed through slots 1-2 and A's row kept in L1 while the result tiles stay in its row
+  (if it fits below slot 256, else streamed through slots 3-4). A unary op runs on the SFPU over Dst: in place, on the
+  result of the op below it if nothing else reads that, or else on its operand plus the zero tile (slot 0). A row reduction folds each column
   tile of its operand into an accumulator in Dst, then across the row (see across_rows), and packs one tile.
   A row is done in passes: a pass is a sweep over its column tiles, and a reduction's result can only be read in the
   pass after the one that swept it. Each pass recomputes what it needs (softmax computes exp twice) rather than keep
@@ -614,8 +615,8 @@ void kmain(volatile unsigned *a) {{
 
 def transpose_kernel(rows, cols):
   """x.T for x of (rows, cols), each matrix of a batch, args [first unit, units, out, x's address, tile strides for batch
-  and row, tile offset]: result tile (i, j) is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal faces swapped, and unpacker 0 transposes
-  each face on its way into SrcA (Haloize_mode), so x + 0 through the FPU lands the transpose in Dst. Haloize_mode is
+  and row, tile offset]: result tile (i, j) is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal
+  faces swapped, and unpacker 0 transposes each face on its way into SrcA (Haloize_mode), so x + 0 through the FPU lands the transpose in Dst. Haloize_mode is
   backend config, so it holds for every SrcA load in the kernel: a transpose is a kernel of its own."""
   ct, frame = -(-rows // 32), lambda f: (FRAMES + 2 * f, FRAMES + 2 * f + 1)  # the result's tile columns; x's slot and the result's
   per = ct * -(-cols // 32)  # tiles a matrix
@@ -743,9 +744,10 @@ class Tensor:
     if self.op is None: return self
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
       for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
-      reads = [id(s) for t in _lazy(self, set()) for s in t.srcs]  # and what a reduction and something else both read, if
-      for x in [t.srcs[0] for t in _lazy(self, set()) if t.op in COMBINE]:  # it is elementwise: on as many workers as it has
-        if reads.count(id(x)) > 1 and all(t.op not in COMBINE and t.op != "matmul" for t in _lazy(x, set())): x.realize()  # tiles
+      # and an elementwise value that a reduction and something else both read: once, on as many workers as it has tiles
+      reads = [id(s) for t in _lazy(self, set()) for s in t.srcs]
+      for x in [t.srcs[0] for t in _lazy(self, set()) if t.op in COMBINE]:
+        if reads.count(id(x)) > 1 and all(t.op not in COMBINE and t.op != "matmul" for t in _lazy(x, set())): x.realize()
     while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): down the heaviest branch, the first part
       t = self                    # that fits goes first, on its own, so what is on top (a layer norm, say) stays whole
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
@@ -759,7 +761,7 @@ class Tensor:
     return self._run(kernel, self.addr, *args, units=self.batch * units)
 
   def _run(self, kernel, *args, units=None):
-    """Queue kernel over this tensor's tiles, or rows, split evenly over as many workers as have any. Nothing waits for
+    """Queue kernel over units of this tensor (tiles unless told), split evenly over as many workers as have any. Nothing waits for
     it: launches run in order, so the next kernel reads this result, and reading it back (tobytes) waits."""
     self.rt.launch(kernel, args, units or self.tiles)
     return self
@@ -839,12 +841,7 @@ def _expr(t, shape, inputs, kernel):
     return ("matmul", _expr(a, shape, inputs, kernel), _expr(b, shape, inputs, kernel))
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
-def _subexprs(e):
-  yield e
-  if isinstance(e, tuple):
-    for c in e[1:]: yield from _subexprs(c)
-
-kernels = {}  # (expression, input shapes), or a kernel's name and shape -> compiled kernel image
+kernels = {}  # (expression, input shapes) -> (image, units a matrix), or a kernel's name and shape -> image
 def _cached(key, compile):
   if key not in kernels: kernels[key] = compile()
   return kernels[key]

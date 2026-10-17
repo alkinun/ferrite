@@ -1,15 +1,17 @@
 # The runtime: resident firmware on each Tensix tile's BRISC and TRISCs, kernels launched on them without resetting
 # anything, and a command ring in host memory that one tile's BRISC, the dispatcher, reads by itself.
-import functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile
+import collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile
 from ferrite import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
-# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for the kernel's cores to talk through), two buffers of kernel arguments
-# (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds, a
-# tile of zeros (2 KiB, for kernels to read and never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle,
-# how many], an outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the workers' reports, and
-# staging for one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
+# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for
+# the kernel's cores to talk through), two buffers of kernel arguments (launches alternate between them, so the next
+# launch's arguments go in while this one runs), the kernels it holds, a tile of zeros (2 KiB, for kernels to read and
+# never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the
+# workers' rectangle, how many], an outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the
+# workers' reports, and staging for one command, both above the kernels (loading a kernel writes the dispatcher's
+# tile too).
 MAILBOX, TRISCS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x7F800, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
@@ -238,7 +240,8 @@ class Runtime:
     assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
-    self.chip, self.launches, self.wptr, self.workers = chip, 0, 0, []  # workers: how many each launch went to
+    self.chip, self.launches, self.wptr = chip, 0, 0
+    self.workers = collections.deque()  # (launch, how many workers) of the launches that may not be done
     self.holes, self.used, self.freed = [(0, bh.DRAM_BANK_SIZE)], {}, []  # DRAM: free (address, size) in order,
     # address -> size, and (launches queued, address) of what was freed while launches queued before might still use it
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS  # kernels in L1: image -> address; where the next goes
@@ -251,7 +254,7 @@ class Runtime:
     chip.halt(*end, start)
     chip.write(*end, 0, worker, start)
     chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
-    for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done, all zero but whom to report to
+    for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done: zero, but for whom to report to and the index
       chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, dx | dy << 6, 0, i).ljust(SYNC - MAILBOX, b"\0"))
     chip.write(dx, dy, 0, dispatcher)
     rect = end[0] | end[1] << 6 | (start[0] | start[1] << 6) << 12  # a multicast's NOC_RET_ADDR_HI
@@ -298,7 +301,7 @@ class Runtime:
     self.ring[at:at + length] = cmd
     self.wptr += length
     self.launches += 1
-    self.workers.append(n)
+    self.workers.append((self.launches, n))
     self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))  # the launch's one PCIe write
 
   def args(self):  # where the last launch's arguments are, on each worker it went to (its results, for some kernels)
@@ -325,6 +328,7 @@ class Runtime:
 
   def reclaim(self):  # the freed DRAM no unfinished launch can use goes back into the holes
     done = self.launches - (self.launches - self.read_status(1)) % 2**32
+    while self.workers and self.workers[0][0] <= done: self.workers.popleft()
     for launches, addr in [f for f in self.freed if f[0] <= done]:
       self.freed.remove((launches, addr))
       self.holes = sorted(self.holes + [(addr, self.used.pop(addr))])
@@ -347,6 +351,7 @@ class Runtime:
     try: self.until(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
     except TimeoutError as e:
       current = self.chip.read32(*self.dispatcher, OUTBOX)
-      stuck = [c for c in self.cores[:self.workers[current - 1] if current else 0] if self.chip.read32(*c, MAILBOX + 16) != current]
+      n = next((n for launch, n in self.workers if launch % 2**32 == current), 0)
+      stuck = [c for c in self.cores[:n] if self.chip.read32(*c, MAILBOX + 16) != current]
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}") from None
     self.reclaim()
