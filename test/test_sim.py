@@ -493,12 +493,13 @@ def test_mnist_mlp(chip):
   clear = top2[:, 1] - top2[:, 0] > 0.05
   assert clear.sum() >= 8 and (logits.argmax(1) == want.argmax(1))[clear].all()
 
-def test_gpt2_layer(chip):
-  # goal 1's finish line: a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on 16 tokens, against the same code
-  # (test/gpt2.py) in numpy, float64, with the same bf16 weights. Weights as GPT-2 initialises them; the attention is
-  # causal and not uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to
-  # ~2) must match to within 3% of its size
-  rt, rng, n, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 16, 768
+@pytest.mark.parametrize("n", [16, 40])
+def test_gpt2_layer(chip, n):
+  # goal 1's finish line: a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so
+  # attention spans tiles), against the same code (test/gpt2.py) in numpy, float64, with the same bf16 weights. Weights
+  # as GPT-2 initialises them; the attention is causal and not uniform (scores of a few units). Every intermediate is
+  # bf16 here, so the block's change to x (up to ~2) must match to within 3% of its size
+  rt, rng, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 768
   shapes = {"ln_1.weight": (1, d, 1), "ln_1.bias": (1, d, 0), "attn.c_attn.weight": (d, 3 * d, 0), "attn.c_attn.bias": (1, 3 * d, 0),
             "attn.c_proj.weight": (d, d, 0), "attn.c_proj.bias": (1, d, 0), "ln_2.weight": (1, d, 1), "ln_2.bias": (1, d, 0),
             "mlp.c_fc.weight": (d, 4 * d, 0), "mlp.c_fc.bias": (1, 4 * d, 0), "mlp.c_proj.weight": (4 * d, d, 0), "mlp.c_proj.bias": (1, d, 0)}
