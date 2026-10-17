@@ -179,7 +179,7 @@ def test_pack_waits_for_math(chip):
   a, b = ([[float((r * c + k) % 9 - 4) for c in range(64)] for r in range(128)] for k in (1, 2))
   ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
   out = Tensor(rt, 128, 64)
-  out._run(compiler.fused_kernel(("add", 0, 1), 2, order="pack_first"), out.addr, ta.addr, tb.addr)
+  out._run(compiler.fused_kernel(("add", 0, 1), [(4, 2), (4, 2)], order="pack_first"), out.addr, ta.addr, tb.addr)
   assert out.tolist() == [[x + y for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
 
 def unfused(t):  # the same tree of ops, realized one launch per op
@@ -208,7 +208,7 @@ def test_fusion_waits(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
   a, b, c, d = (Tensor.of(rt, [[float((r * 3 + c * k) % 7 - 3) for c in range(64)] for r in range(64)]) for k in (1, 2, 5, 6))
   out = Tensor(rt, 64, 64)
-  out._run(compiler.fused_kernel(("add", ("add", 0, 1), ("add", ("sub", 2, 3), ("mul", 0, 1))), 2, order="thread"), out.addr, a.addr, b.addr, c.addr, d.addr)
+  out._run(compiler.fused_kernel(("add", ("add", 0, 1), ("add", ("sub", 2, 3), ("mul", 0, 1))), [(2, 2)] * 4, order="thread"), out.addr, a.addr, b.addr, c.addr, d.addr)
   assert out.tolist() == unfused((a + b) + ((c - d) + a * b)).tolist()
 
 def test_matmul_fusion(chip):
@@ -285,21 +285,27 @@ def test_reductions(chip):
   assert (tx.rowmax() * Tensor.full(rt, 32, 32, 0.5)).tolist() == [[max(row) / 2] * 32 for row in x]
 
 def test_softmax_and_layernorm(chip):
-  # built from the primitives: softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)); layernorm(x) = (x - mean)
-  # * rsqrt(var + eps) * gamma + beta with gamma and beta one tile tall, repeated down the rows
-  rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 128
+  # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
+  # staying in Dst and their results in L1. softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)), three passes;
+  # layernorm(x) = (x - mean) * rsqrt(var + eps) * gamma + beta, gamma and beta one tile tall, repeated down the rows.
+  # On one worker (3 rows in a row, slots and accumulators reused) and on many
   bf = lambda v: from_bf16(to_bf16(v))
-  x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
-  tx = Tensor.of(rt, x)
-  e = (tx - tx.rowmax()).exp()
-  for got, row in zip((e * e.rowsum().reciprocal()).tolist(), x):
-    want = [math.exp(v - max(row)) for v in row]
-    assert all(abs(g - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for g, w in zip(got, want))
-  gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
-  inv_n, eps = Tensor.full(rt, 32, 32, 1 / cols), Tensor.full(rt, 32, 32, 1e-5)
-  d = tx - tx.rowsum() * inv_n
-  y = d * ((d * d).rowsum() * inv_n + eps).rsqrt() * Tensor.of(rt, [gamma] * 32) + Tensor.of(rt, [beta] * 32)
-  for got, row in zip(y.tolist(), x):
-    mean = sum(row) / cols
-    sd = math.sqrt(sum((v - mean) ** 2 for v in row) / cols + 1e-5)
-    assert all(abs(g - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for g, v, gm, bt in zip(got, row, gamma, beta))
+  for workers, rows, cols in ((chip.tensix[1], 96, 128), (chip.tensix[-1], 64, 160)):
+    rt = Runtime(chip, chip.tensix[0], workers)
+    x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
+    tx = Tensor.of(rt, x)
+    e = (tx - tx.rowmax()).exp()
+    launches, got = rt.launches, (e * e.rowsum().reciprocal()).tolist()
+    assert rt.launches == launches + 1
+    for g, row in zip(got, x):
+      want = [math.exp(v - max(row)) for v in row]
+      assert all(abs(gv - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for gv, w in zip(g, want))
+    gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
+    inv_n, eps, tg, tb = Tensor.full(rt, 32, 32, 1 / cols), Tensor.full(rt, 32, 32, 1e-5), Tensor.of(rt, [gamma] * 32), Tensor.of(rt, [beta] * 32)
+    d = tx - tx.rowsum() * inv_n
+    launches, got = rt.launches, (d * ((d * d).rowsum() * inv_n + eps).rsqrt() * tg + tb).tolist()
+    assert rt.launches == launches + 1
+    for g, row in zip(got, x):
+      mean = sum(row) / cols
+      sd = math.sqrt(sum((v - mean) ** 2 for v in row) / cols + 1e-5)
+      assert all(abs(gv - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for gv, v, gm, bt in zip(g, row, gamma, beta))

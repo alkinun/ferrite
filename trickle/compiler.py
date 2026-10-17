@@ -13,10 +13,12 @@ from trickle.runtime import DATA, KERNEL, compile_rv32
 
 TILE = 32 * 32 * 2  # bytes in a bf16 tile: one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
 SLOTS = DATA  # L1 tile slots: slot i at SLOTS + i * TILE, picked by the unpackers' Z and the packer's channel 1 Y counters
-UNPACKED, PACKED = 63, 62  # thread 0 GPRs BRISC polls: matmul steps unpacked, output tiles packed
+UNPACKED, PACKED = 63, 62  # thread 0 GPRs BRISC polls: tiles and matmul steps unpacked, output tiles packed
 DST_HALF = 64  # Dst rows of one result in fp32; Dst holds two, so math fills one half while pack drains the other
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2  # results in Dst to pack, outputs packed but not reported, and
                                                        # intermediates packed into L1 but not yet waited for
+ACCS = ((256, 1 << 3), (320, 1 << 4))  # row reductions accumulate here in Dst (scratch 128 rows on), each with a
+                                       # semaphore that is 1 while it is free: taken by the first step, given back by the pack
 
 def ins(name, **fields):
   opcode, layout = bh.TENSIX_OPS[name]
@@ -76,7 +78,8 @@ PACRS = 0
 # is a few entries deep, and a full FIFO stalls BRISC.
 UNPACKERS = bh.UNPACK0 | bh.UNPACK1
 SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem_sel=SEM_PACKED, max_value=15),
-                ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SETADCXY", cnt_set_mask=UNPACKERS, bit_mask=0b1111),
+                ins("SEMINIT", sem_sel=SEM_L1, max_value=15), *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS],
+                ins("SETADCXY", cnt_set_mask=UNPACKERS, bit_mask=0b1111),
                 ins("SETADCZW", cnt_set_mask=UNPACKERS, bit_mask=0b1111), ins("SETADCXX", cnt_set_mask=UNPACKERS, x_end2=1023)]
 SETUP_PACK = [ins("SETADCXY", cnt_set_mask=bh.PACK, bit_mask=0b1111), ins("SETADCZW", cnt_set_mask=bh.PACK, bit_mask=0b1111),
               ins("SETADCXX", cnt_set_mask=bh.PACK, x_end2=15)] + record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
@@ -88,15 +91,16 @@ def math_begin(half, zero):  # wait for a free Dst half, aim the FPU at it, and 
            ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=DST_HALF * half)] +
           [ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=4 * half + b) for b in range(4) if zero])  # 16-row blocks
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU), ins("SEMPOST", sem_sel=SEM_DST)]
-def pack(half, slot, done):  # a Dst half into an L1 slot, then free the half and post done
+def pack(row, slot, *done):  # 64 Dst rows from row into an L1 slot, then free them and post done
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
-          ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=DST_HALF * half),  # channel 0 Y: Dst row
+          ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=row),  # channel 0 Y: Dst row
           ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=slot),  # channel 1 Y: L1 slot
           ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
-          ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST), ins("SEMPOST", sem_sel=done)]
+          ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + [ins("SEMPOST", sem_sel=d) for d in done]
 RELAY = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_PACKED, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_PACKED)]
 UNPACKED_REPORT = [ins("STALLWAIT", stall_res=bh.STALL_THCON, wait_res=bh.WAIT_UNPACK)]  # then BRISC's SETGPR(UNPACKED)
+TAKE_L1 = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)]
 
 def matmul_phase():
   """One fidelity phase of Dst += A @ B on a pair of tiles, A in SrcB and B in SrcA: MVMUL does
@@ -198,10 +202,16 @@ def elementwise(op, slots, dst=0):
   fpu = {"add": "ELWADD", "sub": "ELWSUB"}[op]
   return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [last(ins(fpu, dst=dst))]
 
-def reduce_step(kind, slots, first):  # one column tile of a reduction: into the result's half, or into scratch and folded in
-  if first: return elementwise("add", slots)
-  return (elementwise("add", slots, dst=128) + [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
+def at(row): return ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=row)  # aim FPU and SFPU at row
+def reduce_step(kind, slots, acc, first):
+  """One column tile of a row reduction, which has SrcA = the tile and SrcB = zeros: the first lands in the
+  accumulator once it is free; later ones land in scratch and the SFPU folds them in."""
+  row, sem = ACCS[acc]
+  if first: return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem), at(row)] + elementwise("add", slots)
+  return ([at(row)] + elementwise("add", slots, dst=128) + [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
           run(slots, kind) * 32)
+def reduce_finish(kind, slots, acc, posts):  # fold each row across, run the SFPU ops on the result, hand it to pack
+  return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), at(ACCS[acc][0])] + across_rows(kind) + sfpu(posts, slots) + MATH_END
 
 def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU just wrote
   return [w for u in posts for w in [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
@@ -210,24 +220,24 @@ def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU jus
 def _array(name, words, t="unsigned"): return f"static const {t} {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
 def _arrays(name, programs): return f"static const unsigned {name}[{len(programs)}][{len(programs[0])}] = {{{', '.join('{' + ', '.join(f'{w:#x}' for w in p) + '}' for p in programs)}}};"
 
-ZERO_SLOT, FRAMES = 4, 5  # slots 0-3 stream matmul tiles, 4 holds a zero tile, frames start at 5
+ZERO_SLOT, FRAMES = 4, 5  # slots 0-3 stream matmul tiles, 4 holds a zero tile, then two frames, then row values
 
 def _kernel(slots, zero, arrays, body):
-  """A BRISC kernel: backend config, the semaphores and every thread's setup, then body. body can push(t, p) a program
-  to thread t, step() a matmul, reduce() a row, and writeback(n, slot, base, tile) the n-th output (1-based)."""
+  """A BRISC kernel: backend config, the semaphores and every thread's setup, then body, which runs with these:
+  push(t, p) a program to thread t; step() a matmul step; tile_begin(f) / tile_end(f) around a tile that uses frame f;
+  drain() before unpacking anything packed earlier; output(slot, base, tile) once a result tile's pack is pushed."""
   setgpr = ins("SETGPR", reg_index_16b=0)
   return compile_rv32(f"""
 {_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", THREAD)} {_array("relay", RELAY)}
 {_array("setup_unpack", SETUP_UNPACK)} {_array("setup_math", setup_math(slots))} {_array("setup_pack", SETUP_PACK)}
-{_array("bank", [x | y << 6 for x, y in bh.DRAM])}
+{_array("bank", [x | y << 6 for x, y in bh.DRAM])} {_array("report", UNPACKED_REPORT)} {_array("take_l1", TAKE_L1)}
 {_arrays("mm_unpack", [unpack(s, 2 + s) + UNPACKED_REPORT for s in (0, 1)])} {_array("mm", matmul(slots))}
-{_arrays("r_unpack", [unpack(s, ZERO_SLOT) + UNPACKED_REPORT for s in (0, 1)])}
 {arrays}
 #define PUSH(t) (*(volatile unsigned *)({bh.TENSIX_PUSH:#x} + 0x10000 * (t)))
 #define GPR(r) (((volatile unsigned *){bh.TENSIX_GPR:#x})[r])
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
 #define SLOT(i) ({SLOTS:#x} + (i) * {TILE})
-#define push(t, p) for (unsigned i = 0; i < sizeof p / 4; i++) issue(t, p[i])
+#define push(t, p) for (unsigned i_ = 0; i_ < sizeof p / 4; i_++) issue(t, p[i_])
 #define setgpr(r, v) PUSH(0) = {setgpr:#x} | 2 * (r) | ((v) & 0xFFFF) << 8
 #define reached(r, v) while ((GPR(r) & 0xFFFF) < (v)) {{}}  // 16-bit counts: a launch handles under 65536 of each
 static void issue(unsigned t, unsigned w) {{
@@ -238,21 +248,30 @@ static void issue(unsigned t, unsigned w) {{
 }}
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, SLOT(slot), {TILE}); }}
-static void writeback(unsigned n, unsigned slot, unsigned base, unsigned t) {{  // once the n-th output is packed, send it home
-  push(0, relay); setgpr({PACKED}, n);
-  reached({PACKED}, n);
-  noc_write(SLOT(slot), bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, {TILE}); noc_wait();
-}}
-static unsigned steps;  // matmul steps so far: their B and A tiles alternate between slots 0, 1 and 2, 3
+// Thread 0 counts what it has unpacked into GPR {UNPACKED}: BRISC refills a frame or stream slot only once the tiles in it
+// two uses ago are unpacked. Results BRISC sends home are counted by the pack thread, relayed through thread 0.
+static unsigned unpacked, frame_done[2], stream_done[2], steps, posted, drained, outputs;
+static unsigned out[2][4];  // results to send home: [0] from the tile before this one, [1] from this one: {{set, slot, base, tile}}
+static void counted(void) {{ setgpr({UNPACKED}, ++unpacked); }}
 static void step(unsigned a, unsigned a_tile, unsigned b, unsigned b_tile) {{  // A's tile goes to SrcB, B's to SrcA
-  if (steps >= 2) reached({UNPACKED}, steps - 1);  // the slots' tiles from two steps ago have been unpacked
+  reached({UNPACKED}, stream_done[steps & 1]);
   get(b, b_tile, steps & 1); get(a, a_tile, 2 + (steps & 1)); noc_wait();
-  push(0, mm_unpack[steps & 1]); steps++; setgpr({UNPACKED}, steps);
+  push(0, mm_unpack[steps & 1]); counted(); stream_done[steps++ & 1] = unpacked;
 }}
-static void reduce(unsigned x, unsigned tile) {{  // a reduction's next tile: into SrcA, the zero tile into SrcB
-  if (steps >= 2) reached({UNPACKED}, steps - 1);
-  get(x, tile, steps & 1); noc_wait();
-  push(0, r_unpack[steps & 1]); steps++; setgpr({UNPACKED}, steps);
+static void drain(void) {{ for (; drained < posted; drained++) push(0, take_l1); }}  // everything packed so far has landed
+static void send(unsigned *o) {{  // once the pack thread has packed it, a result tile goes home
+  if (!o[0]) return;
+  push(0, relay); setgpr({PACKED}, ++outputs);
+  reached({PACKED}, outputs);
+  noc_write(SLOT(o[1]), bank[o[3] % 8] & 63, bank[o[3] % 8] >> 6, o[2] + o[3] / 8 * {TILE}, {TILE}); noc_wait();
+  o[0] = 0;
+}}
+static void output(unsigned slot, unsigned base, unsigned t) {{ out[1][0] = 1; out[1][1] = slot; out[1][2] = base; out[1][3] = t; }}
+static void tile_begin(unsigned f) {{ reached({UNPACKED}, frame_done[f]); }}
+static void tile_end(unsigned f) {{  // a result goes home one tile late, so waiting for it does not stall the pipeline,
+  push(0, report); counted(); frame_done[f] = unpacked;  // and before its slot is packed into again two tiles on
+  send(out[0]);
+  for (unsigned i = 0; i < 4; i++) {{ out[0][i] = out[1][i]; out[1][i] = 0; }}
 }}
 void kmain(volatile unsigned *a) {{
   for (unsigned i = 0; i < sizeof cfg_index / 4; i++) CFG[cfg_index[i]] = cfg_value[i];
@@ -266,104 +285,148 @@ void kmain(volatile unsigned *a) {{
   setgpr({PACKED}, 0);
   push(1, thread); push(1, setup_math); push(2, thread); push(2, setup_pack);
 {body}
+  send(out[0]); send(out[1]);
 }}
 """, KERNEL)
 
-def fused_kernel(expr, nt, shapes=(), order="op"):
-  """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip and
-  rsqrt, ("matmul", a, b, K tiles) and (rowsum or rowmax, a, K tiles) where a and b are inputs, and plain numbers for
-  inputs. nt: the result's width in tiles; shapes: the inputs' (rows, columns) in tiles, where a 1 repeats that one
-  tile row or column across the result (broadcasting). args: [first tile, tiles, out, input 0, input 1, ...].
-  Ops: an elementwise op unpacks its operands from their L1 slots and computes into a Dst half; a matmul streams its K
-  pairs of tiles through slots 0-3 into a Dst half, a reduction its K tiles of a row. A unary op runs on the SFPU over a Dst half: in place, on the
-  result of the op below it if nothing else reads that, or else on its operand plus a zero tile. Each op then packs
-  its Dst half into its own slot, so intermediates never leave L1. Slots: 0-3 stream matmul tiles, 4 is zero, then a
-  frame per output tile holds the inputs, then one slot per op in post order (equal subexpressions are one op), the
-  last op being the result. Two frames alternate between output tiles. Every intermediate is rounded to bf16 on the way
-  to L1, exactly as if each op ran on its own.
+def fused_kernel(expr, shapes, order="op"):
+  """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
+  rowsum and rowmax, ("matmul", a, b, K tiles) where a and b are inputs, and plain numbers for inputs. shapes: each
+  input's (rows, columns) in tiles; one tile tall or wide repeats across the others (broadcasting).
+  args: [first unit, units, out, input 0, input 1, ...]. A unit is a tile of the result, or, if the expression reduces
+  rows, a whole row of tiles, so the reduction can stay on chip.
+
+  Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
+  its K pairs of tiles streamed through slots 0-3. A unary op runs on the SFPU over Dst: in place, on the result of the
+  op below it if nothing else reads that, or else on its operand plus a zero tile. A row reduction folds each column
+  tile of its operand into an accumulator in Dst, then across the row (see across_rows), and packs one tile.
+  A row is done in passes: a pass is a sweep over its column tiles, and a reduction's result can only be read in the
+  pass after the one that swept it. Each pass recomputes what it needs (softmax computes exp twice) rather than keep
+  whole rows in L1. Values one tile wide (reductions, ops on them, narrow inputs) are worked out once per row, in the
+  first tile of the pass that needs them, into slots of their own.
+  Two frames of slots alternate between tiles: inputs, then one slot per op. Every intermediate is rounded to bf16 on
+  its way to L1, exactly as if each op ran on its own; in-place SFPU ops see the fp32 result.
   order is how BRISC queues the work: "op" (unpack, math, pack, op by op) is the only one safe on silicon. The others
   make a thread wait for real on ttsim, which otherwise runs every instruction the moment it can: "pack_first" queues
-  each pack before its math, "thread" queues a whole tile for thread 0, then 1, then 2 (no matmuls). On silicon they
-  would stall BRISC on a full FIFO before it pushes what unblocks it; ttsim's FIFOs are deep enough."""
+  each pack before its math, "thread" queues a whole tile for thread 0, then 1, then 2 (no matmuls or reductions). On
+  silicon they would stall BRISC on a full FIFO before it pushes what unblocks it; ttsim's FIFOs are deep enough."""
   uses, seen_exprs = {}, set()
   def count(e):  # how many ops read each subexpression
     if isinstance(e, int) or e in seen_exprs: return
     seen_exprs.add(e)
-    for c in (() if e[0] in STREAMED else e[1:]):
+    for c in (() if e[0] == "matmul" else e[1:]):
       uses[c] = uses.get(c, 0) + 1
       count(c)
   count(expr)
-  ops, refs, inputs, fetched = [], {}, 0, set()  # ops: [kind, x, y, K tiles, SFPU ops after it]; refs: expr -> input or ("op", j)
+  ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, width; refs: expr -> input number or ("op", j)
+  width = lambda r: shapes[r][1] if isinstance(r, int) else ops[r[1]]["width"]
   def visit(e):
-    nonlocal inputs
-    if isinstance(e, int):
-      inputs, _ = max(inputs, e + 1), fetched.add(e)
-      return e
+    if isinstance(e, int): return e
     if e in refs: return refs[e]
-    if e[0] == "matmul":
-      inputs = max(inputs, e[1] + 1, e[2] + 1)
-      ops.append(["matmul", e[1], e[2], e[3], []])
-    elif e[0] in COMBINE:
-      assert nt == 1, "a reduction's result is one tile wide"
-      inputs = max(inputs, e[1] + 1)
-      ops.append([e[0], e[1], None, e[2], []])
+    if e[0] == "matmul": op = dict(kind="matmul", x=e[1], y=e[2], kt=e[3], width=shapes[e[2]][1])
+    elif e[0] in COMBINE: op = dict(kind=e[0], x=visit(e[1]), width=1)
     elif e[0] in SFPU:
       x = visit(e[1])
       if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below
-        ops[x[1]][4].append(e[0])
+        ops[x[1]]["posts"].append(e[0])
         refs[e] = x
         return x
-      ops.append(["add", x, "zero", None, [e[0]]])  # operand + 0 into Dst, then the SFPU
-    else: ops.append([e[0], visit(e[1]), visit(e[2]), None, []])
+      op = dict(kind="add", x=x, y="zero", width=width(x), posts=[e[0]])  # operand + 0 into Dst, then the SFPU
+    else:
+      x, y = visit(e[1]), visit(e[2])
+      op = dict(kind=e[0], x=x, y=y, width=max(width(x), width(y)))
+    ops.append({"posts": [], **op})
     refs[e] = ("op", len(ops) - 1)
     return refs[e]
-  visit(expr)
+  root = visit(expr)[1]
+  inputs, w = len(shapes), max([op["width"] for op in ops] + [c for _, c in shapes])
+  wide = lambda r: r != "zero" and width(r) == w  # varies along the row; otherwise one tile a row
+  operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
+  rowwise = any(op["kind"] in COMBINE for op in ops)
   assert len(ops) <= 15, "SEM_L1 counts at most 15 intermediates"
-  slots = allocate({"mm" for op in ops if op[0] == "matmul"} | {"mul" for op in ops if op[0] == "mul"} | {u for op in ops for u in op[4]} |
-                   {op[0] for op in ops if op[0] in COMBINE})
+  # passes: a wide op runs in the pass after every reduction it depends on has finished; a narrow one is ready then
+  ready, sweep = {}, {}  # ready: first pass a value can be read in; sweep: pass a reduction sweeps its operand in
+  for j, op in enumerate(ops):
+    deps = [ready[r[1]] if isinstance(r, tuple) else 0 for r in operands(op)]
+    if op["kind"] in COMBINE: sweep[j] = max(deps, default=0); ready[j] = sweep[j] + 1
+    else: ready[j] = max(deps, default=0)
+  last = sweep[root] if root in sweep else ready[root]
+  slots = allocate({"mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul"} |
+                   {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE})
   frame = inputs + len(ops)
-  def tile(i):  # which tile of input i goes with output tile t: a one-tile-tall or -wide input repeats that tile
-    rows, cols = shapes[i] if shapes else (None, nt)
-    if rows != 1 and cols == nt: return "t"
-    return f"{f't / {nt}' if rows > 1 else 0} * {cols} + {f't % {nt}' if cols > 1 else 0}"
-  def slot(f, x): return ZERO_SLOT if x == "zero" else FRAMES + f * frame + (x if isinstance(x, int) else inputs + x[1])
-  arrays, bodies = [], []
-  def words(ws): arrays.append(_array(f"w{len(arrays)}", ws)); return f"w{len(arrays) - 1}"
-  for f in (0, 1):
-    stmts, seen = [], 0  # (thread, C statement); seen: ops whose intermediates the unpack thread has waited for
-    for j, (kind, x, y, kt, posts) in enumerate(ops):
-      half = (f * len(ops) + j) % 2
-      pack_stmt = (2, f"push(2, {words(pack(half, slot(f, ('op', j)), SEM_PACKED if j == len(ops) - 1 else SEM_L1))});")
-      if kind == "matmul":
-        begin, end = words(math_begin(half, True)), words(sfpu(posts, slots) + MATH_END)
-        stmts += [(0, f"for (unsigned k = 0; k < {kt}; k++) {{ step(a[{3 + x}], t / {nt} * {kt} + k, a[{3 + y}], k * {nt} + t % {nt});"
-                      f" if (k == 0) push(1, {begin}); push(1, mm); }} push(1, {end});"), pack_stmt]
-        continue
-      if kind in COMBINE:
-        first, rest = words(math_begin(half, False) + reduce_step(kind, slots, True)), words(reduce_step(kind, slots, False))
-        end = words(across_rows(kind) + sfpu(posts, slots) + MATH_END)
-        stmts += [(0, f"for (unsigned k = 0; k < {kt}; k++) {{ reduce(a[{3 + x}], t * {kt} + k); if (k) push(1, {rest}); else push(1, {first}); }}"
-                      f" push(1, {end});"), pack_stmt]
-        continue
-      wait = []
-      if isinstance(x, tuple) or isinstance(y, tuple):  # reads an intermediate: wait for every op packed before it
-        wait, seen = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)] * (j - seen), j
-      steps = [(0, f"push(0, {words(wait + unpack(slot(f, x), slot(f, y)))});"),
-               (1, f"push(1, {words(math_begin(half, kind == 'mul') + elementwise(kind, slots) + sfpu(posts, slots) + MATH_END)});"), pack_stmt]
-      stmts += steps[2:] + steps[:2] if order == "pack_first" else steps
-    if order == "thread":
-      assert all(op[0] not in STREAMED for op in ops), "thread order cannot interleave a streamed op's fetches"
-      stmts.sort(key=lambda s: s[0])
-    bodies.append(" ".join([f"get(a[{3 + i}], {tile(i)}, {slot(f, i)});" for i in sorted(fetched)] + ["noc_wait();"] + [c for _, c in stmts]))
-  out = lambda f: slot(f, ("op", len(ops) - 1))
-  return _kernel(slots, any(op[2] == "zero" or op[0] in COMBINE for op in ops), "\n".join(arrays), f"""
-  for (unsigned n = 0; n < a[1]; n++) {{
-    unsigned t = a[0] + n;
-    if (n & 1) {{ {bodies[1]} }}
-    else {{ {bodies[0]} }}
-    if (n) writeback(n, (n & 1) ? {out(0)} : {out(1)}, a[2], t - 1);  // the frame two tiles back is free again after this
-  }}
-  if (a[1]) writeback(a[1], (a[1] & 1) ? {out(0)} : {out(1)}, a[2], a[0] + a[1] - 1);""")
+  def slot(f, r):  # an input or wide op lives in the frame, a narrow op in its own slot after both frames
+    if r == "zero": return ZERO_SLOT
+    if isinstance(r, int): return FRAMES + f * frame + r
+    return FRAMES + (f * frame + inputs + r[1] if wide(r) else 2 * frame + r[1])
+  def tile(i):  # which tile of input i goes with this unit's row i_ and column j
+    rows, cols = shapes[i]
+    return f"{'i_' if rows > 1 else 0} * {cols} + {'j' if cols > 1 else 0}"
+  arrays = []
+  def words(*variants):  # a program, or one per Dst half, as a C array; returns how to name it
+    arrays.append(_arrays(f"w{len(arrays)}", variants) if len(variants) > 1 else _array(f"w{len(arrays)}", variants[0]))
+    return f"w{len(arrays) - 1}" + ("[h]" if len(variants) > 1 else "")
+  passes = []
+  for p in range(last + 1):
+    reductions = [j for j in sweep if sweep[j] == p]
+    sinks = [ops[j]["x"] for j in reductions] + ([("op", root)] if p == last and wide(("op", root)) else [])
+    swept = []  # the wide ops this pass computes, operands first
+    def need(r):
+      if isinstance(r, tuple) and wide(r) and r[1] not in swept:
+        for o in operands(ops[r[1]]): need(o)
+        swept.append(r[1])
+    for r in sinks: need(r)
+    once = [j for j, op in enumerate(ops) if not wide(("op", j)) and op["kind"] not in COMBINE and ready[j] == p]
+    bodies = []
+    for f in (0, 1):
+      stmts = []  # (thread, C): thread decides only the "thread" order; bookkeeping rides on thread 0's statements
+      fetch = sorted({r for j in once + swept + reductions for r in operands(ops[j]) if isinstance(r, int)})
+      stmts.append((0, " ".join(f"get(a[{3 + r}], {tile(r)}, {slot(f, r)});" for r in fetch) + " noc_wait();"))
+      for j in once + swept:
+        op, me = ops[j], ("op", j)
+        cond = "if (k == 0) " if j in once else ""
+        done = [SEM_PACKED if j == root else SEM_L1]
+        target = slot(f, me)
+        result = f" output({target}, a[2], {'i_ * ' + str(w) + ' + j' if wide(me) else 'i_'});" if j == root else ""
+        bump = "" if j == root else " posted++;"
+        pk = words(*[pack(DST_HALF * h, target, *done) for h in (0, 1)])
+        if op["kind"] == "matmul":
+          assert order == "op", "only op order can interleave a matmul's fetches"
+          begin, end = words(*[math_begin(h, True) for h in (0, 1)]), words(sfpu(op["posts"], slots) + MATH_END)
+          bw = shapes[op["y"]][1]  # B's width in tiles
+          stmts.append((0, f"{cond}{{ for (unsigned m = 0; m < {op['kt']}; m++) {{ step(a[{3 + op['x']}], i_ * {op['kt']} + m, a[{3 + op['y']}], m * {bw} + {'j' if bw > 1 else 0});"
+                           f" if (m == 0) push(1, {begin}); push(1, mm); }} push(1, {end}); push(2, {pk});{bump}{result} h ^= 1; }}"))
+          continue
+        drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
+        math = words(*[math_begin(h, op["kind"] == "mul") + elementwise(op["kind"], slots) + sfpu(op["posts"], slots) + MATH_END for h in (0, 1)])
+        group = [(0, f"{cond}{{ {drain}push(0, {words(unpack(slot(f, op['x']), slot(f, op['y'])))});{bump} }}"),
+                 (1, f"{cond}{{ unsigned h = hs[{j}]; push(1, {math}); }}"), (2, f"{cond}{{ unsigned h = hs[{j}]; push(2, {pk});{result} }}")]
+        stmts += [(0, f"{cond}{{ hs[{j}] = h; h ^= 1; }}")] + (group[2:] + group[:2] if order == "pack_first" else group)  # its Dst half first
+      for acc, j in enumerate(reductions):
+        assert acc < len(ACCS) and order == "op", "two reductions a pass, in op order"
+        op, me = ops[j], ("op", j)
+        drain = "drain(); " if isinstance(op["x"], tuple) else ""
+        first, rest = words(reduce_step(op["kind"], slots, acc, True)), words(reduce_step(op["kind"], slots, acc, False))
+        result = f" output({slot(f, me)}, a[2], i_);" if j == root else ""
+        pk = words(pack(ACCS[acc][0], slot(f, me), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
+        stmts.append((0, f"{drain}push(0, {words(unpack(slot(f, op['x']), ZERO_SLOT))}); if (k == 0) push(1, {first}); else push(1, {rest});"
+                         f" if (j == j1 - 1) {{ push(1, {words(reduce_finish(op['kind'], slots, acc, op['posts']))}); push(2, {pk});"
+                         f"{'' if j == root else ' posted++;'}{result} }}"))
+      if order == "thread": stmts.sort(key=lambda s: s[0])
+      bodies.append(" ".join(c for _, c in stmts))
+    passes.append((bool(swept or reductions), bodies))
+  sweeps = "\n".join(f"""    for (unsigned j = j0, k = 0; j < {'j1' if full else 'j0 + 1'}; j++, k++) {{
+      unsigned f = tiles++ & 1;
+      tile_begin(f);
+      if (f) {{ {b[1]} }} else {{ {b[0]} }}
+      tile_end(f);
+    }}""" for full, b in passes)
+  return _kernel(slots, rowwise or any(op.get("y") == "zero" for op in ops), "\n".join(arrays), f"""
+  static unsigned tiles, h, hs[{len(ops)}];  // tiles pushed, the Dst half the next op gets, and the one each op got
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned unit = a[0] + u, i_ = {'unit' if rowwise else f'unit / {w}'}, j0 = {'0' if rowwise else f'unit % {w}'}, j1 = {w if rowwise else 'j0 + 1'};
+{sweeps}
+  }}""")
+
 
 def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16  # where (r, c) of a tile sits in it
 
@@ -406,22 +469,21 @@ class Tensor:
       if t.op is None:
         if all(t is not u for u in inputs): inputs.append(t)
         return next(i for i, u in enumerate(inputs) if u is t)
-      if t is not self and (t.rows, t.cols) != (self.rows, self.cols): return expr(t.realize())  # broadcast: compute it once
+      if t.rows != self.rows: return expr(t.realize())  # one tile tall, repeated down: compute it once
       if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
         a, b = (s.realize() for s in t.srcs)
         return ("matmul", expr(a), expr(b), a.cols // 32)
-      if t.op in ("rowsum", "rowmax"):  # likewise, a whole row
-        a = t.srcs[0].realize()
-        return (t.op, expr(a), a.cols // 32)
       return (t.op, *map(expr, t.srcs))
-    key = (expr(self), self.cols // 32, tuple((u.rows // 32, u.cols // 32) for u in inputs))
+    e = expr(self)
+    key = (e, tuple((u.rows // 32, u.cols // 32) for u in inputs))
     kernel = kernels.get(key) or kernels.setdefault(key, fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
-    return self._run(kernel, self.addr, *[t.addr for t in inputs])
+    rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
+    return self._run(kernel, self.addr, *[t.addr for t in inputs], units=self.rows // 32 if rowwise else None)
 
-  def _run(self, kernel, *args):  # this tensor's tiles split evenly over the workers
-    cores = self.rt.cores
-    share = {xy: (i * self.tiles // len(cores), (i + 1) * self.tiles // len(cores)) for i, xy in enumerate(cores)}
+  def _run(self, kernel, *args, units=None):  # this tensor's tiles, or rows, split evenly over the workers
+    cores, units = self.rt.cores, units or self.tiles
+    share = {xy: (i * units // len(cores), (i + 1) * units // len(cores)) for i, xy in enumerate(cores)}
     self.rt.launch(kernel, lambda x, y: (share[x, y][0], share[x, y][1] - share[x, y][0], *args))
     self.rt.wait()
     return self
@@ -449,4 +511,9 @@ class Tensor:
     assert self.cols == other.rows, f"({self.rows}, {self.cols}) @ ({other.rows}, {other.cols})"
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other))
 
-kernels = {}  # (expression, width in tiles) -> compiled kernel image
+def _subexprs(e):
+  yield e
+  if isinstance(e, tuple):
+    for c in e[1:]: yield from _subexprs(c)
+
+kernels = {}  # (expression, input shapes) -> compiled kernel image
