@@ -716,6 +716,8 @@ class Tensor:
 
   def realize(self):
     if self.op is None: return self
+    if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
+      for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
     while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): down the heaviest branch, the first part
       t = self                    # that fits goes first, on its own, so what is on top (a layer norm, say) stays whole
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
@@ -770,6 +772,12 @@ class Tensor:
     assert self.cols == other.rows and (self.batch == other.batch or 1 in (self.batch, other.batch)), f"{self.shape} @ {other.shape}"
     if self.cols == 1: return self * other  # (R, 1) @ (1, C) is broadcasting
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other), max(self.batch, other.batch))
+
+def _lazy(t, seen):  # the unrealized ops under t, t first
+  if t.op is None or id(t) in seen: return
+  seen.add(id(t))
+  yield t
+  for s in () if t.op == "matmul" else t.srcs: yield from _lazy(s, seen)
 
 def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
   if t.op is None or id(t) in seen: return 0
