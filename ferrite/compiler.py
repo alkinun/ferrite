@@ -589,24 +589,34 @@ def gather_kernel():
   """Rows of a tensor into a new one, args [first unit, units, out, the tensor's address, tile stride, tile offset, the
   result's tile columns, rows, their indices...]. BRISC alone: for each result tile, each row's two 16-datum runs (left
   and right face) come from wherever that row sits in the tensor's tiles. A NoC read from DRAM must keep its address's
-  low 6 bits, so each run comes in as the 64-byte block holding it and is copied into place from there."""
+  low 6 bits, so each run comes in as the 64-byte block holding it and is copied into place from there. One row fills
+  its tile: it comes in once and is doubled up inside L1 by NoC copies from the tile to itself."""
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
 #define BLOCK {DATA + TILE:#x}
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
+static void copy(unsigned from, unsigned to, unsigned n) {{ noc_read(noc_me() & 63, noc_me() >> 6, from, to, n); }}
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned t = a[0] + u, i = t / a[6], j = t % a[6];
-    for (unsigned r = 0; r < 32; r++) {{
-      unsigned row = a[7] == 1 ? 0 : i * 32 + r;  // one row fills the tile
+    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] == 1 ? 1 : 32;
+    copy({ZEROS:#x}, SLOT, {TILE});  // the rows past the end stay zero
+    noc_wait();
+    for (unsigned r = 0; r < rows; r++) {{
+      unsigned row = i * 32 + r;
       for (unsigned face = r / 16 * 2; face < r / 16 * 2 + 2; face++) {{
         volatile unsigned *to = (volatile unsigned *)(SLOT + face * 512 + r % 16 * 32);
-        if (row >= a[7]) {{ for (unsigned k = 0; k < 8; k++) to[k] = 0; continue; }}
+        if (row >= a[7]) continue;
         unsigned id = a[8 + row], from = id / 32 * a[4] + j + a[5], at = (id % 32 / 16 * 2 + face % 2) * 512 + id % 16 * 32;
         noc_read(bank[from % 8] & 63, bank[from % 8] >> 6, a[3] + from / 8 * {TILE} + at / 64 * 64, BLOCK, 64);
         noc_wait();
         for (unsigned k = 0; k < 8; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
       }}
+    }}
+    if (rows == 1) {{  // row 0 of faces 0 and 1 down their 16 rows, then faces 0-1 onto 2-3
+      l1_settle(SLOT);
+      for (unsigned n = 32; n < 512; n *= 2) {{ copy(SLOT, SLOT + n, n); copy(SLOT + 512, SLOT + 512 + n, n); noc_wait(); }}
+      copy(SLOT, SLOT + 1024, 1024);
+      noc_wait();
     }}
     noc_write(SLOT, bank[t % 8] & 63, bank[t % 8] >> 6, a[2] + t / 8 * {TILE}, {TILE});
     noc_wait();
