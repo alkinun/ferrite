@@ -31,6 +31,8 @@ TAG_AICLK, TAG_GDDR_STATUS, TAG_TENSIX_COLS, TAG_GDDR_ENABLED = 14, 22, 34, 36  
 
 # Tensix tile, at the same addresses over the NoC and from its own cores
 L1_SIZE = 1536 * 1024
+AICLK = 1.35e9  # Hz, the cores' and Tensix's clock (ISA BabyRISCV/README.md); telemetry TAG_AICLK has the live value
+MVMUL_FLOPS = 2 * 8 * 16 * 16  # an MVMUL a cycle, one fidelity phase: Dst[8x16] += SrcB[8x16] @ SrcA[16x16]
 SOFT_RESET = 0xFFB121B0  # RISCV_DEBUG_REG_SOFT_RESET_0: a set bit holds that core in reset
 BRISC, TRISC0, TRISC1, TRISC2, NCRISC = 1 << 11, 1 << 12, 1 << 13, 1 << 14, 1 << 18
 ALL_CORES = BRISC | TRISC0 | TRISC1 | TRISC2 | NCRISC  # power-on value

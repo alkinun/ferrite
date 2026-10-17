@@ -29,6 +29,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `trickle/runtime.py`: compiling device C with clang + lld (with the device NoC API prepended), kernels as a program per core (`compile_kernel`), firmware for a worker's BRISC and TRISCs and for the dispatcher, and the command ring in host memory: a launch is one PCIe write, completion is read from host memory.
 - `trickle/compiler.py`: Tensix instruction assembler (encodings and config fields as data in `bh.py`), per-tile programs (elementwise, matmul with MVMUL), kernels as four programs that stream tiles through the three Tensix threads (BRISC moves tiles; each TRISC feeds one thread, unpack, math or pack, with `.ttinsn` instructions), SFPU programs (relu, exp, reciprocal, rsqrt), row reductions, broadcasting by tile reuse, fusion of whole op trees into one kernel with intermediates in L1 (rows swept in passes when they reduce, so softmax and layer norm are one launch each; too-big trees split), transpose, the tile layout, and `Tensor`: bf16 tensors of any shape in DRAM (freed when dropped) with numpy broadcasting, tile-aligned views, lazy `+`, `-`, `*`, `/`, `@`, `relu`, `exp`, `reciprocal`, `rsqrt`, `gelu`, `rowsum`, `rowmax`, `.T`, and numbers or `Tensor.full` for constants, on every worker. `frombytes`/`tobytes` for bf16 in bulk, and `gather` for embeddings. Enough for GPT-2 small (`test/gpt2.py`).
 - `trickle/hello.py`: fib(n) on every Tensix core, the one-command demo.
+- `trickle/bench.py`: goal 3's number, a matmul's time and TFLOPS (simulated cycles on ttsim).
 - `test/test_sim.py`: every step, on ttsim (or on a card when `TTSIM` is not set).
 - `test/gpt2.py`: GPT-2 small (written once for trickle Tensors and numpy), and greedy generation from the real weights, checked against numpy step by step.
 - `NOTES.md`: what we learned about the chip, and what is still unknown.
@@ -39,6 +40,7 @@ Needs clang and lld on PATH, and ttsim's `libttsim.so` built for Blackhole (outs
 
     TTSIM=/path/to/libttsim.so python3 -m trickle.hello
     TTSIM=/path/to/libttsim.so python3 -m pytest test
+    TTSIM=/path/to/libttsim.so python3 -m trickle.bench
     TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "The meaning of life is" 8
 
 The tests need numpy; `test/gpt2.py` also tiktoken and the weights (Hugging Face `openai-community/gpt2`, `model.safetensors`), and `GPT2=path/to/model.safetensors` adds the whole model to the tests. Without `TTSIM`, `pci.open_device()` looks for a real Blackhole on the PCI bus.

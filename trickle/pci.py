@@ -1,6 +1,6 @@
 # The device interface at the PCIe level: config space, BARs, and host memory the device can DMA to.
 # Two backends with the same methods: Sim (ttsim's libttsim.so) and Card (a real card through sysfs).
-import ctypes, mmap, os
+import ctypes, mmap, os, time
 from trickle import bh
 
 class Sim:
@@ -19,7 +19,7 @@ class Sim:
     lib.libttsim_set_pci_dma_mem_callbacks(*self.cbs)
     lib.libttsim_init()
     self.bars = {i: self.cfg_read(0x10 + 4 * i) & ~0xF | self.cfg_read(0x14 + 4 * i) << 32 for i in (0, 2, 4)}
-    self.dma = []  # (bus address, size, host address, buffer)
+    self.dma, self.clocks = [], 0  # (bus address, size, host address, buffer); chip cycles run so far
 
   def cfg_read(self, off): return self.lib.libttsim_pci_config_rd32(0, off)
   def cfg_write(self, off, val): self.lib.libttsim_pci_config_wr32(0, off, val)
@@ -40,7 +40,10 @@ class Sim:
       if base <= bus and bus + n <= base + size: return addr + bus - base
     raise RuntimeError(f"device DMA to {bus:#x}+{n}, which is not host memory we allocated")
 
-  def tick(self): self.lib.libttsim_clock(1000)  # the simulator only runs when we let it
+  def tick(self):  # the simulator only runs when we let it
+    self.lib.libttsim_clock(1000)
+    self.clocks += 1000
+  def now(self): return self.clocks / bh.AICLK  # seconds of chip time, by ttsim's clock, which is not silicon's timing
 
 class Card:
   """A real card from userspace: config space and BARs through sysfs, DMA memory from locked hugepages.
@@ -82,6 +85,7 @@ class Card:
     return memoryview(buf)[:size], pfn * mmap.PAGESIZE
 
   def tick(self): pass  # real hardware runs on its own
+  def now(self): return time.monotonic()
 
 def _write(path, s):
   with open(path, "w") as f: f.write(s)
