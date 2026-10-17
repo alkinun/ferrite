@@ -788,6 +788,12 @@ class Tensor:
   def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
     k = 2 * math.sqrt(2 / math.pi)
     return self * (1 + (self * (self * self * (-0.044715 * k) - k)).exp()).reciprocal()
+  def softmax(self):  # along each row, max first so exp stays in range
+    e = (self - self.rowmax()).exp()
+    return e / e.rowsum()
+  def layernorm(self, eps=1e-5):  # each row to mean 0 and variance 1
+    c = self - self.rowsum() * (1 / self.cols)
+    return c * ((c * c).rowsum() * (1 / self.cols) + eps).rsqrt()
   def rowsum(self): return self if self.cols == 1 else self._unary("rowsum", 1)
   def rowmax(self): return self if self.cols == 1 else self._unary("rowmax", 1)
   def __add__(self, other): return self._elementwise("add", other)

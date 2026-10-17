@@ -522,16 +522,14 @@ def test_softmax_and_layernorm(chip):
     rt = Runtime(chip, chip.tensix[0], workers)
     x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
     tx = Tensor.of(rt, x)
-    e = (tx - tx.rowmax()).exp()
-    launches, got = rt.launches, (e * e.rowsum().reciprocal()).tolist()
+    launches, got = rt.launches, tx.softmax().tolist()
     assert rt.launches == launches + 1
     for g, row in zip(got, x):
       want = [math.exp(v - max(row)) for v in row]
       assert all(abs(gv - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for gv, w in zip(g, want))
     gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
     tg, tb = Tensor.of(rt, [gamma]), Tensor.of(rt, [beta])
-    d = tx - tx.rowsum() * (1 / cols)
-    launches, got = rt.launches, (d * ((d * d).rowsum() * (1 / cols) + 1e-5).rsqrt() * tg + tb).tolist()
+    launches, got = rt.launches, (tx.layernorm() * tg + tb).tolist()
     assert rt.launches == launches + 1
     for g, row in zip(got, x):
       mean = sum(row) / cols

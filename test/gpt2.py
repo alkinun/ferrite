@@ -13,16 +13,14 @@ HEADS = 12
 def fns(x):  # what numpy and ferrite spell differently
   if isinstance(x, np.ndarray):
     split = lambda a, n, axis=1: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2) if axis else a.reshape(n, -1, a.shape[1])
-    return SimpleNamespace(rowsum=lambda a: a.sum(-1, keepdims=True), rowmax=lambda a: a.max(-1, keepdims=True), exp=np.exp,
-                           rsqrt=lambda a: 1 / np.sqrt(a), rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split,
+    softmax = lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True)
+    layernorm = lambda a: (a - a.mean(-1, keepdims=True)) / np.sqrt(a.var(-1, keepdims=True) + 1e-5)
+    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split, softmax=softmax, layernorm=layernorm,
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))))
-  return SimpleNamespace(rowsum=Tensor.rowsum, rowmax=Tensor.rowmax, exp=Tensor.exp, rsqrt=Tensor.rsqrt, rows=Tensor.gather,
-                         width=lambda a: a.cols, split=Tensor.split, gelu=Tensor.gelu)
+  return SimpleNamespace(rows=Tensor.gather, width=lambda a: a.cols, split=Tensor.split, softmax=Tensor.softmax,
+                         layernorm=Tensor.layernorm, gelu=Tensor.gelu)
 
-def layernorm(x, g, b):
-  f = fns(x)
-  c = x - f.rowsum(x) * (1 / f.width(x))
-  return c * f.rsqrt(f.rowsum(c * c) * (1 / f.width(x)) + 1e-5) * g + b
+def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 
 def layer(x, p, mask, heads=HEADS):
   """One transformer block: attention then MLP, each after a layer norm and added back. p: the block's weights by their
@@ -34,8 +32,7 @@ def layer(x, p, mask, heads=HEADS):
   # the heads as a batch: queries and values split by columns, the keys transposed and split by rows
   q, kt, v = f.split(qkv[:, :d], heads), f.split(qkv[:, d:2 * d].T, heads, 0), f.split(qkv[:, 2 * d:], heads)
   s = q @ kt * (1 / math.sqrt(hd)) + mask
-  e = f.exp(s - f.rowmax(s))
-  y = (e / f.rowsum(e)) @ v @ f.split(p["attn.c_proj.weight"], heads, 0)  # each head through its rows of c_proj
+  y = f.softmax(s) @ v @ f.split(p["attn.c_proj.weight"], heads, 0)  # each head through its rows of c_proj
   # summed (the same as concatenating) with the bias, then added to x last: x is the large one, so it is rounded once
   x = x + (sum(y[i] for i in range(1, heads)) + y[0] + p["attn.c_proj.bias"])
   h = layernorm(x, p["ln_2.weight"], p["ln_2.bias"]) @ p["mlp.c_fc.weight"] + p["mlp.c_fc.bias"]
