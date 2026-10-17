@@ -1,8 +1,8 @@
 # Milestone 1 end to end, now on the runtime: boot firmware on one Tensix BRISC, launch a kernel compiled with plain
-# clang and lld, and read back what it wrote.   TTSIM=/path/to/libttsim.so python3 -m trickle.hello
-from trickle import pci
-from trickle.chip import Chip
-from trickle.runtime import Runtime, compile_kernel
+# clang and lld, and read back what it wrote.   TTSIM=/path/to/libttsim.so python3 -m ferrite.hello
+from ferrite import pci
+from ferrite.chip import Chip
+from ferrite.runtime import Runtime, compile_kernel
 
 FIB = """
 void kmain(volatile unsigned *args) {  // args: [n, fib(n)]

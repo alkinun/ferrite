@@ -1,16 +1,16 @@
-# GPT-2 small on trickle: the real weights, greedy generation, each step checked against the same model in numpy (the
-# same bf16 weights, float32 math). The model is written once, for trickle Tensors and numpy arrays alike.
+# GPT-2 small on ferrite: the real weights, greedy generation, each step checked against the same model in numpy (the
+# same bf16 weights, float32 math). The model is written once, for ferrite Tensors and numpy arrays alike.
 #   TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "prompt" [tokens]
 # The weights are Hugging Face's openai-community/gpt2 model.safetensors; the tokenizer is tiktoken's "gpt2".
 import json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from trickle.compiler import Tensor
+from ferrite.compiler import Tensor
 
 HEADS = 12
 
-def fns(x):  # what numpy and trickle spell differently
+def fns(x):  # what numpy and ferrite spell differently
   if isinstance(x, np.ndarray):
     split = lambda a, n, axis=1: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2) if axis else a.reshape(n, -1, a.shape[1])
     return SimpleNamespace(rowsum=lambda a: a.sum(-1, keepdims=True), rowmax=lambda a: a.max(-1, keepdims=True), exp=np.exp,
@@ -64,7 +64,7 @@ def load(path):
     out[name] = (bits, (bits.astype(np.uint32) << 16).view(np.float32))
   return out
 
-def upload(rt, weights):  # the weights as trickle Tensors, the output layer's transposed on the chip
+def upload(rt, weights):  # the weights as ferrite Tensors, the output layer's transposed on the chip
   t = {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
   t["wte.T"] = t["wte.weight"].T
   return t
@@ -82,9 +82,9 @@ def logits(ids, w, rt=None):
 
 def main():
   import tiktoken
-  from trickle import pci
-  from trickle.chip import Chip
-  from trickle.runtime import Runtime
+  from ferrite import pci
+  from ferrite.chip import Chip
+  from ferrite.runtime import Runtime
   path, prompt, steps = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "The meaning of life is", int(sys.argv[3]) if len(sys.argv) > 3 else 8
   enc, chip = tiktoken.get_encoding("gpt2"), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
@@ -99,8 +99,8 @@ def main():
     got, want = logits(ids, t, rt), logits(ids, w)
     agree += int(got.argmax()) == int(want.argmax())
     ids.append(int(want.argmax()))  # numpy's pick, so that one near tie does not send the two down different paths
-    print(enc.decode([ids[-1]]) + ("" if got.argmax() == want.argmax() else f"[trickle: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
+    print(enc.decode([ids[-1]]) + ("" if got.argmax() == want.argmax() else f"[ferrite: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
     print(f" ({time.time() - start:.0f}s, logits within {np.abs(got - want).max():.2f})", end="", file=sys.stderr, flush=True)
-  print(f"\ntrickle picked the same token as numpy {agree} times out of {steps}")
+  print(f"\nferrite picked the same token as numpy {agree} times out of {steps}")
 
 if __name__ == "__main__": main()

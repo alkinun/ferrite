@@ -1,7 +1,7 @@
 # The runtime: resident firmware on each Tensix tile's BRISC and TRISCs, kernels launched on them without resetting
 # anything, and a command ring in host memory that one tile's BRISC, the dispatcher, reads by itself.
 import pathlib, shutil, struct, subprocess, tempfile
-from trickle import bh
+from ferrite import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments] [done, report x | y << 6, report address] (done is 16-byte

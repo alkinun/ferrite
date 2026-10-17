@@ -1,6 +1,6 @@
 # A Blackhole over its PCIe device interface: NoC reads and writes through one 2 MiB TLB window, and core reset.
 import struct, time
-from trickle import bh
+from ferrite import bh
 
 def tlb_config(**fields):
   cfg = 0

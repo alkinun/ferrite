@@ -2,12 +2,12 @@
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
 import math, os, random, struct, pytest
 import numpy as np
-from trickle import bh, pci
-from trickle.chip import Chip
-from trickle import compiler
-from trickle.compiler import Tensor, from_bf16, to_bf16
-from trickle.hello import hello
-from trickle.runtime import DATA, KERNELS, Runtime, compile_kernel
+from ferrite import bh, pci
+from ferrite.chip import Chip
+from ferrite import compiler
+from ferrite.compiler import Tensor, from_bf16, to_bf16
+from ferrite.hello import hello
+from ferrite.runtime import DATA, KERNELS, Runtime, compile_kernel
 import gpt2
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does

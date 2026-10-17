@@ -2,7 +2,7 @@
 
 What the milestones so far learned about the chip, where each fact comes from, and what is still unknown.
 Sources: **ISA** = tt-isa-documentation/BlackholeA0, **sim** = ttsim `src/`, **kmd** = tt-kmd, **umd** = tt-umd.
-Facts the code uses live in `trickle/bh.py`.
+Facts the code uses live in `ferrite/bh.py`.
 
 ## Goals
 
@@ -19,7 +19,7 @@ Each has a finish line we can check. Ticked when a test shows it.
    - [x] the tests run on a card when `TTSIM` is not set
    - [x] a bring-up checklist, step by step ("Bring-up on a p150")
 3. **Fast.** Finish line: a matmul benchmark with a number, measured against the chip's peak and improved over time (tile reuse, deeper pipelines, the MOP expander).
-   - [x] the benchmark: `python3 -m trickle.bench [M K N]`, wall time on a card, simulated cycles on ttsim (a work count, not silicon speed). 512x768 @ 768x3072 on ttsim: 35k cycles, "93 of 166 TFLOPS" at four fidelity phases; 22k ("153") with A's row kept in L1, resident kernels and launches queued back to back
+   - [x] the benchmark: `python3 -m ferrite.bench [M K N]`, wall time on a card, simulated cycles on ttsim (a work count, not silicon speed). 512x768 @ 768x3072 on ttsim: 35k cycles, "93 of 166 TFLOPS" at four fidelity phases; 22k ("153") with A's row kept in L1, resident kernels and launches queued back to back
    - [ ] the same on silicon
 
 ## Address map
@@ -41,7 +41,7 @@ Vendor 0x1E52, device 0xB140 (sim `pcie.cpp`, kmd). Three 64-bit prefetchable BA
 
 17 x 12 grid. Raw NoC0 coordinates (ISA `Diagrams/Src/NoC.lua`, sim `tile.cpp`): DRAM at x=0 (banks 0-3) and x=9 (banks 4-7), ARC (8,0), PCIe 0 (2,0) and PCIe 1 (11,0), Ethernet on y=1, Tensix at x=1..7,10..16, y=2..11. NoC1 numbers the same grid from the other corner: (16-x, 11-y).
 
-Firmware turns on **coordinate translation** at boot (`NIU_CFG_0` bit 14) and programs every tile's translation tables, so harvested Tensix columns move to the highest x and software never sees which physical columns are dead (ISA `NoC/Coordinates.md`). trickle uses translated coordinates everywhere:
+Firmware turns on **coordinate translation** at boot (`NIU_CFG_0` bit 14) and programs every tile's translation tables, so harvested Tensix columns move to the highest x and software never sees which physical columns are dead (ISA `NoC/Coordinates.md`). ferrite uses translated coordinates everywhere:
 
 | Translated (x, y) | What |
 |---|---|
@@ -104,7 +104,7 @@ A TLB window turns a range of BAR0 (or BAR4) into a range of one tile's NoC addr
 
 Write the three dwords with 32-bit stores (odd TLBs are not 8-byte aligned), and the address must be window aligned (kmd, umd). umd turns on static VC for windows that only write or only read, and leaves it off for a window that does both: a read+write window on a static VC "crashes the host" (umd `architecture_tlbs.cpp`).
 
-trickle uses one 2 MiB window (TLB 0) with strict ordering, and moves it whenever an access crosses into another 2 MiB block. Unicast uses dynamic VC. Multicast (`Chip.write(..., start=...)`) sets x_start/y_start, mcast, and static VC class 2, as umd does. Slow on purpose: simple first. Faster later: a window per target, posted ordering for bulk writes, BAR4 windows for DRAM.
+ferrite uses one 2 MiB window (TLB 0) with strict ordering, and moves it whenever an access crosses into another 2 MiB block. Unicast uses dynamic VC. Multicast (`Chip.write(..., start=...)`) sets x_start/y_start, mcast, and static VC class 2, as umd does. Slow on purpose: simple first. Faster later: a window per target, posted ordering for bulk writes, BAR4 windows for DRAM.
 
 ## Reset sequence
 
@@ -132,7 +132,7 @@ Nothing of ours: there is no boot ROM in a Tensix tile. A released core fetches 
 | TRISC0/1/2 | `0x6000`/`0xA000`/`0xE000`, or `RISCV_DEBUG_REG_TRISCn_RESET_PC` (`0xFFB1_2228/222C/2230`) if bit n of `0xFFB1_2234` is set |
 | NCRISC | `0x12000`, or `0xFFB1_2238` if bit 0 of `0xFFB1_223C` is set |
 
-The baby cores are rv32im with Zicsr, Zaamo (no lr/sc), Zba, Zbb, and a partial F (no fdiv/fsqrt). No C extension: its encoding space holds `.ttinsn`. trickle compiles with plain `clang --target=riscv32-unknown-elf -march=rv32im` and links a flat binary at 0 with lld. Gotchas (ISA `BabyRISCV/`):
+The baby cores are rv32im with Zicsr, Zaamo (no lr/sc), Zba, Zbb, and a partial F (no fdiv/fsqrt). No C extension: its encoding space holds `.ttinsn`. ferrite compiles with plain `clang --target=riscv32-unknown-elf -march=rv32im` and links a flat binary at 0 with lld. Gotchas (ISA `BabyRISCV/`):
 
 - `mhartid` reads 0 on every core per ISA; ttsim does not implement it and kills the process. Tell cores apart by entry point.
 - `fence.i` does not flush the instruction cache (ttsim rejects it). New code needs a reset release, or a write to `RISCV_IC_INVALIDATE` in Tensix config from a core.
@@ -144,13 +144,13 @@ Elsewhere on the chip, firmware is already running when we arrive: ARC runs the 
 
 ## What tt-kmd does that a userspace driver must do instead
 
-What kmd does for a Blackhole at probe, open, reset and remove (kmd `enumerate.c`, `blackhole.c`, `chardev.c`, `memory.c`, `pcie.c`), and where trickle stands:
+What kmd does for a Blackhole at probe, open, reset and remove (kmd `enumerate.c`, `blackhole.c`, `chardev.c`, `memory.c`, `pcie.c`), and where ferrite stands:
 
-| kmd | trickle |
+| kmd | ferrite |
 |---|---|
 | `pci_enable_device`, 58-bit DMA mask, bus mastering | `Card`: unbind kmd, write sysfs `enable`, set memory + bus master in `PCI_COMMAND` |
 | Max Read Request Size 4096 in PCIe Device Control | not done (throughput only) |
-| Maps BAR0 TLB config + NIU, BAR2, BAR4; reserves TLB 201 for its own NoC accesses; hands other TLBs out per fd | `Card` mmaps sysfs `resource0/2/4`; with kmd gone every TLB is ours; trickle uses TLB 0 |
+| Maps BAR0 TLB config + NIU, BAR2, BAR4; reserves TLB 201 for its own NoC accesses; hands other TLBs out per fd | `Card` mmaps sysfs `resource0/2/4`; with kmd gone every TLB is ours; ferrite uses TLB 0 |
 | Waits for ARC: `0x80030408` bit 0 (500 ms); umd waits for `& 7 == 5` (300 s after a reset) | `Chip.__init__` waits for `& 7 == 5`, 2 s (tested on sim) |
 | ARC messages `0xA0` (ASIC_STATE0, then reads `0x80030410` bit 1 for a power-cable fault), `0xC1` (watchdog, 10 s), `0xC7` (firmware log buffer) | not done; `Chip.arc_msg` can send them |
 | Power policy: with no fd open, ARC message `0x21` with all flags 0 (minimum AICLK, GDDR PHY down, **Tensix clock-gated**); opening an fd sends `0x7FFE0F21` (everything on); remove sends `0xA3` | `Chip.__init__` sends `0x21` with all 15 flags valid and set (`0x7FFF0F21`: max AI clock, GDDR PHY awake, Tensix and L2CPU on) through `Chip.arc_msg` (tested on sim). Never powers down again. `0x52` (AICLK go busy), which umd also sends, is not sent |
@@ -160,11 +160,11 @@ What kmd does for a Blackhole at probe, open, reset and remove (kmd `enumerate.c
 | Telemetry table: `*0x80030434` (tags) and `*0x80030430` (values), each tag word is `id \| index << 16` | `Chip.telemetry`. `Chip.__init__` takes the Tensix column count from tag 34 (enabled columns; good ones come first in translated x) and waits up to 60 s for tag 22 to show every bank in tag 36 trained |
 | "NoC cleanup": puts cores back in reset when a process dies | not done: a dead process leaves its firmware polling, which is harmless; the next `Runtime` resets the cores it uses |
 
-ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003042C` (SCRATCH_RAM[11]) points at a control block whose word 0 is the base of 4 queues and word 1 is `entries | queues << 8`. Queue i (0 = kmd, 3 = applications) is a 32-byte header (`+0` request wptr, `+4` response rptr, `+0x10` request rptr, `+0x14` response wptr; pointers wrap at 2N) followed by N request slots and N response slots of 32 bytes (`u32 header, u32 payload[7]`). Write the slot, bump the request wptr, poke the ARC (kmd: write 0 to `0x800B0000`; umd: write `0x10000` to `0x80030100`), poll the response wptr for up to 1 s. Status is the low byte of the response header, below 240 means OK. trickle uses queue 3 and umd's poke (ARC_MISC_CNTL IRQ0); ttsim models both pokes and answers kmd's and umd's messages, but kills the process on an unknown code, and returns all-zero responses (so `0x57` "get harvesting" is not usable there; telemetry is).
+ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003042C` (SCRATCH_RAM[11]) points at a control block whose word 0 is the base of 4 queues and word 1 is `entries | queues << 8`. Queue i (0 = kmd, 3 = applications) is a 32-byte header (`+0` request wptr, `+4` response rptr, `+0x10` request rptr, `+0x14` response wptr; pointers wrap at 2N) followed by N request slots and N response slots of 32 bytes (`u32 header, u32 payload[7]`). Write the slot, bump the request wptr, poke the ARC (kmd: write 0 to `0x800B0000`; umd: write `0x10000` to `0x80030100`), poll the response wptr for up to 1 s. Status is the low byte of the response header, below 240 means OK. ferrite uses queue 3 and umd's poke (ARC_MISC_CNTL IRQ0); ttsim models both pokes and answers kmd's and umd's messages, but kills the process on an unknown code, and returns all-zero responses (so `0x57` "get harvesting" is not usable there; telemetry is).
 
 ## The launch loop and the command queue
 
-`trickle/runtime.py`. Built and tested on ttsim.
+`ferrite/runtime.py`. Built and tested on ttsim.
 
 **Cores.** `Runtime(chip, start, end)` takes a rectangle of Tensix in translated coordinates. Its last core runs the **dispatcher**; the rest are **workers**. A rectangle of good columns in translated space covers exactly those cores: harvested and non-Tensix columns in between opt out of multicast.
 
@@ -204,9 +204,9 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 ## The Tensix coprocessor, and the first compiler
 
-`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_fusion`, `test_threads_wait`, `test_matmul_fusion`, `test_sfpu`, `test_reductions`, `test_softmax_and_layernorm`.
+`ferrite/compiler.py`, encodings and register numbers in `ferrite/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_fusion`, `test_threads_wait`, `test_matmul_fusion`, `test_sfpu`, `test_reductions`, `test_softmax_and_layernorm`.
 
-**Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). TRISC t pushes to thread t, through that thread's MOP expander; BRISC can push to all three (`0xFFE4_0000 + 0x10000 t`, skipping the MOP expander), but a BRISC push and a TRISC push in the same cycle drop the TRISC's, so only one of them may feed a thread. trickle: each TRISC feeds its own thread and BRISC only moves data (ISA `BabyRISCV/PushTensixInstruction.md`).
+**Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). TRISC t pushes to thread t, through that thread's MOP expander; BRISC can push to all three (`0xFFE4_0000 + 0x10000 t`, skipping the MOP expander), but a BRISC push and a TRISC push in the same cycle drop the TRISC's, so only one of them may feed a thread. ferrite: each TRISC feeds its own thread and BRISC only moves data (ISA `BabyRISCV/PushTensixInstruction.md`).
 
 **Instruction words.** `opcode << 24 | fields` (ISA `Diagrams/Src/Bits32.lua`; ttsim `data/bh/tensix_isa.json` agrees and names the fields). A TRISC pushes one by storing it to `0xFFE4_0000`, or by executing it: `.ttinsn` is the word rotated left by 2, written straight into the code (opcodes are below `0xC0`, so the low bits are never `0b11` and it cannot be read as RISC-V). Either way a full FIFO stalls the TRISC. The generated programs are mostly `.ttinsn` words (`compiler.tt`, as `.word`s, since clang has no `.ttinsn`); runs that differ per Dst half or frame are branches between two copies. Setup goes through stores instead: a TRISC fuses up to four `.ttinsn`s in a row, and fused ones must not be what a `REPLAY` records.
 
@@ -315,9 +315,9 @@ Book-keeping happens at run time, in each program, because what a tile does depe
 
 **Upload and download** go a tile at a time through the `array` module (floats to fp32 bytes, then bf16 bits with one list comprehension), about 10x faster than a struct call per value, which matters at GPT-2's 768 x 3072.
 
-**A GPT-2 layer** (`test_gpt2_layer`). GPT-2 small's block: 768 wide, 12 heads of 64, MLP 3072, on 16 tokens, with weights drawn the way GPT-2 initialises them. `gpt2_layer` is written once and runs on both trickle `Tensor`s and numpy arrays (the reference, float64, same bf16 weights). Layer norms are one launch each; q, k and v are 64-column views of one qkv result; the heads are a batch (`split`): queries and values split by columns, the keys transposed once and split by rows, then one kernel for every head's scores, mask and softmax, one for attention times values, and one through each head's 64 rows of `w_proj`; the 12 heads are summed (the same as concatenating them, with no concat) and added to the residual last, after the bias, so the large value is rounded once. Inside a kernel that sweeps rows in passes, a long matmul (K over 256) runs first on its own, or each pass would recompute it. A token is 148 launches, 0.8M simulated cycles. The residual reaches 3000 in one channel, where bf16 steps by 16, so the logits drift about 1 from numpy's over 12 blocks: a pick within that of numpy's best is a tie bf16 cannot break (`test_gpt2_model`). 49 launches, about 6 s on ttsim. Every intermediate is bf16, so the block's change to x matches to within 2% of its size (0.03 against 1.7). Breaking the row mask, the tidy padding, the transpose's face swap or the views' offsets each fails it.
+**A GPT-2 layer** (`test_gpt2_layer`). GPT-2 small's block: 768 wide, 12 heads of 64, MLP 3072, on 16 tokens, with weights drawn the way GPT-2 initialises them. `gpt2_layer` is written once and runs on both ferrite `Tensor`s and numpy arrays (the reference, float64, same bf16 weights). Layer norms are one launch each; q, k and v are 64-column views of one qkv result; the heads are a batch (`split`): queries and values split by columns, the keys transposed once and split by rows, then one kernel for every head's scores, mask and softmax, one for attention times values, and one through each head's 64 rows of `w_proj`; the 12 heads are summed (the same as concatenating them, with no concat) and added to the residual last, after the bias, so the large value is rounded once. Inside a kernel that sweeps rows in passes, a long matmul (K over 256) runs first on its own, or each pass would recompute it. A token is 148 launches, 0.8M simulated cycles. The residual reaches 3000 in one channel, where bf16 steps by 16, so the logits drift about 1 from numpy's over 12 blocks: a pick within that of numpy's best is a tie bf16 cannot break (`test_gpt2_model`). 49 launches, about 6 s on ttsim. Every intermediate is bf16, so the block's change to x matches to within 2% of its size (0.03 against 1.7). Breaking the row mask, the tidy padding, the transpose's face swap or the views' offsets each fails it.
 
-**GPT-2 small, the real thing** (`test/gpt2.py`, `test_gpt2_model` when `GPT2=` names the weights). Hugging Face's `openai-community/gpt2` `model.safetensors` (float32, read with numpy and rounded to bf16), tiktoken's `gpt2` tokenizer. `forward` is written once for Tensors and numpy arrays: token and position embeddings, 12 blocks, the last layer norm, and the output layer, which is the token embedding again. The numpy version, in fp32, matches Hugging Face's own GPT-2 to 1e-4 in the logits, so it is the model and not just a copy of our mistakes. On ttsim, greedy from "The meaning of life is", trickle writes " not the same as the meaning of death", the same 8 tokens as numpy and as Hugging Face, each step's 50257 logits within about 1.5 (they span about 100). What it took:
+**GPT-2 small, the real thing** (`test/gpt2.py`, `test_gpt2_model` when `GPT2=` names the weights). Hugging Face's `openai-community/gpt2` `model.safetensors` (float32, read with numpy and rounded to bf16), tiktoken's `gpt2` tokenizer. `forward` is written once for Tensors and numpy arrays: token and position embeddings, 12 blocks, the last layer norm, and the output layer, which is the token embedding again. The numpy version, in fp32, matches Hugging Face's own GPT-2 to 1e-4 in the logits, so it is the model and not just a copy of our mistakes. On ttsim, greedy from "The meaning of life is", ferrite writes " not the same as the meaning of death", the same 8 tokens as numpy and as Hugging Face, each step's 50257 logits within about 1.5 (they span about 100). What it took:
 
 - `Tensor.frombytes` / `tobytes`: bf16 in row-major order, moved into tile order 16 values at a time with no per-value Python work. All 124M weights are on the chip in 5 s.
 - `Tensor.gather(ids)`, the embedding lookup: a BRISC-only kernel that copies each row's two 32-byte runs out of the table's tiles. A NoC read from DRAM keeps its low 6 address bits, so a run comes in as the 64-byte block holding it and is copied into place.
@@ -388,7 +388,7 @@ Before: `lspci -d 1e52:b140` shows the card; the IOMMU is off or in passthrough 
 |---|---|---|
 | 1 | `pytest test -k "config_space or arc"` | BARs, the TLB config registers (`bh.TLB_CONFIG`, `TLB_FIELDS`), the NoC coordinates of ARC, ARC's boot status, message queue and telemetry tags, and that `POWER_ON` wakes Tensix (else try AICLK go busy, `0x52`) |
 | 2 | `-k "dma or l1 or dram"` | the PCIe tile's loopback into host memory (`bh.PCIE`, bus addresses below 2^58), multicast and unicast L1 writes, DRAM bank coordinates and GDDR training |
-| 3 | `python3 -m trickle.hello` | soft reset bits, reset PCs and their override (`bh.TRISC_RESET_PC`), the firmware's jump table, the NIU's request registers, device writes into host memory, and the dispatcher |
+| 3 | `python3 -m ferrite.hello` | soft reset bits, reset PCs and their override (`bh.TRISC_RESET_PC`), the firmware's jump table, the NIU's request registers, device writes into host memory, and the dispatcher |
 | 4 | `-k "every_core or relaunch or moves_data or queue or hung"` | the launch path end to end; instruction cache invalidation (`bh.CFG_IC_INVALIDATE`, a no-op in ttsim, so only here can a stale kernel show) |
 | 5 | `-k "tile_math or tensor_math"` | the backend config indices (`bh.TENSIX_CFG_FIELDS`, from ttsim's `tensix_regs.json`, not the ISA), instruction encodings, `.ttinsn`, semaphores from the TRISCs, unpack and pack of bf16 |
 | 6 | `-k "matmul or stream"` | MVMUL, the 3-bit address modes (from ttsim's `tensix_isa.json`; the ISA pages are Wormhole's), fidelity phases, the replay buffer |

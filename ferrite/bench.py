@@ -1,11 +1,11 @@
 # Goal 3's number: how fast a bf16 matmul runs on every worker. On a card the time is wall time; on ttsim it is
 # simulated cycles at the chip's clock, which tracks how much work the kernels do but not how fast silicon does it
-# (ttsim runs each instruction at once).   TTSIM=/path/to/libttsim.so python3 -m trickle.bench [M K N]
+# (ttsim runs each instruction at once).   TTSIM=/path/to/libttsim.so python3 -m ferrite.bench [M K N]
 import sys
-from trickle import bh, pci
-from trickle.chip import Chip
-from trickle.compiler import Tensor
-from trickle.runtime import Runtime
+from ferrite import bh, pci
+from ferrite.chip import Chip
+from ferrite.compiler import Tensor
+from ferrite.runtime import Runtime
 
 def bench(chip, m, k, n, repeat=3):
   """Seconds per (m x k) @ (k x n), and the TFLOPS that is; inputs of 1.0, so the result is checkable."""

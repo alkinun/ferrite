@@ -1,7 +1,7 @@
 # The device interface at the PCIe level: config space, BARs, and host memory the device can DMA to.
 # Two backends with the same methods: Sim (ttsim's libttsim.so) and Card (a real card through sysfs).
 import ctypes, mmap, os, time
-from trickle import bh
+from ferrite import bh
 
 class Sim:
   """libttsim.so: a virtual Blackhole driven by forwarding config and BAR accesses. One per process."""

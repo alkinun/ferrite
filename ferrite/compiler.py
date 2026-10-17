@@ -10,8 +10,8 @@
 # tile; this is the layout the FPU's 16x16 matrix multiply wants. An unpacker reads a whole tile into a SrcA/SrcB bank,
 # so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
 import array, math, struct
-from trickle import bh
-from trickle.runtime import DATA, SYNC, compile_kernel
+from ferrite import bh
+from ferrite.runtime import DATA, SYNC, compile_kernel
 
 TILE = 32 * 32 * 2  # bytes in a bf16 tile: one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
 SLOTS = DATA  # L1 tile slots: slot i at SLOTS + i * TILE, picked by the unpackers' Z and the packer's channel 1 Y counters
