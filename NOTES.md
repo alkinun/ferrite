@@ -8,12 +8,12 @@ Facts the code uses live in `trickle/bh.py`.
 
 Each has a finish line we can check. Ticked when a test shows it.
 
-1. **A real model runs on the simulator.** Finish line: one GPT-2 transformer layer matches a CPU reference.
+1. **A real model runs on the simulator.** Finish line: one GPT-2 transformer layer matches a CPU reference. **Done.**
    - [x] DRAM is freed when a tensor goes away (`test_dram_is_freed`)
    - [x] any tensor shape, not just multiples of 32 (`test_any_shape`)
    - [x] views, transpose, gelu (`test_views_transpose_gelu`)
    - [x] halfway: a small MNIST network (matmuls, bias, relu) matches (`test_mnist_mlp`)
-   - [ ] a GPT-2 layer (layer norm, attention, MLP) matches
+   - [x] a GPT-2 layer (layer norm, attention, MLP) matches (`test_gpt2_layer`)
 2. **First light on silicon.** Finish line: `hello` on every core of a p150, then every test passing on the card. Before the card arrives: tests that can run on `Card`, and a bring-up checklist of everything only ttsim has confirmed.
 3. **Fast.** Finish line: a matmul benchmark with a number, measured against the chip's peak and improved over time (tile reuse, deeper pipelines, the MOP expander).
 
@@ -306,6 +306,10 @@ Book-keeping happens at run time, in each program, because what a tile does depe
 **gelu** is GPT-2's tanh form, built from what is there: `0.5 x (1 + tanh(z))` is `x / (1 + e^(-2z))`, so `x * (1 + exp(x (-k c x^2 - k))).reciprocal()` with `k = 2 sqrt(2/pi)`, `c = 0.044715`. One kernel; within 2% of numpy after the bf16 rounding of each step.
 
 **Upload and download** go a tile at a time through the `array` module (floats to fp32 bytes, then bf16 bits with one list comprehension), about 10x faster than a struct call per value, which matters at GPT-2's 768 x 3072.
+
+**A GPT-2 layer** (`test_gpt2_layer`). GPT-2 small's block: 768 wide, 12 heads of 64, MLP 3072, on 16 tokens, with weights drawn the way GPT-2 initialises them. `gpt2_layer` is written once and runs on both trickle `Tensor`s and numpy arrays (the reference, float64, same bf16 weights). Layer norms are one launch each; q, k and v are 64-column views of one qkv result; each head is `q @ k.T`, scaled, plus a causal mask, softmax, `@ v`, then its 64 rows of `w_proj`, and the 12 heads are summed (the same as concatenating them, with no concat). 49 launches, about 6 s on ttsim. Every intermediate is bf16, so the block's change to x matches to within 2% of its size (0.03 against 1.7). Breaking the row mask, the tidy padding, the transpose's face swap or the views' offsets each fails it.
+
+**Too big for one kernel.** A kernel holds at most 15 ops (SEM_L1 is 4 bits); the 12 heads' sum alone is 23. `realize` counts the ops a kernel would get and, while there are too many, realizes the operand with the most first, on its own.
 
 **MNIST** (`test_mnist_mlp`): 784 -> 128 -> 10 with relu and biases on a batch of 16, two launches, against numpy in float64: logits within 2%, and the same predicted classes wherever the top two are not a near tie. It found a bug as old as matmul fusion: the kernel took its row width from every input, including a matmul's A, whose columns are K. With K wider than the result (784 against 128) the units were cut wrong and whole result tiles were never computed. The tests had only multiplied with K at most the result's width. Now the width comes from what elementwise ops and reductions sweep.
 

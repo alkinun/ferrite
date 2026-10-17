@@ -605,6 +605,8 @@ class Tensor:
 
   def realize(self):
     if self.op is None: return self
+    while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): its biggest part goes first, on its own
+      max((s for s in self.srcs if s.op), key=lambda s: _ops(s, set())).realize()
     inputs = []
     e = _expr(self, self.rows, inputs)
     key = (e, tuple((u.rows, u.cols) for u in inputs))
@@ -649,6 +651,11 @@ class Tensor:
     assert self.cols == other.rows, f"({self.rows}, {self.cols}) @ ({other.rows}, {other.cols})"
     if self.cols == 1: return self * other  # (R, 1) @ (1, C) is broadcasting
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other))
+
+def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
+  if t.op is None or id(t) in seen: return 0
+  seen.add(id(t))
+  return 1 + (0 if t.op == "matmul" else sum(_ops(s, seen) for s in t.srcs))
 
 def _expr(t, rows, inputs):  # the tree of unrealized ops under t, realized tensors as numbers into inputs
   if t.op is None:

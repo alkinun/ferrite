@@ -362,6 +362,46 @@ def test_mnist_mlp(chip):
   clear = top2[:, 1] - top2[:, 0] > 0.05
   assert clear.sum() >= 8 and (logits.argmax(1) == want.argmax(1))[clear].all()
 
+def gpt2_layer(x, p, heads):
+  """One GPT-2 transformer block (pre-layer-norm attention, then MLP, each added back), written once for both trickle
+  Tensors and numpy arrays; p holds the weights (mask: 0 on and below the diagonal, -1e9 above)."""
+  numpy, d = isinstance(x, np.ndarray), x.shape[1] if isinstance(x, np.ndarray) else x.cols
+  hd = d // heads
+  if numpy:
+    rowsum, rowmax, exp, rsqrt, t = (lambda a: a.sum(1, keepdims=True)), (lambda a: a.max(1, keepdims=True)), np.exp, (lambda a: a**-0.5), (lambda a: a.T)
+    gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
+  else:
+    rowsum, rowmax, exp, rsqrt, t, gelu = Tensor.rowsum, Tensor.rowmax, Tensor.exp, Tensor.rsqrt, (lambda a: a.T), Tensor.gelu
+  def layernorm(x, g, b):
+    c = x - rowsum(x) * (1 / d)
+    return c * rsqrt(rowsum(c * c) * (1 / d) + 1e-5) * g + b
+  qkv = layernorm(x, p["ln1_g"], p["ln1_b"]) @ p["w_qkv"] + p["b_qkv"]
+  y = 0
+  for i in range(heads):  # each head's attention, projected by its rows of w_proj and summed (the same as concatenating)
+    q, k, v = (qkv[:, j * d + i * hd:j * d + (i + 1) * hd] for j in range(3))
+    s = q @ t(k) * (1 / math.sqrt(hd)) + p["mask"]
+    e = exp(s - rowmax(s))
+    y = (e / rowsum(e)) @ v @ p["w_proj"][i * hd:(i + 1) * hd, :] + y
+  x = x + y + p["b_proj"]
+  return x + gelu(layernorm(x, p["ln2_g"], p["ln2_b"]) @ p["w_fc"] + p["b_fc"]) @ p["w_mlp"] + p["b_mlp"]
+
+def test_gpt2_layer(chip):
+  # goal 1's finish line: a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on 16 tokens, against the same code
+  # in numpy, float64, with the same bf16 weights. Weights as GPT-2 initialises them; the attention is causal and not
+  # uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to ~2) must match
+  # to within 3% of its size
+  rt, rng, n, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 16, 768
+  shapes = {"ln1_g": (1, d, 1), "ln1_b": (1, d, 0), "w_qkv": (d, 3 * d, 0), "b_qkv": (1, 3 * d, 0), "w_proj": (d, d, 0),
+            "b_proj": (1, d, 0), "ln2_g": (1, d, 1), "ln2_b": (1, d, 0), "w_fc": (d, 4 * d, 0), "b_fc": (1, 4 * d, 0),
+            "w_mlp": (4 * d, d, 0), "b_mlp": (1, d, 0)}
+  p = {k: bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, c))) for k, (r, c, mean) in shapes.items()}
+  p["mask"] = np.triu(np.full((n, n), -1e9), 1)
+  x = bf16(rng.normal(0, 1, (n, d)))
+  got = np.array(gpt2_layer(Tensor.of(rt, x.tolist()), {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}, 12).tolist())
+  want = gpt2_layer(x, p, 12)
+  change = np.abs(want - x).max()
+  assert change > 1 and np.abs(got - want).max() < 0.03 * change, (np.abs(got - want).max(), change)
+
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
   # staying in Dst and their results in L1. softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)), three passes;
