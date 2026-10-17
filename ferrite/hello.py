@@ -5,19 +5,19 @@ from ferrite.chip import Chip
 from ferrite.runtime import Runtime, compile_kernel
 
 FIB = """
-void kmain(volatile unsigned *args) {  // args: [n, fib(n)]
+void kmain(volatile unsigned *args) {  // args: [first unit, units, n, then fib(n)]
   unsigned a = 0, b = 1;
-  for (unsigned i = 0; i < args[0]; i++) { unsigned t = a + b; a = b; b = t; }
-  args[1] = a;
+  for (unsigned i = 0; i < args[2]; i++) { unsigned t = a + b; a = b; b = t; }
+  args[3] = a;
 }
 """
 
 def hello(chip, start, end, n):
   """fib(n) on every worker in the rectangle from start to end: {core: answer}."""
   rt = Runtime(chip, start, end)
-  rt.launch(compile_kernel(FIB), lambda x, y: (n, 0))
+  rt.launch(compile_kernel(FIB), (n, 0))
   rt.wait()
-  return {(x, y): chip.read32(x, y, rt.args() + 4) for x, y in rt.cores}
+  return {(x, y): chip.read32(x, y, rt.args() + 12) for x, y in rt.cores}
 
 if __name__ == "__main__":
   chip = Chip(pci.open_device())

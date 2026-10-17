@@ -764,10 +764,7 @@ class Tensor:
   def _run(self, kernel, *args, units=None):
     """Queue kernel over this tensor's tiles, or rows, split evenly over as many workers as have any. Nothing waits for
     it: launches run in order, so the next kernel reads this result, and reading it back (tobytes) waits."""
-    units = units or self.tiles
-    cores = self.rt.cores[:units]
-    share = {xy: (i * units // len(cores), (i + 1) * units // len(cores)) for i, xy in enumerate(cores)}
-    self.rt.launch(kernel, lambda x, y: (share[x, y][0], share[x, y][1] - share[x, y][0], *args), len(cores))
+    self.rt.launch(kernel, args, units or self.tiles)
     return self
 
   def _elementwise(self, op, other):

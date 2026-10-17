@@ -27,5 +27,6 @@ if __name__ == "__main__":
   m, k, n = map(int, sys.argv[1:4]) if len(sys.argv) > 3 else (512, 768, 3072)
   seconds, tflops, reread = bench(chip, m, k, n)
   peak = len(chip.tensix) * bh.MVMUL_FLOPS * bh.AICLK / 4 / 1e12  # four fidelity phases, as our matmuls do
-  print(f"{m}x{k} @ {k}x{n}: {seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at full precision"
-        f"{' (ttsim cycles, not silicon time)' if isinstance(chip.pci, pci.Sim) else ''}; DRAM reads {reread:.1f}x the inputs")
+  speed = (f"{seconds * bh.AICLK / 1e3:.1f}k ttsim cycles (it does not time Tensix instructions: a count of work, not silicon time)"
+           if isinstance(chip.pci, pci.Sim) else f"{seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at full precision")
+  print(f"{m}x{k} @ {k}x{n}: {speed}; DRAM reads {reread:.1f}x the inputs")

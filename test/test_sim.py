@@ -70,16 +70,16 @@ def test_relaunch_without_reset(chip):
   cores = rt.cores
   for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 2):
     rt.evict()
-    rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] {op} 3; }}"), lambda x, y: (x * 100 + y + i, 0))
+    rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ a[3] = (noc_me() + a[2]) {op} 3; }}"), (i, 0))
     rt.wait()
-    for x, y in cores: assert chip.read32(x, y, rt.args() + 4) == f(x * 100 + y + i, 3), f"launch {i} on {x},{y}"
+    for x, y in cores: assert chip.read32(x, y, rt.args() + 12) == f((x | y << 6) + i, 3), f"launch {i} on {x},{y}"
   # kernels stay loaded until the room is full; then the next load evicts them all (once the queue is done)
   big = [compile_kernel(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] + {k}; }}").ljust(300_000, b"\0") for k in (1, 2)]
   rt.evict()
   for k, image in enumerate(big + big):
-    rt.launch(image, lambda x, y: (x, 0))
+    rt.launch(image)
     rt.wait()
-    assert rt.loaded == {image: KERNELS} and all(chip.read32(x, y, rt.args() + 4) == x + k % 2 + 1 for x, y in cores)
+    assert rt.loaded == {image: KERNELS} and all(chip.read32(x, y, rt.args() + 4) == i + k % 2 + 1 for i, (x, y) in enumerate(cores))
 
 def test_kernel_moves_data(chip):
   # each core pulls its own 40 KiB slice of DRAM into L1 (3 NoC packets), adds its index to every word, writes it
@@ -88,16 +88,15 @@ def test_kernel_moves_data(chip):
   cores, (bx, by), src, dst = rt.cores, bh.DRAM[3], 1 << 20, 2 << 20
   data = [random.randbytes(n) for _ in cores]
   for i, d in enumerate(data): chip.write(bx, by, src + i * n, d)
-  args = {xy: (i, bx, by, src + i * n, dst + i * n, n, *cores[(i + 1) % len(cores)]) for i, xy in enumerate(cores)}
   rt.launch(compile_kernel("""
-void kmain(volatile unsigned *a) {  // a: [index, bank x, bank y, src, dst, n, next x, next y]
-  unsigned *buf = (unsigned *)L1_DATA;
-  noc_read(a[1], a[2], a[3], L1_DATA, a[5]);
+void kmain(volatile unsigned *a) {  // a: [index, 1, bank x, bank y, src, dst, n, workers, each worker's x | y << 6]
+  unsigned i = a[0], *buf = (unsigned *)L1_DATA, next = a[8 + (i + 1) % a[7]];
+  noc_read(a[2], a[3], a[4] + i * a[6], L1_DATA, a[6]);
   noc_wait();
-  for (unsigned i = 0; i < a[5] / 4; i++) buf[i] += a[0];
-  noc_write(L1_DATA, a[1], a[2], a[4], a[5]);
-  noc_write(L1_DATA, a[6], a[7], L1_DATA + a[5], 64);
-}"""), lambda x, y: args[x, y])
+  for (unsigned k = 0; k < a[6] / 4; k++) buf[k] += i;
+  noc_write(L1_DATA, a[2], a[3], a[5] + i * a[6], a[6]);
+  noc_write(L1_DATA, next & 63, next >> 6, L1_DATA + a[6], 64);
+}"""), (bx, by, src, dst, n, len(cores), *[x | y << 6 for x, y in cores]))
   rt.wait()
   out = [struct.pack(f"<{n // 4}I", *[(w + i) & 0xFFFFFFFF for w in struct.unpack(f"<{n // 4}I", d)]) for i, d in enumerate(data)]
   for i, ((x, y), o) in enumerate(zip(cores, out)):
@@ -109,14 +108,14 @@ def test_queue(chip):
   # dispatcher wraps around it six times. Each launch adds its index to a word in every worker's L1.
   rt = Runtime(chip, chip.tensix[0], chip.tensix[2], ring=2048)
   for x, y in rt.cores: chip.write32(x, y, DATA, 0)
-  add = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[0]; }")
+  add = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[2]; }")
   rt.load(add)  # once, before: then it stays
   writes, write = [], chip.pci.write
   chip.pci.write = lambda *a: (writes.append(a), write(*a))
   try:
     for i in range(100):
       before = len(writes)
-      rt.launch(add, lambda x, y: (i,))
+      rt.launch(add, (i,))
       assert len(writes) - before == 1, "a launch is one PCIe write: the doorbell"
   finally: chip.pci.write = write
   rt.wait()
