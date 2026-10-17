@@ -14,6 +14,7 @@ Each has a finish line we can check. Ticked when a test shows it.
    - [x] views, transpose, gelu (`test_views_transpose_gelu`)
    - [x] halfway: a small MNIST network (matmuls, bias, relu) matches (`test_mnist_mlp`)
    - [x] a GPT-2 layer (layer norm, attention, MLP) matches (`test_gpt2_layer`)
+   - [x] beyond it: GPT-2 small's real weights generate text, token for token the same as numpy and Hugging Face (`test/gpt2.py`, `test_gpt2_model`)
 2. **First light on silicon.** Finish line: `hello` on every core of a p150, then every test passing on the card. Before the card arrives: tests that can run on `Card`, and a bring-up checklist of everything only ttsim has confirmed.
 3. **Fast.** Finish line: a matmul benchmark with a number, measured against the chip's peak and improved over time (tile reuse, deeper pipelines, the MOP expander).
 
@@ -310,6 +311,15 @@ Book-keeping happens at run time, in each program, because what a tile does depe
 **Upload and download** go a tile at a time through the `array` module (floats to fp32 bytes, then bf16 bits with one list comprehension), about 10x faster than a struct call per value, which matters at GPT-2's 768 x 3072.
 
 **A GPT-2 layer** (`test_gpt2_layer`). GPT-2 small's block: 768 wide, 12 heads of 64, MLP 3072, on 16 tokens, with weights drawn the way GPT-2 initialises them. `gpt2_layer` is written once and runs on both trickle `Tensor`s and numpy arrays (the reference, float64, same bf16 weights). Layer norms are one launch each; q, k and v are 64-column views of one qkv result; each head is `q @ k.T`, scaled, plus a causal mask, softmax, `@ v`, then its 64 rows of `w_proj`, and the 12 heads are summed (the same as concatenating them, with no concat). 49 launches, about 6 s on ttsim. Every intermediate is bf16, so the block's change to x matches to within 2% of its size (0.03 against 1.7). Breaking the row mask, the tidy padding, the transpose's face swap or the views' offsets each fails it.
+
+**GPT-2 small, the real thing** (`test/gpt2.py`, `test_gpt2_model` when `GPT2=` names the weights). Hugging Face's `openai-community/gpt2` `model.safetensors` (float32, read with numpy and rounded to bf16), tiktoken's `gpt2` tokenizer. `forward` is written once for Tensors and numpy arrays: token and position embeddings, 12 blocks, the last layer norm, and the output layer, which is the token embedding again. The numpy version, in fp32, matches Hugging Face's own GPT-2 to 1e-4 in the logits, so it is the model and not just a copy of our mistakes. On ttsim, greedy from "The meaning of life is", trickle writes " not the same as the meaning of death", the same 8 tokens as numpy and as Hugging Face, each step's 50257 logits within about 1.5 (they span about 100). What it took:
+
+- `Tensor.frombytes` / `tobytes`: bf16 in row-major order, moved into tile order 16 values at a time with no per-value Python work. All 124M weights are on the chip in 5 s.
+- `Tensor.gather(ids)`, the embedding lookup: a BRISC-only kernel that copies each row's two 32-byte runs out of the table's tiles. A NoC read from DRAM keeps its low 6 address bits, so a run comes in as the 64-byte block holding it and is copied into place.
+- The output layer multiplies by `wte.T`, transposed on the chip once (37,700 tiles, 1.4 s on ttsim).
+- Logits only for the last position: `gather([n - 1])` of the final layer norm, a filled one-row tile.
+- No KV cache: up to 32 tokens are one tile row anyway, so a step costs the same either way. 27 s a token on ttsim, about 120,000 matmul steps (one per weight tile); the output layer is 7 s of that. On silicon the same work is a few milliseconds.
+- `Tensor._run` waits up to 60 s: on the simulator the biggest kernels take seconds.
 
 **Too big for one kernel.** A kernel holds at most 15 ops (SEM_L1 is 4 bits); the 12 heads' sum alone is 23. `realize` counts the ops a kernel would get and, while there are too many, realizes the operand with the most first, on its own.
 

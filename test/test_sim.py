@@ -7,6 +7,7 @@ from trickle import compiler
 from trickle.compiler import Tensor, from_bf16, to_bf16
 from trickle.hello import hello
 from trickle.runtime import ARGS, DATA, Runtime, compile_kernel
+import gpt2
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
   b = np.asarray(a, np.float32).view(np.uint32)
@@ -340,6 +341,8 @@ def test_views_transpose_gelu(chip):
   close(tx.T + trow.T, x.T + row.T, 2**-7)
   q, k = ty[:, 64:128], ty[:, 128:192]  # one head's query and key
   close(q @ k.T, y[:, 64:128] @ y[:, 128:192].T, 2**-6)
+  assert tx.gather([5, 0, 69, 37, 5]).tolist() == x[[5, 0, 69, 37, 5]].tolist()  # rows from both tile rows, one twice
+  close(tx + tx.gather([7]), x + x[7], 2**-7)  # a single row fills its tile, so it broadcasts
   gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
   close(tx.gelu(), gelu(x), 0.02)
 
@@ -362,45 +365,33 @@ def test_mnist_mlp(chip):
   clear = top2[:, 1] - top2[:, 0] > 0.05
   assert clear.sum() >= 8 and (logits.argmax(1) == want.argmax(1))[clear].all()
 
-def gpt2_layer(x, p, heads):
-  """One GPT-2 transformer block (pre-layer-norm attention, then MLP, each added back), written once for both trickle
-  Tensors and numpy arrays; p holds the weights (mask: 0 on and below the diagonal, -1e9 above)."""
-  numpy, d = isinstance(x, np.ndarray), x.shape[1] if isinstance(x, np.ndarray) else x.cols
-  hd = d // heads
-  if numpy:
-    rowsum, rowmax, exp, rsqrt, t = (lambda a: a.sum(1, keepdims=True)), (lambda a: a.max(1, keepdims=True)), np.exp, (lambda a: a**-0.5), (lambda a: a.T)
-    gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
-  else:
-    rowsum, rowmax, exp, rsqrt, t, gelu = Tensor.rowsum, Tensor.rowmax, Tensor.exp, Tensor.rsqrt, (lambda a: a.T), Tensor.gelu
-  def layernorm(x, g, b):
-    c = x - rowsum(x) * (1 / d)
-    return c * rsqrt(rowsum(c * c) * (1 / d) + 1e-5) * g + b
-  qkv = layernorm(x, p["ln1_g"], p["ln1_b"]) @ p["w_qkv"] + p["b_qkv"]
-  y = 0
-  for i in range(heads):  # each head's attention, projected by its rows of w_proj and summed (the same as concatenating)
-    q, k, v = (qkv[:, j * d + i * hd:j * d + (i + 1) * hd] for j in range(3))
-    s = q @ t(k) * (1 / math.sqrt(hd)) + p["mask"]
-    e = exp(s - rowmax(s))
-    y = (e / rowsum(e)) @ v @ p["w_proj"][i * hd:(i + 1) * hd, :] + y
-  x = x + y + p["b_proj"]
-  return x + gelu(layernorm(x, p["ln2_g"], p["ln2_b"]) @ p["w_fc"] + p["b_fc"]) @ p["w_mlp"] + p["b_mlp"]
-
 def test_gpt2_layer(chip):
   # goal 1's finish line: a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on 16 tokens, against the same code
-  # in numpy, float64, with the same bf16 weights. Weights as GPT-2 initialises them; the attention is causal and not
-  # uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to ~2) must match
-  # to within 3% of its size
+  # (test/gpt2.py) in numpy, float64, with the same bf16 weights. Weights as GPT-2 initialises them; the attention is
+  # causal and not uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to
+  # ~2) must match to within 3% of its size
   rt, rng, n, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 16, 768
-  shapes = {"ln1_g": (1, d, 1), "ln1_b": (1, d, 0), "w_qkv": (d, 3 * d, 0), "b_qkv": (1, 3 * d, 0), "w_proj": (d, d, 0),
-            "b_proj": (1, d, 0), "ln2_g": (1, d, 1), "ln2_b": (1, d, 0), "w_fc": (d, 4 * d, 0), "b_fc": (1, 4 * d, 0),
-            "w_mlp": (4 * d, d, 0), "b_mlp": (1, d, 0)}
+  shapes = {"ln_1.weight": (1, d, 1), "ln_1.bias": (1, d, 0), "attn.c_attn.weight": (d, 3 * d, 0), "attn.c_attn.bias": (1, 3 * d, 0),
+            "attn.c_proj.weight": (d, d, 0), "attn.c_proj.bias": (1, d, 0), "ln_2.weight": (1, d, 1), "ln_2.bias": (1, d, 0),
+            "mlp.c_fc.weight": (d, 4 * d, 0), "mlp.c_fc.bias": (1, 4 * d, 0), "mlp.c_proj.weight": (4 * d, d, 0), "mlp.c_proj.bias": (1, d, 0)}
   p = {k: bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, c))) for k, (r, c, mean) in shapes.items()}
-  p["mask"] = np.triu(np.full((n, n), -1e9), 1)
   x = bf16(rng.normal(0, 1, (n, d)))
-  got = np.array(gpt2_layer(Tensor.of(rt, x.tolist()), {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}, 12).tolist())
-  want = gpt2_layer(x, p, 12)
+  got = np.array(gpt2.layer(Tensor.of(rt, x.tolist()), {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}, Tensor.of(rt, gpt2.mask(n).tolist())).tolist())
+  want = gpt2.layer(x, p, gpt2.mask(n))
   change = np.abs(want - x).max()
   assert change > 1 and np.abs(got - want).max() < 0.03 * change, (np.abs(got - want).max(), change)
+
+@pytest.mark.skipif("GPT2" not in os.environ, reason="GPT2=/path/to/model.safetensors (Hugging Face openai-community/gpt2) runs it")
+def test_gpt2_model(chip):
+  # goal 1, bigger: GPT-2 small's real weights, all 12 blocks, the embeddings (gathered on the chip) and the output layer
+  # (the token embedding transposed on the chip). After "The meaning of life is", the next token's 50257 logits against
+  # the same model in numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and the same pick:
+  # " not". About 30 s on ttsim; test/gpt2.py generates text
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  weights = gpt2.load(os.environ["GPT2"])
+  ids = [464, 3616, 286, 1204, 318]  # "The meaning of life is" (tiktoken's gpt2 encoding)
+  got, want = gpt2.logits(ids, gpt2.upload(rt, weights), rt), gpt2.logits(ids, gpt2.arrays(weights))
+  assert got.argmax() == want.argmax() == 407 and np.abs(got - want).max() < 3, np.abs(got - want).max()
 
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions

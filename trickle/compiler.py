@@ -519,6 +519,34 @@ def fused_kernel(expr, shapes):
   return compile_kernel(_brisc(zero, total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
 
 
+def gather_kernel():
+  """Rows of a tensor into a new one, args [first unit, units, out, the tensor's address, tile stride, tile offset, the
+  result's tile columns, rows, their indices...]. BRISC alone: for each result tile, each row's two 16-datum runs (left
+  and right face) come from wherever that row sits in the tensor's tiles. A NoC read from DRAM must keep its address's
+  low 6 bits, so each run comes in as the 64-byte block holding it and is copied into place from there."""
+  return compile_kernel(f"""
+#define SLOT {SLOTS:#x}
+#define BLOCK {SLOTS + TILE:#x}
+{_array("bank", [x | y << 6 for x, y in bh.DRAM])}
+void kmain(volatile unsigned *a) {{
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned t = a[0] + u, i = t / a[6], j = t % a[6];
+    for (unsigned r = 0; r < 32; r++) {{
+      unsigned row = a[7] == 1 ? 0 : i * 32 + r;  // one row fills the tile
+      for (unsigned face = r / 16 * 2; face < r / 16 * 2 + 2; face++) {{
+        volatile unsigned *to = (volatile unsigned *)(SLOT + face * 512 + r % 16 * 32);
+        if (row >= a[7]) {{ for (unsigned k = 0; k < 8; k++) to[k] = 0; continue; }}
+        unsigned id = a[8 + row], from = id / 32 * a[4] + j + a[5], at = (id % 32 / 16 * 2 + face % 2) * 512 + id % 16 * 32;
+        noc_read(bank[from % 8] & 63, bank[from % 8] >> 6, a[3] + from / 8 * {TILE} + at / 64 * 64, BLOCK, 64);
+        noc_wait();
+        for (unsigned k = 0; k < 8; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
+      }}
+    }}
+    noc_write(SLOT, bank[t % 8] & 63, bank[t % 8] >> 6, a[2] + t / 8 * {TILE}, {TILE});
+    noc_wait();
+  }}
+}}""")
+
 def transpose_kernel(rows, cols):
   """x.T for x of (rows, cols), args [first unit, units, out, x's address, tile stride, tile offset]: result tile (i, j)
   is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal faces swapped, and unpacker 0 transposes
@@ -565,31 +593,48 @@ class Tensor:
   @classmethod
   def of(cls, rt, rows):
     """From a list of rows of numbers, rounded to bf16 (to nearest even)."""
-    t, ct = cls(rt, len(rows), len(rows[0])), -(-len(rows[0]) // 32)
+    bits = array.array("I", array.array("f", [v for row in rows for v in row]).tobytes())
+    return cls.frombytes(rt, len(rows), len(rows[0]), array.array("H", [(b + 0x7FFF + (b >> 16 & 1)) >> 16 for b in bits]))
+
+  @classmethod
+  def frombytes(cls, rt, rows, cols, data):
+    """From bf16 in row-major order (2 bytes a value, little-endian). Runs of 16 values are copied into tile order as
+    they are, nothing per value, which is what makes a model's weights quick to load."""
+    t, ct, data, pad = cls(rt, rows, cols), -(-cols // 32), memoryview(data).cast("B"), bytes(32)
+    assert len(data) == 2 * rows * cols, f"{len(data)} bytes for {rows} x {cols}"
     for i in range(t.tiles):
       r0, c0, tile = i // ct * 32, i % ct * 32, []
       for face in range(4):  # 16 rows of 16, face by face (see tile_index)
         c = c0 + face % 2 * 16
         for r in range(r0 + face // 2 * 16, r0 + face // 2 * 16 + 16):
-          row = rows[0] if t.rows == 1 else rows[r] if r < t.rows else []
-          run = row[:1] * 16 if t.cols == 1 else row[c:c + 16]  # a dimension of 1 fills the tile; the rest pads with 0
-          tile += [*run, *[0.0] * (16 - len(run))]
-      bits = array.array("I", array.array("f", tile).tobytes())
-      t.rt.chip.write(*t._where(i // ct, i % ct), array.array("H", [(b + 0x7FFF + (b >> 16 & 1)) >> 16 for b in bits]).tobytes())
+          r = 0 if rows == 1 else r  # a dimension of 1 fills the tile; the rest pads with 0
+          run = b"" if r >= rows else bytes(data[2 * r * cols:2 * r * cols + 2]) * 16 if cols == 1 else bytes(data[2 * (r * cols + c):2 * (r * cols + min(c + 16, cols))])
+          tile.append(run + pad[len(run):])
+      t.rt.chip.write(*t._where(i // ct, i % ct), b"".join(tile))
     return t
 
-  def tolist(self):
+  def tobytes(self):
+    """bf16 in row-major order, as frombytes takes it."""
     self.realize()
-    out, ct = [[0.0] * self.cols for _ in range(self.rows)], -(-self.cols // 32)
+    out, ct = bytearray(2 * self.rows * self.cols), -(-self.cols // 32)
     for i in range(self.tiles):
-      r0, c0 = i // ct * 32, i % ct * 32
-      bits = array.array("I", [b << 16 for b in array.array("H", self.rt.chip.read(*self._where(i // ct, i % ct), TILE))])
-      tile = array.array("f", bits.tobytes()).tolist()
+      r0, c0, tile = i // ct * 32, i % ct * 32, self.rt.chip.read(*self._where(i // ct, i % ct), TILE)
       for face in range(4):
         c, n = c0 + face % 2 * 16, min(16, self.cols - c0 - face % 2 * 16)
         for k, r in enumerate(range(r0 + face // 2 * 16, min(r0 + face // 2 * 16 + 16, self.rows))):
-          if n > 0: out[r][c:c + n] = tile[face * 256 + k * 16:face * 256 + k * 16 + n]
-    return out
+          if n > 0: out[2 * (r * self.cols + c):2 * (r * self.cols + c + n)] = tile[face * 512 + k * 32:face * 512 + k * 32 + 2 * n]
+    return bytes(out)
+
+  def tolist(self):
+    values = array.array("f", array.array("I", [b << 16 for b in array.array("H", self.tobytes())]).tobytes()).tolist()
+    return [values[r * self.cols:(r + 1) * self.cols] for r in range(self.rows)]
+
+  def gather(self, ids):
+    """Rows ids of this tensor, as a tensor: an embedding lookup. A data-movement kernel (see gather_kernel)."""
+    assert all(0 <= i < self.rows for i in ids)
+    out, ct = Tensor(self.rt, len(ids), self.cols), -(-self.cols // 32)
+    kernel = kernels.get("gather") or kernels.setdefault("gather", gather_kernel())
+    return out._run(kernel, out.addr, self.realize().addr, self.stride, self.offset, ct, len(ids), *ids)
 
   def __getitem__(self, key):
     """x[r0:r1, c0:c1], a view of whole tiles: starts on tile boundaries, and ends too unless at the tensor's end. No
@@ -627,7 +672,7 @@ class Tensor:
     cores = self.rt.cores[:units]
     share = {xy: (i * units // len(cores), (i + 1) * units // len(cores)) for i, xy in enumerate(cores)}
     self.rt.launch(kernel, lambda x, y: (share[x, y][0], share[x, y][1] - share[x, y][0], *args), len(cores))
-    self.rt.wait()
+    self.rt.wait(60)  # a model's biggest kernels take seconds on the simulator (milliseconds on a chip)
     return self
 
   def _elementwise(self, op, other):
