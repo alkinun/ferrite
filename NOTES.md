@@ -114,7 +114,7 @@ Per Tensix tile, `RISCV_DEBUG_REG_SOFT_RESET_0` at `0xFFB1_21B0`, reachable over
 
 Other bits reset parts of the Tensix coprocessor. There is no atomic set/clear; it is read-modify-write. Power-on value is `0x47800`, all five cores held (sim; ISA does not say). umd releases with `0x80047000`: bit 31 is "staggered start", which spreads core start-up across the chip (power, not function; sim ignores it).
 
-To run code on a core: write `0x47800` (hold everything), write the program into L1, write `0x47000` (release BRISC only), poll L1 for its result with a timeout, write `0x47800` again. That is `Chip.run`/`Chip.halt`.
+To run code on a core: write `0x47800` (hold everything), write the program into L1, write `0x47000` (release BRISC only), poll L1 for its result with a timeout, write `0x47800` again. `Chip.halt` holds a rectangle; `Runtime` boots it and releases BRISC and the TRISCs.
 
 Leaving reset: the instruction cache is invalidated, GPRs are zeroed, the PC is set (below), and the core's data RAM zeroes itself over up to 2048 cycles unless `RISCV_DEBUG_REG_DISABLE_RESET` (`0xFFB1_2224`) says not to. So: load code while the core is held, and do not preload data RAM over the NoC without setting that bit.
 

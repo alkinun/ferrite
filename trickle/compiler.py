@@ -1,13 +1,14 @@
 # The compiler: tensor ops emitted as Tensix instructions straight from the ISA, no LLK. A tensor lives in DRAM as
-# bf16 32x32 tiles, tile i in bank i % 8. Ops are lazy: a tree of elementwise ops, matmuls and SFPU ops (relu, exp,
-# reciprocal) becomes one fused kernel, which fetches each input tile once, keeps every intermediate in L1 and writes
-# only the result to DRAM. A kernel is four programs for each worker tile: BRISC fetches operand tiles into L1 over the
+# bf16 32x32 tiles, tile i in bank i % 8. Ops are lazy: a tree of elementwise ops, matmuls, SFPU ops (relu, exp,
+# reciprocal, rsqrt) and row reductions becomes one fused kernel, which fetches each input tile once, keeps every
+# intermediate in L1 and writes only the result to DRAM. A kernel is four programs for each worker tile: BRISC fetches operand tiles into L1 over the
 # NoC and sends results home, and each TRISC feeds one Tensix thread its instructions (unpack, math, pack), the three
 # running at the same time on different tiles.
 #
 # Tile layout: four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face
-# row-major. The ISA has no notion of a tile; this is the layout the FPU's 16x16 matrix multiply wants. An unpacker
-# reads a whole tile into a SrcA/SrcB bank, so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
+# row-major, so datum (r, c) is at (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16. The ISA has no notion of a
+# tile; this is the layout the FPU's 16x16 matrix multiply wants. An unpacker reads a whole tile into a SrcA/SrcB bank,
+# so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
 import array, math, struct
 from trickle import bh
 from trickle.runtime import DATA, SYNC, compile_kernel
@@ -160,7 +161,6 @@ SFPU = {
 # Reductions along rows: x + 0 lands in Dst (the first column tile in the result's half, the rest 128 rows further
 # on, where the SFPU folds them in). Then each row is folded across its 32 columns and the result written to all of
 # them, so the tile broadcasts along rows as is.
-STREAMED = ("matmul", "rowsum", "rowmax")  # ops that stream their own operand tiles instead of reading a frame slot
 def fold(kind, d, t):  # LReg d = d op t (for max, t is left with the min)
   return ins("SFPSWAP", vd=t, vc=d, mod1=1) if kind == "rowmax" else mad(d, t, ONE, d)
 COMBINE = {k: [ins("SFPLOAD", vd=0, mod0=3, addr_mode=2), ins("SFPLOAD", vd=1, mod0=3, addr_mode=2, imm10=128), fold(k, 0, 1), sfp_store(0)]
@@ -246,6 +246,7 @@ def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU jus
           SFPU[u][0] + runs(slots, u, 32)]
 
 def _array(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
+def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }}"  # one program per Dst half, by h
 
 def tt(words):
   """C for a TRISC to push words to its thread as .ttinsn instructions: each word rotated left by 2 and written into
@@ -441,7 +442,6 @@ def fused_kernel(expr, shapes):
     rows, cols = tiles[i]
     return f"{'i_' if rows > 1 else 0} * a[{4 + 3 * i}] + {'j' if cols > 1 else 0} + a[{5 + 3 * i}]"
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
-  def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }}"  # one per Dst half
   rows, cols = size(("op", root))
   def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
     if j != root: return tt(MATH_END)
@@ -558,14 +558,11 @@ def transpose_kernel(rows, cols):
     unsigned t = a[0] + u;
     if (u & 1) {{ {per_frame[1]} }} else {{ {per_frame[0]} }}
   }}"""
-  halves = lambda programs: f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }} h ^= 1;"
   return compile_kernel(
     _brisc(True, "a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t % {ct} * a[4] + t / {ct} + a[5], {frame(f)[0]}); ready(); frame_done[{f}] = ++events;" for f in (0, 1)])),
     _unpacker(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]), TRANSPOSING),
-    _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)])] * 2)),  # padding stays 0
-    _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + halves([pack(DST_HALF * h, frame(f)[1], SEM_PACKED) for h in (0, 1)]) for f in (0, 1)])))
-
-def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16  # where (r, c) of a tile sits in it
+    _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)]) + " h ^= 1;"] * 2)),  # padding stays 0
+    _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + halves([pack(DST_HALF * h, frame(f)[1], SEM_PACKED) for h in (0, 1)]) + " h ^= 1;" for f in (0, 1)])))
 
 class Tensor:
   """rows x cols of bf16: in DRAM as 32x32 tiles in row-major tile order, tile i in bank i % 8; or, until realized, an
@@ -604,7 +601,7 @@ class Tensor:
     assert len(data) == 2 * rows * cols, f"{len(data)} bytes for {rows} x {cols}"
     for i in range(t.tiles):
       r0, c0, tile = i // ct * 32, i % ct * 32, []
-      for face in range(4):  # 16 rows of 16, face by face (see tile_index)
+      for face in range(4):  # 16 rows of 16, face by face (the tile layout, at the top)
         c = c0 + face % 2 * 16
         for r in range(r0 + face // 2 * 16, r0 + face // 2 * 16 + 16):
           r = 0 if rows == 1 else r  # a dimension of 1 fills the tile; the rest pads with 0
@@ -632,9 +629,8 @@ class Tensor:
   def gather(self, ids):
     """Rows ids of this tensor, as a tensor: an embedding lookup. A data-movement kernel (see gather_kernel)."""
     assert all(0 <= i < self.rows for i in ids)
-    out, ct = Tensor(self.rt, len(ids), self.cols), -(-self.cols // 32)
-    kernel = kernels.get("gather") or kernels.setdefault("gather", gather_kernel())
-    return out._run(kernel, out.addr, self.realize().addr, self.stride, self.offset, ct, len(ids), *ids)
+    out = Tensor(self.rt, len(ids), self.cols)
+    return out._run(_cached("gather", gather_kernel), out.addr, self.realize().addr, self.stride, self.offset, -(-self.cols // 32), len(ids), *ids)
 
   def __getitem__(self, key):
     """x[r0:r1, c0:c1], a view of whole tiles: starts on tile boundaries, and ends too unless at the tensor's end. No
@@ -650,10 +646,8 @@ class Tensor:
   @property
   def T(self):
     """The transpose, computed now, in a kernel of its own (see transpose_kernel)."""
-    key = ("transpose", self.rows, self.cols)
-    kernel = kernels.get(key) or kernels.setdefault(key, transpose_kernel(self.rows, self.cols))
     out = Tensor(self.rt, self.cols, self.rows)
-    return out._run(kernel, out.addr, self.realize().addr, self.stride, self.offset)
+    return out._run(_cached(("transpose", self.rows, self.cols), lambda: transpose_kernel(self.rows, self.cols)), out.addr, self.realize().addr, self.stride, self.offset)
 
   def realize(self):
     if self.op is None: return self
@@ -662,7 +656,7 @@ class Tensor:
     inputs = []
     e = _expr(self, self.rows, inputs)
     key = (e, tuple((u.rows, u.cols) for u in inputs))
-    kernel = kernels.get(key) or kernels.setdefault(key, fused_kernel(*key))
+    kernel = _cached(key, lambda: fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
     rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
     return self._run(kernel, self.addr, *[v for t in inputs for v in (t.addr, t.stride, t.offset)], units=-(-self.rows // 32) if rowwise else None)
@@ -725,4 +719,7 @@ def _subexprs(e):
   if isinstance(e, tuple):
     for c in e[1:]: yield from _subexprs(c)
 
-kernels = {}  # (expression, input shapes) -> compiled kernel image
+kernels = {}  # (expression, input shapes), or a kernel's name and shape -> compiled kernel image
+def _cached(key, compile):
+  if key not in kernels: kernels[key] = compile()
+  return kernels[key]

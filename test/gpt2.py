@@ -26,7 +26,8 @@ def layernorm(x, g, b):
 def layer(x, p, mask, heads=HEADS):
   """One transformer block: attention then MLP, each after a layer norm and added back. p: the block's weights by their
   names in the file, less "h.<layer>."; mask: 0 on and below the diagonal, -1e9 above."""
-  f, d = fns(x), fns(x).width(x)
+  f = fns(x)
+  d = f.width(x)
   hd = d // heads
   qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
   y = 0
