@@ -12,11 +12,12 @@ HEADS = 12
 
 def fns(x):  # what numpy and trickle spell differently
   if isinstance(x, np.ndarray):
-    return SimpleNamespace(rowsum=lambda a: a.sum(1, keepdims=True), rowmax=lambda a: a.max(1, keepdims=True), exp=np.exp,
-                           rsqrt=lambda a: 1 / np.sqrt(a), rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[1],
+    split = lambda a, n, axis=1: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2) if axis else a.reshape(n, -1, a.shape[1])
+    return SimpleNamespace(rowsum=lambda a: a.sum(-1, keepdims=True), rowmax=lambda a: a.max(-1, keepdims=True), exp=np.exp,
+                           rsqrt=lambda a: 1 / np.sqrt(a), rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split,
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))))
   return SimpleNamespace(rowsum=Tensor.rowsum, rowmax=Tensor.rowmax, exp=Tensor.exp, rsqrt=Tensor.rsqrt, rows=Tensor.gather,
-                         width=lambda a: a.cols, gelu=Tensor.gelu)
+                         width=lambda a: a.cols, split=Tensor.split, gelu=Tensor.gelu)
 
 def layernorm(x, g, b):
   f = fns(x)
@@ -30,15 +31,15 @@ def layer(x, p, mask, heads=HEADS):
   d = f.width(x)
   hd = d // heads
   qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
-  kt, y = qkv[:, d:2 * d].T, 0  # every head's keys, transposed at once
-  for i in range(heads):  # each head's attention, through its rows of c_proj, summed: the same as concatenating them
-    q, v = qkv[:, i * hd:(i + 1) * hd], qkv[:, 2 * d + i * hd:2 * d + (i + 1) * hd]
-    s = q @ kt[i * hd:(i + 1) * hd, :] * (1 / math.sqrt(hd)) + mask
-    e = f.exp(s - f.rowmax(s))
-    y = (e / f.rowsum(e)) @ v @ p["attn.c_proj.weight"][i * hd:(i + 1) * hd, :] + y
-  x = x + y + p["attn.c_proj.bias"]
+  # the heads as a batch: queries and values split by columns, the keys transposed and split by rows
+  q, kt, v = f.split(qkv[:, :d], heads), f.split(qkv[:, d:2 * d].T, heads, 0), f.split(qkv[:, 2 * d:], heads)
+  s = q @ kt * (1 / math.sqrt(hd)) + mask
+  e = f.exp(s - f.rowmax(s))
+  y = (e / f.rowsum(e)) @ v @ f.split(p["attn.c_proj.weight"], heads, 0)  # each head through its rows of c_proj
+  # summed (the same as concatenating) with the bias, then added to x last: x is the large one, so it is rounded once
+  x = x + (sum(y[i] for i in range(1, heads)) + y[0] + p["attn.c_proj.bias"])
   h = layernorm(x, p["ln_2.weight"], p["ln_2.bias"]) @ p["mlp.c_fc.weight"] + p["mlp.c_fc.bias"]
-  return x + f.gelu(h) @ p["mlp.c_proj.weight"] + p["mlp.c_proj.bias"]
+  return x + (f.gelu(h) @ p["mlp.c_proj.weight"] + p["mlp.c_proj.bias"])
 
 def forward(ids, w, mask):
   """The logits for the token after ids: token and position embeddings, the blocks, a last layer norm, and the output

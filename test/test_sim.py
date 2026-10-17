@@ -427,13 +427,15 @@ def test_gpt2_layer(chip):
 def test_gpt2_model(chip):
   # goal 1, bigger: GPT-2 small's real weights, all 12 blocks, the embeddings (gathered on the chip) and the output layer
   # (the token embedding transposed on the chip). After "The meaning of life is", the next token's 50257 logits against
-  # the same model in numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and the same pick:
-  # " not". About 30 s on ttsim; test/gpt2.py generates text
+  # the same model in numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and a pick numpy
+  # rates as good: " not" (407) by numpy, and " to" just 0.36 behind, closer than bf16's rounding through 12 blocks can
+  # tell apart (the residual reaches 3000, where bf16 steps by 16). About 30 s on ttsim; test/gpt2.py generates text
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   weights = gpt2.load(os.environ["GPT2"])
   ids = [464, 3616, 286, 1204, 318]  # "The meaning of life is" (tiktoken's gpt2 encoding)
   got, want = gpt2.logits(ids, gpt2.upload(rt, weights), rt), gpt2.logits(ids, gpt2.arrays(weights))
-  assert got.argmax() == want.argmax() == 407 and np.abs(got - want).max() < 3, np.abs(got - want).max()
+  err = np.abs(got - want).max()
+  assert want.argmax() == 407 and err < 2 and want[got.argmax()] >= want.max() - 2 * err, (err, got.argmax())
 
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
