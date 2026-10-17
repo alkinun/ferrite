@@ -7,7 +7,7 @@ from trickle import bh
 # 4 + 4i). A worker: a mailbox [go, report x | y << 6, report address lo, hi, done] (done is 16-byte aligned like the
 # slot it is copied to), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for the kernel's cores to
 # talk through), kernel arguments, one kernel, then free space. The dispatcher: its config [doorbell, ring lo, hi, ring
-# size, status lo, hi, workers] and the workers' x | y << 6 after it, an outbox [go] [rptr, launches done], a done slot
+# size, status lo, hi] and the workers' x | y << 6 after it, an outbox [go] [rptr, launches done], a done slot
 # per worker, and staging for one command.
 MAILBOX, TRISCS, SYNC, ARGS, KERNEL, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x10000
 SYNC_SIZE = 64
@@ -123,8 +123,9 @@ void trisc_loop(unsigned i) {{
 }}
 """
 
-# A command is a 16-byte header [length, kernel bytes, argument bytes per worker, 0], the kernel, then each worker's
-# arguments; everything 16-byte aligned, the whole 64-byte aligned. Length 0 means: the rest of the ring is unused.
+# A command is a 16-byte header [length, kernel bytes, argument bytes per worker, workers], the kernel, then each
+# worker's arguments; everything 16-byte aligned, the whole 64-byte aligned. Length 0 means: the rest of the ring is
+# unused. A launch goes to the first `workers` workers only: each one costs the dispatcher time, work or not.
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
 #define WORKER ((volatile unsigned *){WORKERS:#x})
@@ -135,7 +136,7 @@ __attribute__((naked)) void park(void) {{ asm("1: j 1b"); }}
 __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\n j loop"); }}
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
-  unsigned size = CONFIG[3], n = CONFIG[6], rptr = 0, launches = 0;
+  unsigned size = CONFIG[3], rptr = 0, launches = 0;
   volatile unsigned *cmd = (volatile unsigned *){STAGING:#x};
   for (;;) {{
     while (CONFIG[0] == rptr) asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
@@ -143,11 +144,11 @@ void loop(void) {{
     noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at, {STAGING:#x}, 16);
     noc_wait();
     if (cmd[0] == 0) {{ rptr += size - rptr % size; continue; }}
-    unsigned kernel = cmd[1], args = cmd[2];
+    unsigned kernel = cmd[1], args = cmd[2], n = cmd[3];
     noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at + 16, {STAGING + 16:#x}, cmd[0] - 16);
     noc_wait();
     launches++;
-    for (unsigned i = 0; i < n; i++) {{  // a worker is idle here: it finished the last launch before we got here
+    for (unsigned i = 0; i < n; i++) {{  // a worker is idle here: it finished its last launch before we got here
       noc_write({STAGING + 16:#x}, WORKER[i] & 63, WORKER[i] >> 6, {KERNEL:#x}, kernel);
       noc_write({STAGING + 16:#x} + kernel + i * args, WORKER[i] & 63, WORKER[i] >> 6, {ARGS:#x}, args);
     }}
@@ -174,7 +175,7 @@ class Runtime:
     assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
-    self.chip, self.launches, self.wptr = chip, 0, 0
+    self.chip, self.launches, self.wptr, self.workers = chip, 0, 0, []  # workers: how many each launch went to
     self.holes, self.used = [(0, bh.DRAM_BANK_SIZE)], {}  # DRAM: free (address, size) in order, and address -> size
     *self.cores, self.dispatcher = cores
     buf, bus = chip.pci.alloc(64 + ring)
@@ -187,7 +188,7 @@ class Runtime:
     for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done, all zero but where to report
       chip.write(x, y, MAILBOX, struct.pack("<5I", 0, dx | dy << 6, DONE + 16 * i, 0, 0).ljust(SYNC - MAILBOX, b"\0"))
     chip.write(dx, dy, 0, dispatcher)
-    chip.write(dx, dy, DISPATCH, struct.pack("<7I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, n))
+    chip.write(dx, dy, DISPATCH, struct.pack("<6I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32))
     chip.write(dx, dy, WORKERS, struct.pack(f"<{n}I", *[x | y << 6 for x, y in self.cores]))
     chip.write(dx, dy, DONE, bytes(16 * n))
     self.doorbell = chip.map(dx, dy, DISPATCH)  # a TLB of its own, so ringing never has to move a window first
@@ -195,16 +196,17 @@ class Runtime:
     chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
     chip.write32(*end, bh.SOFT_RESET, bh.NCRISC, start)  # BRISC and the TRISCs go
 
-  def launch(self, kernel, args=lambda x, y: ()):
-    """Queue kernel, an image from compile_kernel, for every worker with args(x, y) as its arguments."""
+  def launch(self, kernel, args=lambda x, y: (), workers=None):
+    """Queue kernel, an image from compile_kernel, for the first `workers` workers (all by default), with args(x, y) as
+    each one's arguments."""
     assert len(kernel) <= DATA - KERNEL, f"kernel is {len(kernel)} bytes, room for {DATA - KERNEL}"
-    kernel = kernel.ljust(-(-len(kernel) // 16) * 16, b"\0")
-    a = [struct.pack(f"<{len(v)}I", *v) for v in (args(x, y) for x, y in self.cores)]
+    kernel, cores = kernel.ljust(-(-len(kernel) // 16) * 16, b"\0"), self.cores[:workers]
+    a = [struct.pack(f"<{len(v)}I", *v) for v in (args(x, y) for x, y in cores)]
     stride = -(-max(map(len, a)) // 16) * 16
     assert stride <= KERNEL - ARGS, f"{stride} bytes of arguments, room for {KERNEL - ARGS}"
     body = kernel + b"".join(v.ljust(stride, b"\0") for v in a)
     length = -(-(16 + len(body)) // 64) * 64
-    cmd = struct.pack("<4I", length, len(kernel), stride, 0) + body.ljust(length - 16, b"\0")
+    cmd = struct.pack("<4I", length, len(kernel), stride, len(cores)) + body.ljust(length - 16, b"\0")
     size, at = len(self.ring), self.wptr % len(self.ring)
     skip = size - at if at + length > size else 0  # commands never wrap: mark the tail unused and start over
     assert length <= STAGING_ROOM and length + skip <= size, f"a {length}-byte command does not fit"
@@ -215,6 +217,7 @@ class Runtime:
     self.ring[at:at + length] = cmd
     self.wptr += length
     self.launches += 1
+    self.workers.append(len(cores))
     self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))  # the launch's one PCIe write
 
   def dram_alloc(self, size):
@@ -243,5 +246,5 @@ class Runtime:
     try: self.chip.wait(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
     except TimeoutError as e:
       current, done = self.chip.read32(*self.dispatcher, OUTBOX), self.chip.read(*self.dispatcher, DONE, 16 * len(self.cores))
-      stuck = [c for i, c in enumerate(self.cores) if int.from_bytes(done[16 * i:16 * i + 4], "little") != current]
+      stuck = [c for i, c in enumerate(self.cores[:self.workers[current - 1]]) if int.from_bytes(done[16 * i:16 * i + 4], "little") != current]
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}") from None

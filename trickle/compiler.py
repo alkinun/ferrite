@@ -192,6 +192,15 @@ def mask_columns(kind, n, d):
     if t < 8: p += [ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=7, mod1=9, imm12=-2 * t & 0xFFF),  # lanes t+
                     ins("SFPSTORE", vd=fill, mod0=3, addr_mode=2, imm10=d + base + 16 * right + 2 * odd)]  # right faces: 16 rows on
   return p + [ins("SFPENCC", mod1=10, imm2=2)]
+def mask_rows(m):
+  """Rows m and on of the tile at the math thread's Dst half to 0, past a result's last row. A store covers 4 rows, lane l
+  in row l // 8 of them, and LReg 15 holds 2l, so LReg 15 - 16k >= 0 picks the rows from k on."""
+  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+  for r in range(0, 32, 4):  # tile rows r..r+3: Dst rows (r // 16) * 32 + r % 16 on, left face, and 16 more, right face
+    k = max(0, m - r)
+    if k < 4: p += [w for d in (0, 2, 16, 18) for w in (ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=15, mod1=9, imm12=-16 * k & 0xFFF),
+                                                     ins("SFPSTORE", vd=ZERO, mod0=3, addr_mode=2, imm10=r // 16 * 32 + r % 16 + d))]
+  return p + [ins("SFPENCC", mod1=10, imm2=2)]
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
@@ -229,8 +238,8 @@ def reduce_step(kind, slots, acc, first, edge=0):
                     elementwise("add", slots) + (mask_columns(kind, edge, 0) if edge else []))
   return ([at(row)] + elementwise("add", slots, dst=128) + (mask_columns(kind, edge, 128) if edge else []) +
           [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] + runs(slots, kind, 32))
-def reduce_finish(kind, slots, acc, posts):  # fold each row across, run the SFPU ops on the result, hand it to pack
-  return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), at(ACCS[acc][0])] + across_rows(kind) + sfpu(posts, slots) + MATH_END
+def reduce_finish(kind, slots, acc, posts):  # fold each row across and run the SFPU ops on the result (then MATH_END)
+  return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), at(ACCS[acc][0])] + across_rows(kind) + sfpu(posts, slots)
 
 def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU just wrote
   return [w for u in posts for w in [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
@@ -271,16 +280,9 @@ static void push(const unsigned *p, unsigned n) {{ for (unsigned i = 0; i < n; i
 #define PUSH(p) push(p, sizeof p / 4)
 """
 
-def _brisc(zero, total, shape, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
-  (rows, cols), (rt, ct) = shape, (-(-shape[0] // 32), -(-shape[1] // 32))
-  pad = [f"if (t % {ct} == {ct - 1}) for (unsigned r = 0; r < 32; r++) for (unsigned c = {cols % 32}; c < 32; c++) d[AT(r, c)] = 0;"] * (cols > 1 and cols % 32 > 0)
-  pad += [f"if (t / {ct} == {rt - 1}) for (unsigned r = {rows % 32}; r < 32; r++) for (unsigned c = 0; c < 32; c++) d[AT(r, c)] = 0;"] * (rows > 1 and rows % 32 > 0)
+def _brisc(zero, total, body):  # moves tiles: inputs into L1 ahead of thread 0, results home behind the pack thread
   return SYNC_WORDS + f"""
 #define SLOT(i) ({SLOTS:#x} + (i) * {TILE})
-#define AT(r, c) (((r) / 16 * 2 + (c) / 16) * 256 + (r) % 16 * 16 + (c) % 16)  // datum (r, c) of a tile (see tile_index)
-// The result's padding, past its last row and column, goes home as zeros, which is what lets a later matmul add up a
-// padded K. Tile t of the result, in slot.
-static void tidy(unsigned slot, unsigned t) {{ volatile unsigned short *d = (volatile unsigned short *)SLOT(slot); (void)d; (void)t; {" ".join(pad)} }}
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
 static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out;
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
@@ -293,7 +295,6 @@ static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
 static void send(void) {{  // the results packed so far go home, in the order they were packed
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1);
-    tidy(slot, t);
     noc_write(SLOT(slot), bank[t % 8] & 63, bank[t % 8] >> 6, out + t / 8 * {TILE}, {TILE}); noc_wait();
   }}
 }}
@@ -441,6 +442,12 @@ def fused_kernel(expr, shapes):
     return f"{'i_' if rows > 1 else 0} * a[{4 + 3 * i}] + {'j' if cols > 1 else 0} + a[{5 + 3 * i}]"
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
   def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }}"  # one per Dst half
+  rows, cols = size(("op", root))
+  def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
+    if j != root: return tt(MATH_END)
+    edge = [f"if ({f'j == {w - 1}' if wide(('op', root)) else 1}) {{ {tt(mask_columns('rowsum', cols % 32, 0))} }}"] * (cols > 1 and cols % 32 > 0)
+    edge += [f"if (i_ == {-(-rows // 32) - 1}) {{ {tt(mask_rows(rows % 32))} }}"] * (rows > 1 and rows % 32 > 0)
+    return " ".join(edge + [tt(MATH_END)])
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
     me = ("op", j)
     return f"output({f if wide(me) else 0}, {slot(f, me)}, {f'i_ * {w} + j' if wide(me) else 'i_'}); " if j == root else ""
@@ -472,11 +479,11 @@ def fused_kernel(expr, shapes):
           c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
                       f"if (steps++ & 1) {{ {tt(unpack(1, 3) + REPORT)} }} else {{ {tt(unpack(0, 2) + REPORT)} }} }}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
-                      f"{tt(sfpu(op['posts'], slots) + MATH_END)} h ^= 1; }}")
+                      f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
           continue
         drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
         c[U].append(f"{cond}{{ {drain}{tt(unpack(slot(f, op['x']), slot(f, op['y'])))}{posted} }}")
-        c[M].append(f"{cond}{{ {halves([math_begin(h, op['kind'] == 'mul') + elementwise(op['kind'], slots) + sfpu(op['posts'], slots) + MATH_END for h in (0, 1)])} h ^= 1; }}")
+        c[M].append(f"{cond}{{ {halves([math_begin(h, op['kind'] == 'mul') + elementwise(op['kind'], slots) + sfpu(op['posts'], slots) for h in (0, 1)])} {math_end(j)} h ^= 1; }}")
       for acc, j in enumerate(reductions):
         assert acc < len(ACCS), "two reductions a pass"
         op, me, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
@@ -486,7 +493,7 @@ def fused_kernel(expr, shapes):
         def step(first):  # the last tile's padding must not count
           plain, cut = tt(reduce_step(kind, slots, acc, first)), tt(reduce_step(kind, slots, acc, first, edge))
           return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
-        finish, posted = tt(reduce_finish(kind, slots, acc, op["posts"])), "" if j == root else " posted++;"
+        finish, posted = f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}', "" if j == root else " posted++;"
         pk = tt(pack(ACCS[acc][0], slot(f, me), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
         if wide(x):  # swept over the row
           c[U].append(f"{drain}{tt(unpack(slot(f, x), ZERO_SLOT))} if ({end}) {{{posted} }}")
@@ -509,7 +516,7 @@ def fused_kernel(expr, shapes):
   }}"""
   total = f"a[1] * {w if rowwise and wide(('op', root)) else 1}"  # results this worker sends home
   zero = rowwise or any(op.get("y") == "zero" for op in ops)
-  return compile_kernel(_brisc(zero, total, size(("op", root)), program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
+  return compile_kernel(_brisc(zero, total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
 
 
 def transpose_kernel(rows, cols):
@@ -525,9 +532,9 @@ def transpose_kernel(rows, cols):
   }}"""
   halves = lambda programs: f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }} h ^= 1;"
   return compile_kernel(
-    _brisc(True, "a[1]", (cols, rows), loop(*[f"reached(frame_done[{f}]); flipped(a[3], t % {ct} * a[4] + t / {ct} + a[5], {frame(f)[0]}); ready(); frame_done[{f}] = ++events;" for f in (0, 1)])),
+    _brisc(True, "a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t % {ct} * a[4] + t / {ct} + a[5], {frame(f)[0]}); ready(); frame_done[{f}] = ++events;" for f in (0, 1)])),
     _unpacker(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]), TRANSPOSING),
-    _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)])] * 2)),
+    _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)])] * 2)),  # padding stays 0
     _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + halves([pack(DST_HALF * h, frame(f)[1], SEM_PACKED) for h in (0, 1)]) for f in (0, 1)])))
 
 def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16  # where (r, c) of a tile sits in it
@@ -615,10 +622,11 @@ class Tensor:
     rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
     return self._run(kernel, self.addr, *[v for t in inputs for v in (t.addr, t.stride, t.offset)], units=-(-self.rows // 32) if rowwise else None)
 
-  def _run(self, kernel, *args, units=None):  # this tensor's tiles, or rows, split evenly over the workers
-    cores, units = self.rt.cores, units or self.tiles
+  def _run(self, kernel, *args, units=None):  # this tensor's tiles, or rows, split evenly over as many workers as have any
+    units = units or self.tiles
+    cores = self.rt.cores[:units]
     share = {xy: (i * units // len(cores), (i + 1) * units // len(cores)) for i, xy in enumerate(cores)}
-    self.rt.launch(kernel, lambda x, y: (share[x, y][0], share[x, y][1] - share[x, y][0], *args))
+    self.rt.launch(kernel, lambda x, y: (share[x, y][0], share[x, y][1] - share[x, y][0], *args), len(cores))
     self.rt.wait()
     return self
 
