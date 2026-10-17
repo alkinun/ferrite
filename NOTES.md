@@ -181,7 +181,7 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 ## The Tensix coprocessor, and the first compiler
 
-`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`.
+`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`.
 
 **Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). BRISC can push into all three: a store of the instruction word to `0xFFE4_0000` (thread 0), `0xFFE5_0000`, `0xFFE6_0000`. Its pushes skip the MOP expander (MOP from BRISC is an error; REPLAY works), and a full FIFO stalls BRISC. TRISCs push only to their own thread. Milestone: BRISC alone drives thread 0, TRISCs stay in reset (a BRISC push and a TRISC push in the same cycle drop the TRISC's).
 
@@ -203,6 +203,12 @@ BRISC's config stores are not ordered with its instruction pushes (Auto TTSync c
 4. `STALLWAIT` packer-until-FPU-idle, then 16 x `PACR` (4 Dst rows each through all 4 read ports, address mode 0 steps the packer's Y by 4), the last with `last`.
 5. `STALLWAIT` ThCon-until-packer-idle, then `SETGPR` a sequence number into GPR 63, which BRISC polls at `0xFFE0_00FC`.
 
+**Tile layout** (ours; the ISA has no notion of a tile). A 32x32 tile is four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face row-major: element (r, c) is at `(r//16*2 + c//16)*256 + r%16*16 + c%16`. An unpacker copies the 1024 datums linearly into Src rows, so face f is Src rows 16f..16f+15, which is what `MVMUL` wants; Dst and the packer keep the same order. Elementwise ops do not care. Tensors are tiles in row-major tile order, tile i in DRAM bank i % 8 at `base + i//8 * 2048`.
+
+**Matmul, one pair of tiles** (`compiler.matmul`). `MVMUL` does `Dst[8x16] += SrcB[8x16] @ SrcA[16x16]`: SrcB rows from its row counter (a multiple of 8), SrcA rows from its counter (a multiple of 16 in ttsim), Dst rows from the instruction's `dst` field plus the Dst counter. So the left tile goes to SrcB (unpacker 1) and the right tile to SrcA (unpacker 0). Output face (i, j) = sum over k of left face (i, k) @ right face (k, j): 8 face products of 2 `MVMUL`s each, 16 per fidelity phase, 4 phases (SrcA gives 5 mantissa bits a phase, SrcB 7). The `dst` field carries the output rows; the Src counters walk in the order i, k, h (half), j, which needs only four address modes: SrcA +16 rows (next j), SrcA -16 / SrcB +8 (next h), SrcA +16 / SrcB +8 (next k or i), and the same plus fidelity +1 at the end of a phase. Counters wrap at 64, so that last step lands back on row 0. The last `MVMUL` of the last phase gives both banks back to the unpackers.
+
+**Matmul, whole tensors.** Each worker owns some output tiles. Per output tile: `ZEROACC` Dst once, then for each k tile: fetch left (i, k) and right (k, j) tiles into L1, unpack, 64 `MVMUL`s, wait (the L1 tiles are reused for the next k), and finally pack and write the tile back. Dst accumulates over k in fp32. Error on random bf16 inputs is under 2^-8 of sum |a*b| (1.4e-3 measured on 64x96 @ 96x128).
+
 **Precision.** Dst is kept in fp32 (`Fp32_enabled`); the packer rounds it to bf16 (`(bits + 0x8000) >> 16`, the only fp32-Dst-to-bf16 mode ttsim allows is `Read_32b_data` with In = bf16). With 4 fidelity phases a bf16 x bf16 product is exact before that rounding (bit-exact on 8192 random pairs). `ELWADD`/`ELWSUB` align the two 11-bit mantissas with round-half-up first, so about 0.4% of random sums differ from the fp32 sum by a last-place bf16 step. fp32 tensors would lose 13 mantissa bits in SrcA/SrcB (TF32); full fp32 needs unpack-to-Dst and the SFPU.
 
 **Where the docs and ttsim disagree.** `UNPACR` bit 7 is `MultiContextMode` in the ISA and `ovrd_thread_id` in ttsim; both say it must be 1. Bit 0 is "write 0" in the ISA, `last` (must be 1) in ttsim; we follow ttsim. The Blackhole README says "4x packer", the PACR page says one packer with four Dst read ports. `SETDVALID` is unsupported on Blackhole (use `UNPACR_NOP`).
@@ -213,7 +219,7 @@ BRISC's config stores are not ordered with its instruction pushes (Auto TTSync c
 
 1. Three threads in parallel: TRISC firmware with unpack, math and pack on their own threads and semaphores between them, so tile n+1 unpacks while tile n packs. Double-buffered Dst halves.
 2. `REPLAY` (32 entries per thread) instead of re-pushing the same 40 words per tile.
-3. Matmul (`MVMUL`): here the layout inside a tile matters (faces of 16x16 feeding SrcA/SrcB), and the ISA does not define one.
+3. Matmul reuse: each step refetches both tiles from DRAM. Keep a row of left tiles in L1 across j, and fetch the next pair while the FPU runs (two L1 slots, two Src banks).
 4. Fusion: chains of elementwise ops on the tile while it is in Dst, instead of a DRAM round trip per op.
 5. The SFPU, for fp32, exp, recip, and the rest.
 

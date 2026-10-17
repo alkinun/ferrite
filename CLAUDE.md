@@ -27,7 +27,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `trickle/pci.py`: the device interface (config space, BARs, DMA memory, `tick`) with two backends: `Sim` (libttsim.so) and `Card` (sysfs).
 - `trickle/chip.py`: NoC reads and writes (unicast and multicast) through a shared TLB window, dedicated TLBs (`map`), waiting with a timeout, ARC messages and telemetry, core reset.
 - `trickle/runtime.py`: compiling device C with clang + lld (with the device NoC API prepended), worker and dispatcher firmware, and the command ring in host memory: a launch is one PCIe write, completion is read from host memory.
-- `trickle/compiler.py`: Tensix instruction assembler (encodings and config fields as data in `bh.py`), the per-tile unpack/FPU/pack program, generated BRISC kernels, and `Tensor`: bf16 tensors in DRAM with `+`, `-`, `*` on every worker.
+- `trickle/compiler.py`: Tensix instruction assembler (encodings and config fields as data in `bh.py`), per-tile programs (elementwise, matmul with MVMUL), generated BRISC kernels, the tile layout, and `Tensor`: bf16 tensors in DRAM with `+`, `-`, `*`, `@` on every worker.
 - `trickle/hello.py`: fib(n) on every Tensix core, the one-command demo.
 - `test/test_sim.py`: every step, on ttsim.
 - `NOTES.md`: what we learned about the chip, and what is still unknown.

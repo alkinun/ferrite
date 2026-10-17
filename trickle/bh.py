@@ -46,6 +46,7 @@ _ELW = {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 2), "dest_accu
 _ADC = {"bit_mask": (0, 4), "ch0_x": (6, 3), "ch0_y": (9, 3), "ch1_x": (12, 3), "ch1_y": (15, 3), "cnt_set_mask": (21, 3)}
 TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "ZEROACC": (0x10, {"where": (0, 10), "addr_mode": (14, 3), "use_32_bit_mode": (18, 1), "clear_mode": (19, 2)}),
+  "MVMUL": (0x26, {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 1), "clear_dvalid": (22, 2)}),
   "ELWMUL": (0x27, _ELW), "ELWADD": (0x28, _ELW), "ELWSUB": (0x30, _ELW),
   "SETRWC": (0x37, {"bit_mask": (0, 4), "rwc_a": (6, 4), "rwc_b": (10, 4), "rwc_d": (14, 4), "rwc_cr": (18, 4), "clear_ab_vld": (22, 2)}),
   "PACR": (0x41, {"last": (0, 1), "read_intf_sel": (8, 4), "addr_mode": (15, 2)}),
@@ -75,11 +76,10 @@ TENSIX_CFG_FIELDS = {
   "SEC1_format": (112, 0, 4), "SEC1_x_dim": (112, 16, 16), "SEC1_y_dim": (113, 0, 8), "SEC1_z_dim": (113, 16, 8),
   "SEC1_out_format": (120, 0, 4), "SEC1_uncompressed": (121, 0, 1), "SEC1_base": (124, 0, 32), "PCK_dest_offset": (180, 0, 12),
 }
-# Thread config: 16-bit registers per thread, written only by SETC16 from that thread: field -> (register, first bit, width)
-TENSIX_THREAD_FIELDS = {
-  "StateID": (0, 0, 1), "MATH_Offset": (1, 0, 12), "DISABLE_IMPLIED_SRCA": (2, 0, 1), "DISABLE_IMPLIED_SRCB": (3, 0, 1),
-  "SRCA_SET": (5, 0, 3), "CLR_DVALID": (7, 0, 2), "FIDELITY_BASE": (11, 0, 2),
-  "AB0_SrcAIncr": (12, 0, 6), "AB0_SrcBIncr": (12, 8, 6), "AB1": (13, 0, 16),
-  "DST0_DestIncr": (28, 0, 10), "DST1_FidelityIncr": (29, 13, 2), "PACK0_YsrcIncr": (37, 0, 4),
-  "UNPACK_MISC": (41, 0, 16), "BIAS0": (47, 0, 5), "BIAS1": (48, 0, 5),
-}
+# Thread config: 16-bit registers per thread, written only by SETC16 from that thread. Register indices; the address
+# modes are 8 slots each (an instruction's addr_mode picks one), slot i at base + i.
+THREAD_CFG = {"StateID": 0, "MATH_Offset": 1, "DISABLE_IMPLIED_SRCA": 2, "DISABLE_IMPLIED_SRCB": 3, "SRCA_SET": 5,
+              "CLR_DVALID": 7, "FIDELITY_BASE": 11, "UNPACK_MISC": 41}
+SRCA_SET_BY_ADDR = 1 << 2  # SrcA/SrcB rows come from the unpacker's address, which our UNPACRs rely on
+ADDR_MOD_AB, ADDR_MOD_DST, ADDR_MOD_PACK, ADDR_MOD_BIAS = 12, 28, 37, 47  # AB: SrcAIncr | SrcBIncr << 8,
+FIDELITY_INCR = 13  # DST: DestIncr | FidelityIncr << 13, PACK: YsrcIncr. Row counters wrap at 64 (Src) and 1024 (Dst).

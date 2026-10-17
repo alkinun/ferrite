@@ -129,3 +129,25 @@ def test_tensor_math(chip):
       for c in range(cols):
         x, y = a[r][c], b[r][c]
         assert abs(got[r][c] - f(x, y)) <= max(abs(x), abs(y)) * 2**-7, (r, c, x, y, got[r][c])
+
+def test_matmul_exact(chip):
+  # small integers, K = 2 tiles so Dst accumulates across them; then A @ I == A bit for bit, which pins the tile layout
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  a = [[float((r * 7 + c * 3) % 3 - 1) for c in range(64)] for r in range(32)]
+  b = [[float((r * 5 + c) % 3 - 1) for c in range(32)] for r in range(64)]
+  assert (Tensor.of(rt, a) @ Tensor.of(rt, b)).tolist() == [[sum(a[i][k] * b[k][j] for k in range(64)) for j in range(32)] for i in range(32)]
+  x = [[from_bf16(to_bf16(random.uniform(-8, 8))) for _ in range(64)] for _ in range(96)]
+  eye = [[float(r == c) for c in range(64)] for r in range(64)]
+  assert (Tensor.of(rt, x) @ Tensor.of(rt, eye)).tolist() == x
+
+def test_matmul_random(chip):
+  # 64x96 @ 96x128: 8 output tiles on 8 workers, 3 K tiles each. Four fidelity phases make every product exact, Dst sums
+  # in fp32, the packer rounds once to bf16: the error stays under one bf16 step of sum |a*b|
+  rt, (m, k, n) = Runtime(chip, chip.tensix[0], chip.tensix[-1]), (64, 96, 128)
+  a = [[from_bf16(to_bf16(random.uniform(-1, 1))) for _ in range(k)] for _ in range(m)]
+  b = [[from_bf16(to_bf16(random.uniform(-1, 1))) for _ in range(n)] for _ in range(k)]
+  got = (Tensor.of(rt, a) @ Tensor.of(rt, b)).tolist()
+  for i in range(m):
+    for j in range(n):
+      terms = [a[i][x] * b[x][j] for x in range(k)]
+      assert abs(got[i][j] - sum(terms)) <= 2**-8 * sum(map(abs, terms)), (i, j, got[i][j], sum(terms))
