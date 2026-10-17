@@ -140,6 +140,12 @@ def test_matmul_exact(chip):
   x = [[from_bf16(to_bf16(random.uniform(-8, 8))) for _ in range(64)] for _ in range(96)]
   eye = [[float(r == c) for c in range(64)] for r in range(64)]
   assert (Tensor.of(rt, x) @ Tensor.of(rt, eye)).tolist() == x
+  # X @ diag(d) with full-mantissa d: every output is one product, exact in fp32 Dst only if all four fidelity phases
+  # ran (each holds a different slice of the mantissas), then rounded once by the packer
+  d = [from_bf16(to_bf16(random.uniform(1, 2))) for _ in range(64)]
+  packed = lambda v: from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)
+  diag = [[d[c] if r == c else 0.0 for c in range(64)] for r in range(64)]
+  assert (Tensor.of(rt, x) @ Tensor.of(rt, diag)).tolist() == [[packed(v * d[c]) for c, v in enumerate(row)] for row in x]
 
 def test_matmul_random(chip):
   # 64x96 @ 96x128: 8 output tiles on 8 workers, 3 K tiles each. Four fidelity phases make every product exact, Dst sums
@@ -216,3 +222,12 @@ def test_matmul_fusion(chip):
       launches, got = rt.launches, build().tolist()
       assert rt.launches == launches + 1, "one kernel"
       assert got == unfused(build()).tolist()
+
+def test_replay_keeps_pushes_small():
+  # BRISC pushes every Tensix instruction, so its time per tile is mostly this. The repeating runs (a matmul phase, a
+  # mul phase, 15 PACRs) are recorded in the threads' replay buffers once per kernel and replayed by one word each
+  c = compiler
+  tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(0, op == "mul") + c.elementwise(op) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
+  assert tile("add") <= 26 and tile("mul") <= 27, "was 48 and 80 before replay"
+  assert len(c.unpack(0, 2) + c.UNPACKED_REPORT) + 1 + len(c.matmul()) <= 12, "a matmul step was 71"
+  assert len(c.SETUP_MATH) <= 33 and len(c.SETUP_PACK) <= 32, "each thread's replay buffer has 32 entries"

@@ -48,18 +48,21 @@ CONFIG = config(
   SEC1_base=SLOTS // 16 - 1, L1_Dest_addr=SLOTS // 16 - 1, Disable_zero_compress=1, Pack_out_format=bh.BF16,
   Pack_in_format=bh.BF16, PCK_dest_offset=0)
 
+# The math thread's address modes, as (SrcA step, SrcB step) and (Dst step, fidelity step): slots 0-1 for elementwise
+# ops, 4-7 for matmul, so one kernel can mix them without rewriting any between ops.
+ADDR_MODES = {0: ((8, 8), (8, 0)), 1: ((0, 0), (0, 1)), 4: ((16, 0), (0, 0)), 5: ((48, 8), (0, 0)), 6: ((16, 8), (0, 0)), 7: ((16, 8), (0, 1))}
 THREAD = [ins("SETC16", setc16_reg=r, setc16_value=v) for r, v in  # every thread: the basics, written since reset values are undocumented
           ({r: 0 for r in bh.THREAD_CFG.values()} | {bh.THREAD_CFG["SRCA_SET"]: bh.SRCA_SET_BY_ADDR, bh.ADDR_MOD_PACK: 4} |
-           {bh.ADDR_MOD_BIAS + m: 0 for m in range(4)}).items()]  # address mode 0 of the packer moves on 4 Dst rows a PACR
+           {bh.ADDR_MOD_BIAS + m: 0 for m in range(8)} |  # address mode 0 of the packer moves on 4 Dst rows a PACR
+           {bh.ADDR_MOD_AB + m: a | b << 8 for m, ((a, b), _) in ADDR_MODES.items()} |
+           {bh.ADDR_MOD_DST + m: d | f << bh.FIDELITY_INCR for m, (_, (d, f)) in ADDR_MODES.items()}).items()]
 
-# The math thread's address modes 0-3, as (SrcA step, SrcB step) and (Dst step, fidelity step). An op sets its own kind
-# at the start of its math, so one kernel can mix elementwise ops and matmuls.
-ADDR_MODES = {"elementwise": ([(8, 8), (0, 0), (0, 0), (0, 0)], [(8, 0), (0, 1), (0, 0), (0, 0)]),
-              "matmul": ([(16, 0), (48, 8), (16, 8), (16, 8)], [(0, 0), (0, 0), (0, 0), (0, 1)])}
-def addr_modes(kind):
-  ab, dst = ADDR_MODES[kind]
-  return ([ins("SETC16", setc16_reg=bh.ADDR_MOD_AB + m, setc16_value=a | b << 8) for m, (a, b) in enumerate(ab)] +
-          [ins("SETC16", setc16_reg=bh.ADDR_MOD_DST + m, setc16_value=d | f << bh.FIDELITY_INCR) for m, (d, f) in enumerate(dst)])
+# Each thread has a 32-entry replay buffer: REPLAY with load records the next instructions, without it plays them
+# back. The setup records the runs that repeat, so a tile costs BRISC a few words instead of dozens.
+def replay(index, count): return ins("REPLAY", index=index, count=count)
+def record(index, words): return [ins("REPLAY", load=1, index=index, count=len(words))] + words
+MM, MUL, PACRS = 0, 16, 0  # what the setup records where: math thread a matmul phase at 0 and a mul phase at 16,
+                           # pack thread 15 PACRs at 0
 
 # The three threads. Thread 0 unpacks and reports, thread 1 does the math, thread 2 packs. Between them:
 #   unpack -> math: SrcA/SrcB each have two banks; UNPACR waits for a free bank, the FPU for a full one, by hardware.
@@ -75,7 +78,7 @@ SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem
                 ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SETADCXY", cnt_set_mask=UNPACKERS, bit_mask=0b1111),
                 ins("SETADCZW", cnt_set_mask=UNPACKERS, bit_mask=0b1111), ins("SETADCXX", cnt_set_mask=UNPACKERS, x_end2=1023)]
 SETUP_PACK = [ins("SETADCXY", cnt_set_mask=bh.PACK, bit_mask=0b1111), ins("SETADCZW", cnt_set_mask=bh.PACK, bit_mask=0b1111),
-              ins("SETADCXX", cnt_set_mask=bh.PACK, x_end2=15)]  # 16 datums a Dst row
+              ins("SETADCXX", cnt_set_mask=bh.PACK, x_end2=15)] + record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
 def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then handed to the FPU
   return [ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=2, value=a), ins("SETADC", cnt_set_mask=bh.UNPACK1, dimension_index=2, value=b),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
@@ -85,37 +88,39 @@ def math_begin(half, zero):  # wait for a free Dst half, aim the FPU at it, and 
           [ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=4 * half + b) for b in range(4) if zero])  # 16-row blocks
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU), ins("SEMPOST", sem_sel=SEM_DST)]
 def pack(half, slot, done):  # a Dst half into an L1 slot, then free the half and post done
-  return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
-           ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=DST_HALF * half),  # channel 0 Y: Dst row
-           ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=slot),  # channel 1 Y: L1 slot
-           ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_FPU)] +
-          [ins("PACR", last=int(i == 15)) for i in range(16)] +  # all four Dst read ports: 4 rows a PACR
-          [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST), ins("SEMPOST", sem_sel=done)])
+  return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
+          ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=DST_HALF * half),  # channel 0 Y: Dst row
+          ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=slot),  # channel 1 Y: L1 slot
+          ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_FPU),
+          replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
+          ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST), ins("SEMPOST", sem_sel=done)]
 RELAY = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_PACKED, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_PACKED)]
 UNPACKED_REPORT = [ins("STALLWAIT", stall_res=bh.STALL_THCON, wait_res=bh.WAIT_UNPACK)]  # then BRISC's SETGPR(UNPACKED)
 
-def elementwise(op):
-  """Math for one tile of SrcA op SrcB: 8 rows of 16 per instruction, address mode 0 steps 8 rows. ELWMUL always
-  accumulates and multiplies a slice of the mantissas per fidelity phase: on a zeroed Dst, all 4 phases, the last
-  instruction of each in address mode 1, which steps the phase."""
-  fpu = {"add": "ELWADD", "sub": "ELWSUB", "mul": "ELWMUL"}[op]
-  if op != "mul": return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, clear_dvalid=3 * (i == 7)) for i in range(8)]
-  return [ins("SETRWC", bit_mask=0b1111)] + [w for phase in range(4) for w in [ins("SETRWC", bit_mask=0b0111)] +
-          [ins(fpu, addr_mode=int(i == 7), clear_dvalid=3 * (phase == 3 and i == 7)) for i in range(8)]]
-
-def matmul():
-  """Math for one step of Dst += A @ B on a pair of tiles, A in SrcB and B in SrcA: MVMUL does
+def matmul_phase():
+  """One fidelity phase of Dst += A @ B on a pair of tiles, A in SrcB and B in SrcA: MVMUL does
   Dst[8x16] += SrcB[8x16] @ SrcA[16x16]. Output face (i, j) adds A face (i, k) times B face (k, j) for k = 0, 1, in two
   MVMULs of 8 rows (h). In the order below SrcA steps by (16, -16, 16, -16, ...) faces and SrcB by (0, 8, 0, 8, ...)
-  rows, so four address modes cover it, and the last one wraps both back to row 0 (counters wrap at 64) and moves on
-  to the next fidelity phase."""
-  step = [ins("SETRWC", bit_mask=0b1111)]
-  for phase in range(4):  # SrcA gives 5 mantissa bits a phase, SrcB 7; four phases make the whole bf16 product
-    for i, k, h, j in [(i, k, h, j) for i in (0, 1) for k in (0, 1) for h in (0, 1) for j in (0, 1)]:
-      last = (i, k, h, j) == (1, 1, 1, 1)
-      step.append(ins("MVMUL", dst=32 * i + 16 * j + 8 * h, addr_mode=0 if j == 0 else 1 if h == 0 else 3 if last else 2,
-                      clear_dvalid=3 * (phase == 3 and last)))
-  return step
+  rows, so four address modes (4-7) cover it, and the last one wraps both back to row 0 (counters wrap at 64) and
+  moves on to the next fidelity phase."""
+  phase = []
+  for i, k, h, j in [(i, k, h, j) for i in (0, 1) for k in (0, 1) for h in (0, 1) for j in (0, 1)]:
+    last = (i, k, h, j) == (1, 1, 1, 1)
+    phase.append(ins("MVMUL", dst=32 * i + 16 * j + 8 * h, addr_mode=4 + (0 if j == 0 else 1 if h == 0 else 3 if last else 2)))
+  return phase
+MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
+SETUP_MATH = record(MM, matmul_phase()) + record(MUL, MUL_PHASE)
+
+def last(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
+def matmul():  # one matmul step: four phases (SrcA gives 5 mantissa bits a phase, SrcB 7: four make the whole product)
+  return [ins("SETRWC", bit_mask=0b1111)] + [replay(MM, 16)] * 3 + [replay(MM, 15), last(matmul_phase()[-1])]
+
+def elementwise(op):
+  """Math for one tile of SrcA op SrcB: 8 rows of 16 per instruction, address mode 0 steps 8 rows. ELWMUL always
+  accumulates and multiplies a slice of the mantissas per fidelity phase: on a zeroed Dst, all 4 phases."""
+  if op == "mul": return [ins("SETRWC", bit_mask=0b1111)] + [replay(MUL, 9)] * 3 + [replay(MUL, 8), last(MUL_PHASE[-1])]
+  fpu = {"add": "ELWADD", "sub": "ELWSUB"}[op]
+  return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu) for _ in range(7)] + [last(ins(fpu))]
 
 def _array(name, words, t="unsigned"): return f"static const {t} {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
 def _arrays(name, programs): return f"static const unsigned {name}[{len(programs)}][{len(programs[0])}] = {{{', '.join('{' + ', '.join(f'{w:#x}' for w in p) + '}' for p in programs)}}};"
@@ -126,7 +131,8 @@ def _kernel(arrays, body):
   setgpr = ins("SETGPR", reg_index_16b=0)
   return compile_rv32(f"""
 {_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", THREAD)} {_array("relay", RELAY)}
-{_array("setup_unpack", SETUP_UNPACK)} {_array("setup_pack", SETUP_PACK)} {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
+{_array("setup_unpack", SETUP_UNPACK)} {_array("setup_math", SETUP_MATH)} {_array("setup_pack", SETUP_PACK)}
+{_array("bank", [x | y << 6 for x, y in bh.DRAM])}
 {_arrays("mm_unpack", [unpack(s, 2 + s) + UNPACKED_REPORT for s in (0, 1)])} {_array("mm", matmul())} {_array("math_end", MATH_END)}
 {arrays}
 #define PUSH(t) (*(volatile unsigned *)({bh.TENSIX_PUSH:#x} + 0x10000 * (t)))
@@ -158,7 +164,7 @@ void kmain(volatile unsigned *a) {{
   push(0, thread); push(0, setup_unpack); setgpr({PACKED}, 0xFFFF);
   reached({PACKED}, 0xFFFF);  // semaphores are initialised before the other threads can touch them
   setgpr({PACKED}, 0);
-  push(1, thread); push(2, thread); push(2, setup_pack);
+  push(1, thread); push(1, setup_math); push(2, thread); push(2, setup_pack);
 {body}
 }}
 """, KERNEL)
@@ -194,7 +200,7 @@ def fused_kernel(expr, nt, order="op"):
       half, pack_stmt = (f * len(ops) + j) % 2, (2, f"push(2, {words(pack((f * len(ops) + j) % 2, slot(f, op), SEM_PACKED if j == len(ops) - 1 else SEM_L1))});")
       if op[0] == "matmul":
         _, ia, ib, kt = op
-        begin = words(addr_modes("matmul") + math_begin(half, True))
+        begin = words(math_begin(half, True))
         stmts += [(0, f"for (unsigned k = 0; k < {kt}; k++) {{ step(a[{3 + ia}], t / {nt} * {kt} + k, a[{3 + ib}], k * {nt} + t % {nt});"
                       f" if (k == 0) push(1, {begin}); push(1, mm); }} push(1, math_end);"), pack_stmt]
         continue
@@ -203,7 +209,7 @@ def fused_kernel(expr, nt, order="op"):
       if not (isinstance(x, int) and isinstance(y, int)):  # reads an intermediate: wait for every op packed before it
         wait, seen = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)] * (j - seen), j
       steps = [(0, f"push(0, {words(wait + unpack(slot(f, x), slot(f, y)))});"),
-               (1, f"push(1, {words(addr_modes('elementwise') + math_begin(half, name == 'mul') + elementwise(name) + MATH_END)});"), pack_stmt]
+               (1, f"push(1, {words(math_begin(half, name == 'mul') + elementwise(name) + MATH_END)});"), pack_stmt]
       stmts += steps[2:] + steps[:2] if order == "pack_first" else steps
     if order == "thread":
       assert all(op[0] != "matmul" for op in ops), "thread order cannot interleave a matmul's fetches"

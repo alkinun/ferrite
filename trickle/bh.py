@@ -45,6 +45,7 @@ TENSIX_PUSH, TENSIX_GPR = 0xFFE40000, 0xFFE00000
 _ELW = {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 2), "dest_accum_en": (21, 1), "clear_dvalid": (22, 2)}
 _ADC = {"bit_mask": (0, 4), "ch0_x": (6, 3), "ch0_y": (9, 3), "ch1_x": (12, 3), "ch1_y": (15, 3), "cnt_set_mask": (21, 3)}
 TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
+  "REPLAY": (0x04, {"load": (0, 1), "exec": (1, 1), "count": (4, 6), "index": (14, 5)}),  # a thread's 32-entry buffer
   "ZEROACC": (0x10, {"where": (0, 10), "addr_mode": (14, 3), "use_32_bit_mode": (18, 1), "clear_mode": (19, 2)}),
   "MVMUL": (0x26, {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 1), "clear_dvalid": (22, 2)}),
   "ELWMUL": (0x27, _ELW), "ELWADD": (0x28, _ELW), "ELWSUB": (0x30, _ELW),
@@ -81,7 +82,8 @@ TENSIX_CFG_FIELDS = {
   "SEC1_out_format": (120, 0, 4), "SEC1_uncompressed": (121, 0, 1), "SEC1_base": (124, 0, 32), "PCK_dest_offset": (180, 0, 12),
 }
 # Thread config: 16-bit registers per thread, written only by SETC16 from that thread. Register indices; the address
-# modes are 8 slots each (an instruction's addr_mode picks one), slot i at base + i.
+# modes are 8 slots each, slot i at base + i. Blackhole's addr_mode field is 3 bits wide (ttsim's tensix_isa.json; the
+# ISA pages are Wormhole's, with 2 bits and a separate ADDR_MOD_SET_Base that Blackhole dropped), so all 8 are usable.
 THREAD_CFG = {"StateID": 0, "MATH_Offset": 1, "DISABLE_IMPLIED_SRCA": 2, "DISABLE_IMPLIED_SRCB": 3, "SRCA_SET": 5,
               "CLR_DVALID": 7, "FIDELITY_BASE": 11, "UNPACK_MISC": 41}
 SRCA_SET_BY_ADDR = 1 << 2  # SrcA/SrcB rows come from the unpacker's address, which our UNPACRs rely on
