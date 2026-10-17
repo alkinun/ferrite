@@ -30,10 +30,10 @@ def layer(x, p, mask, heads=HEADS):
   d = f.width(x)
   hd = d // heads
   qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
-  y = 0
+  kt, y = qkv[:, d:2 * d].T, 0  # every head's keys, transposed at once
   for i in range(heads):  # each head's attention, through its rows of c_proj, summed: the same as concatenating them
-    q, k, v = (qkv[:, j * d + i * hd:j * d + (i + 1) * hd] for j in range(3))
-    s = q @ k.T * (1 / math.sqrt(hd)) + mask
+    q, v = qkv[:, i * hd:(i + 1) * hd], qkv[:, 2 * d + i * hd:2 * d + (i + 1) * hd]
+    s = q @ kt[i * hd:(i + 1) * hd, :] * (1 / math.sqrt(hd)) + mask
     e = f.exp(s - f.rowmax(s))
     y = (e / f.rowsum(e)) @ v @ p["attn.c_proj.weight"][i * hd:(i + 1) * hd, :] + y
   x = x + y + p["attn.c_proj.bias"]
