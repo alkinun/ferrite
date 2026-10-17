@@ -2,6 +2,7 @@
 import os, random, struct, pytest
 from trickle import bh, pci
 from trickle.chip import Chip
+from trickle import compiler
 from trickle.compiler import Tensor, from_bf16, to_bf16
 from trickle.hello import hello
 from trickle.runtime import ARGS, DATA, KERNEL, Runtime, compile_rv32
@@ -151,3 +152,26 @@ def test_matmul_random(chip):
     for j in range(n):
       terms = [a[i][x] * b[x][j] for x in range(k)]
       assert abs(got[i][j] - sum(terms)) <= 2**-8 * sum(map(abs, terms)), (i, j, got[i][j], sum(terms))
+
+def test_stream_on_one_worker(chip):
+  # one worker gets every tile, so the pipeline really cycles: L1 slots and Dst halves alternate, the threads hand
+  # tiles along by semaphore, and BRISC fetches and writes back around them. 32 elementwise tiles, then a 128x96 @ 96x128
+  # matmul: 16 output tiles of 3 steps each
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  a, b = ([[from_bf16(to_bf16(random.uniform(-2, 2))) for _ in range(128)] for _ in range(256)] for _ in range(2))
+  packed = lambda v: from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)
+  assert (Tensor.of(rt, a) * Tensor.of(rt, b)).tolist() == [[packed(x * y) for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
+  x = [[float((r + 2 * c) % 5 - 2) for c in range(96)] for r in range(128)]
+  y = [[float((3 * r + c) % 3 - 1) for c in range(128)] for r in range(96)]
+  assert (Tensor.of(rt, x) @ Tensor.of(rt, y)).tolist() == [[sum(x[i][k] * y[k][j] for k in range(96)) for j in range(128)] for i in range(128)]
+
+def test_pack_waits_for_math(chip):
+  # ttsim runs each instruction the moment it can, so in the normal push order the math is always done before the pack
+  # arrives. Queue each pack before its math instead: only the pack thread's semaphore wait keeps it from packing Dst
+  # before the result is there
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  a, b = ([[float((r * c + k) % 9 - 4) for c in range(64)] for r in range(128)] for k in (1, 2))
+  ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
+  out = Tensor(rt, 128, 64)
+  ta._run(compiler.elementwise_kernel("add", pack_first=True), out, ta.addr, tb.addr, out.addr, 1)
+  assert out.tolist() == [[x + y for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]

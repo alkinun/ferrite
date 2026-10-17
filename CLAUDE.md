@@ -27,7 +27,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `trickle/pci.py`: the device interface (config space, BARs, DMA memory, `tick`) with two backends: `Sim` (libttsim.so) and `Card` (sysfs).
 - `trickle/chip.py`: NoC reads and writes (unicast and multicast) through a shared TLB window, dedicated TLBs (`map`), waiting with a timeout, ARC messages and telemetry, core reset.
 - `trickle/runtime.py`: compiling device C with clang + lld (with the device NoC API prepended), worker and dispatcher firmware, and the command ring in host memory: a launch is one PCIe write, completion is read from host memory.
-- `trickle/compiler.py`: Tensix instruction assembler (encodings and config fields as data in `bh.py`), per-tile programs (elementwise, matmul with MVMUL), generated BRISC kernels, the tile layout, and `Tensor`: bf16 tensors in DRAM with `+`, `-`, `*`, `@` on every worker.
+- `trickle/compiler.py`: Tensix instruction assembler (encodings and config fields as data in `bh.py`), per-tile programs (elementwise, matmul with MVMUL), the BRISC kernel that streams tiles through the three Tensix threads (unpack, math, pack), the tile layout, and `Tensor`: bf16 tensors in DRAM with `+`, `-`, `*`, `@` on every worker.
 - `trickle/hello.py`: fib(n) on every Tensix core, the one-command demo.
 - `test/test_sim.py`: every step, on ttsim.
 - `NOTES.md`: what we learned about the chip, and what is still unknown.
@@ -41,4 +41,4 @@ Needs clang and lld on PATH, and ttsim's `libttsim.so` built for Blackhole (outs
 
 Without `TTSIM`, `pci.open_device()` looks for a real Blackhole on the PCI bus.
 
-The simulator is a process-wide singleton that kills the process on any contract violation (bad address, bad TLB config): a test run that stops early with an `ERROR:` line from ttsim means the code did something the hardware would not like.
+The simulator is a process-wide singleton that kills the process on any contract violation (bad address, bad TLB config, a semaphore taken while empty): a test run that stops early means the code did something the hardware would not like. pytest hides ttsim's `ERROR:` line; run with `-s` to see it.

@@ -52,14 +52,18 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "PACR": (0x41, {"last": (0, 1), "read_intf_sel": (8, 4), "addr_mode": (15, 2)}),
   "UNPACR": (0x42, {"last": (0, 1), "set_dat_valid": (6, 1), "ovrd_thread_id": (7, 1), "addr_mode": (15, 8), "unpack_block_selection": (23, 1)}),
   "SETGPR": (0x45, {"reg_index_16b": (0, 7), "value": (8, 16)}),  # SETDMAREG: 16 bits into half a GPR (index = 2*gpr + hi)
+  "SETADC": (0x50, {"value": (0, 18), "dimension_index": (18, 2), "channel_index": (20, 1), "cnt_set_mask": (21, 3)}),
   "SETADCXY": (0x51, _ADC), "SETADCZW": (0x54, _ADC),  # in ZW, x means z and y means w
   "SETADCXX": (0x5E, {"x_start": (0, 10), "x_end2": (10, 10), "cnt_set_mask": (21, 3)}),
   "STALLWAIT": (0xA2, {"wait_res": (0, 13), "stall_res": (15, 9)}),
+  "SEMINIT": (0xA3, {"sem_sel": (2, 8), "init_value": (16, 4), "max_value": (20, 4)}),
+  "SEMPOST": (0xA4, {"sem_sel": (2, 8)}), "SEMGET": (0xA5, {"sem_sel": (2, 8)}),
+  "SEMWAIT": (0xA6, {"wait_sem_cond": (0, 2), "sem_sel": (2, 8), "stall_res": (15, 9)}),  # cond 1: while 0, 2: while at max
   "SETC16": (0xB2, {"setc16_value": (0, 16), "setc16_reg": (16, 8)}),
 }
 UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets
-STALL_PACK, STALL_THCON = 1 << 2, 1 << 5  # STALLWAIT stall_res: blocks those units' instructions until ...
-WAIT_PACK, WAIT_FPU = 1 << 3, 1 << 4  # ... wait_res: the packer / the FPU is idle
+STALL_SYNC, STALL_PACK, STALL_THCON, STALL_ALL = 1 << 1, 1 << 2, 1 << 5, 0x1FF  # STALLWAIT/SEMWAIT stall_res: blocks
+WAIT_UNPACK, WAIT_PACK, WAIT_FPU = 0b110, 1 << 3, 1 << 4  # those units until (wait_res) the unpackers/packer/FPU are idle
 BF16 = 5  # data format code (ISA Unpackers/FormatConversion.md)
 
 # Backend config: field -> (32-bit word index at TENSIX_CFG, first bit, width). The ISA docs defer these numbers to
