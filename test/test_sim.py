@@ -1,5 +1,5 @@
 # Milestone 1 on ttsim, one test per step. TTSIM=/path/to/libttsim.so python3 -m pytest test
-import os, random, struct, pytest
+import math, os, random, struct, pytest
 from trickle import bh, pci
 from trickle.chip import Chip
 from trickle import compiler
@@ -184,8 +184,8 @@ def test_pack_waits_for_math(chip):
 
 def unfused(t):  # the same tree of ops, realized one launch per op
   if t.op is None: return t
-  x, y = unfused(t.srcs[0]), unfused(t.srcs[1])
-  return (x @ y if t.op == "matmul" else x._elementwise(t.op, y)).realize()
+  srcs = [unfused(s) for s in t.srcs]
+  return (srcs[0] @ srcs[1] if t.op == "matmul" else Tensor(t.rt, t.rows, t.cols, t.op, tuple(srcs))).realize()
 
 def test_fusion(chip):
   # a fused chain is one launch, its intermediates never get DRAM, and it is bit for bit the same as running each op on
@@ -226,8 +226,46 @@ def test_matmul_fusion(chip):
 def test_replay_keeps_pushes_small():
   # BRISC pushes every Tensix instruction, so its time per tile is mostly this. The repeating runs (a matmul phase, a
   # mul phase, 15 PACRs) are recorded in the threads' replay buffers once per kernel and replayed by one word each
-  c = compiler
-  tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(0, op == "mul") + c.elementwise(op) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
+  c, slots = compiler, compiler.allocate({"mm", "mul"})
+  tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(0, op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
   assert tile("add") <= 26 and tile("mul") <= 27, "was 48 and 80 before replay"
-  assert len(c.unpack(0, 2) + c.UNPACKED_REPORT) + 1 + len(c.matmul()) <= 12, "a matmul step was 71"
-  assert len(c.SETUP_MATH) <= 33 and len(c.SETUP_PACK) <= 32, "each thread's replay buffer has 32 entries"
+  assert len(c.unpack(0, 2) + c.UNPACKED_REPORT) + 1 + len(c.matmul(slots)) <= 12, "a matmul step was 71"
+  assert len(c.sfpu(["exp"], c.allocate({"exp"}))) <= 45, "32 passes of 19 words, replayed"
+  for names in ({"mm", "mul"}, {"exp", "recip", "relu", "mm", "mul"}):  # what is recorded fits the 32-entry buffer
+    assert sum(len(c.MATH_RUNS[n]) for n in c.allocate(names)) <= 32
+
+def test_sfpu(chip):
+  # relu exactly, exp and 1/x to a bf16 step (they are fp32 on the SFPU, rounded once by the packer), including the
+  # edges. The Tensix flushes denormals to zero on the way in and out, so the reference does too: 1/denormal is inf,
+  # exp(-100) is 0. On an input (through x + 0), and in place after an add, where exp sees the add's fp32 result: no
+  # bf16 rounding in between, so the reference is exp of the exact sum
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[2])
+  bf = lambda v: from_bf16(to_bf16(v))
+  flush = lambda v: 0.0 if abs(v) < 2**-126 else v
+  x = [[bf(random.uniform(-6, 6)) for _ in range(64)] for _ in range(64)]
+  x[0][:10] = map(bf, [0.0, -0.0, 1.0, -1.0, -100.0, 3.0e-39, 1e30, -1e30, math.inf, -math.inf])
+  y = [[bf(random.uniform(-1, 1)) for _ in range(64)] for _ in range(64)]
+  tx, ty = Tensor.of(rt, x), Tensor.of(rt, y)
+  def check(got_rows, ins, f):  # within a bf16 step; 1/0 only has to be infinite
+    for got, row in zip(got_rows, ins):
+      for g, v in zip(got, row):
+        want = f(flush(v))
+        assert (math.isinf(g) if flush(v) == 0 and f is recip else g == want or abs(g - want) <= abs(want) * 2**-7), (v, g, want)
+  exp = lambda v: math.inf if v > 88.7 else 0.0 if v < -104 else flush(bf(math.exp(v)))
+  recip = lambda v: math.inf if v == 0 else flush(bf(1 / v))  # 1/inf is 0
+  assert tx.relu().tolist() == [[max(flush(v), 0.0) for v in row] for row in x]
+  check(tx.exp().tolist(), x, exp)
+  check(tx.reciprocal().tolist(), x, recip)
+  check((tx + ty).exp().tolist(), [[a + b for a, b in zip(ra, rb)] for ra, rb in zip(x, y)], exp)
+  # relu fused onto a matmul plus an add, one launch; rounding commutes with relu, so bit for bit as op by op
+  a, b, c = (Tensor.of(rt, [[bf(random.uniform(-1, 1)) for _ in range(64)] for _ in range(64)]) for _ in range(3))
+  launches, fused = rt.launches, ((a @ b) + c).relu().tolist()
+  assert rt.launches == launches + 1 and fused == unfused(((a @ b) + c).relu()).tolist()
+  # all three SFPU programs in one kernel: exp and recip fill the 32-entry replay buffer, so relu goes word by word
+  u = [[bf(random.uniform(-3, 3)) for _ in range(64)] for _ in range(64)]
+  w = [[bf(random.choice((-1, 1)) * random.uniform(0.5, 2)) for _ in range(64)] for _ in range(64)]
+  got = (Tensor.of(rt, u).exp().relu() + Tensor.of(rt, w).reciprocal()).tolist()
+  for g, ru, rw in zip(got, u, w):
+    for gv, uv, wv in zip(g, ru, rw):
+      e, r = exp(uv), recip(wv)
+      assert abs(gv - (e + r)) <= 2**-6 * max(abs(e), abs(r)), (uv, wv, gv, e + r)

@@ -181,7 +181,7 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 ## The Tensix coprocessor, and the first compiler
 
-`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`, `test_matmul_fusion`.
+`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`, `test_matmul_fusion`, `test_sfpu`.
 
 **Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). BRISC can push into all three: a store of the instruction word to `0xFFE4_0000` (thread 0), `0xFFE5_0000`, `0xFFE6_0000`. Its pushes skip the MOP expander (MOP from BRISC is an error; REPLAY works), and a full FIFO stalls BRISC. TRISCs push only to their own thread. trickle: BRISC alone drives all three threads, TRISCs stay in reset (a BRISC push and a TRISC push in the same cycle drop the TRISC's). BRISC can read only thread 0's GPRs in ttsim (ISA: all three at `0xFFE0_0000 + 4*(64t + r)`), which decides who reports what.
 
@@ -219,6 +219,29 @@ Handoffs:
 Thread setup goes to all three threads; thread 0 initialises the semaphores, and BRISC waits for that before pushing anything to the others.
 
 **Fusion** (`fused_kernel`, `Tensor` is lazy). `+`, `-`, `*` and `@` build a tree; `realize` (or `tolist`) compiles the whole tree into one kernel, so `(a @ b) * d - c` or `(a @ b) + (e @ f)` is one launch. A matmul's own operands are realized first: each of its output tiles needs a whole row and column of them. Equal subtrees become one op. Slots 0-3 stream matmul tiles; per output tile, a frame of slots holds the elementwise inputs, then one slot per op in post order; the last is the result. BRISC fetches the inputs into the frame and pushes, op by op: an elementwise op's unpack (from its operands' slots), math (into the next Dst half) and pack (into its own slot); or a matmul's K steps (each: wait until the stream slots from two steps back are unpacked, fetch A(i, k) and B(k, j), unpack, MVMULs) and its pack. Intermediates live in L1 only, and only the result goes to DRAM. Two frames alternate, so tile n + 1 is fetched while tile n computes, and BRISC writes tile n - 1 back. Every intermediate is rounded to bf16 on its way to L1, exactly as it would be on its way to DRAM, so a fused chain is bit for bit the same as one launch per op (`test_fusion` checks). A single op is just a one-op chain. Limits: binary ops on equal shapes, matmuls only over realized tensors (no fused prologue), at most 15 ops (SEM_L1 is 4 bits).
+
+**The SFPU: relu, exp, reciprocal** (`compiler.SFPU`). A 32-lane fp32 vector unit that works on Dst, issued from the math thread right after the FPU, over the same Dst half. Facts (ISA `VectorUnit.md`, `SFPLOAD.md` and the per-instruction pages; ttsim `tensix.cpp`):
+
+- LRegs 0-7 are writable; 8 = 0.8373, 9 = 0.0, 10 = 1.0, 11 = -1.0 are constants. Writing 12-15 configures load macros instead of computing, so never use them as a destination.
+- An `SFPLOAD`/`SFPSTORE` moves 4 Dst rows x 8 columns (even columns at address 4r, odd at 4r + 2). So 32 of them cover a tile, and the address is the instruction's immediate plus the Dst counter plus the math thread's `MATH_Offset`. With fp32 Dst use mod0 3; the 16-bit modes address raw rows.
+- We load with address mode 2 (no step) and store with 3 (Dst counter + 2), so one body repeated 32 times walks the tile, and it is recorded in the replay buffer.
+- `SFPMAD` is a fused multiply-add with one rounding; denormals flush to zero in and out. Blackhole stalls for the 2-cycle MAD latency by itself (Wormhole needed `SFPNOP`s), with listed exceptions none of our programs hit.
+- `SFPSWAP` mod 1 leaves the min in vd and the max in vc. `SFPARECIP` (Blackhole only) is a reciprocal estimate within 0.6%: inf for 0 and denormals, 0 above 2^126. There is no exp instruction in ttsim (`SFPARECIP` mode 2 is rejected).
+- Condition codes are shared by all threads: `SFPENCC` mod 10 imm 3 turns lane flags on with all lanes set, imm 2 turns them off. `SFPIADD` with an immediate narrows the enabled lanes.
+
+The programs:
+
+- **relu**: `max(x, 0)` with one `SFPSWAP` against 0.
+- **exp**: `(e^(x/4096))^4096` as a degree-4 Taylor series and 12 squarings, only multiply-adds. x is raised to at least -104 first, or the series overflows for very negative x. About 1e-4 relative in fp32, within a bf16 step after packing.
+- **reciprocal**: the `SFPARECIP` estimate and two Newton steps `y += y(1 - xy)`, only in lanes where x is a normal number. 0 and inf would make `0 * inf = NaN`, so those lanes keep the estimate (inf and 0).
+
+Packing to bf16 turns NaN into inf, so a missing guard shows only for an inf input. `test_sfpu` feeds ±inf, ±0, a denormal and ±1e30.
+
+**Where a unary op runs.** In place, on the Dst result of the op below it, if nothing else reads that result (`relu(a @ b + c)` is one op with two SFPU programs after it). Otherwise its operand goes through `x + 0` (slot 4 is a zero tile, zeroed by BRISC at kernel start) into Dst first. In place it sees the fp32 result, not one rounded to bf16, so it can be more accurate than op by op: `exp(x + y)` fused is `exp` of the fp32 sum.
+
+**ttsim and REPLAY.** ttsim executes one instruction per pipe per clock, and BRISC's MMIO pushes have no backpressure. A `REPLAY` word expands to up to 21 instructions, so 32 back to back overflow its 512-entry FIFO. BRISC therefore waits about the replay's length after each `REPLAY` it pushes; on silicon BRISC would stall that long anyway.
+
+**Replay budget.** The math thread's 32 entries are shared out per kernel: SFPU bodies first (32 replays a tile, longest first), then the matmul and mul phases (4). A run that does not fit is pushed word by word, still correct, just more BRISC words. exp (21) and reciprocal (12) do not fit together.
 
 **Replay buffers and address modes keep BRISC's share small.** BRISC pushes every Tensix instruction, so words per tile are BRISC's time per tile. Each thread has a 32-entry replay buffer (`REPLAY` with `load` records the next N instructions; without it, plays them back; it works from BRISC because it sits after the MOP expander). Each kernel's setup records the runs that repeat: one 16-`MVMUL` fidelity phase and one 9-word `ELWMUL` phase in the math thread, 15 `PACR`s in the pack thread. The last instruction of a sequence that also has to release the Src banks is pushed by itself with `clear_dvalid`. Elementwise ops use address modes 0-1 and matmul 4-7, all set once at setup, so a kernel can mix them with no per-op rewrites. Blackhole's `addr_mode` field is 3 bits (bits 16:14 in ttsim's `tensix_isa.json`; the ISA pages are Wormhole's, with 2 bits plus an `ADDR_MOD_SET_Base` that Blackhole dropped). This needs confirming on silicon.
 
