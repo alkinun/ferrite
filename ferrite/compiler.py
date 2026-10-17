@@ -385,7 +385,7 @@ def fused_kernel(expr, shapes):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
   rowsum and rowmax, ("matmul", a, b) where a and b are inputs, and plain numbers for inputs. shapes: each input's
   (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
-  args: [first unit, units, out, then for each input its DRAM address and tile strides for batch and row, and tile
+  args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
   offset (Tensor's)]. A unit is a tile of the result, or a block of up to 4 x 4 of them (one matmul and nothing that
   reduces rows), or, if the expression reduces rows, a whole row of tiles, so the reduction can stay on chip; units run
   through the batch, matrix after matrix.
@@ -474,7 +474,7 @@ def fused_kernel(expr, shapes):
     if r == "zero": return ZERO_SLOT
     if isinstance(r, int): return FRAMES + f * frame + r
     return FRAMES + (f * frame + inputs + r[1] if wide(r) else 2 * frame + r[1])
-  arg = lambda i: 3 + 4 * i  # input i's [address, batch stride, row stride, offset] in a
+  arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
   in_batch = lambda i: f"b * a[{arg(i) + 1}] + " if batch[i] > 1 else ""  # one matrix repeats across the batch
   def tile(i):  # which tile of input i goes with this unit's matrix b, row i_ and column j
     rows, cols = tiles[i]
@@ -487,7 +487,7 @@ def fused_kernel(expr, shapes):
     return " ".join(edge + [tt(MATH_END)])
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
     me = ("op", j)
-    return f"output({f if wide(me) else 0}, {slot(f, me)}, {f'(b * {rt} + i_) * {w} + j' if wide(me) else f'b * {rt} + i_'}); " if j == root else ""
+    return f"output({f if wide(me) else 0}, {slot(f, me)}, b * a[3] + i_ * a[4] + {'j' if wide(me) else 0} + a[5]); " if j == root else ""
   passes = []
   for p in range(last + 1):
     reductions = [j for j in sweep if sweep[j] == p]
@@ -743,6 +743,13 @@ class Tensor:
     assert self.rows % (32 * n) == 0
     return self._view(self.rows // n, self.cols, n, 0, self.rows // n // 32 * self.stride)
 
+  def merge(self):
+    """The batch side by side as one matrix, the inverse of split: x.split(n).merge() is x. The kernel computing it
+    writes each matrix into its columns (realize into a view); one already computed is copied there."""
+    out = Tensor(self.rt, self.rows, self.batch * self.cols)
+    (self if self.op else self + 0.0).realize(out.split(self.batch))
+    return out
+
   @property
   def T(self):
     """The transpose (of each matrix of a batch), computed now, in a kernel of its own (see transpose_kernel)."""
@@ -750,7 +757,8 @@ class Tensor:
     kernel = _cached(("transpose", self.rows, self.cols), lambda: transpose_kernel(self.rows, self.cols))
     return out._run(kernel, out.addr, self.realize().addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset)
 
-  def realize(self):
+  def realize(self, into=None):
+    """Compute it now, into DRAM of its own, or into the view `into` (see merge). Returns it, now realized."""
     if self.op is None: return self
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
       for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
@@ -766,9 +774,11 @@ class Tensor:
     e = _expr(self, (self.batch, self.rows), inputs, [-(-self.cols // 32) if self.cols > 1 else None, set()])
     key = (e, tuple((u.batch, u.rows, u.cols) for u in inputs))
     kernel, units = _cached(key, lambda: fused_kernel(*key))
-    self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
-    args = [v for t in inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
-    return self._run(kernel, self.addr, *args, units=self.batch * units)
+    if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
+    else: self.addr = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
+    self.op, self.srcs = None, ()
+    args = [v for t in [self] + inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
+    return self._run(kernel, *args, units=self.batch * units)
 
   def _run(self, kernel, *args, units=None):
     """Queue kernel over units of this tensor (tiles unless told), split evenly over as many workers as have any. Nothing waits for
@@ -814,7 +824,7 @@ class Tensor:
     assert self.cols == other.rows and (self.batch == other.batch or 1 in (self.batch, other.batch)), f"{self.shape} @ {other.shape}"
     if self.cols == 1: return self * other  # (R, 1) @ (1, C) is broadcasting
     kt, tiles = self.cols // 32, -(-self.rows // 32) * -(-other.cols // 32)
-    s = max([s for s in (2, 4, 8) if self.batch == other.batch == 1 and self.cols % (32 * s) == 0 and kt // s >= 8 and
+    s = max([s for s in (2, 4, 8) if self.batch == other.batch == 1 and self.cols % (32 * s) == 0 and kt // s >= 4 and
              s * tiles <= len(self.rt.cores)], default=1)
     if s > 1:  # too few result tiles to keep the workers busy (a token's MLP): K cut in s, a batch, and the parts summed
       parts = self.split(s) @ other.split(s, 0)

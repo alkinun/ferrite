@@ -16,9 +16,10 @@ def fns(x):  # what numpy and ferrite spell differently
     softmax = lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True)
     layernorm = lambda a: (a - a.mean(-1, keepdims=True)) / np.sqrt(a.var(-1, keepdims=True) + 1e-5)
     return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split, softmax=softmax, layernorm=layernorm,
+                           merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1),
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))))
   return SimpleNamespace(rows=Tensor.gather, width=lambda a: a.cols, split=Tensor.split, softmax=Tensor.softmax,
-                         layernorm=Tensor.layernorm, gelu=Tensor.gelu)
+                         layernorm=Tensor.layernorm, merge=Tensor.merge, gelu=Tensor.gelu)
 
 def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 
@@ -32,9 +33,8 @@ def layer(x, p, mask, heads=HEADS):
   # the heads as a batch: queries and values split by columns, the keys transposed and split by rows
   q, kt, v = f.split(qkv[:, :d], heads), f.split(qkv[:, d:2 * d].T, heads, 0), f.split(qkv[:, 2 * d:], heads)
   s = q @ kt * (1 / math.sqrt(hd)) + mask
-  y = f.softmax(s) @ v @ f.split(p["attn.c_proj.weight"], heads, 0)  # each head through its rows of c_proj
-  # summed (the same as concatenating) with the bias, then added to x last: x is the large one, so it is rounded once
-  x = x + (sum(y[i] for i in range(1, heads)) + y[0] + p["attn.c_proj.bias"])
+  y = f.merge(f.softmax(s) @ v) @ p["attn.c_proj.weight"]  # the heads side by side, then c_proj
+  x = x + (y + p["attn.c_proj.bias"])  # x last: it is the large one, so it is rounded once
   h = layernorm(x, p["ln_2.weight"], p["ln_2.bias"]) @ p["mlp.c_fc.weight"] + p["mlp.c_fc.bias"]
   return x + (f.gelu(h) @ p["mlp.c_proj.weight"] + p["mlp.c_proj.bias"])
 

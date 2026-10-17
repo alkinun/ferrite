@@ -407,6 +407,9 @@ def test_batch(chip):
   assert np.array(keys.tolist()).tolist() == kt.reshape(3, 64, 40).tolist()
   close(heads @ keys, qkv.reshape(40, 3, 64).transpose(1, 0, 2) @ kt.reshape(3, 64, 40), 2**-6)
   assert np.array(heads.T.tolist()).tolist() == qkv.reshape(40, 3, 64).transpose(1, 2, 0).tolist()  # each matrix, transposed
+  assert heads.merge().tolist() == qkv.tolist()  # side by side again: a copy, and a kernel's result written into its columns
+  (m, tm) = make(64, 64)
+  close((heads @ tm).merge(), (qkv.reshape(40, 3, 64) @ m).reshape(40, 192), 2**-6)
   one, a = Runtime(chip, chip.tensix[0], chip.tensix[1]), a[:, :20]  # last: it takes two of rt's cores. One worker, and one
   close(Tensor.of(one, a.tolist()) @ Tensor.of(one, b.tolist()), a @ b, 2**-6)  # tile row a matrix: A's row in L1 changes with the matrix
 
