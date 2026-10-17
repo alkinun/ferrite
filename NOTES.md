@@ -19,7 +19,7 @@ Each has a finish line we can check. Ticked when a test shows it.
    - [x] the tests run on a card when `TTSIM` is not set
    - [x] a bring-up checklist, step by step ("Bring-up on a p150")
 3. **Fast.** Finish line: a matmul benchmark with a number, measured against the chip's peak and improved over time (tile reuse, deeper pipelines, the MOP expander).
-   - [x] the benchmark: `python3 -m trickle.bench [M K N]`, wall time on a card, simulated cycles on ttsim (a work count, not silicon speed). 512x768 @ 768x3072 on ttsim: 35k cycles, "93 of 166 TFLOPS" at four fidelity phases
+   - [x] the benchmark: `python3 -m trickle.bench [M K N]`, wall time on a card, simulated cycles on ttsim (a work count, not silicon speed). 512x768 @ 768x3072 on ttsim: 35k cycles, "93 of 166 TFLOPS" at four fidelity phases; 22k ("153") with A's row kept in L1, resident kernels and launches queued back to back
    - [ ] the same on silicon
 
 ## Address map
