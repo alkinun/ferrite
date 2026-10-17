@@ -650,8 +650,8 @@ class Tensor:
   b * bstride + i * stride + j + offset."""
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1):
     self.rt, self.rows, self.cols, self.batch, self.op, self.srcs = rt, rows, cols, batch, op, srcs
-    rt_, ct = -(-rows // 32), -(-cols // 32)
-    self.tiles, self.bstride, self.stride, self.offset, self.owner = batch * rt_ * ct, rt_ * ct, ct, 0, None
+    tr, tc = -(-rows // 32), -(-cols // 32)  # tile rows and columns
+    self.tiles, self.bstride, self.stride, self.offset, self.owner = batch * tr * tc, tr * tc, tc, 0, None
     self.addr = None if op else rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
 
   def __del__(self):  # its DRAM goes back once nothing refers to it (and no queued launch can still use it)
@@ -676,10 +676,10 @@ class Tensor:
   def frombytes(cls, rt, rows, cols, data, batch=1):
     """From bf16 in row-major order (2 bytes a value, little-endian), matrix after matrix. Runs of 16 values are copied
     into tile order as they are, nothing per value, which is what makes a model's weights quick to load."""
-    t, rt_, ct, data, pad = cls(rt, rows, cols, batch=batch), -(-rows // 32), -(-cols // 32), memoryview(data).cast("B"), bytes(32)
+    t, tr, tc, data, pad = cls(rt, rows, cols, batch=batch), -(-rows // 32), -(-cols // 32), memoryview(data).cast("B"), bytes(32)
     assert len(data) == 2 * batch * rows * cols, f"{len(data)} bytes for {batch} x {rows} x {cols}"
-    for b, i in ((b, i) for b in range(batch) for i in range(rt_ * ct)):
-      m, r0, c0, tile = data[2 * b * rows * cols:2 * (b + 1) * rows * cols], i // ct * 32, i % ct * 32, []
+    for b, i in ((b, i) for b in range(batch) for i in range(tr * tc)):
+      m, r0, c0, tile = data[2 * b * rows * cols:2 * (b + 1) * rows * cols], i // tc * 32, i % tc * 32, []
       for face in range(4):  # 16 rows of 16, face by face (the tile layout, at the top)
         c = c0 + face % 2 * 16
         for r in range(r0 + face // 2 * 16, r0 + face // 2 * 16 + 16):
@@ -687,7 +687,7 @@ class Tensor:
           at = 2 * (r * cols + c)
           run = b"" if r >= rows else bytes(m[2 * r:2 * r + 2]) * 16 if cols == 1 else bytes(m[at:at + 2 * max(0, min(16, cols - c))])
           tile.append(run + pad[len(run):])
-      t.rt.chip.write(*t._where(b, i // ct, i % ct), b"".join(tile))
+      t.rt.chip.write(*t._where(b, i // tc, i % tc), b"".join(tile))
     return t
 
   def tobytes(self):
