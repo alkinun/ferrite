@@ -14,7 +14,8 @@ from ferrite import bh
 from ferrite.runtime import DATA, SYNC, ZEROS, compile_kernel
 
 TILE = 32 * 32 * 2  # bytes in a bf16 tile: one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
-SLOTS = ZEROS  # L1 tile slots: slot i at SLOTS + i * TILE (slot 0 is the runtime's zeros), picked by the unpackers' Z and the packer's channel 1 Y counters
+SLOTS = ZEROS  # L1 tile slots: slot i at SLOTS + i * TILE (slot 0 is the runtime's zeros), picked by the unpackers'
+               # Z and the packer's channel 1 Y counters
 DST_HALF = 64  # Dst rows of one result in fp32; Dst holds two, so math fills one half while pack drains the other
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2  # results in Dst to pack, outputs packed but not reported, and
                                                        # intermediates packed into L1 but not yet waited for
@@ -89,9 +90,9 @@ SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem
                 ins("SETADCZW", cnt_set_mask=UNPACKERS, bit_mask=0b1111), ins("SETADCXX", cnt_set_mask=UNPACKERS, x_end2=1023)]
 SETUP_PACK = [ins("SETADCXY", cnt_set_mask=bh.PACK, bit_mask=0b1111), ins("SETADCZW", cnt_set_mask=bh.PACK, bit_mask=0b1111),
               ins("SETADCXX", cnt_set_mask=bh.PACK, x_end2=15)] + record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
+def setadc(unpacker, slot): return ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=slot)  # its Z: the slot
 def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then handed to the FPU
-  return [ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=2, value=a), ins("SETADC", cnt_set_mask=bh.UNPACK1, dimension_index=2, value=b),
-          ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
+  return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
 REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
 def haloize(on):  # unpacker 0 transposes each 16x16 face into SrcA from its next unpack on (or stops): the config write
@@ -99,7 +100,7 @@ def haloize(on):  # unpacker 0 transposes each 16x16 face into SrcA from its nex
   return [ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_UNPACK0),
           ins(f"RMWCIB{bit // 8}", cfg_reg_addr=word, data=on << bit % 8, mask=1 << bit % 8), ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)]
 def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and A's next tile in its row into SrcB
-  return [ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=2, value=s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
+  return [setadc(bh.UNPACK0, s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
 def math_begin(half, zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
   return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2),
@@ -523,7 +524,6 @@ def fused_kernel(expr, shapes):
           b_tile = f"{in_batch(op['y'])}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch(op['y'])}m * a[{y + 2}] + {bj} + a[{y + 3}]"
           on, off = (tt(haloize(1)), tt(haloize(0))) if bt else ("", "")
           a_tile = f"{in_batch(op['x'])}i_ * a[{x + 2}] + m + a[{x + 3}]"
-          setadc = lambda unpacker, slot: ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=slot)
           if kept_b is not None:  # A's bp rows and B's column in L1: unpacker 0 walks the column, 1 the row of A
             c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); for (unsigned m = 0; m < {kt}; m++) "
                         f"step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
