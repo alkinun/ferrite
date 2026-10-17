@@ -329,6 +329,12 @@ def test_reductions(chip):
   for got, row in zip((tx - tx.rowmax()).tolist(), x):
     assert all(abs(g - (v - max(row))) <= 2**-7 * max(abs(v), abs(max(row))) for g, v in zip(got, row))
   assert (tx.rowmax() * 0.5).tolist() == [[max(row) / 2] for row in x]
+  # a kernel sweeps its rows at one width and has two accumulators: reductions of a wider tensor, and a third, run first
+  # on their own (found by test_fuzz's longer runs)
+  y = [[bf(random.uniform(-4, 4)) for _ in range(200)] for _ in range(rows)]
+  ty = Tensor.of(rt, y)
+  for (got,), a, b in zip((tx.rowmax() + ty.rowmax()).tolist(), x, y): assert abs(got - (max(a) + max(b))) <= 2**-6 * 8, (got, a, b)
+  for (got,), a in zip((tx.rowmax() + tx.rowsum() * 0.0 + (tx * 2.0).rowmax()).tolist(), x): assert abs(got - 3 * max(a)) <= 2**-6 * 12
 
 def test_any_shape(chip):
   # 45 x 70 is two tile rows by three tile columns, the last of each cut short; a dimension of 1 broadcasts. Results go
@@ -419,7 +425,7 @@ def test_fuzz(chip, monkeypatch):
       while compiler._ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: compiler._ops(s, set()))
       u.realize()
     inputs = []
-    e = compiler._expr(t, (t.batch, t.rows), inputs)
+    e = compiler._expr(t, (t.batch, t.rows), inputs, [-(-t.cols // 32) if t.cols > 1 else None, set()])
     xs = [value(u) for u in inputs]
     realize(t)
     want, got = numpy(e, xs), value(t)

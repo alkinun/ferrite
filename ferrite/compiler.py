@@ -444,6 +444,7 @@ def fused_kernel(expr, shapes):
   operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
   # w: the row's width in tiles, what ops sweep (a matmul's A can be wider: its columns are K, streamed, not swept)
   inputs, w = len(shapes), max([op["width"] for op in ops] + [width(r) for op in ops for r in operands(op)])
+  assert all(width(r) in (1, w) for op in ops for r in operands(op)), "a kernel sweeps its rows at one width"
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
   wide = lambda r: r != "zero" and width(r) == w and not reduced(r)  # varies along the row; otherwise one tile a row
   rowwise = any(op["kind"] in COMBINE for op in ops)
@@ -753,7 +754,7 @@ class Tensor:
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
       t.realize()
     inputs = []
-    e = _expr(self, (self.batch, self.rows), inputs)
+    e = _expr(self, (self.batch, self.rows), inputs, [-(-self.cols // 32) if self.cols > 1 else None, set()])
     key = (e, tuple((u.batch, u.rows, u.cols) for u in inputs))
     kernel, units = _cached(key, lambda: fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
@@ -813,15 +814,24 @@ def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU o
   seen.add(id(t))
   return 1 + (0 if t.op == "matmul" else sum(_ops(s, seen) for s in t.srcs))
 
-def _expr(t, shape, inputs):  # the tree of unrealized ops under t, realized tensors as numbers into inputs
+def _expr(t, shape, inputs, kernel):
+  """The tree of unrealized ops under t, realized tensors as numbers into inputs. A kernel sweeps its rows at one width
+  (in tiles; kernel[0], the first one seen if t is one column), and has two accumulators for row reductions (kernel[1]
+  holds those it has): a reduction of anything wider than a tile but not that wide, or past the second, is computed
+  first, on its own."""
   if t.op is None:
     if all(t is not u for u in inputs): inputs.append(t)
     return next(i for i, u in enumerate(inputs) if u is t)
-  if (t.batch, t.rows) != shape: return _expr(t.realize(), shape, inputs)  # repeated down or through the batch: compute it once
+  if (t.batch, t.rows) != shape: return _expr(t.realize(), shape, inputs, kernel)  # repeated down or through the batch: compute it once
+  if t.op in COMBINE:
+    w = -(-t.srcs[0].cols // 32)
+    if w > 1 and kernel[0] is None: kernel[0] = w
+    if (w > 1 and w != kernel[0]) or (id(t) not in kernel[1] and len(kernel[1]) == len(ACCS)): return _expr(t.realize(), shape, inputs, kernel)
+    kernel[1].add(id(t))
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = (s.realize() for s in t.srcs)
-    return ("matmul", _expr(a, shape, inputs), _expr(b, shape, inputs))
-  return (t.op, *(_expr(s, shape, inputs) for s in t.srcs))
+    return ("matmul", _expr(a, shape, inputs, kernel), _expr(b, shape, inputs, kernel))
+  return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
 def _subexprs(e):
   yield e
