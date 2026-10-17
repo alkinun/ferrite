@@ -426,7 +426,7 @@ def test_fuzz(chip, monkeypatch):
   def numpy(e, xs):
     if isinstance(e, int): return xs[e]
     v = [numpy(s, xs) for s in e[1:]]
-    return {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "relu": lambda a: np.maximum(a, 0),
+    return {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "T": lambda a: a.swapaxes(-1, -2), "relu": lambda a: np.maximum(a, 0),
             "exp": np.exp, "recip": lambda a: 1 / a, "rsqrt": lambda a: 1 / np.sqrt(a),
             "rowsum": lambda a: a.sum(-1, keepdims=True), "rowmax": lambda a: a.max(-1, keepdims=True)}[e[0]](*v)
   realize = Tensor.realize
@@ -466,7 +466,8 @@ def test_fuzz(chip, monkeypatch):
       return x.rowsum() * (1 / n) if rng.random() < 0.5 else x.rowmax()
     if kind == "mm" and r > 1 and c > 1:
       k = int(rng.choice([32, 50, 64]))
-      return (leaf((b, r, k)) @ leaf((b if rng.random() < 0.5 else 1, k, c))) * (1 / k)
+      bb = b if rng.random() < 0.5 else 1
+      return (leaf((b, r, k)) @ (leaf((bb, c, k)).T if rng.random() < 0.3 else leaf((bb, k, c)))) * (1 / k)  # B read transposed, or not
     return leaf(shape)
   for _ in range(30):  # sizes past 4 tiles make part-blocks of matmul results
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
