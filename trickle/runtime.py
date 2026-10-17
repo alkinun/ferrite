@@ -1,6 +1,6 @@
 # The runtime: resident firmware on each Tensix tile's BRISC and TRISCs, kernels launched on them without resetting
 # anything, and a command ring in host memory that one tile's BRISC, the dispatcher, reads by itself.
-import pathlib, struct, subprocess, tempfile
+import pathlib, shutil, struct, subprocess, tempfile
 from trickle import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
@@ -54,6 +54,7 @@ static inline void tensix_idle(void) {{
 
 def compile_rv32(src, base=0):
   """C source, after DEVICE, to a flat rv32 image that runs from base: `.start` first, else `kmain`, then the rest."""
+  if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")
   link = f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) *(.sbss*) *(.bss*) }} }}"
   with tempfile.TemporaryDirectory() as d:  # one output section, so .bss is zeros inside the image
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
