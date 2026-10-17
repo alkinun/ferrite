@@ -1,6 +1,6 @@
 # Notes: talking to a Blackhole
 
-What milestone 1 learned about the chip, where each fact comes from, and what is still unknown.
+What milestones 1 and 2 learned about the chip, where each fact comes from, and what is still unknown.
 Sources: **ISA** = tt-isa-documentation/BlackholeA0, **sim** = ttsim `src/`, **kmd** = tt-kmd, **umd** = tt-umd.
 Facts the code uses live in `trickle/bh.py`.
 
@@ -86,7 +86,7 @@ A TLB window turns a range of BAR0 (or BAR4) into a range of one tile's NoC addr
 
 Write the three dwords with 32-bit stores (odd TLBs are not 8-byte aligned), and the address must be window aligned (kmd, umd). umd turns on static VC for windows that only write or only read, and leaves it off for a window that does both: a read+write window on a static VC "crashes the host" (umd `architecture_tlbs.cpp`).
 
-trickle uses one 2 MiB window (TLB 0), unicast, strict ordering, dynamic VC, and moves it whenever an access crosses into another 2 MiB block. That is slow on purpose: simple first. Faster later: a window per target, posted ordering for bulk writes, BAR4 windows for DRAM, multicast for loading every core.
+trickle uses one 2 MiB window (TLB 0) with strict ordering, and moves it whenever an access crosses into another 2 MiB block. Unicast uses dynamic VC. Multicast (`Chip.write(..., start=...)`) sets x_start/y_start, mcast, and static VC class 2, as umd does. Slow on purpose: simple first. Faster later: a window per target, posted ordering for bulk writes, BAR4 windows for DRAM.
 
 ## Reset sequence
 
@@ -134,31 +134,48 @@ What kmd does for a Blackhole at probe, open, reset and remove (kmd `enumerate.c
 | Max Read Request Size 4096 in PCIe Device Control | not done (throughput only) |
 | Maps BAR0 TLB config + NIU, BAR2, BAR4; reserves TLB 201 for its own NoC accesses; hands other TLBs out per fd | `Card` mmaps sysfs `resource0/2/4`; with kmd gone every TLB is ours; trickle uses TLB 0 |
 | Waits for ARC: `0x80030408` bit 0 (500 ms); umd waits for `& 7 == 5` (300 s after a reset) | `Chip.__init__` waits for `& 7 == 5`, 2 s (tested on sim) |
-| ARC messages `0xA0` (ASIC_STATE0, then reads `0x80030410` bit 1 for a power-cable fault), `0xC1` (watchdog, 10 s), `0xC7` (firmware log buffer) | not done |
-| Power policy: with no fd open, ARC message `0x21` with all flags 0 (minimum AICLK, GDDR PHY down, **Tensix clock-gated**); opening an fd sends `0x7FFE0F21` (everything on); remove sends `0xA3` | **not done: the first thing the p150 needs.** If kmd ever ran, the Tensix cores are likely clock-gated and `hello` will time out until we send `0x21` with TENSIX_ENABLE (bit 2 of the flags, header `0x21 \| validity<<8 \| flags<<16`, 14 u16 settings as payload) and probably `0x52` (AICLK go busy) |
+| ARC messages `0xA0` (ASIC_STATE0, then reads `0x80030410` bit 1 for a power-cable fault), `0xC1` (watchdog, 10 s), `0xC7` (firmware log buffer) | not done; `Chip.arc_msg` can send them |
+| Power policy: with no fd open, ARC message `0x21` with all flags 0 (minimum AICLK, GDDR PHY down, **Tensix clock-gated**); opening an fd sends `0x7FFE0F21` (everything on); remove sends `0xA3` | `Chip.__init__` sends `0x21` with all 15 flags valid and set (`0x7FFF0F21`: max AI clock, GDDR PHY awake, Tensix and L2CPU on) through `Chip.arc_msg` (tested on sim). Never powers down again. `0x52` (AICLK go busy), which umd also sends, is not sent |
 | Pins host memory: IOVA from the IOMMU, or physically contiguous pages without one; programs an outbound iATU region so the device sees it at `0x1000_0000_0000_0000 + offset` | `Card.alloc`: a locked 2 MiB hugepage, bus address from `/proc/self/pagemap` (IOMMU off or passthrough). The device uses the bus address directly: kmd's own comment says an IOVA below 2^58 is a valid NoC address, so no iATU. With an IOMMU on, VFIO type1 `VFIO_IOMMU_MAP_DMA` would supply the IOVA; not written |
 | One MSI, only for the firmware log | none needed |
 | Reset: set `PCI_COMMAND` bit 6 as a marker, config writes `0x934 = 1` then `0x930 = 0x11` (or ARC `0x56` arg 3), wait >= 2 s, wait for the device to reappear and firmware to clear bit 6, restore config space and MPS (via DBI at NoC `(x,0)` `0xF800_0000_0000_0078`), wait for ARC again | not done; all of it is reachable from userspace through sysfs `config` |
-| Telemetry table: `*0x80030434` (tags) and `*0x80030430` (values), each tag word is `id \| offset << 16` | not done; tag 22 GDDR training, tag 34 enabled Tensix columns (harvesting) |
-| "NoC cleanup": puts cores back in reset when a process dies | `hello` halts its core in a `finally` |
+| Telemetry table: `*0x80030434` (tags) and `*0x80030430` (values), each tag word is `id \| index << 16` | `Chip.telemetry`. `Chip.__init__` takes the Tensix column count from tag 34 (enabled columns; good ones come first in translated x) and waits up to 60 s for tag 22 to show every bank in tag 36 trained |
+| "NoC cleanup": puts cores back in reset when a process dies | not done: a dead process leaves its firmware polling, which is harmless; the next `Runtime` resets the cores it uses |
 
-ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003042C` (SCRATCH_RAM[11]) points at a control block whose word 0 is the base of 4 queues and word 1 is `entries | queues << 8`. Queue i (0 = kmd, 3 = applications) is a 32-byte header (`+0` request wptr, `+4` response rptr, `+0x10` request rptr, `+0x14` response wptr; pointers wrap at 2N) followed by N request slots and N response slots of 32 bytes (`u32 header, u32 payload[7]`). Write the slot, bump the request wptr, poke the ARC (kmd: write 0 to `0x800B0000`; umd: write `0x10000` to `0x80030100`), poll the response wptr for up to 1 s. Status is the low byte of the response header, below 240 means OK. ttsim implements this queue, so it can be built and tested on the sim.
+ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003042C` (SCRATCH_RAM[11]) points at a control block whose word 0 is the base of 4 queues and word 1 is `entries | queues << 8`. Queue i (0 = kmd, 3 = applications) is a 32-byte header (`+0` request wptr, `+4` response rptr, `+0x10` request rptr, `+0x14` response wptr; pointers wrap at 2N) followed by N request slots and N response slots of 32 bytes (`u32 header, u32 payload[7]`). Write the slot, bump the request wptr, poke the ARC (kmd: write 0 to `0x800B0000`; umd: write `0x10000` to `0x80030100`), poll the response wptr for up to 1 s. Status is the low byte of the response header, below 240 means OK. trickle uses queue 3 and umd's poke (ARC_MISC_CNTL IRQ0); ttsim models both pokes and answers kmd's and umd's messages, but kills the process on an unknown code, and returns all-zero responses (so `0x57` "get harvesting" is not usable there; telemetry is).
 
-## What a minimal launch loop needs
+## The launch loop
 
-`trickle.hello` is the degenerate launch loop: reset, load, release, poll, reset. A real one, for milestone 2:
+`trickle/runtime.py`. Built and tested on ttsim; the shape follows the plan from milestone 1.
 
-1. **Resident firmware** on each core, loaded once with the reset sequence above: a loop that waits on a mailbox word in L1 (with a `fence` in the loop), jumps to the kernel address it names with an argument pointer, then reports done. Because `fence.i` does not work, BRISC firmware invalidates the instruction caches through Tensix config before jumping to newly loaded code, or the host reloads with a reset.
-2. **Loading**: kernel binary and arguments written to L1 (multicast TLB to many tiles at once), or to DRAM and pulled by the cores over the NoC.
-3. **Go**: one store to each core's mailbox.
-4. **Done**: the core writes a completion word into a pinned host buffer through the PCIe tile (19, 24), so the host polls its own memory instead of doing ~1 us BAR reads. The flag must land after the data: same NoC, static VC, and the store, load, use pattern on the core side.
-5. **Every wait times out**, and on timeout the host reads each core's PC snapshot (`0xFFB1_3138`...) so the error says where the chip is stuck.
-6. **Queues** come after that: a command ring in host memory or DRAM that a dispatcher core reads, so the host does not touch each tile per launch.
+**L1 layout** (ours): firmware at `0x0` (BRISC's reset PC), mailbox at `0x1000`, kernel arguments at `0x1100`, one kernel at `0x2000`, kernel data from `0x10000` (`L1_DATA`).
+
+**Boot** (`Runtime(chip, start, end)`, a rectangle of Tensix in translated coordinates): multicast reset of all five cores, multicast firmware image, a unicast mailbox per core (its slot in a host buffer), multicast release of BRISC. A rectangle of good columns in translated space covers exactly those cores: harvested and non-Tensix columns in between opt out of multicast.
+
+**Firmware** (300 bytes): poll `go` with a `fence` in the loop; invalidate the instruction cache (Tensix config 185) then `fence`, read config back, `fence` so the invalidate has landed before the jump; call `kmain(args)` at `0x2000`; `noc_wait` for the kernel's transfers; write the launch count to `done` in L1 and send it with a NoC write to the core's 16-byte slot in host memory through the PCIe tile.
+
+**Launch** (`Runtime.launch(kernel, args)`): multicast the kernel image, unicast each core's arguments, multicast the new `go`. **Wait** (`Runtime.wait`) polls the host buffer, not the chip, with a timeout per core.
+
+**Device API**, prepended to every program (`DEVICE`): `noc_me()` (own translated coordinates, `NOC_ID_LOGICAL`), `noc_read`, `noc_write`, `noc_wait`, `l1_settle`. All requests go through NIU 0, request initiator 0, transaction ID 0, acknowledged (`RESP_MARKED`) so `NIU_MST_REQS_OUTSTANDING_ID(0)` counts them, dynamic VC. Rules (ISA `NoC/MemoryMap.md`, `NoC/Counters.md`, enforced by ttsim):
+
+- At most 16 KiB per request (`noc_read`/`noc_write` split; ttsim does not model hardware splitting).
+- Source and destination agree in their low 4 bits for L1, low 6 bits when DRAM is involved.
+- Reads must be acknowledged. Inline writes to L1 are broken on Blackhole; we never use inline writes.
+- Wait for `NOC_CMD_CTRL` bit 0 to clear before touching an initiator; read `NOC_CMD_CTRL` back before reading counters.
+- Before the NIU reads data a core just stored: `fence`, load from L1, `fence` (`l1_settle`). After data lands: `fence` before reading it (the L0 data cache).
+
+**Not built yet:**
+
+1. **Queues.** Each launch is several PCIe writes from the host. Next: a command ring in host memory or DRAM that a dispatcher core reads, so a launch is one write.
+2. **The other four cores.** TRISC0-2 drive the Tensix coprocessor, NCRISC is a second data mover. They start from their reset PCs (`0x6000`/`0xA000`/`0xE000`/`0x12000`, overridable); firmware for them, and a BRISC-to-TRISC handoff, comes with the compiler.
+3. **Per-core arguments** are one unicast write per core; fine for 120 cores, a table in DRAM would be one write.
+4. **Hang reports.** On timeout the host should read each core's PC snapshot (`0xFFB1_3138`...); ttsim does not model those registers, so it is not done.
+5. **Ordering of multicast-then-go** relies on the TLB's strict ordering. ttsim cannot tell posted from strict, so silicon must confirm it.
 
 ## Still unknown or untested
 
 - The real-card backend (`pci.Card`) has never run: the p150 has not arrived. It assumes root, the IOMMU off or in passthrough, and a free 2 MiB hugepage (`echo 1 > /proc/sys/vm/nr_hugepages`).
-- The Tensix power state on a card that never saw kmd, versus one kmd left clock-gated. Expect to need the ARC power message above before `hello` works on silicon.
+- Whether the all-on power message is enough to wake Tensix on silicon after kmd clock-gated it, or whether `0x52` (AICLK go busy) is needed too.
 - Whether the host-to-PCIe-tile loopback in `test_dma` (BAR read that turns into a device read of host memory) behaves on silicon as it does on ttsim. Device-initiated writes from a core's NIU are the path that matters and are untested.
 - ISA does not document BAR2 (iATU, DMA engine), the DRAM tile's internal address map, ARC's message protocol, or the power-on value of soft reset. ttsim models them; real silicon may differ.
-- ttsim does not model `mhartid`, `fence.i`, or most of BAR2.
+- ttsim does not model `mhartid`, `fence.i`, the PC snapshot registers, NoC request splitting, or most of BAR2, and it completes every NoC request instantly, so the outstanding-request counters never move there. Instruction cache invalidation is a no-op in ttsim, so `test_relaunch_without_reset` cannot catch a stale-instruction bug.
