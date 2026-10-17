@@ -93,6 +93,9 @@ def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then hande
   return [ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=2, value=a), ins("SETADC", cnt_set_mask=bh.UNPACK1, dimension_index=2, value=b),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
 REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
+def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and A's next tile in its row into SrcB
+  return [ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=2, value=s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
+          ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
 def math_begin(half, zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
   return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2),
            ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=DST_HALF * half)] +
@@ -262,7 +265,7 @@ def tt(words):
     if w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
   return " ".join(c)
 
-ZERO_SLOT, FRAMES = 4, 5  # slots 0-3 stream matmul tiles, 4 holds a zero tile, then two frames, then row values
+ZERO_SLOT, FRAMES = 2, 3  # slots 0-1 stream a matmul's B, 2 holds a zero tile, then two frames, row values, A's rows
 
 # SYNC (zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
 # one of them: FETCHED, how many times BRISC has fetched tiles into L1 (a frame, or a matmul step's pair); UNPACKED, how
@@ -285,7 +288,7 @@ def _brisc(zero, total, body):  # moves tiles: inputs into L1 ahead of thread 0,
   return SYNC_WORDS + f"""
 #define SLOT(i) ({SLOTS:#x} + (i) * {TILE})
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
-static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out;
+static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out, rows[16];  // rows: i + 1 of each matmul's A row in L1
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, SLOT(slot), {TILE}); }}
 // the same with its two off-diagonal faces swapped, half of transposing it (unpacker 0 does the rest)
@@ -299,13 +302,20 @@ static void send(void) {{  // the results packed so far go home, in the order th
     noc_write(SLOT(slot), bank[t % 8] & 63, bank[t % 8] >> 6, out + t / 8 * {TILE}, {TILE}); noc_wait();
   }}
 }}
-// A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, the matmul pair two
-// steps back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
+// A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, B's slot two steps
+// back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
-static void step(unsigned a, unsigned a_tile, unsigned b, unsigned b_tile) {{  // A's tile goes to SrcB, B's to SrcA
+// A matmul step: B's tile into a stream slot (for SrcA), and A's, unless its row is in L1 already, into its row slot
+static void step(unsigned b, unsigned b_tile, unsigned a, unsigned a_tile, unsigned a_slot) {{
   reached(stream_done[steps & 1]);
-  get(b, b_tile, steps & 1); get(a, a_tile, 2 + (steps & 1)); ready();
+  get(b, b_tile, steps & 1); if (a_slot) get(a, a_tile, a_slot); ready();
   stream_done[steps++ & 1] = ++events;
+}}
+// A matmul's row i of A stays in L1 while the result tiles stay in row i; a new row waits for the old to be unpacked
+static unsigned fresh(unsigned q, unsigned i) {{
+  if (rows[q] == i + 1) return 0;
+  reached(events);
+  return rows[q] = i + 1;
 }}
 void kmain(volatile unsigned *a) {{
   out = a[2];
@@ -433,7 +443,9 @@ def fused_kernel(expr, shapes):
   last = sweep[root] if root in sweep else ready[root]
   slots = allocate({"mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul"} |
                    {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE})
-  frame = inputs + len(ops)
+  frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
+  row = lambda q: FRAMES + 2 * frame + len(ops) + sum(ops[j]["kt"] for j in matmuls[:q])  # matmul q's row of A
+  assert row(len(matmuls)) <= (bh.L1_SIZE - SLOTS) // TILE and len(matmuls) <= 16, "too many tiles for L1"
   def slot(f, r):  # an input or wide op lives in the frame, a narrow op in its own slot after both frames
     if r == "zero": return ZERO_SLOT
     if isinstance(r, int): return FRAMES + f * frame + r
@@ -473,11 +485,12 @@ def fused_kernel(expr, shapes):
         cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
         c[P].append(f"{cond}{{ {output(j, f)}{halves([pack(DST_HALF * h, slot(f, me), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])} h ^= 1; }}")
         if op["kind"] == "matmul":
-          kt, bw = op["kt"], tiles[op["y"]][1]  # B's width in tiles
+          kt, bw, q = op["kt"], tiles[op["y"]][1], matmuls.index(j)  # B's width in tiles; which matmul
           x, y = 3 + 3 * op["x"], 3 + 3 * op["y"]  # A's and B's address, stride, offset in a
-          c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step(a[{x}], i_ * a[{x + 1}] + m + a[{x + 2}], a[{y}], m * a[{y + 1}] + {'j' if bw > 1 else 0} + a[{y + 2}]);")
-          c[U].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                      f"if (steps++ & 1) {{ {tt(unpack(1, 3) + REPORT)} }} else {{ {tt(unpack(0, 2) + REPORT)} }} }}{posted} }}")
+          c[B].append(f"{cond}{{ unsigned new = fresh({q}, i_); for (unsigned m = 0; m < {kt}; m++) "
+                      f"step(a[{y}], m * a[{y + 1}] + {'j' if bw > 1 else 0} + a[{y + 2}], a[{x}], i_ * a[{x + 1}] + m + a[{x + 2}], new ? {row(q)} + m : 0); }}")
+          c[U].append(f"{cond}{{ {tt([ins('SETADC', cnt_set_mask=bh.UNPACK1, dimension_index=2, value=row(q))])} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
+                      f"if (steps++ & 1) {{ {tt(step_unpack(1))} }} else {{ {tt(step_unpack(0))} }} }}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
           continue

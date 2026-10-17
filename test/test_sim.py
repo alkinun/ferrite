@@ -257,7 +257,7 @@ def test_replay_keeps_pushes_small():
   c, slots = compiler, compiler.allocate({"mm", "mul"})
   tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(0, op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
   assert tile("add") <= 26 and tile("mul") <= 27, "was 48 and 80 before replay"
-  assert len(c.unpack(0, 2) + c.REPORT + c.matmul(slots)) <= 12, "a matmul step was 71"
+  assert len(c.step_unpack(0) + c.matmul(slots)) <= 12, "a matmul step was 71"
   assert len(c.sfpu(["exp"], c.allocate({"exp"}))) <= 45, "32 passes of 19 words, replayed"
   for names in ({"mm", "mul"}, {"exp", "recip", "relu", "mm", "mul"}):  # what is recorded fits the 32-entry buffer
     assert sum(len(c.MATH_RUNS[n]) for n in c.allocate(names)) <= 32
