@@ -665,8 +665,10 @@ class Tensor:
 
   def realize(self):
     if self.op is None: return self
-    while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): its biggest part goes first, on its own
-      max((s for s in self.srcs if s.op), key=lambda s: _ops(s, set())).realize()
+    while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): down the heaviest branch, the first part
+      t = self                    # that fits goes first, on its own, so what is on top (a layer norm, say) stays whole
+      while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
+      t.realize()
     inputs = []
     e = _expr(self, self.rows, inputs)
     key = (e, tuple((u.rows, u.cols) for u in inputs))
