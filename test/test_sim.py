@@ -7,7 +7,7 @@ from trickle.chip import Chip
 from trickle import compiler
 from trickle.compiler import Tensor, from_bf16, to_bf16
 from trickle.hello import hello
-from trickle.runtime import ARGS, DATA, Runtime, compile_kernel
+from trickle.runtime import ARGS, DATA, KERNELS, Runtime, compile_kernel
 import gpt2
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
@@ -64,13 +64,22 @@ def test_every_core(chip):
   for x, y in rt.cores: assert chip.read32(x, y, ARGS) == x | y << 6
 
 def test_relaunch_without_reset(chip):
-  # different kernels at the same address, back to back: each must run, not a stale copy of the one before
+  # different kernels at the same address, back to back (each loaded after the last is evicted): each must run, not a
+  # stale copy of the one before
   rt = Runtime(chip, chip.tensix[0], chip.tensix[2])
   cores = rt.cores
   for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 2):
+    rt.evict()
     rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] {op} 3; }}"), lambda x, y: (x * 100 + y + i, 0))
     rt.wait()
     for x, y in cores: assert chip.read32(x, y, ARGS + 4) == f(x * 100 + y + i, 3), f"launch {i} on {x},{y}"
+  # kernels stay loaded until the room is full; then the next load evicts them all (once the queue is done)
+  big = [compile_kernel(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] + {k}; }}").ljust(300_000, b"\0") for k in (1, 2)]
+  rt.evict()
+  for k, image in enumerate(big + big):
+    rt.launch(image, lambda x, y: (x, 0))
+    rt.wait()
+    assert rt.loaded == {image: KERNELS} and all(chip.read32(x, y, ARGS + 4) == x + k % 2 + 1 for x, y in cores)
 
 def test_kernel_moves_data(chip):
   # each core pulls its own 40 KiB slice of DRAM into L1 (3 NoC packets), adds its index to every word, writes it
@@ -101,6 +110,7 @@ def test_queue(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[2], ring=2048)
   for x, y in rt.cores: chip.write32(x, y, DATA, 0)
   add = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[0]; }")
+  rt.load(add)  # once, before: then it stays
   writes, write = [], chip.pci.write
   chip.pci.write = lambda *a: (writes.append(a), write(*a))
   try:
