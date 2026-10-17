@@ -411,7 +411,7 @@ Before: `lspci -d 1e52:b140` shows the card; the IOMMU is off or in passthrough 
 | 4 | `-k "every_core or relaunch or moves_data or queue or hung"` | the launch path end to end; instruction cache invalidation (`bh.CFG_IC_INVALIDATE`, a no-op in ttsim, so only here can a stale kernel show) |
 | 5 | `-k "tile_math or tensor_math"` | the backend config indices (`bh.TENSIX_CFG_FIELDS`, from ttsim's `tensix_regs.json`, not the ISA), instruction encodings, `.ttinsn`, semaphores from the TRISCs, unpack and pack of bf16 |
 | 6 | `-k "matmul or stream"` | MVMUL, the 3-bit address modes (from ttsim's `tensix_isa.json`; the ISA pages are Wormhole's), fidelity phases, the replay buffer |
-| 7 | `-k "sfpu or reductions or any_shape or views"` | SFPU encodings, LReg 15 as 2 x lane, lane flags, `SFPARECIP`, `Haloize_mode` |
+| 7 | `-k "sfpu or reductions or any_shape or views or batch"` | SFPU encodings, LReg 15 as 2 x lane, lane flags, `SFPARECIP`, `Haloize_mode`, and switching it inside the unpack thread (`haloize`; if `q @ k.T` is wrong while `k.T` alone is right, look at the `STALLWAIT`s around the `RMWCIB`) |
 | 8 | the whole suite, a few times over | the waits ttsim never makes happen: the `STALLWAIT`s before reports and packs, TRISC2's wait for `READY`, `tensix_idle` before setting it (NOTES above: "What ttsim can and cannot check here"). A failure that comes and goes points here |
 | 9 | `GPT2=... pytest test -k gpt2`, then `test/gpt2.py` | everything at once, and the first real timings |
 
