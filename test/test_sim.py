@@ -1,9 +1,9 @@
 # Milestone 1 on ttsim, one test per step. TTSIM=/path/to/libttsim.so python3 -m pytest test
-import os, random, pytest
+import os, random, struct, pytest
 from trickle import bh, pci
 from trickle.chip import Chip
 from trickle.hello import hello
-from trickle.runtime import ARGS, KERNEL, Runtime, compile_rv32
+from trickle.runtime import ARGS, DATA, KERNEL, Runtime, compile_rv32
 
 @pytest.fixture(scope="session")
 def chip():
@@ -52,6 +52,30 @@ def test_relaunch_without_reset(chip):
     rt.launch(compile_rv32(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] {op} 3; }}", KERNEL), lambda x, y: (x * 100 + y + i, 0))
     rt.wait()
     for x, y in cores: assert chip.read32(x, y, ARGS + 4) == f(x * 100 + y + i, 3), f"launch {i} on {x},{y}"
+
+def test_kernel_moves_data(chip):
+  # each core pulls its own 40 KiB slice of DRAM into L1 (3 NoC packets), adds its index to every word, writes it
+  # back elsewhere in DRAM, then sends its first 64 bytes to the next core's L1
+  cores, n = chip.tensix[:4], 40 * 1024
+  (bx, by), src, dst = bh.DRAM[3], 1 << 20, 2 << 20
+  data = [random.randbytes(n) for _ in cores]
+  for i, d in enumerate(data): chip.write(bx, by, src + i * n, d)
+  args = {xy: (i, bx, by, src + i * n, dst + i * n, n, *cores[(i + 1) % len(cores)]) for i, xy in enumerate(cores)}
+  rt = Runtime(chip, cores)
+  rt.launch(compile_rv32("""
+void kmain(volatile unsigned *a) {  // a: [index, bank x, bank y, src, dst, n, next x, next y]
+  unsigned *buf = (unsigned *)L1_DATA;
+  noc_read(a[1], a[2], a[3], L1_DATA, a[5]);
+  noc_wait();
+  for (unsigned i = 0; i < a[5] / 4; i++) buf[i] += a[0];
+  noc_write(L1_DATA, a[1], a[2], a[4], a[5]);
+  noc_write(L1_DATA, a[6], a[7], L1_DATA + a[5], 64);
+}""", KERNEL), lambda x, y: args[x, y])
+  rt.wait()
+  out = [struct.pack(f"<{n // 4}I", *[(w + i) & 0xFFFFFFFF for w in struct.unpack(f"<{n // 4}I", d)]) for i, d in enumerate(data)]
+  for i, ((x, y), o) in enumerate(zip(cores, out)):
+    assert chip.read(bx, by, dst + i * n, n) == o, f"DRAM slice {i}"
+    assert chip.read(*cores[(i + 1) % len(cores)], DATA + n, 64) == o[:64], f"L1 of the core after {i}"
 
 def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, chip.tensix[:1])

@@ -2,18 +2,52 @@
 import pathlib, struct, subprocess, tempfile
 from trickle import bh
 
-# L1 layout, ours to choose: firmware at 0 where BRISC starts, a mailbox, kernel arguments, one kernel, then free space
-MAILBOX, ARGS, KERNEL, DATA = 0x1000, 0x1100, 0x2000, 0x10000  # mailbox words: [go, done]
+# L1 layout, ours to choose: firmware at 0 where BRISC starts, a mailbox, kernel arguments, one kernel, then free space.
+# Mailbox words: [go, report x | y << 6, report address lo, hi, done]; done is 16-byte aligned like its host slot.
+MAILBOX, ARGS, KERNEL, DATA = 0x1000, 0x1100, 0x2000, 0x10000
+
+# Prepended to every device program: NoC transfers through request initiator 0 of NIU 0 (ISA NoC/MemoryMap.md).
+DEVICE = f"""
+#define L1_DATA {DATA:#x}
+#define NIU(reg) (((volatile unsigned *){bh.NIU:#x})[(reg) / 4])
+enum {{ TARG_LO = 0x0, TARG_MID = 0x4, TARG_HI = 0x8, RET_LO = 0xC, RET_MID = 0x10, RET_HI = 0x14, PACKET_TAG = 0x18,
+        CTRL = 0x1C, LEN = 0x20, CMD = 0x40, ID_LOGICAL = 0x148, OUTSTANDING = 0x240 }};
+enum {{ READ = 0x10, WRITE = 0x12, MAX_PACKET = 16384 }};  // both acknowledged, so OUTSTANDING counts them
+static inline unsigned noc_me(void) {{ return NIU(ID_LOGICAL) & 0xFFF; }}  // this tile's translated x | y << 6
+static inline void noc_issue(unsigned long long targ, unsigned targ_xy, unsigned long long ret, unsigned ret_xy,
+                             unsigned ctrl, unsigned n) {{
+  while (NIU(CMD) & 1) {{}}  // the initiator still holds the previous request
+  NIU(TARG_LO) = targ; NIU(TARG_MID) = targ >> 32; NIU(TARG_HI) = targ_xy;
+  NIU(RET_LO) = ret; NIU(RET_MID) = ret >> 32; NIU(RET_HI) = ret_xy;
+  NIU(PACKET_TAG) = 0; NIU(CTRL) = ctrl; NIU(LEN) = n;
+  NIU(CMD) = 1;
+}}
+// until this core's earlier stores to L1 are processed: they are out, a load behind them is answered
+static inline void l1_settle(unsigned addr) {{ asm volatile("fence"); (void)*(volatile unsigned *)addr; asm volatile("fence"); }}
+// Copy n bytes between (x, y, addr) and this tile's L1. The low 4 bits of the two addresses must match (6 for DRAM).
+static inline void noc_read(unsigned x, unsigned y, unsigned long long addr, unsigned l1, unsigned n) {{
+  for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(addr, x | y << 6, l1, noc_me(), READ, k = n < MAX_PACKET ? n : MAX_PACKET);
+}}
+static inline void noc_write(unsigned l1, unsigned x, unsigned y, unsigned long long addr, unsigned n) {{
+  l1_settle(l1);  // the NIU reads L1 on its own; our stores must be there first
+  for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(l1, noc_me(), addr, x | y << 6, WRITE, k = n < MAX_PACKET ? n : MAX_PACKET);
+}}
+static inline void noc_wait(void) {{  // until every read has landed and every write is acknowledged
+  (void)NIU(CMD);  // reading the initiator first keeps the counter read behind the last request
+  while (NIU(OUTSTANDING)) {{}}
+  asm volatile("fence");  // drop L0 data cache lines the NoC may have just overwritten
+}}
+"""
 
 def compile_rv32(src, base=0):
-  """C source to a flat rv32 image that runs from base: `.start` first, else `kmain`, then everything else."""
+  """C source, after DEVICE, to a flat rv32 image that runs from base: `.start` first, else `kmain`, then the rest."""
   link = f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) *(.sbss*) *(.bss*) }} }}"
   with tempfile.TemporaryDirectory() as d:  # one output section, so .bss is zeros inside the image
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
     out = pathlib.Path(d, "prog.bin")
     subprocess.run(["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-O2", "-ffreestanding", "-nostdlib",
                     "-ffunction-sections", "-fuse-ld=lld", f"-Wl,-T,{ld},--oformat=binary", "-x", "c", "-", "-o", str(out)],
-                   input=src.encode(), check=True)
+                   input=(DEVICE + src).encode(), check=True)
     return out.read_bytes()
 
 FIRMWARE = f"""
@@ -29,21 +63,26 @@ void loop(void) {{
     (void)CFG[0];
     asm volatile("fence");  // and we have that read's answer before jumping
     ((void (*)(volatile unsigned *)){KERNEL:#x})((volatile unsigned *){ARGS:#x});
-    MAILBOX[1] = seen;  // L1 stores land in order, so the kernel's results are in place before this
+    noc_wait();  // whatever the kernel sent is in place before we say it is done
+    MAILBOX[4] = seen;
+    noc_write({MAILBOX + 16:#x}, MAILBOX[1] & 63, MAILBOX[1] >> 6, MAILBOX[2] | (unsigned long long)MAILBOX[3] << 32, 4);
+    noc_wait();
   }}
 }}
 """
 
 class Runtime:
-  """Firmware on the BRISC of each of cores, then any number of launches of `void kmain(volatile unsigned *args)`."""
+  """Firmware on the BRISC of each of cores, then any number of launches of `void kmain(volatile unsigned *args)`.
+  Each core reports a finished launch by writing its count into its own 16-byte slot of a host buffer."""
   def __init__(self, chip, cores):
     self.chip, self.cores, self.launches = chip, cores, 0
+    self.done, bus = chip.pci.alloc(16 * len(cores))
     fw = compile_rv32(FIRMWARE)
     assert len(fw) <= MAILBOX, "firmware overlaps the mailbox"
-    for x, y in cores:
+    for i, (x, y) in enumerate(cores):
       chip.halt(x, y)
       chip.write(x, y, 0, fw)
-      chip.write(x, y, MAILBOX, bytes(8))
+      chip.write(x, y, MAILBOX, struct.pack("<5I", 0, bh.PCIE[0] | bh.PCIE[1] << 6, (bus + 16 * i) & 0xFFFFFFFF, (bus + 16 * i) >> 32, 0))
       chip.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES & ~bh.BRISC)
 
   def launch(self, kernel, args=lambda x, y: ()):
@@ -57,6 +96,7 @@ class Runtime:
       self.chip.write32(x, y, MAILBOX, self.launches)
 
   def wait(self, timeout=2.0):
-    for x, y in self.cores:
-      self.chip.wait(lambda: self.chip.read32(x, y, MAILBOX + 4) == self.launches,
+    """Until every core has reported the last launch: polls host memory, not the chip."""
+    for i, (x, y) in enumerate(self.cores):
+      self.chip.wait(lambda: int.from_bytes(self.done[16 * i:16 * i + 4], "little") == self.launches,
                      f"finish launch {self.launches} on Tensix ({x},{y})", timeout)
