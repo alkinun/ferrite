@@ -173,5 +173,32 @@ def test_pack_waits_for_math(chip):
   a, b = ([[float((r * c + k) % 9 - 4) for c in range(64)] for r in range(128)] for k in (1, 2))
   ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
   out = Tensor(rt, 128, 64)
-  ta._run(compiler.elementwise_kernel("add", pack_first=True), out, ta.addr, tb.addr, out.addr, 1)
+  out._run(compiler.fused_kernel(("add", 0, 1), order="pack_first"), out.addr, ta.addr, tb.addr)
   assert out.tolist() == [[x + y for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
+
+def unfused(t):  # the same tree of ops, realized one launch per op
+  return t if t.op is None else unfused(t.srcs[0])._elementwise(t.op, unfused(t.srcs[1])).realize()
+
+def test_fusion(chip):
+  # a fused chain is one launch, its intermediates never get DRAM, and it is bit for bit the same as running each op on
+  # its own: every intermediate is rounded to bf16 on its way to L1 just as it would be on its way to DRAM. Both trees
+  # have ops that read two intermediates, and in the second one an op reads an intermediate made two ops earlier
+  for workers in (chip.tensix[1], chip.tensix[-1]):  # one worker cycling through 12 tiles, then a tile per worker
+    rt = Runtime(chip, chip.tensix[0], workers)
+    a, b, c, d = (Tensor.of(rt, [[from_bf16(to_bf16(random.uniform(-3, 3))) for _ in range(96)] for _ in range(128)]) for _ in range(4))
+    for build in (lambda a, b, c, d: (a + b) * c - d * a, lambda a, b, c, d: (a + b) * ((c - d) + a * a)):
+      fused, launches = build(a, b, c, d), rt.launches
+      lazy = [t for t in (fused, *fused.srcs, *fused.srcs[0].srcs, *fused.srcs[1].srcs) if t.op]
+      got = fused.tolist()
+      assert rt.launches == launches + 1 and all(t.addr is None for t in lazy[1:]), "one kernel, intermediates stay on chip"
+      assert got == unfused(build(a, b, c, d)).tolist()
+
+def test_fusion_waits(chip):
+  # (a+b) + ((c-d) + a*b), queued thread by thread so the threads really wait on ttsim: thread 0 reaches the ops that
+  # read intermediates before the pack thread has written them (SEM_L1), and the math thread gets three ops that read
+  # only inputs in a row, so the third must wait for the pack thread to drain a Dst half (SEM_DST)
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  a, b, c, d = (Tensor.of(rt, [[float((r * 3 + c * k) % 7 - 3) for c in range(64)] for r in range(64)]) for k in (1, 2, 5, 6))
+  out = Tensor(rt, 64, 64)
+  out._run(compiler.fused_kernel(("add", ("add", 0, 1), ("add", ("sub", 2, 3), ("mul", 0, 1))), order="thread"), out.addr, a.addr, b.addr, c.addr, d.addr)
+  assert out.tolist() == unfused((a + b) + ((c - d) + a * b)).tolist()

@@ -181,7 +181,7 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 ## The Tensix coprocessor, and the first compiler
 
-`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`.
+`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`.
 
 **Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). BRISC can push into all three: a store of the instruction word to `0xFFE4_0000` (thread 0), `0xFFE5_0000`, `0xFFE6_0000`. Its pushes skip the MOP expander (MOP from BRISC is an error; REPLAY works), and a full FIFO stalls BRISC. TRISCs push only to their own thread. trickle: BRISC alone drives all three threads, TRISCs stay in reset (a BRISC push and a TRISC push in the same cycle drop the TRISC's). BRISC can read only thread 0's GPRs in ttsim (ISA: all three at `0xFFE0_0000 + 4*(64t + r)`), which decides who reports what.
 
@@ -195,18 +195,19 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 BRISC's config stores are not ordered with its instruction pushes (Auto TTSync covers TRISCs only), so the kernel writes config, then `fence`, reads back a config word, `fence`, and only then pushes.
 
-**The pipeline** (`compiler.stream_kernel`). Each thread has one job, so unpack, math and pack work on different tiles at the same time:
+**The pipeline** (`compiler._kernel`, `fused_kernel`, `matmul_kernel`). Each thread has one job, so unpack, math and pack work on different tiles at the same time. L1 holds an array of tile slots; the unpackers' Z counter (Z stride: one tile) and the packer's channel-1 Y counter (that Y stride: one tile) pick the slot, so moving between slots never touches config:
 
 | Thread | Job | Per tile (or matmul step) |
 |---|---|---|
-| 0 | unpack, and report to BRISC | pick the L1 slot (ADC Z = slot; the unpackers' Z stride is one tile), `UNPACR` into SrcA and SrcB, wait for the unpackers, then BRISC's `SETGPR` 63 = steps unpacked |
-| 1 | math | per output tile: aim at Dst half n % 2 (`SETC16 MATH_Offset` = 64 n % 2), zero it if the op accumulates (`ZEROACC` four 16-row blocks); per step: the FPU program; at the end: wait for the FPU, `SEMPOST` SEM_DST |
-| 2 | pack | `SEMWAIT` SEM_DST, aim the packer at the Dst half (ADC ch0 Y) and the output L1 slot (ADC ch1 Y; channel-1 Y stride is one tile), 16 `PACR`, wait for the packer, `SEMGET` SEM_DST, `SEMPOST` SEM_PACKED |
+| 0 | unpack, and report to BRISC | `SETADC` each unpacker's Z to its slot, `UNPACR` into SrcA and SrcB; in matmul, wait for the unpackers and BRISC's `SETGPR` 63 = steps unpacked |
+| 1 | math | per result: `SEMWAIT` for a free Dst half, aim at it (`SETC16 MATH_Offset` = 0 or 64), zero it if the op accumulates (`ZEROACC` four 16-row blocks); the FPU program (one per step); at the end: wait for the FPU, `SEMPOST` SEM_DST |
+| 2 | pack | `SEMWAIT` SEM_DST, aim the packer at the Dst half (ADC ch0 Y) and the L1 slot (ADC ch1 Y), 16 `PACR`, wait for the packer, `SEMGET` SEM_DST, `SEMPOST` SEM_L1 (an intermediate) or SEM_PACKED (an output) |
 
 Handoffs:
 
 - **Unpack to math**: SrcA and SrcB have two banks each, and the hardware does the rest (`UNPACR` waits for a bank the FPU has released, the FPU for one the unpacker has filled).
-- **Math to pack**: SEM_DST counts output tiles in Dst waiting to be packed (max 2, one per half). Math never waits for a free half: BRISC does not push tile n + 2 until it has seen tile n packed.
+- **Math to pack**: SEM_DST counts results in Dst waiting to be packed (max 2, one per half). Math waits while both halves are full, pack while none is.
+- **Pack to unpack** (fused chains): an intermediate is packed into L1 and unpacked by a later op. Pack posts SEM_L1 for each; before an op that reads an intermediate, unpack takes one for every op packed since it last looked. Packs happen in op order, so that covers whichever earlier op it reads (a plain count would not: the op might read an older intermediate than the one just posted).
 - **Pack to BRISC**: BRISC cannot read the semaphores, nor (on ttsim) thread 2's GPRs. So BRISC pushes a relay into thread 0 (`SEMWAIT` SEM_PACKED, `SEMGET`, `SETGPR` 62) and polls GPR 62.
 
 **BRISC's loop**:
@@ -215,11 +216,13 @@ Handoffs:
 2. Push the unpack to thread 0, the math to thread 1, and after the last step of an output tile its pack to thread 2.
 3. Then wait for the previous output tile to be packed and write it home, which frees its L1 slot before the next pack can reuse it.
 
-L1 holds two slots each for SrcA tiles, SrcB tiles and results. Thread setup goes to all three threads; thread 0 initialises the semaphores, and BRISC waits for that before pushing anything to the others. Elementwise ops are the same with one step per tile.
+Thread setup goes to all three threads; thread 0 initialises the semaphores, and BRISC waits for that before pushing anything to the others.
 
-**Push order matters on silicon.** BRISC's path into a thread is a few entries deep and a full FIFO stalls BRISC. So BRISC must never queue work a thread will block on, unless what unblocks it has already been pushed: unpack, then math, then pack. `pack_first` breaks that rule on purpose for one test, which only ttsim (512-entry FIFOs) survives.
+**Fusion** (`fused_kernel`, `Tensor` is lazy). `+`, `-`, `*` build a tree; `realize` (or `tolist`, or `@` on it) compiles the whole tree into one kernel. Equal subtrees become one op. Per output tile, a frame of slots holds the inputs, then one slot per op in post order; the last is the result. BRISC fetches the inputs into the frame and pushes, op by op, its unpack (from its operands' slots), math (into the next Dst half) and pack (into its own slot). Intermediates live in L1 only, and only the result goes to DRAM. Two frames alternate, so tile n + 1 is fetched while tile n computes, and BRISC writes tile n - 1 back. Every intermediate is rounded to bf16 on its way to L1, exactly as it would be on its way to DRAM, so a fused chain is bit for bit the same as one launch per op (`test_fusion` checks). A single op is just a one-op chain. Limits: binary ops on equal shapes, at most 15 ops (SEM_L1 is 4 bits).
 
-**What ttsim can and cannot check here.** ttsim runs each Tensix instruction the moment it can, in zero time, and ignores the busy conditions of `STALLWAIT`. In the normal push order every handoff has already happened by the time its wait runs. That is why `test_pack_waits_for_math` queues each pack before its math: without the pack's `SEMWAIT`, ttsim stops on `SEMGET` of an empty semaphore. Speed-up from the overlap cannot be measured on ttsim at all; that waits for silicon.
+**Push order matters on silicon.** BRISC's path into a thread is a few entries deep and a full FIFO stalls BRISC. So BRISC must never queue work a thread will block on, unless what unblocks it has already been pushed: unpack, then math, then pack, op by op. `fused_kernel(order=...)` breaks that rule on purpose for tests, which only ttsim (512-entry FIFOs) survives: `pack_first` queues each pack before its math, `thread` queues a whole tile for thread 0, then 1, then 2.
+
+**What ttsim can and cannot check here.** ttsim runs each Tensix instruction the moment it can, in zero time, and ignores the busy conditions of `STALLWAIT`. In the normal push order every handoff has already happened by the time its wait runs, so a missing wait would pass. Hence the test-only orders: without the pack's `SEMWAIT`, `test_pack_waits_for_math` dies on `SEMGET` of an empty semaphore; without the SEM_L1 wait or the math's Dst-half wait, `test_fusion_waits` fails. Speed-up from the overlap cannot be measured on ttsim at all; that waits for silicon.
 
 **Tile layout** (ours; the ISA has no notion of a tile). A 32x32 tile is four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), each face row-major: element (r, c) is at `(r//16*2 + c//16)*256 + r%16*16 + c%16`. An unpacker copies the 1024 datums linearly into Src rows, so face f is Src rows 16f..16f+15, which is what `MVMUL` wants; Dst and the packer keep the same order. Elementwise ops do not care. Tensors are tiles in row-major tile order, tile i in DRAM bank i % 8 at `base + i//8 * 2048`.
 
@@ -238,7 +241,7 @@ L1 holds two slots each for SrcA tiles, SrcB tiles and results. Thread setup goe
 1. BRISC pushes every Tensix instruction (65 a matmul step), which keeps it from moving data. `REPLAY` (32 entries per thread) or TRISC firmware that loops locally (with MOP) would cut that to a few words a step.
 2. Deeper pipelines: more L1 slots, so DRAM latency hides behind more than one step.
 3. Matmul reuse: each step refetches both tiles from DRAM. Keep a row of left tiles in L1 across j, and fetch the next pair while the FPU runs (two L1 slots, two Src banks).
-4. Fusion: chains of elementwise ops on the tile while it is in Dst, instead of a DRAM round trip per op.
+4. Fusion beyond elementwise chains: a matmul's epilogue (`(a @ b) + c`, accumulating into the same Dst half), unary ops, broadcasts. Keeping intermediates in fp32 (an fp32 pack, or moving Dst back into SrcA/SrcB) instead of rounding each to bf16.
 5. The SFPU, for fp32, exp, recip, and the rest.
 
 ## Still unknown or untested
