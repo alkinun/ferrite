@@ -41,5 +41,6 @@ def hello(chip, x, y, n):
   return chip.read32(x, y, IO + 8)
 
 if __name__ == "__main__":
-  x, y = bh.TENSIX[0]
-  print(f"BRISC on Tensix ({x},{y}) says fib(30) = {hello(Chip(pci.open_device()), x, y, 30)}")
+  chip = Chip(pci.open_device())
+  x, y = chip.tensix[0]
+  print(f"BRISC on Tensix ({x},{y}) says fib(30) = {hello(chip, x, y, 30)}")

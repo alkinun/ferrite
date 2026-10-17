@@ -14,6 +14,11 @@ def test_config_space(chip):
   assert chip.pci.cfg_read(0x04) & 0x2, "memory decode is off"
   assert len(set(chip.pci.bars.values())) == 3
 
+def test_arc(chip):
+  chip.arc_msg(0x90)  # TEST
+  t = chip.telemetry()
+  assert len(chip.tensix) == 120 and t[bh.TAG_AICLK] > 0, "ttsim models a p150: 12 of 14 Tensix columns"
+
 def test_dma(chip):
   # the PCIe tile forwards NoC addresses below 2**58 to the host as bus addresses: point the TLB there and the
   # device reads and writes host memory
@@ -25,7 +30,7 @@ def test_dma(chip):
 
 def test_l1(chip):
   # write every target before reading any back, so two targets that alias each other fail
-  addr, data = bh.L1_SIZE - 65536, {xy: random.randbytes(65536) for xy in (bh.TENSIX[0], bh.TENSIX[-1])}
+  addr, data = bh.L1_SIZE - 65536, {xy: random.randbytes(65536) for xy in (chip.tensix[0], chip.tensix[-1])}
   for (x, y), d in data.items(): chip.write(x, y, addr, d)
   for (x, y), d in data.items(): assert chip.read(x, y, addr, len(d)) == d, f"Tensix {x},{y}"
 
@@ -36,11 +41,11 @@ def test_dram(chip):
     for port in range(3): assert chip.read(x, y + port, addr, len(d)) == d, f"bank {bank} port {port}"
 
 def test_hello(chip):
-  for x, y in (bh.TENSIX[0], bh.TENSIX[-1]):
+  for x, y in (chip.tensix[0], chip.tensix[-1]):
     assert hello(chip, x, y, 30) == 832040
 
 def test_hung_core_times_out(chip):
-  x, y = bh.TENSIX[0]
+  x, y = chip.tensix[0]
   chip.write32(x, y, 0x10000, 0)
   chip.run(x, y, compile_rv32('__attribute__((section(".start"))) void _start(void) { for (;;); }'))
   with pytest.raises(TimeoutError): chip.wait(lambda: chip.read32(x, y, 0x10000) == 1, "write 1", timeout=0.2)

@@ -10,12 +10,21 @@ TLB_FIELDS = {"addr": (0, 43), "x_end": (43, 6), "y_end": (49, 6), "ordering": (
 STRICT = 1  # ordering: each write is acknowledged before the next one starts
 
 # NoC endpoints in translated coordinates, which firmware sets up at boot so that harvesting is invisible:
-# Tensix x is 1..7,10..16 with good columns first, y is 2..11. A p150 has 12 good columns, so x in 1..7,10..14.
-TENSIX = [(x, y) for y in range(2, 12) for x in (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14)]
+# Tensix columns with the good ones first (a p150 has 12, telemetry says how many), rows 2..11.
+TENSIX_X, TENSIX_Y = (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16), range(2, 12)
 DRAM = [(17 + b // 4, 12 + 3 * (b % 4)) for b in range(8)]  # bank b; each bank also answers at y+1 and y+2
 PCIE = (19, 24)
 ARC = (8, 0)  # rows 0 and 1 are not translated
-ARC_BOOT_STATUS = 0x80030408  # ARC reset unit SCRATCH_RAM[2]: low 3 bits are 5 once firmware is up and taking messages
+
+# ARC, the management core, through its reset unit's scratch registers
+ARC_BOOT_STATUS = 0x80030408  # SCRATCH_RAM[2]: low 3 bits are 5 once firmware is up and taking messages
+ARC_QUEUES = 0x8003042C  # SCRATCH_RAM[11]: address of the message queue control block {base, entries | count << 8}
+ARC_IRQ = 0x80030100, 1 << 16  # ARC_MISC_CNTL IRQ0: tells ARC to look at its queues
+ARC_TELEMETRY = 0x80030434, 0x80030430  # SCRATCH_RAM[13], [12]: addresses of {version, count, tag | index << 16}, values
+APP_QUEUE = 3  # queues 0..3 are for kmd, monitoring, tools, applications
+# POWER_SETTING with all 15 flags valid and set: max AI clock, GDDR PHY awake, Tensix and L2CPU clocks on
+POWER_ON = 0x21 | 15 << 8 | 0x7FFF << 16
+TAG_AICLK, TAG_GDDR_STATUS, TAG_TENSIX_COLS, TAG_GDDR_ENABLED = 14, 22, 34, 36  # telemetry; GDDR_STATUS: 2 bits a bank
 
 # Tensix tile, at the same addresses over the NoC and from its own cores
 L1_SIZE = 1536 * 1024
