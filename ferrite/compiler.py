@@ -747,6 +747,9 @@ class Tensor:
     if self.op is None: return self
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
       for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
+      reads = [id(s) for t in _lazy(self, set()) for s in t.srcs]  # and what a reduction and something else both read, if
+      for x in [t.srcs[0] for t in _lazy(self, set()) if t.op in COMBINE]:  # it is elementwise: on as many workers as it has
+        if reads.count(id(x)) > 1 and all(t.op not in COMBINE and t.op != "matmul" for t in _lazy(x, set())): x.realize()  # tiles
     while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): down the heaviest branch, the first part
       t = self                    # that fits goes first, on its own, so what is on top (a layer norm, say) stays whole
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
