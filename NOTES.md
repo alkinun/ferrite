@@ -179,6 +179,44 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 5. **Hang reports from silicon.** The host should also read each stuck core's PC snapshot (`0xFFB1_3138`...); ttsim does not model those registers.
 6. **Ordering of the host's ring writes before the doorbell** relies on x86 ordering cached stores before an uncached MMIO write. Fine on x86, and needs a barrier anywhere else.
 
+## The Tensix coprocessor, and the first compiler
+
+`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`.
+
+**Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). BRISC can push into all three: a store of the instruction word to `0xFFE4_0000` (thread 0), `0xFFE5_0000`, `0xFFE6_0000`. Its pushes skip the MOP expander (MOP from BRISC is an error; REPLAY works), and a full FIFO stalls BRISC. TRISCs push only to their own thread. Milestone: BRISC alone drives thread 0, TRISCs stay in reset (a BRISC push and a TRISC push in the same cycle drop the TRISC's).
+
+**Instruction words.** `opcode << 24 | fields` (ISA `Diagrams/Src/Bits32.lua`; ttsim `data/bh/tensix_isa.json` agrees and names the fields). `.ttinsn` is the same word rotated left by 2, so it only covers opcodes below `0xC0`.
+
+**Configuration.** Three kinds, all needed:
+
+- *Backend config*: 32-bit words at `0xFFEF_0000`, two banks (thread chooses with `CFG_STATE_ID`), a RISC-V store hits bank 0. The ISA docs name the fields but defer every index, shift and width to tt-metal's `cfg_defines.h`; ours come from ttsim's `tensix_regs.json` and must be checked on silicon.
+- *Thread config*: 16-bit registers per thread, written only by `SETC16` from that thread, so they are set in-band at the start of the kernel. Reset values are undocumented, so every one we depend on is written.
+- *ADCs and RWCs*: per-thread address counters (`SETADC*`) for unpackers and packer, and register-window counters (`SETRWC`) for the FPU.
+
+BRISC's config stores are not ordered with its instruction pushes (Auto TTSync covers TRISCs only), so the kernel writes config, then `fence`, reads back a config word, `fence`, and only then pushes.
+
+**One tile, C = A op B** (32x32 bf16, everything in L1). The program is fixed; only the DRAM addresses change per tile:
+
+1. Reset RWCs and ADCs; set ADC X ranges: unpackers 0..1023 (a whole tile per `UNPACR`), packer 0..15 (one Dst row).
+2. `UNPACR` A into SrcA, `UNPACR` B into SrcB, each with `set_dat_valid` to hand the bank to the FPU. Unpacker 0 writes SrcA from address 64 (`Dest_cntx0_address`; SrcA rows are biased by 4); `SRCA_SET_SetOvrdWithAddr` must be set for both.
+3. FPU: 8 x `ELWADD`/`ELWSUB` (8 rows of 16 each; address mode 0 steps the SrcA, SrcB and Dst counters by 8), the last one clearing both data-valids. `ELWMUL` always accumulates and multiplies a slice of the mantissas per fidelity phase: `ZEROACC` all of Dst, then 4 phases of 8 `ELWMUL`, the last of each phase in address mode 1 (`FidelityIncr` 1).
+4. `STALLWAIT` packer-until-FPU-idle, then 16 x `PACR` (4 Dst rows each through all 4 read ports, address mode 0 steps the packer's Y by 4), the last with `last`.
+5. `STALLWAIT` ThCon-until-packer-idle, then `SETGPR` a sequence number into GPR 63, which BRISC polls at `0xFFE0_00FC`.
+
+**Precision.** Dst is kept in fp32 (`Fp32_enabled`); the packer rounds it to bf16 (`(bits + 0x8000) >> 16`, the only fp32-Dst-to-bf16 mode ttsim allows is `Read_32b_data` with In = bf16). With 4 fidelity phases a bf16 x bf16 product is exact before that rounding (bit-exact on 8192 random pairs). `ELWADD`/`ELWSUB` align the two 11-bit mantissas with round-half-up first, so about 0.4% of random sums differ from the fp32 sum by a last-place bf16 step. fp32 tensors would lose 13 mantissa bits in SrcA/SrcB (TF32); full fp32 needs unpack-to-Dst and the SFPU.
+
+**Where the docs and ttsim disagree.** `UNPACR` bit 7 is `MultiContextMode` in the ISA and `ovrd_thread_id` in ttsim; both say it must be 1. Bit 0 is "write 0" in the ISA, `last` (must be 1) in ttsim; we follow ttsim. The Blackhole README says "4x packer", the PACR page says one packer with four Dst read ports. `SETDVALID` is unsupported on Blackhole (use `UNPACR_NOP`).
+
+**What ttsim cannot check here.** It executes each Tensix instruction atomically and ignores most `STALLWAIT` conditions (FPU, packer, unpacker busy), so a missing wait between units passes on ttsim and fails on silicon. The `STALLWAIT`s above are what the ISA asks for.
+
+**Next for the compiler:**
+
+1. Three threads in parallel: TRISC firmware with unpack, math and pack on their own threads and semaphores between them, so tile n+1 unpacks while tile n packs. Double-buffered Dst halves.
+2. `REPLAY` (32 entries per thread) instead of re-pushing the same 40 words per tile.
+3. Matmul (`MVMUL`): here the layout inside a tile matters (faces of 16x16 feeding SrcA/SrcB), and the ISA does not define one.
+4. Fusion: chains of elementwise ops on the tile while it is in Dst, instead of a DRAM round trip per op.
+5. The SFPU, for fp32, exp, recip, and the rest.
+
 ## Still unknown or untested
 
 - The real-card backend (`pci.Card`) has never run: the p150 has not arrived. It assumes root, the IOMMU off or in passthrough, and a free 2 MiB hugepage (`echo 1 > /proc/sys/vm/nr_hugepages`).

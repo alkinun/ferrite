@@ -2,6 +2,7 @@
 import os, random, struct, pytest
 from trickle import bh, pci
 from trickle.chip import Chip
+from trickle.compiler import Tensor, from_bf16, to_bf16
 from trickle.hello import hello
 from trickle.runtime import ARGS, DATA, KERNEL, Runtime, compile_rv32
 
@@ -105,3 +106,26 @@ def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
   rt.launch(compile_rv32("void kmain(volatile unsigned *a) { for (;;); }", KERNEL))
   with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]"): rt.wait(timeout=0.2)
+
+def test_tile_math(chip):
+  # one tile of small integers through unpack -> FPU -> pack: add, sub and mul must be exact
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  a = [[float((r * 32 + c) % 17 - 8) for c in range(32)] for r in range(32)]
+  b = [[float((r + 3 * c) % 11 - 5) for c in range(32)] for r in range(32)]
+  ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
+  for got, f in ((ta + tb, float.__add__), (ta - tb, float.__sub__), (ta * tb, float.__mul__)):
+    assert got.tolist() == [[f(x, y) for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
+
+def test_tensor_math(chip):
+  # random bf16 over 8 tiles on 8 workers. mul runs all four fidelity phases into fp32 Dst, so it is the exact product
+  # rounded once by the packer; add and sub align mantissas at 11 bits first, so allow one bf16 step of the larger input
+  rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 128
+  a, b = ([[from_bf16(to_bf16(random.uniform(-4, 4))) for _ in range(cols)] for _ in range(rows)] for _ in range(2))
+  ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
+  packed = lambda v: from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)  # the packer's rounding
+  assert (ta * tb).tolist() == [[packed(x * y) for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
+  for got, f in (((ta + tb).tolist(), float.__add__), ((ta - tb).tolist(), float.__sub__)):
+    for r in range(rows):
+      for c in range(cols):
+        x, y = a[r][c], b[r][c]
+        assert abs(got[r][c] - f(x, y)) <= max(abs(x), abs(y)) * 2**-7, (r, c, x, y, got[r][c])

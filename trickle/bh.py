@@ -35,5 +35,51 @@ BRISC, TRISC0, TRISC1, TRISC2, NCRISC = 1 << 11, 1 << 12, 1 << 13, 1 << 14, 1 <<
 ALL_CORES = BRISC | TRISC0 | TRISC1 | TRISC2 | NCRISC  # power-on value
 BRISC_STACK_TOP = 0xFFB00000 + 8 * 1024  # end of BRISC's private data RAM; BRISC starts at PC 0 in L1
 NIU = 0xFFB20000  # NoC 0 interface: request initiators at +0x800*i, counters at +0x200, translated id at +0x148
-TENSIX_CFG = 0xFFEF0000  # Tensix backend config, one word per register; BRISC and TRISCs only, not the NoC
+TENSIX_CFG = 0xFFEF0000  # Tensix backend config bank 0, one word per register; BRISC and TRISCs only, not the NoC
 CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: writing bit 0 (BRISC) .. bit 4 (NCRISC) drops that core's instruction cache
+
+# Tensix coprocessor. Encodings: ISA TensixCoprocessor/ and Diagrams/Src/Bits32.lua, field names as in ttsim's
+# data/bh/tensix_isa.json. A word is opcode << 24 | fields. BRISC pushes thread t's instructions by storing the word at
+# TENSIX_PUSH + 0x10000*t (they skip the MOP expander), and sees thread 0's 64 GPRs at TENSIX_GPR.
+TENSIX_PUSH, TENSIX_GPR = 0xFFE40000, 0xFFE00000
+_ELW = {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 2), "dest_accum_en": (21, 1), "clear_dvalid": (22, 2)}
+_ADC = {"bit_mask": (0, 4), "ch0_x": (6, 3), "ch0_y": (9, 3), "ch1_x": (12, 3), "ch1_y": (15, 3), "cnt_set_mask": (21, 3)}
+TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
+  "ZEROACC": (0x10, {"where": (0, 10), "addr_mode": (14, 3), "use_32_bit_mode": (18, 1), "clear_mode": (19, 2)}),
+  "ELWMUL": (0x27, _ELW), "ELWADD": (0x28, _ELW), "ELWSUB": (0x30, _ELW),
+  "SETRWC": (0x37, {"bit_mask": (0, 4), "rwc_a": (6, 4), "rwc_b": (10, 4), "rwc_d": (14, 4), "rwc_cr": (18, 4), "clear_ab_vld": (22, 2)}),
+  "PACR": (0x41, {"last": (0, 1), "read_intf_sel": (8, 4), "addr_mode": (15, 2)}),
+  "UNPACR": (0x42, {"last": (0, 1), "set_dat_valid": (6, 1), "ovrd_thread_id": (7, 1), "addr_mode": (15, 8), "unpack_block_selection": (23, 1)}),
+  "SETGPR": (0x45, {"reg_index_16b": (0, 7), "value": (8, 16)}),  # SETDMAREG: 16 bits into half a GPR (index = 2*gpr + hi)
+  "SETADCXY": (0x51, _ADC), "SETADCZW": (0x54, _ADC),  # in ZW, x means z and y means w
+  "SETADCXX": (0x5E, {"x_start": (0, 10), "x_end2": (10, 10), "cnt_set_mask": (21, 3)}),
+  "STALLWAIT": (0xA2, {"wait_res": (0, 13), "stall_res": (15, 9)}),
+  "SETC16": (0xB2, {"setc16_value": (0, 16), "setc16_reg": (16, 8)}),
+}
+UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets
+STALL_PACK, STALL_THCON = 1 << 2, 1 << 5  # STALLWAIT stall_res: blocks those units' instructions until ...
+WAIT_PACK, WAIT_FPU = 1 << 3, 1 << 4  # ... wait_res: the packer / the FPU is idle
+BF16 = 5  # data format code (ISA Unpackers/FormatConversion.md)
+
+# Backend config: field -> (32-bit word index at TENSIX_CFG, first bit, width). The ISA docs defer these numbers to
+# tt-metal's cfg_defines.h; these are from ttsim's data/bh/tensix_regs.json and still need checking against silicon.
+TENSIX_CFG_FIELDS = {
+  "Dstacc": (1, 25, 4), "Fp32_enabled": (1, 29, 1), "Zero_Flag_disabled_src": (2, 0, 1),
+  "PCK0_Ystride": (12, 16, 16), "PCK0_ZW": (13, 0, 32), "PCK0_Ystride_1": (14, 16, 16), "PCK0_ZW_1": (15, 0, 32), "PCK0_Base_1": (17, 0, 18),
+  "Read_32b_data": (18, 0, 1), "Edge_mask": (24, 0, 16), "pack_reads_per_xy_plane": (28, 8, 8),
+  "UNP0_add_dest_addr_cntr": (50, 8, 1), "UNP0_Ystride_1": (56, 16, 16), "UNP0_ZW_1": (57, 0, 32), "UNP1_ZW_1": (59, 0, 32),
+  "SEC0_format": (64, 0, 4), "SEC0_x_dim": (64, 16, 16), "SEC0_y_dim": (65, 0, 8), "SEC0_z_dim": (65, 16, 8),
+  "L1_Dest_addr": (69, 0, 32), "Disable_zero_compress": (70, 0, 1), "Pack_out_format": (70, 4, 4), "Pack_in_format": (70, 8, 4),
+  "SEC0_out_format": (72, 0, 4), "SEC0_uncompressed": (73, 0, 1), "SEC0_base": (76, 0, 32), "SEC0_dest_addr": (84, 0, 16),
+  "SEC0_tile_x_dim": (86, 0, 16), "SEC0_offset": (92, 0, 16),
+  "SEC1_format": (112, 0, 4), "SEC1_x_dim": (112, 16, 16), "SEC1_y_dim": (113, 0, 8), "SEC1_z_dim": (113, 16, 8),
+  "SEC1_out_format": (120, 0, 4), "SEC1_uncompressed": (121, 0, 1), "SEC1_base": (124, 0, 32), "PCK_dest_offset": (180, 0, 12),
+}
+# Thread config: 16-bit registers per thread, written only by SETC16 from that thread: field -> (register, first bit, width)
+TENSIX_THREAD_FIELDS = {
+  "StateID": (0, 0, 1), "MATH_Offset": (1, 0, 12), "DISABLE_IMPLIED_SRCA": (2, 0, 1), "DISABLE_IMPLIED_SRCB": (3, 0, 1),
+  "SRCA_SET": (5, 0, 3), "CLR_DVALID": (7, 0, 2), "FIDELITY_BASE": (11, 0, 2),
+  "AB0_SrcAIncr": (12, 0, 6), "AB0_SrcBIncr": (12, 8, 6), "AB1": (13, 0, 16),
+  "DST0_DestIncr": (28, 0, 10), "DST1_FidelityIncr": (29, 13, 2), "PACK0_YsrcIncr": (37, 0, 4),
+  "UNPACK_MISC": (41, 0, 16), "BIAS0": (47, 0, 5), "BIAS1": (48, 0, 5),
+}

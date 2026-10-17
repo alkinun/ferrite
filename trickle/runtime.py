@@ -125,7 +125,7 @@ class Runtime:
     assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
-    self.chip, self.launches, self.wptr = chip, 0, 0
+    self.chip, self.launches, self.wptr, self.dram = chip, 0, 0, 0
     *self.cores, self.dispatcher = cores
     buf, bus = chip.pci.alloc(64 + ring)
     self.status, self.ring = buf[:64], buf[64:]
@@ -163,6 +163,11 @@ class Runtime:
     self.wptr += length
     self.launches += 1
     self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))  # the launch's one PCIe write
+
+  def dram_alloc(self, size):
+    """size bytes at the same address in every DRAM bank; a bump allocator, nothing is freed yet."""
+    addr, self.dram = self.dram, self.dram + -(-size // 64) * 64
+    return addr
 
   def read_status(self, i): return int.from_bytes(self.status[4 * i:4 * i + 4], "little")
 
