@@ -382,9 +382,10 @@ void kmain(volatile unsigned *a) {{
 def fused_kernel(expr, shapes):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
   rowsum and rowmax, ("matmul", a, b) where a and b are inputs, and plain numbers for inputs. shapes: each input's
-  (rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
-  args: [first unit, units, out, then for each input its DRAM address, tile stride and tile offset (Tensor's)]. A unit
-  is a tile of the result, or, if the expression reduces rows, a whole row of tiles, so the reduction can stay on chip.
+  (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
+  args: [first unit, units, out, then for each input its DRAM address and tile strides for batch and row, and tile
+  offset (Tensor's)]. A unit is a tile of the result, or, if the expression reduces rows, a whole row of tiles, so the
+  reduction can stay on chip; units run through the batch, matrix after matrix.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
   its K pairs of tiles streamed through slots 0-3. A unary op runs on the SFPU over Dst: in place, on the result of the
@@ -405,6 +406,7 @@ def fused_kernel(expr, shapes):
       uses[c] = uses.get(c, 0) + 1
       count(c)
   count(expr)
+  batch, shapes = [b for b, _, _ in shapes], [(r, c) for _, r, c in shapes]
   tiles = [(-(-r // 32), -(-c // 32)) for r, c in shapes]
   ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, shape, width; refs: expr -> input number or ("op", j)
   size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (rows, columns)
@@ -454,11 +456,14 @@ def fused_kernel(expr, shapes):
     if r == "zero": return ZERO_SLOT
     if isinstance(r, int): return FRAMES + f * frame + r
     return FRAMES + (f * frame + inputs + r[1] if wide(r) else 2 * frame + r[1])
-  def tile(i):  # which tile of input i goes with this unit's row i_ and column j
+  arg = lambda i: 3 + 4 * i  # input i's [address, batch stride, row stride, offset] in a
+  in_batch = lambda i: f"b * a[{arg(i) + 1}] + " if batch[i] > 1 else ""  # one matrix repeats across the batch
+  def tile(i):  # which tile of input i goes with this unit's matrix b, row i_ and column j
     rows, cols = tiles[i]
-    return f"{'i_' if rows > 1 else 0} * a[{4 + 3 * i}] + {'j' if cols > 1 else 0} + a[{5 + 3 * i}]"
+    return f"{in_batch(i)}{'i_' if rows > 1 else 0} * a[{arg(i) + 2}] + {'j' if cols > 1 else 0} + a[{arg(i) + 3}]"
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
   rows, cols = size(("op", root))
+  rt = -(-rows // 32)  # the result's tile rows (in each matrix of the batch)
   def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
     if j != root: return tt(MATH_END)
     edge = [f"if ({f'j == {w - 1}' if wide(('op', root)) else 1}) {{ {tt(mask_columns('rowsum', cols % 32, 0))} }}"] * (cols > 1 and cols % 32 > 0)
@@ -466,7 +471,7 @@ def fused_kernel(expr, shapes):
     return " ".join(edge + [tt(MATH_END)])
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
     me = ("op", j)
-    return f"output({f if wide(me) else 0}, {slot(f, me)}, {f'i_ * {w} + j' if wide(me) else 'i_'}); " if j == root else ""
+    return f"output({f if wide(me) else 0}, {slot(f, me)}, {f'(b * {rt} + i_) * {w} + j' if wide(me) else f'b * {rt} + i_'}); " if j == root else ""
   passes = []
   for p in range(last + 1):
     reductions = [j for j in sweep if sweep[j] == p]
@@ -482,7 +487,7 @@ def fused_kernel(expr, shapes):
     for f in (0, 1):
       c = [[], [], [], []]  # each program's C for this tile
       fetch = sorted({r for j in once + swept + reductions for r in operands(ops[j]) if isinstance(r, int)})
-      c[B] += [f"reached(frame_done[{f}]);"] + [f"get(a[{3 + 3 * r}], {tile(r)}, {slot(f, r)});" for r in fetch] + ["ready();"]
+      c[B] += [f"reached(frame_done[{f}]);"] + [f"get(a[{arg(r)}], {tile(r)}, {slot(f, r)});" for r in fetch] + ["ready();"]
       c[U].append("fetched();")
       for j in once + swept:
         op, me = ops[j], ("op", j)
@@ -491,9 +496,10 @@ def fused_kernel(expr, shapes):
         c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= 1; }}")
         if op["kind"] == "matmul":
           kt, bw, q = op["kt"], tiles[op["y"]][1], matmuls.index(j)  # B's width in tiles; which matmul
-          x, y = 3 + 3 * op["x"], 3 + 3 * op["y"]  # A's and B's address, stride, offset in a
-          b_tile, a_tile = f"m * a[{y + 1}] + {'j' if bw > 1 else 0} + a[{y + 2}]", f"i_ * a[{x + 1}] + m + a[{x + 2}]"
-          c[B].append(f"{cond}{{ unsigned new = fresh({q}, i_); for (unsigned m = 0; m < {kt}; m++) "
+          x, y = arg(op["x"]), arg(op["y"])
+          b_tile = f"{in_batch(op['y'])}m * a[{y + 2}] + {'j' if bw > 1 else 0} + a[{y + 3}]"
+          a_tile = f"{in_batch(op['x'])}i_ * a[{x + 2}] + m + a[{x + 3}]"
+          c[B].append(f"{cond}{{ unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
                       f"step(a[{y}], {b_tile}, a[{x}], {a_tile}, new ? {row(q)} + m : 0); }}")
           row_start = tt([ins("SETADC", cnt_set_mask=bh.UNPACK1, dimension_index=2, value=row(q))])
           c[U].append(f"{cond}{{ {row_start} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
@@ -532,7 +538,8 @@ def fused_kernel(expr, shapes):
       if (tiles++ & 1) {{ {" ".join(b[1][c])} }} else {{ {" ".join(b[0][c])} }}
     }}""" for full, b in passes)
     return f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, i_ = {'unit' if rowwise else f'unit / {w}'}, j0 = {'0' if rowwise else f'unit % {w}'};
+    unsigned unit = a[0] + u, b = unit / {rt if rowwise else rt * w}, i_ = unit % {rt if rowwise else f'{rt * w} / {w}'};
+    unsigned j0 = {'0' if rowwise else f'unit % {w}'};
     unsigned j1 = {w if rowwise else 'j0 + 1'};
 {sweeps}
   }}"""
@@ -589,89 +596,109 @@ def transpose_kernel(rows, cols):
                    for f in (0, 1)])))
 
 class Tensor:
-  """rows x cols of bf16: in DRAM as 32x32 tiles in row-major tile order, tile i in bank i % 8; or, until realized, an
-  op on other tensors. Realizing compiles the whole tree of unrealized ops under it into one kernel; a matmul's own
-  operands are realized first, since each of its output tiles needs a whole row and column of them.
+  """batch x rows x cols of bf16 (batch 1 unless said): in DRAM as 32x32 tiles, matrix after matrix, each in row-major
+  tile order, tile i in bank i % 8; or, until realized, an op on other tensors. Realizing compiles the whole tree of
+  unrealized ops under it into one kernel; a matmul's own operands are realized first, since each of its output tiles
+  needs a whole row and column of them.
   Any shape: the last tile row and column are padded, with zeros, except that a dimension of 1 fills its tile with
   copies (a row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. Every kernel leaves
   its result that way too, so a matmul can sum over a padded K.
-  A view (x[r0:r1, c0:c1] on tile boundaries) shares its owner's DRAM: its tile (i, j) is tile i * stride + j + offset."""
-  def __init__(self, rt, rows, cols, op=None, srcs=()):
-    self.rt, self.rows, self.cols, self.op, self.srcs = rt, rows, cols, op, srcs
-    self.tiles, self.stride, self.offset, self.owner = -(-rows // 32) * -(-cols // 32), -(-cols // 32), 0, None
+  A view (x[r0:r1, c0:c1] on tile boundaries, x[b], x.split(n)) shares its owner's DRAM: its tile (b, i, j) is tile
+  b * bstride + i * stride + j + offset."""
+  def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1):
+    self.rt, self.rows, self.cols, self.batch, self.op, self.srcs = rt, rows, cols, batch, op, srcs
+    rt_, ct = -(-rows // 32), -(-cols // 32)
+    self.tiles, self.bstride, self.stride, self.offset, self.owner = batch * rt_ * ct, rt_ * ct, ct, 0, None
     self.addr = None if op else rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
 
   def __del__(self):  # its DRAM goes back once nothing refers to it (and no queued launch can still use it)
     if self.addr is not None and self.owner is None: self.rt.dram_free(self.addr)
 
-  def _where(self, i, j):  # tile (i, j) in DRAM: (x, y, address)
-    t = i * self.stride + j + self.offset
+  def _where(self, b, i, j):  # tile (i, j) of matrix b in DRAM: (x, y, address)
+    t = b * self.bstride + i * self.stride + j + self.offset
     return (*bh.DRAM[t % 8], self.addr + t // 8 * TILE)
 
   @classmethod
   def full(cls, rt, rows, cols, value): return cls.of(rt, [[value] * cols for _ in range(rows)])
 
   @classmethod
-  def of(cls, rt, rows):
-    """From a list of rows of numbers, rounded to bf16 (to nearest even)."""
-    bits = array.array("I", array.array("f", [v for row in rows for v in row]).tobytes())
-    return cls.frombytes(rt, len(rows), len(rows[0]), array.array("H", [(b + 0x7FFF + (b >> 16 & 1)) >> 16 for b in bits]))
+  def of(cls, rt, data):
+    """From a list of rows of numbers, or a list of those (a batch), rounded to bf16 (to nearest even)."""
+    matrices = data if isinstance(data[0][0], (list, tuple)) else [data]
+    bits = array.array("I", array.array("f", [v for m in matrices for row in m for v in row]).tobytes())
+    bf16 = array.array("H", [(b + 0x7FFF + (b >> 16 & 1)) >> 16 for b in bits])
+    return cls.frombytes(rt, len(matrices[0]), len(matrices[0][0]), bf16, len(matrices))
 
   @classmethod
-  def frombytes(cls, rt, rows, cols, data):
-    """From bf16 in row-major order (2 bytes a value, little-endian). Runs of 16 values are copied into tile order as
-    they are, nothing per value, which is what makes a model's weights quick to load."""
-    t, ct, data, pad = cls(rt, rows, cols), -(-cols // 32), memoryview(data).cast("B"), bytes(32)
-    assert len(data) == 2 * rows * cols, f"{len(data)} bytes for {rows} x {cols}"
-    for i in range(t.tiles):
-      r0, c0, tile = i // ct * 32, i % ct * 32, []
+  def frombytes(cls, rt, rows, cols, data, batch=1):
+    """From bf16 in row-major order (2 bytes a value, little-endian), matrix after matrix. Runs of 16 values are copied
+    into tile order as they are, nothing per value, which is what makes a model's weights quick to load."""
+    t, rt_, ct, data, pad = cls(rt, rows, cols, batch=batch), -(-rows // 32), -(-cols // 32), memoryview(data).cast("B"), bytes(32)
+    assert len(data) == 2 * batch * rows * cols, f"{len(data)} bytes for {batch} x {rows} x {cols}"
+    for b, i in ((b, i) for b in range(batch) for i in range(rt_ * ct)):
+      m, r0, c0, tile = data[2 * b * rows * cols:2 * (b + 1) * rows * cols], i // ct * 32, i % ct * 32, []
       for face in range(4):  # 16 rows of 16, face by face (the tile layout, at the top)
         c = c0 + face % 2 * 16
         for r in range(r0 + face // 2 * 16, r0 + face // 2 * 16 + 16):
           r = 0 if rows == 1 else r  # a dimension of 1 fills the tile; the rest pads with 0
           at = 2 * (r * cols + c)
-          run = b"" if r >= rows else bytes(data[2 * r:2 * r + 2]) * 16 if cols == 1 else bytes(data[at:at + 2 * max(0, min(16, cols - c))])
+          run = b"" if r >= rows else bytes(m[2 * r:2 * r + 2]) * 16 if cols == 1 else bytes(m[at:at + 2 * max(0, min(16, cols - c))])
           tile.append(run + pad[len(run):])
-      t.rt.chip.write(*t._where(i // ct, i % ct), b"".join(tile))
+      t.rt.chip.write(*t._where(b, i // ct, i % ct), b"".join(tile))
     return t
 
   def tobytes(self):
-    """bf16 in row-major order, as frombytes takes it. Waits for the launches queued so far."""
+    """bf16 in row-major order, matrix after matrix, as frombytes takes it. Waits for the launches queued so far."""
     self.realize()
     self.rt.wait()
-    out, ct = bytearray(2 * self.rows * self.cols), -(-self.cols // 32)
-    for i in range(self.tiles):
-      r0, c0, tile = i // ct * 32, i % ct * 32, self.rt.chip.read(*self._where(i // ct, i % ct), TILE)
+    out, rows, cols, ct = bytearray(2 * self.batch * self.rows * self.cols), self.rows, self.cols, -(-self.cols // 32)
+    for b, i in ((b, i) for b in range(self.batch) for i in range(self.tiles // self.batch)):
+      r0, c0, tile, base = i // ct * 32, i % ct * 32, self.rt.chip.read(*self._where(b, i // ct, i % ct), TILE), b * rows * cols
       for face in range(4):
-        c, n = c0 + face % 2 * 16, min(16, self.cols - c0 - face % 2 * 16)
-        for k, r in enumerate(range(r0 + face // 2 * 16, min(r0 + face // 2 * 16 + 16, self.rows))):
-          if n > 0: out[2 * (r * self.cols + c):2 * (r * self.cols + c + n)] = tile[face * 512 + k * 32:face * 512 + k * 32 + 2 * n]
+        c, n = c0 + face % 2 * 16, min(16, cols - c0 - face % 2 * 16)
+        for k, r in enumerate(range(r0 + face // 2 * 16, min(r0 + face // 2 * 16 + 16, rows))):
+          if n > 0: out[2 * (base + r * cols + c):2 * (base + r * cols + c + n)] = tile[face * 512 + k * 32:face * 512 + k * 32 + 2 * n]
     return bytes(out)
 
-  def tolist(self):
+  def tolist(self):  # rows of numbers, or a list of those if this is a batch
     values = array.array("f", array.array("I", [b << 16 for b in array.array("H", self.tobytes())]).tobytes()).tolist()
-    return [values[r * self.cols:(r + 1) * self.cols] for r in range(self.rows)]
+    m = [[values[(b * self.rows + r) * self.cols:(b * self.rows + r + 1) * self.cols] for r in range(self.rows)] for b in range(self.batch)]
+    return m if self.batch > 1 else m[0]
 
   def gather(self, ids):
     """Rows ids of this tensor, as a tensor: an embedding lookup. A data-movement kernel (see gather_kernel)."""
-    assert all(0 <= i < self.rows for i in ids)
+    assert self.batch == 1 and all(0 <= i < self.rows for i in ids)
     out = Tensor(self.rt, len(ids), self.cols)
     return out._run(_cached("gather", gather_kernel), out.addr, self.realize().addr, self.stride, self.offset, -(-self.cols // 32), len(ids), *ids)
 
+  def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
+    v = Tensor(self.rt, rows, cols, "view", batch=batch)
+    v.op, v.addr, v.owner = None, self.realize().addr, self.owner or self
+    v.offset, v.bstride, v.stride = self.offset + offset, bstride, self.stride if stride is None else stride
+    return v
+
   def __getitem__(self, key):
-    """x[r0:r1, c0:c1], a view of whole tiles: starts on tile boundaries, and ends too unless at the tensor's end. No
-    copy; kernels read it in place."""
+    """x[b], one matrix of a batch; or x[r0:r1, c0:c1] of a matrix, a view of whole tiles: starts on tile boundaries,
+    and ends too unless at the tensor's end. No copy; kernels read it in place."""
+    if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)
+    assert self.batch == 1
     (r0, r1, _), (c0, c1, _) = (k.indices(n) for k, n in zip(key, (self.rows, self.cols)))
     assert r0 % 32 == c0 % 32 == 0 and (r1 % 32 == 0 or r1 == self.rows) and (c1 % 32 == 0 or c1 == self.cols), "views are whole tiles"
     assert (r1 - r0 > 1 or self.rows == 1) and (c1 - c0 > 1 or self.cols == 1), "a dimension of 1 must fill its tile"
-    v = Tensor(self.rt, r1 - r0, c1 - c0, "view")
-    v.op, v.addr, v.owner, v.stride = None, self.realize().addr, self.owner or self, self.stride
-    v.offset = self.offset + r0 // 32 * self.stride + c0 // 32
-    return v
+    return self._view(r1 - r0, c1 - c0, 1, r0 // 32 * self.stride + c0 // 32)
+
+  def split(self, n, axis=1):
+    """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads.
+    The parts are whole tiles."""
+    assert self.batch == 1
+    if axis: assert self.cols % (32 * n) == 0; return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)
+    assert self.rows % (32 * n) == 0
+    return self._view(self.rows // n, self.cols, n, 0, self.rows // n // 32 * self.stride)
 
   @property
   def T(self):
     """The transpose, computed now, in a kernel of its own (see transpose_kernel)."""
+    assert self.batch == 1
     out = Tensor(self.rt, self.cols, self.rows)
     kernel = _cached(("transpose", self.rows, self.cols), lambda: transpose_kernel(self.rows, self.cols))
     return out._run(kernel, out.addr, self.realize().addr, self.stride, self.offset)
@@ -683,12 +710,13 @@ class Tensor:
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
       t.realize()
     inputs = []
-    e = _expr(self, self.rows, inputs)
-    key = (e, tuple((u.rows, u.cols) for u in inputs))
+    e = _expr(self, (self.batch, self.rows), inputs)
+    key = (e, tuple((u.batch, u.rows, u.cols) for u in inputs))
     kernel = _cached(key, lambda: fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
+    args = [v for t in inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
     rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
-    return self._run(kernel, self.addr, *[v for t in inputs for v in (t.addr, t.stride, t.offset)], units=-(-self.rows // 32) if rowwise else None)
+    return self._run(kernel, self.addr, *args, units=self.batch * -(-self.rows // 32) if rowwise else None)
 
   def _run(self, kernel, *args, units=None):
     """Queue kernel over this tensor's tiles, or rows, split evenly over as many workers as have any. Nothing waits for
@@ -703,19 +731,22 @@ class Tensor:
     """numpy's broadcasting: shapes match, or one side has 1 where the other does not. A number is a 1 x 1 tensor."""
     if not isinstance(other, Tensor): other = Tensor.full(self.rt, 1, 1, other)
     shape = []
-    for a, b in ((self.rows, other.rows), (self.cols, other.cols)):
-      assert a == b or 1 in (a, b), f"cannot broadcast ({self.rows}, {self.cols}) with ({other.rows}, {other.cols})"
+    for a, b in ((self.batch, other.batch), (self.rows, other.rows), (self.cols, other.cols)):
+      assert a == b or 1 in (a, b), f"cannot broadcast {self.shape} with {other.shape}"
       shape.append(max(a, b))
-    return Tensor(self.rt, *shape, op, (self, other))
-  def relu(self): return Tensor(self.rt, self.rows, self.cols, "relu", (self,))
-  def exp(self): return Tensor(self.rt, self.rows, self.cols, "exp", (self,))
-  def reciprocal(self): return Tensor(self.rt, self.rows, self.cols, "recip", (self,))
-  def rsqrt(self): return Tensor(self.rt, self.rows, self.cols, "rsqrt", (self,))
+    return Tensor(self.rt, shape[1], shape[2], op, (self, other), shape[0])
+  @property
+  def shape(self): return (self.batch, self.rows, self.cols)
+  def _unary(self, op, cols=None): return Tensor(self.rt, self.rows, cols or self.cols, op, (self,), self.batch)
+  def relu(self): return self._unary("relu")
+  def exp(self): return self._unary("exp")
+  def reciprocal(self): return self._unary("recip")
+  def rsqrt(self): return self._unary("rsqrt")
   def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
     k = 2 * math.sqrt(2 / math.pi)
     return self * (1 + (self * (self * self * (-0.044715 * k) - k)).exp()).reciprocal()
-  def rowsum(self): return self if self.cols == 1 else Tensor(self.rt, self.rows, 1, "rowsum", (self,))
-  def rowmax(self): return self if self.cols == 1 else Tensor(self.rt, self.rows, 1, "rowmax", (self,))
+  def rowsum(self): return self if self.cols == 1 else self._unary("rowsum", 1)
+  def rowmax(self): return self if self.cols == 1 else self._unary("rowmax", 1)
   def __add__(self, other): return self._elementwise("add", other)
   def __sub__(self, other): return self._elementwise("sub", other)
   def __mul__(self, other): return self._elementwise("mul", other)
@@ -724,25 +755,25 @@ class Tensor:
   def __rsub__(self, other): return Tensor.full(self.rt, 1, 1, other) - self
   def __neg__(self): return self * -1.0
 
-  def __matmul__(self, other):
-    assert self.cols == other.rows, f"({self.rows}, {self.cols}) @ ({other.rows}, {other.cols})"
+  def __matmul__(self, other):  # matrix by matrix through a batch; a batch of 1 repeats
+    assert self.cols == other.rows and (self.batch == other.batch or 1 in (self.batch, other.batch)), f"{self.shape} @ {other.shape}"
     if self.cols == 1: return self * other  # (R, 1) @ (1, C) is broadcasting
-    return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other))
+    return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other), max(self.batch, other.batch))
 
 def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
   if t.op is None or id(t) in seen: return 0
   seen.add(id(t))
   return 1 + (0 if t.op == "matmul" else sum(_ops(s, seen) for s in t.srcs))
 
-def _expr(t, rows, inputs):  # the tree of unrealized ops under t, realized tensors as numbers into inputs
+def _expr(t, shape, inputs):  # the tree of unrealized ops under t, realized tensors as numbers into inputs
   if t.op is None:
     if all(t is not u for u in inputs): inputs.append(t)
     return next(i for i, u in enumerate(inputs) if u is t)
-  if t.rows != rows: return _expr(t.realize(), rows, inputs)  # one row, repeated down: compute it once
+  if (t.batch, t.rows) != shape: return _expr(t.realize(), shape, inputs)  # repeated down or through the batch: compute it once
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = (s.realize() for s in t.srcs)
-    return ("matmul", _expr(a, rows, inputs), _expr(b, rows, inputs))
-  return (t.op, *(_expr(s, rows, inputs) for s in t.srcs))
+    return ("matmul", _expr(a, shape, inputs), _expr(b, shape, inputs))
+  return (t.op, *(_expr(s, shape, inputs) for s in t.srcs))
 
 def _subexprs(e):
   yield e

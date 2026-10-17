@@ -361,6 +361,30 @@ def test_views_transpose_gelu(chip):
   gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
   close(tx.gelu(), gelu(x), 0.02)
 
+def test_batch(chip):
+  # a batch of matrices: elementwise ops broadcast over it (a batch of 1 repeats), row reductions and softmax per
+  # matrix, matmul matrix by matrix (or by one matrix for all), views that split a matrix into a batch of heads and a
+  # batch back into matrices, all against numpy. Shapes are cut short on purpose (40 rows)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(4)
+  def make(*shape):
+    a = bf16(rng.uniform(-2, 2, shape))
+    return a, Tensor.of(rt, a.tolist())
+  (x, tx), (y, ty), (row, trow) = make(3, 40, 70), make(1, 40, 70), make(1, 70)
+  assert tx.shape == (3, 40, 70) and ty.shape == (1, 40, 70) and np.array(tx.tolist()).tolist() == x.tolist()
+  assert (tx * ty).tolist() == bf16(x * y, True).tolist() and (tx[1] * 2.0).tolist() == (x[1] * 2).tolist()
+  close(tx - trow + 1.0, x - row + 1, 2**-6)
+  assert tx.rowmax().tolist() == x.max(2, keepdims=True).tolist()
+  e = np.exp(x - x.max(2, keepdims=True))
+  close((tx - tx.rowmax()).exp() / (tx - tx.rowmax()).exp().rowsum(), e / e.sum(2, keepdims=True), 0.02)
+  (a, ta), (b, tb), (w, tw) = make(3, 40, 96), make(3, 96, 70), make(96, 70)
+  close(ta @ tb, a @ b, 2**-6)
+  close(ta @ tw + trow, a @ w + row, 2**-6)
+  (qkv, tqkv), (kt, tkt) = make(40, 192), make(192, 40)  # 3 heads of 64: split columns, split rows
+  heads, keys = tqkv.split(3), tkt.split(3, axis=0)
+  assert heads.shape == (3, 40, 64) and np.array(heads.tolist()).tolist() == qkv.reshape(40, 3, 64).transpose(1, 0, 2).tolist()
+  assert np.array(keys.tolist()).tolist() == kt.reshape(3, 64, 40).tolist()
+  close(heads @ keys, qkv.reshape(40, 3, 64).transpose(1, 0, 2) @ kt.reshape(3, 64, 40), 2**-6)
+
 def test_mnist_mlp(chip):
   # goal 1's halfway mark: an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
   # numpy in float64. Two launches: matmul + bias + relu, then matmul + bias. Random weights (no dataset here); the
