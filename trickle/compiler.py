@@ -415,10 +415,11 @@ def fused_kernel(expr, shapes):
     refs[e] = ("op", len(ops) - 1)
     return refs[e]
   root = visit(expr)[1]
-  inputs, w = len(shapes), max([op["width"] for op in ops] + [c for _, c in tiles])
+  operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
+  # w: the row's width in tiles, what ops sweep (a matmul's A can be wider: its columns are K, streamed, not swept)
+  inputs, w = len(shapes), max([op["width"] for op in ops] + [width(r) for op in ops for r in operands(op)])
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
   wide = lambda r: r != "zero" and width(r) == w and not reduced(r)  # varies along the row; otherwise one tile a row
-  operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
   rowwise = any(op["kind"] in COMBINE for op in ops)
   assert len(ops) <= 15, "SEM_L1 counts at most 15 intermediates"
   # passes: a wide op runs in the pass after every reduction it depends on has finished; a narrow one is ready then

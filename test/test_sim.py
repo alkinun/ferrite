@@ -343,6 +343,25 @@ def test_views_transpose_gelu(chip):
   gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
   close(tx.gelu(), gelu(x), 0.02)
 
+def test_mnist_mlp(chip):
+  # goal 1's halfway mark: an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
+  # numpy in float64. Two launches: matmul + bias + relu, then matmul + bias. Random weights (no dataset here); the
+  # logits must match closely and so must the predicted classes, wherever the top two are not a near tie. K = 784 is
+  # 25 tiles, more than the result is wide (which once made the kernel sweep the wrong tiles)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(2)
+  x = bf16(rng.uniform(0, 1, (16, 784)))
+  w1, b1 = bf16(rng.normal(0, 784**-0.5, (784, 128))), bf16(rng.normal(0, 0.1, (1, 128)))
+  w2, b2 = bf16(rng.normal(0, 128**-0.5, (128, 10))), bf16(rng.normal(0, 0.1, (1, 10)))
+  tx, tw1, tb1, tw2, tb2 = (Tensor.of(rt, a.tolist()) for a in (x, w1, b1, w2, b2))
+  launches = rt.launches
+  logits = np.array(((tx @ tw1 + tb1).relu() @ tw2 + tb2).tolist())
+  assert rt.launches == launches + 2
+  want = np.maximum(x @ w1 + b1, 0) @ w2 + b2
+  assert np.allclose(logits, want, rtol=0.02, atol=0.02), np.abs(logits - want).max()
+  top2 = np.sort(want, 1)[:, -2:]
+  clear = top2[:, 1] - top2[:, 0] > 0.05
+  assert clear.sum() >= 8 and (logits.argmax(1) == want.argmax(1))[clear].all()
+
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
   # staying in Dst and their results in L1. softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)), three passes;

@@ -12,7 +12,7 @@ Each has a finish line we can check. Ticked when a test shows it.
    - [x] DRAM is freed when a tensor goes away (`test_dram_is_freed`)
    - [x] any tensor shape, not just multiples of 32 (`test_any_shape`)
    - [x] views, transpose, gelu (`test_views_transpose_gelu`)
-   - [ ] halfway: a small MNIST network (matmuls, bias, relu) matches
+   - [x] halfway: a small MNIST network (matmuls, bias, relu) matches (`test_mnist_mlp`)
    - [ ] a GPT-2 layer (layer norm, attention, MLP) matches
 2. **First light on silicon.** Finish line: `hello` on every core of a p150, then every test passing on the card. Before the card arrives: tests that can run on `Card`, and a bring-up checklist of everything only ttsim has confirmed.
 3. **Fast.** Finish line: a matmul benchmark with a number, measured against the chip's peak and improved over time (tile reuse, deeper pipelines, the MOP expander).
@@ -306,6 +306,8 @@ Book-keeping happens at run time, in each program, because what a tile does depe
 **gelu** is GPT-2's tanh form, built from what is there: `0.5 x (1 + tanh(z))` is `x / (1 + e^(-2z))`, so `x * (1 + exp(x (-k c x^2 - k))).reciprocal()` with `k = 2 sqrt(2/pi)`, `c = 0.044715`. One kernel; within 2% of numpy after the bf16 rounding of each step.
 
 **Upload and download** go a tile at a time through the `array` module (floats to fp32 bytes, then bf16 bits with one list comprehension), about 10x faster than a struct call per value, which matters at GPT-2's 768 x 3072.
+
+**MNIST** (`test_mnist_mlp`): 784 -> 128 -> 10 with relu and biases on a batch of 16, two launches, against numpy in float64: logits within 2%, and the same predicted classes wherever the top two are not a near tie. It found a bug as old as matmul fusion: the kernel took its row width from every input, including a matmul's A, whose columns are K. With K wider than the result (784 against 128) the units were cut wrong and whole result tiles were never computed. The tests had only multiplied with K at most the result's width. Now the width comes from what elementwise ops and reductions sweep.
 
 Bug found on the way: a row reduction whose operand is one tile wide inside a wider kernel was swept like a wide one, adding the same tile once per column tile. It is now reduced in the pass's first tile; `test_any_shape` covers it (and caught the old code).
 
