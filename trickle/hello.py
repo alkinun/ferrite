@@ -2,7 +2,7 @@
 # clang and lld, and read back what it wrote.   TTSIM=/path/to/libttsim.so python3 -m trickle.hello
 from trickle import pci
 from trickle.chip import Chip
-from trickle.runtime import ARGS, Runtime, compile_kernel
+from trickle.runtime import Runtime, compile_kernel
 
 FIB = """
 void kmain(volatile unsigned *args) {  // args: [n, fib(n)]
@@ -17,7 +17,7 @@ def hello(chip, start, end, n):
   rt = Runtime(chip, start, end)
   rt.launch(compile_kernel(FIB), lambda x, y: (n, 0))
   rt.wait()
-  return {(x, y): chip.read32(x, y, ARGS + 4) for x, y in rt.cores}
+  return {(x, y): chip.read32(x, y, rt.args() + 4) for x, y in rt.cores}
 
 if __name__ == "__main__":
   chip = Chip(pci.open_device())

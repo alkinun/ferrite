@@ -4,12 +4,14 @@ import pathlib, shutil, struct, subprocess, tempfile
 from trickle import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
-# 4 + 4i). A worker: a mailbox [go, kernel, report x | y << 6, report address] [done] (done is 16-byte aligned like the
-# slot it is copied to), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for the kernel's cores to
-# talk through), kernel arguments, the kernels it holds, then free space. The dispatcher: its config [doorbell, ring lo,
-# hi, ring size, status lo, hi] and the workers' x | y << 6 after it, an outbox [go, kernel] [rptr, launches done], a
+# 4 + 4i). A worker: a mailbox [go, kernel, arguments] [done, report x | y << 6, report address] (done is 16-byte
+# aligned like the slot it is copied to), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for the
+# kernel's cores to talk through), two buffers of kernel arguments (launches alternate between them, so the next
+# launch's go in while this one runs), the kernels it holds, then free space. The dispatcher: its config [doorbell, ring lo,
+# hi, ring size, status lo, hi] and the workers' x | y << 6 after it, an outbox [go, kernel, arguments] [rptr, launches done], a
 # done slot per worker, and staging for one command, both above the kernels (loading one writes the dispatcher's too).
 MAILBOX, TRISCS, SYNC, ARGS, KERNELS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x80000
+ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
 DISPATCH, WORKERS, OUTBOX, DONE, STAGING = 0x1000, 0x1040, 0x1400, DATA, DATA + 0x1000
 STAGING_ROOM = bh.L1_SIZE - STAGING
@@ -92,7 +94,7 @@ def compile_kernel(*programs):
 def start(brisc, trisc0, trisc1, trisc2):  # firmware's first words: BRISC starts at 0, TRISC i at 4 + 4i (its reset PC)
   return f'__attribute__((naked, section(".start"))) void _start(void) {{ asm("j {brisc}\\n j {trisc0}\\n j {trisc1}\\n j {trisc2}"); }}'
 
-# A launch: BRISC sees go in its mailbox, with the address of the kernel to run, zeroes SYNC, drops the cached
+# A launch: BRISC sees go in its mailbox, with the addresses of the kernel to run and of its arguments, zeroes SYNC, drops the cached
 # instructions of all four cores (the kernel may sit where another was), and tells the TRISCs to go; each core runs its
 # program from the kernel's header, and a TRISC then waits for its Tensix thread to finish everything it pushed. Once
 # all four are done BRISC reports.
@@ -107,7 +109,7 @@ __attribute__((naked)) void trisc1(void) {{ asm("li sp, {bh.TRISC_STACK_TOP:#x}\
 __attribute__((naked)) void trisc2(void) {{ asm("li sp, {bh.TRISC_STACK_TOP:#x}\\n li a0, 2\\n j trisc_loop"); }}
 static void run(unsigned core) {{  // the kernel's program for this core, if it has one
   unsigned kernel = MAILBOX[1], entry = ((volatile unsigned *)kernel)[core];
-  if (entry) ((void (*)(volatile unsigned *))(kernel + entry))((volatile unsigned *){ARGS:#x});
+  if (entry) ((void (*)(volatile unsigned *))(kernel + entry))((volatile unsigned *)MAILBOX[2]);
 }}
 void brisc_loop(void) {{
   for (unsigned seen = 0;;) {{
@@ -124,7 +126,7 @@ void brisc_loop(void) {{
     noc_wait();  // whatever the kernel sent is in place before we say it is done
     for (unsigned i = 1; i <= 3; i++) while (TRISCS[i] != seen) asm volatile("fence" ::: "memory");
     MAILBOX[4] = seen;
-    noc_write({MAILBOX + 16:#x}, MAILBOX[2] & 63, MAILBOX[2] >> 6, MAILBOX[3], 4);
+    noc_write({MAILBOX + 16:#x}, MAILBOX[5] & 63, MAILBOX[5] >> 6, MAILBOX[6], 4);
     noc_wait();
   }}
 }}
@@ -143,7 +145,8 @@ void trisc_loop(unsigned i) {{
 # A command is a 16-byte header [length, kernel address, argument bytes per worker, workers], then each worker's
 # arguments, 16-byte aligned; the whole is 64-byte aligned. Length 0 means: the rest of the ring is unused. The kernel
 # is already in every worker's L1 (Runtime.load). A launch goes to the first `workers` workers only: each one costs the
-# dispatcher time, work or not.
+# dispatcher time, work or not. One launch runs at a time, but the next one's command is read and its arguments
+# written while it runs (into the other argument buffer), so it goes the moment the last worker reports.
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
 #define WORKER ((volatile unsigned *){WORKERS:#x})
@@ -152,33 +155,46 @@ DISPATCHER = f"""
 {start("brisc", "park", "park", "park")}  // its TRISCs have nothing to do
 __attribute__((naked)) void park(void) {{ asm("1: j 1b"); }}
 __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\n j loop"); }}
+static unsigned finished(unsigned launch, unsigned n) {{  // have the first n workers reported this launch?
+  asm volatile("fence" ::: "memory");
+  for (unsigned i = 0; i < n; i++) if (DONE[4 * i] != launch) return 0;
+  return 1;
+}}
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0;
+  unsigned ready = 0, ready_n = 0, ready_kernel = 0, ready_end = 0;  // a launch whose arguments are in place (0: none)
+  unsigned running = 0, running_n = 0, running_end = 0;  // the launch the workers are on
   volatile unsigned *cmd = (volatile unsigned *){STAGING:#x};
   for (;;) {{
-    while (CONFIG[0] == rptr) asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
-    unsigned long long at = ring + rptr % size;
-    noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at, {STAGING:#x}, 16);
-    noc_wait();
-    if (cmd[0] == 0) {{ rptr += size - rptr % size; continue; }}
-    unsigned args = cmd[2], n = cmd[3];
-    noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at + 16, {STAGING + 16:#x}, cmd[0] - 16);
-    noc_wait();
-    launches++;
-    // a worker is idle here: it finished its last launch before we got here
-    for (unsigned i = 0; i < n; i++) noc_write({STAGING + 16:#x} + i * args, WORKER[i] & 63, WORKER[i] >> 6, {ARGS:#x}, args);
-    noc_wait();  // every argument has landed before any go
-    OUT[0] = launches;
-    OUT[1] = cmd[1];
-    for (unsigned i = 0; i < n; i++) noc_write({OUTBOX:#x}, WORKER[i] & 63, WORKER[i] >> 6, {MAILBOX:#x}, 8);
-    noc_wait();
-    for (unsigned i = 0; i < n; i++) while (DONE[4 * i] != launches) asm volatile("fence" ::: "memory");
-    rptr += cmd[0];
-    OUT[4] = rptr;
-    OUT[5] = launches;
-    noc_write({OUTBOX + 16:#x}, {bh.PCIE[0]}, {bh.PCIE[1]}, status, 8);
-    noc_wait();
+    asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
+    if (!ready && CONFIG[0] != rptr) {{  // the next command, while the last launch runs
+      unsigned long long at = ring + rptr % size;
+      noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at, {STAGING:#x}, 16);
+      noc_wait();
+      if (cmd[0] == 0) {{ rptr += size - rptr % size; continue; }}
+      unsigned args = cmd[2], n = cmd[3];
+      noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at + 16, {STAGING + 16:#x}, cmd[0] - 16);
+      noc_wait();
+      ready = ++launches;  // its arguments go into the buffer the running launch is not using
+      for (unsigned i = 0; i < n; i++) noc_write({STAGING + 16:#x} + i * args, WORKER[i] & 63, WORKER[i] >> 6, {ARGS:#x} + ready % 2 * {ARGS_SIZE}, args);
+      noc_wait();  // every argument has landed before any go
+      ready_n = n; ready_kernel = cmd[1]; ready_end = rptr += cmd[0];
+    }}
+    unsigned done = running && finished(running, running_n) ? running : 0, end = running_end;
+    if (done) running = 0;
+    if (ready && !running) {{  // a worker is idle here: it finished its last launch
+      OUT[0] = ready; OUT[1] = ready_kernel; OUT[2] = {ARGS:#x} + ready % 2 * {ARGS_SIZE};
+      for (unsigned i = 0; i < ready_n; i++) noc_write({OUTBOX:#x}, WORKER[i] & 63, WORKER[i] >> 6, {MAILBOX:#x}, 12);
+      noc_wait();
+      running = ready; running_n = ready_n; running_end = ready_end; ready = 0;
+    }}
+    if (done) {{  // only now, so the host hears late rather than the next launch going late
+      OUT[4] = end;
+      OUT[5] = done;
+      noc_write({OUTBOX + 16:#x}, {bh.PCIE[0]}, {bh.PCIE[1]}, status, 8);
+      noc_wait();
+    }}
   }}
 }}
 """
@@ -206,7 +222,7 @@ class Runtime:
     chip.halt(*end, start)
     chip.write(*end, 0, worker, start)
     for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done, all zero but where to report
-      chip.write(x, y, MAILBOX, struct.pack("<4I", 0, 0, dx | dy << 6, DONE + 16 * i).ljust(SYNC - MAILBOX, b"\0"))
+      chip.write(x, y, MAILBOX, struct.pack("<7I", 0, 0, 0, 0, 0, dx | dy << 6, DONE + 16 * i).ljust(SYNC - MAILBOX, b"\0"))
     chip.write(dx, dy, 0, dispatcher)
     chip.write(dx, dy, DISPATCH, struct.pack("<6I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32))
     chip.write(dx, dy, WORKERS, struct.pack(f"<{n}I", *[x | y << 6 for x, y in self.cores]))
@@ -239,7 +255,7 @@ class Runtime:
     at, cores = self.load(kernel), self.cores[:workers]
     a = [struct.pack(f"<{len(v)}I", *v) for v in (args(x, y) for x, y in cores)]
     stride = -(-max(map(len, a)) // 16) * 16
-    assert stride <= KERNELS - ARGS, f"{stride} bytes of arguments, room for {KERNELS - ARGS}"
+    assert stride <= ARGS_SIZE, f"{stride} bytes of arguments, room for {ARGS_SIZE}"
     body = b"".join(v.ljust(stride, b"\0") for v in a)
     length = -(-(16 + len(body)) // 64) * 64
     cmd = struct.pack("<4I", length, at, stride, len(cores)) + body.ljust(length - 16, b"\0")
@@ -255,6 +271,9 @@ class Runtime:
     self.launches += 1
     self.workers.append(len(cores))
     self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))  # the launch's one PCIe write
+
+  def args(self):  # where the last launch's arguments are, on each worker it went to (its results, for some kernels)
+    return ARGS + self.launches % 2 * ARGS_SIZE
 
   def dram_alloc(self, size):
     """size bytes at the same address in every DRAM bank, from the first free hole big enough."""
