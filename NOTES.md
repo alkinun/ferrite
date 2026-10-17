@@ -181,7 +181,7 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 ## The Tensix coprocessor, and the first compiler
 
-`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`.
+`trickle/compiler.py`, encodings and register numbers in `trickle/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_pack_waits_for_math`, `test_fusion`, `test_fusion_waits`, `test_matmul_fusion`.
 
 **Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). BRISC can push into all three: a store of the instruction word to `0xFFE4_0000` (thread 0), `0xFFE5_0000`, `0xFFE6_0000`. Its pushes skip the MOP expander (MOP from BRISC is an error; REPLAY works), and a full FIFO stalls BRISC. TRISCs push only to their own thread. trickle: BRISC alone drives all three threads, TRISCs stay in reset (a BRISC push and a TRISC push in the same cycle drop the TRISC's). BRISC can read only thread 0's GPRs in ttsim (ISA: all three at `0xFFE0_0000 + 4*(64t + r)`), which decides who reports what.
 
@@ -195,12 +195,12 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 BRISC's config stores are not ordered with its instruction pushes (Auto TTSync covers TRISCs only), so the kernel writes config, then `fence`, reads back a config word, `fence`, and only then pushes.
 
-**The pipeline** (`compiler._kernel`, `fused_kernel`, `matmul_kernel`). Each thread has one job, so unpack, math and pack work on different tiles at the same time. L1 holds an array of tile slots; the unpackers' Z counter (Z stride: one tile) and the packer's channel-1 Y counter (that Y stride: one tile) pick the slot, so moving between slots never touches config:
+**The pipeline** (`compiler._kernel`, `fused_kernel`). Each thread has one job, so unpack, math and pack work on different tiles at the same time. L1 holds an array of tile slots; the unpackers' Z counter (Z stride: one tile) and the packer's channel-1 Y counter (that Y stride: one tile) pick the slot, so moving between slots never touches config:
 
 | Thread | Job | Per tile (or matmul step) |
 |---|---|---|
 | 0 | unpack, and report to BRISC | `SETADC` each unpacker's Z to its slot, `UNPACR` into SrcA and SrcB; in matmul, wait for the unpackers and BRISC's `SETGPR` 63 = steps unpacked |
-| 1 | math | per result: `SEMWAIT` for a free Dst half, aim at it (`SETC16 MATH_Offset` = 0 or 64), zero it if the op accumulates (`ZEROACC` four 16-row blocks); the FPU program (one per step); at the end: wait for the FPU, `SEMPOST` SEM_DST |
+| 1 | math | per result: set the address modes for its kind (elementwise or matmul; one kernel can mix them), `SEMWAIT` for a free Dst half, aim at it (`SETC16 MATH_Offset` = 0 or 64), zero it if the op accumulates (`ZEROACC` four 16-row blocks); the FPU program (one per matmul step); at the end: wait for the FPU, `SEMPOST` SEM_DST |
 | 2 | pack | `SEMWAIT` SEM_DST, aim the packer at the Dst half (ADC ch0 Y) and the L1 slot (ADC ch1 Y), 16 `PACR`, wait for the packer, `SEMGET` SEM_DST, `SEMPOST` SEM_L1 (an intermediate) or SEM_PACKED (an output) |
 
 Handoffs:
@@ -218,7 +218,7 @@ Handoffs:
 
 Thread setup goes to all three threads; thread 0 initialises the semaphores, and BRISC waits for that before pushing anything to the others.
 
-**Fusion** (`fused_kernel`, `Tensor` is lazy). `+`, `-`, `*` build a tree; `realize` (or `tolist`, or `@` on it) compiles the whole tree into one kernel. Equal subtrees become one op. Per output tile, a frame of slots holds the inputs, then one slot per op in post order; the last is the result. BRISC fetches the inputs into the frame and pushes, op by op, its unpack (from its operands' slots), math (into the next Dst half) and pack (into its own slot). Intermediates live in L1 only, and only the result goes to DRAM. Two frames alternate, so tile n + 1 is fetched while tile n computes, and BRISC writes tile n - 1 back. Every intermediate is rounded to bf16 on its way to L1, exactly as it would be on its way to DRAM, so a fused chain is bit for bit the same as one launch per op (`test_fusion` checks). A single op is just a one-op chain. Limits: binary ops on equal shapes, at most 15 ops (SEM_L1 is 4 bits).
+**Fusion** (`fused_kernel`, `Tensor` is lazy). `+`, `-`, `*` and `@` build a tree; `realize` (or `tolist`) compiles the whole tree into one kernel, so `(a @ b) * d - c` or `(a @ b) + (e @ f)` is one launch. A matmul's own operands are realized first: each of its output tiles needs a whole row and column of them. Equal subtrees become one op. Slots 0-3 stream matmul tiles; per output tile, a frame of slots holds the elementwise inputs, then one slot per op in post order; the last is the result. BRISC fetches the inputs into the frame and pushes, op by op: an elementwise op's unpack (from its operands' slots), math (into the next Dst half) and pack (into its own slot); or a matmul's K steps (each: wait until the stream slots from two steps back are unpacked, fetch A(i, k) and B(k, j), unpack, MVMULs) and its pack. Intermediates live in L1 only, and only the result goes to DRAM. Two frames alternate, so tile n + 1 is fetched while tile n computes, and BRISC writes tile n - 1 back. Every intermediate is rounded to bf16 on its way to L1, exactly as it would be on its way to DRAM, so a fused chain is bit for bit the same as one launch per op (`test_fusion` checks). A single op is just a one-op chain. Limits: binary ops on equal shapes, matmuls only over realized tensors (no fused prologue), at most 15 ops (SEM_L1 is 4 bits).
 
 **Push order matters on silicon.** BRISC's path into a thread is a few entries deep and a full FIFO stalls BRISC. So BRISC must never queue work a thread will block on, unless what unblocks it has already been pushed: unpack, then math, then pack, op by op. `fused_kernel(order=...)` breaks that rule on purpose for tests, which only ttsim (512-entry FIFOs) survives: `pack_first` queues each pack before its math, `thread` queues a whole tile for thread 0, then 1, then 2.
 
@@ -228,7 +228,7 @@ Thread setup goes to all three threads; thread 0 initialises the semaphores, and
 
 **Matmul, one pair of tiles** (`compiler.matmul`). `MVMUL` does `Dst[8x16] += SrcB[8x16] @ SrcA[16x16]`: SrcB rows from its row counter (a multiple of 8), SrcA rows from its counter (a multiple of 16 in ttsim), Dst rows from the instruction's `dst` field plus the Dst counter. So the left tile goes to SrcB (unpacker 1) and the right tile to SrcA (unpacker 0). Output face (i, j) = sum over k of left face (i, k) @ right face (k, j): 8 face products of 2 `MVMUL`s each, 16 per fidelity phase, 4 phases (SrcA gives 5 mantissa bits a phase, SrcB 7). The `dst` field carries the output rows; the Src counters walk in the order i, k, h (half), j, which needs only four address modes: SrcA +16 rows (next j), SrcA -16 / SrcB +8 (next h), SrcA +16 / SrcB +8 (next k or i), and the same plus fidelity +1 at the end of a phase. Counters wrap at 64, so that last step lands back on row 0. The last `MVMUL` of the last phase gives both banks back to the unpackers.
 
-**Matmul, whole tensors.** Each worker owns some output tiles. Each one is K steps through the pipeline: the left (i, k) and right (k, j) tiles, 64 `MVMUL`s into the same Dst half, which accumulates over k in fp32; then one pack. Error on random bf16 inputs is under 2^-8 of sum |a*b| (1.4e-3 measured on 64x96 @ 96x128).
+**Matmul, whole tensors.** A matmul is an op in a fused kernel (alone, it is a one-op kernel). Each worker owns some output tiles; each is K steps through the pipeline: the left (i, k) and right (k, j) tiles, 64 `MVMUL`s into the same Dst half, which accumulates over k in fp32; then one pack. Error on random bf16 inputs is under 2^-8 of sum |a*b| (1.4e-3 measured on 64x96 @ 96x128).
 
 **Precision.** Dst is kept in fp32 (`Fp32_enabled`); the packer rounds it to bf16 (`(bits + 0x8000) >> 16`, the only fp32-Dst-to-bf16 mode ttsim allows is `Read_32b_data` with In = bf16). With 4 fidelity phases a bf16 x bf16 product is exact before that rounding (bit-exact on 8192 random pairs). `ELWADD`/`ELWSUB` align the two 11-bit mantissas with round-half-up first, so about 0.4% of random sums differ from the fp32 sum by a last-place bf16 step. fp32 tensors would lose 13 mantissa bits in SrcA/SrcB (TF32); full fp32 needs unpack-to-Dst and the SFPU.
 
@@ -241,7 +241,7 @@ Thread setup goes to all three threads; thread 0 initialises the semaphores, and
 1. BRISC pushes every Tensix instruction (65 a matmul step), which keeps it from moving data. `REPLAY` (32 entries per thread) or TRISC firmware that loops locally (with MOP) would cut that to a few words a step.
 2. Deeper pipelines: more L1 slots, so DRAM latency hides behind more than one step.
 3. Matmul reuse: each step refetches both tiles from DRAM. Keep a row of left tiles in L1 across j, and fetch the next pair while the FPU runs (two L1 slots, two Src banks).
-4. Fusion beyond elementwise chains: a matmul's epilogue (`(a @ b) + c`, accumulating into the same Dst half), unary ops, broadcasts. Keeping intermediates in fp32 (an fp32 pack, or moving Dst back into SrcA/SrcB) instead of rounding each to bf16.
+4. Fusion beyond this: a matmul epilogue could stay in Dst (`(a @ b) + c` by unpacking c and adding into the same half, no pack/unpack of the product), prologues (`(a + b) @ c`, per K step), unary ops, broadcasts. Keeping intermediates in fp32 (an fp32 pack, or moving Dst back into SrcA/SrcB) instead of rounding each to bf16.
 5. The SFPU, for fp32, exp, recip, and the rest.
 
 ## Still unknown or untested

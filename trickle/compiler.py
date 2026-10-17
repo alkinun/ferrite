@@ -1,6 +1,6 @@
 # The compiler: tensor ops emitted as Tensix instructions straight from the ISA, no LLK. A tensor lives in DRAM as
-# bf16 32x32 tiles, tile i in bank i % 8. Elementwise ops are lazy: a chain of them becomes one fused kernel, which
-# fetches each input tile once, keeps every intermediate in L1 and writes only the result to DRAM. Each worker's BRISC
+# bf16 32x32 tiles, tile i in bank i % 8. Ops are lazy: a tree of elementwise ops and matmuls becomes one fused kernel,
+# which fetches each input tile once, keeps every intermediate in L1 and writes only the result to DRAM. Each worker's BRISC
 # runs a generated kernel: it pulls operand tiles into L1 over the NoC and streams them through the three Tensix
 # threads, unpack, math and pack running at the same time on different tiles, then writes results back.
 #
@@ -48,15 +48,18 @@ CONFIG = config(
   SEC1_base=SLOTS // 16 - 1, L1_Dest_addr=SLOTS // 16 - 1, Disable_zero_compress=1, Pack_out_format=bh.BF16,
   Pack_in_format=bh.BF16, PCK_dest_offset=0)
 
-def thread_setup(ab, dst):
-  """SETC16s for a thread: the basics, and address modes 0-3 as (SrcA step, SrcB step) and (Dst step, fidelity step)."""
-  regs = {r: 0 for r in bh.THREAD_CFG.values()} | {bh.THREAD_CFG["SRCA_SET"]: bh.SRCA_SET_BY_ADDR}
-  for slot in range(4):
-    regs[bh.ADDR_MOD_AB + slot] = ab[slot][0] | ab[slot][1] << 8
-    regs[bh.ADDR_MOD_DST + slot] = dst[slot][0] | dst[slot][1] << bh.FIDELITY_INCR
-    regs[bh.ADDR_MOD_BIAS + slot] = 0
-  regs[bh.ADDR_MOD_PACK] = 4  # each PACR moves on 4 Dst rows
-  return [ins("SETC16", setc16_reg=r, setc16_value=v) for r, v in regs.items()]
+THREAD = [ins("SETC16", setc16_reg=r, setc16_value=v) for r, v in  # every thread: the basics, written since reset values are undocumented
+          ({r: 0 for r in bh.THREAD_CFG.values()} | {bh.THREAD_CFG["SRCA_SET"]: bh.SRCA_SET_BY_ADDR, bh.ADDR_MOD_PACK: 4} |
+           {bh.ADDR_MOD_BIAS + m: 0 for m in range(4)}).items()]  # address mode 0 of the packer moves on 4 Dst rows a PACR
+
+# The math thread's address modes 0-3, as (SrcA step, SrcB step) and (Dst step, fidelity step). An op sets its own kind
+# at the start of its math, so one kernel can mix elementwise ops and matmuls.
+ADDR_MODES = {"elementwise": ([(8, 8), (0, 0), (0, 0), (0, 0)], [(8, 0), (0, 1), (0, 0), (0, 0)]),
+              "matmul": ([(16, 0), (48, 8), (16, 8), (16, 8)], [(0, 0), (0, 0), (0, 0), (0, 1)])}
+def addr_modes(kind):
+  ab, dst = ADDR_MODES[kind]
+  return ([ins("SETC16", setc16_reg=bh.ADDR_MOD_AB + m, setc16_value=a | b << 8) for m, (a, b) in enumerate(ab)] +
+          [ins("SETC16", setc16_reg=bh.ADDR_MOD_DST + m, setc16_value=d | f << bh.FIDELITY_INCR) for m, (d, f) in enumerate(dst)])
 
 # The three threads. Thread 0 unpacks and reports, thread 1 does the math, thread 2 packs. Between them:
 #   unpack -> math: SrcA/SrcB each have two banks; UNPACR waits for a free bank, the FPU for a full one, by hardware.
@@ -91,7 +94,6 @@ def pack(half, slot, done):  # a Dst half into an L1 slot, then free the half an
 RELAY = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_PACKED, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_PACKED)]
 UNPACKED_REPORT = [ins("STALLWAIT", stall_res=bh.STALL_THCON, wait_res=bh.WAIT_UNPACK)]  # then BRISC's SETGPR(UNPACKED)
 
-ELEMENTWISE_THREAD = thread_setup(ab=[(8, 8), (0, 0), (0, 0), (0, 0)], dst=[(8, 0), (0, 1), (0, 0), (0, 0)])
 def elementwise(op):
   """Math for one tile of SrcA op SrcB: 8 rows of 16 per instruction, address mode 0 steps 8 rows. ELWMUL always
   accumulates and multiplies a slice of the mantissas per fidelity phase: on a zeroed Dst, all 4 phases, the last
@@ -101,7 +103,6 @@ def elementwise(op):
   return [ins("SETRWC", bit_mask=0b1111)] + [w for phase in range(4) for w in [ins("SETRWC", bit_mask=0b0111)] +
           [ins(fpu, addr_mode=int(i == 7), clear_dvalid=3 * (phase == 3 and i == 7)) for i in range(8)]]
 
-MATMUL_THREAD = thread_setup(ab=[(16, 0), (48, 8), (16, 8), (16, 8)], dst=[(0, 0), (0, 0), (0, 0), (0, 1)])
 def matmul():
   """Math for one step of Dst += A @ B on a pair of tiles, A in SrcB and B in SrcA: MVMUL does
   Dst[8x16] += SrcB[8x16] @ SrcA[16x16]. Output face (i, j) adds A face (i, k) times B face (k, j) for k = 0, 1, in two
@@ -116,16 +117,17 @@ def matmul():
                       clear_dvalid=3 * (phase == 3 and last)))
   return step
 
-def _array(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
-def _arrays(name, programs, t="unsigned"): return f"static const {t} {name}[{len(programs)}][{len(programs[0])}] = {{{', '.join('{' + ', '.join(f'{w:#x}' for w in p) + '}' for p in programs)}}};"
+def _array(name, words, t="unsigned"): return f"static const {t} {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
+def _arrays(name, programs): return f"static const unsigned {name}[{len(programs)}][{len(programs[0])}] = {{{', '.join('{' + ', '.join(f'{w:#x}' for w in p) + '}' for p in programs)}}};"
 
-def _kernel(thread, arrays, body):
+def _kernel(arrays, body):
   """A BRISC kernel: backend config, the semaphores and every thread's setup, then body. body can push(t, p) a program
-  to thread t, wait for unpacking with UNPACKED, and writeback(n, slot, base, tile) the n-th output (1-based)."""
+  to thread t, step() a matmul, and writeback(n, slot, base, tile) the n-th output (1-based)."""
   setgpr = ins("SETGPR", reg_index_16b=0)
   return compile_rv32(f"""
-{_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", thread)} {_array("relay", RELAY)}
+{_array("cfg_index", CONFIG)} {_array("cfg_value", CONFIG.values())} {_array("thread", THREAD)} {_array("relay", RELAY)}
 {_array("setup_unpack", SETUP_UNPACK)} {_array("setup_pack", SETUP_PACK)} {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
+{_arrays("mm_unpack", [unpack(s, 2 + s) + UNPACKED_REPORT for s in (0, 1)])} {_array("mm", matmul())} {_array("math_end", MATH_END)}
 {arrays}
 #define PUSH(t) (*(volatile unsigned *)({bh.TENSIX_PUSH:#x} + 0x10000 * (t)))
 #define GPR(r) (((volatile unsigned *){bh.TENSIX_GPR:#x})[r])
@@ -141,6 +143,12 @@ static void writeback(unsigned n, unsigned slot, unsigned base, unsigned t) {{  
   reached({PACKED}, n);
   noc_write(SLOT(slot), bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, {TILE}); noc_wait();
 }}
+static unsigned steps;  // matmul steps so far: their B and A tiles alternate between slots 0, 1 and 2, 3
+static void step(unsigned a, unsigned a_tile, unsigned b, unsigned b_tile) {{  // A's tile goes to SrcB, B's to SrcA
+  if (steps >= 2) reached({UNPACKED}, steps - 1);  // the slots' tiles from two steps ago have been unpacked
+  get(b, b_tile, steps & 1); get(a, a_tile, 2 + (steps & 1)); noc_wait();
+  push(0, mm_unpack[steps & 1]); steps++; setgpr({UNPACKED}, steps);
+}}
 void kmain(volatile unsigned *a) {{
   for (unsigned i = 0; i < sizeof cfg_index / 4; i++) CFG[cfg_index[i]] = cfg_value[i];
   GPR({UNPACKED}) = GPR({PACKED}) = 0;
@@ -155,69 +163,61 @@ void kmain(volatile unsigned *a) {{
 }}
 """, KERNEL)
 
-def fused_kernel(expr, order="op"):
-  """A kernel for an elementwise expression: nested (op, x, y) tuples with leaves as input numbers. args: [first tile,
-  tiles, out, input 0, input 1, ...]. A tile's slots: inputs, then one per op in post order (equal subexpressions are
-  one op); the last op is the result. Each op unpacks its operands from their slots, computes into a Dst half, and
-  packs into its slot, so intermediates never leave L1. Two frames of slots alternate between output tiles. Every
-  intermediate is rounded to bf16 on the way to L1, exactly as if each op ran on its own.
+def fused_kernel(expr, nt, order="op"):
+  """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, ("matmul", a, b, K tiles) where a and
+  b are inputs, and plain numbers for inputs. nt: the result's width in tiles. args: [first tile, tiles, out, input 0,
+  input 1, ...]. Slots 0-3 stream matmul tiles; then a frame per output tile holds the inputs, then one slot per op in
+  post order (equal subexpressions are one op), the last op being the result. An elementwise op unpacks its operands
+  from their slots, a matmul streams its K pairs of tiles through slots 0-3; either computes into a Dst half and packs
+  into its own slot, so intermediates never leave L1. Two frames alternate between output tiles. Every intermediate
+  is rounded to bf16 on the way to L1, exactly as if each op ran on its own.
   order is how BRISC queues the work: "op" (unpack, math, pack, op by op) is the only one safe on silicon. The others
   make a thread wait for real on ttsim, which otherwise runs every instruction the moment it can: "pack_first" queues
-  each pack before its math, "thread" queues a whole tile for thread 0, then 1, then 2. On silicon they would stall
-  BRISC on a full FIFO before it pushes what unblocks it; ttsim's FIFOs are deep enough."""
-  ops, inputs = [], 0
+  each pack before its math, "thread" queues a whole tile for thread 0, then 1, then 2 (no matmuls). On silicon they
+  would stall BRISC on a full FIFO before it pushes what unblocks it; ttsim's FIFOs are deep enough."""
+  ops, inputs, fetched = [], 0, set()
   def visit(e):
     nonlocal inputs
-    if isinstance(e, int): inputs = max(inputs, e + 1)
-    elif e not in ops: visit(e[1]); visit(e[2]); ops.append(e)
+    if isinstance(e, int): inputs = max(inputs, e + 1); fetched.add(e)
+    elif e[0] == "matmul": inputs = max(inputs, e[1] + 1, e[2] + 1)
+    else: visit(e[1]); visit(e[2])
+    if not isinstance(e, int) and e not in ops: ops.append(e)
   visit(expr)
   assert len(ops) <= 15, "SEM_L1 counts at most 15 intermediates"
   frame = inputs + len(ops)
-  def slot(f, e): return f * frame + (e if isinstance(e, int) else inputs + ops.index(e))
-  programs = []
+  def slot(f, e): return 4 + f * frame + (e if isinstance(e, int) else inputs + ops.index(e))
+  arrays, bodies = [], []
+  def words(ws): arrays.append(_array(f"w{len(arrays)}", ws)); return f"w{len(arrays) - 1}"
   for f in (0, 1):
-    pushes, seen = [], 0  # ops whose intermediates the unpack thread has waited for
-    for j, (op, x, y) in enumerate(ops):
+    stmts, seen = [], 0  # (thread, C statement); seen: ops whose intermediates the unpack thread has waited for
+    for j, op in enumerate(ops):
+      half, pack_stmt = (f * len(ops) + j) % 2, (2, f"push(2, {words(pack((f * len(ops) + j) % 2, slot(f, op), SEM_PACKED if j == len(ops) - 1 else SEM_L1))});")
+      if op[0] == "matmul":
+        _, ia, ib, kt = op
+        begin = words(addr_modes("matmul") + math_begin(half, True))
+        stmts += [(0, f"for (unsigned k = 0; k < {kt}; k++) {{ step(a[{3 + ia}], t / {nt} * {kt} + k, a[{3 + ib}], k * {nt} + t % {nt});"
+                      f" if (k == 0) push(1, {begin}); push(1, mm); }} push(1, math_end);"), pack_stmt]
+        continue
+      name, x, y = op
       wait = []
       if not (isinstance(x, int) and isinstance(y, int)):  # reads an intermediate: wait for every op packed before it
         wait, seen = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)] * (j - seen), j
-      half = (f * len(ops) + j) % 2
-      steps = [(0, wait + unpack(slot(f, x), slot(f, y))), (1, math_begin(half, op == "mul") + elementwise(op) + MATH_END),
-               (2, pack(half, slot(f, ops[j]), SEM_PACKED if j == len(ops) - 1 else SEM_L1))]
-      if order == "pack_first": steps = steps[2:] + steps[:2]
-      pushes += [(t, w) for t, words in steps for w in words]
-    programs.append(sorted(pushes, key=lambda p: p[0]) if order == "thread" else pushes)
-  out = inputs + len(ops) - 1
-  return _kernel(ELEMENTWISE_THREAD, _arrays("words", [[w for _, w in p] for p in programs]) + _arrays("threads", [[t for t, _ in p] for p in programs], "unsigned char"), f"""
+      steps = [(0, f"push(0, {words(wait + unpack(slot(f, x), slot(f, y)))});"),
+               (1, f"push(1, {words(addr_modes('elementwise') + math_begin(half, name == 'mul') + elementwise(name) + MATH_END)});"), pack_stmt]
+      stmts += steps[2:] + steps[:2] if order == "pack_first" else steps
+    if order == "thread":
+      assert all(op[0] != "matmul" for op in ops), "thread order cannot interleave a matmul's fetches"
+      stmts.sort(key=lambda s: s[0])
+    bodies.append(" ".join([f"get(a[{3 + i}], t, {slot(f, i)});" for i in sorted(fetched)] + ["noc_wait();"] + [c for _, c in stmts]))
+  out = lambda f: slot(f, ops[-1])
+  return _kernel("\n".join(arrays), f"""
   for (unsigned n = 0; n < a[1]; n++) {{
-    unsigned t = a[0] + n, f = n & 1;
-    for (unsigned i = 0; i < {inputs}; i++) get(a[3 + i], t, f * {frame} + i);
-    noc_wait();
-    for (unsigned i = 0; i < sizeof words[f] / 4; i++) PUSH(threads[f][i]) = words[f][i];
-    if (n) writeback(n, (f ^ 1) * {frame} + {out}, a[2], t - 1);  // the frame two tiles back is free again after this
-  }}
-  if (a[1]) writeback(a[1], ((a[1] - 1) & 1) * {frame} + {out}, a[2], a[0] + a[1] - 1);""")
-
-def matmul_kernel():
-  """args: [first output tile, tiles, A, B, C, K tiles, N tiles]. Each output tile is K steps: A's tile (i, k) to SrcB
-  and B's tile (k, j) to SrcA, alternating between two slot pairs, MVMULs into the same Dst half, then one pack."""
-  return _kernel(MATMUL_THREAD, _arrays("unpack", [unpack(s, 2 + s) + UNPACKED_REPORT for s in (0, 1)]) +
-                 _arrays("math_begin", [math_begin(h, True) for h in (0, 1)]) + _array("step", matmul()) +
-                 _array("math_end", MATH_END) + _arrays("pack", [pack(h, 4 + h, SEM_PACKED) for h in (0, 1)]), """
-  for (unsigned n = 0, s = 0; n < a[1]; n++) {
     unsigned t = a[0] + n;
-    for (unsigned k = 0; k < a[5]; k++, s++) {
-      if (s >= 2) reached(%d, s - 1);  // the slots' tiles from two steps ago have been unpacked
-      get(a[3], k * a[6] + t %% a[6], s & 1); get(a[2], t / a[6] * a[5] + k, 2 + (s & 1)); noc_wait();
-      push(0, unpack[s & 1]); setgpr(%d, s + 1);
-      if (k == 0) push(1, math_begin[n & 1]);
-      push(1, step);
-      if (k == a[5] - 1) push(1, math_end);
-    }
-    push(2, pack[n & 1]);
-    if (n) writeback(n, 4 + ((n - 1) & 1), a[4], t - 1);  // before the next pack reuses its slot
-  }
-  if (a[1]) writeback(a[1], 4 + ((a[1] - 1) & 1), a[4], a[0] + a[1] - 1);""" % (UNPACKED, UNPACKED))
+    if (n & 1) {{ {bodies[1]} }}
+    else {{ {bodies[0]} }}
+    if (n) writeback(n, (n & 1) ? {out(0)} : {out(1)}, a[2], t - 1);  // the frame two tiles back is free again after this
+  }}
+  if (a[1]) writeback(a[1], (a[1] & 1) ? {out(0)} : {out(1)}, a[2], a[0] + a[1] - 1);""")
 
 def to_bf16(x):
   bits = struct.unpack("<I", struct.pack("<f", x))[0]
@@ -227,7 +227,8 @@ def tile_index(r, c): return (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 1
 
 class Tensor:
   """rows x cols of bf16: in DRAM as 32x32 tiles in row-major tile order, tile i in bank i % 8; or, until realized, an
-  elementwise op on other tensors. Realizing compiles the whole tree of unrealized ops under it into one kernel."""
+  op on other tensors. Realizing compiles the whole tree of unrealized ops under it into one kernel; a matmul's own
+  operands are realized first, since each of its output tiles needs a whole row and column of them."""
   def __init__(self, rt, rows, cols, op=None, srcs=()):
     assert rows % 32 == 0 and cols % 32 == 0, "tensors are whole tiles"
     self.rt, self.rows, self.cols, self.tiles, self.op, self.srcs = rt, rows, cols, rows * cols // 1024, op, srcs
@@ -260,9 +261,12 @@ class Tensor:
       if t.op is None:
         if all(t is not u for u in inputs): inputs.append(t)
         return next(i for i, u in enumerate(inputs) if u is t)
+      if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
+        a, b = (s.realize() for s in t.srcs)
+        return ("matmul", expr(a), expr(b), a.cols // 32)
       return (t.op, expr(t.srcs[0]), expr(t.srcs[1]))
-    e = expr(self)
-    kernel = kernels.get(e) or kernels.setdefault(e, fused_kernel(e))
+    key = (expr(self), self.cols // 32)
+    kernel = kernels.get(key) or kernels.setdefault(key, fused_kernel(*key))
     self.addr, self.op, self.srcs = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE), None, ()
     return self._run(kernel, self.addr, *[t.addr for t in inputs])
 
@@ -282,8 +286,6 @@ class Tensor:
 
   def __matmul__(self, other):
     assert self.cols == other.rows, f"({self.rows}, {self.cols}) @ ({other.rows}, {other.cols})"
-    a, b, out = self.realize(), other.realize(), Tensor(self.rt, self.rows, other.cols)
-    kernel = kernels.get("matmul") or kernels.setdefault("matmul", matmul_kernel())
-    return out._run(kernel, a.addr, b.addr, out.addr, self.cols // 32, other.cols // 32)
+    return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other))
 
-kernels = {}  # expression or "matmul" -> compiled kernel image
+kernels = {}  # (expression, width in tiles) -> compiled kernel image

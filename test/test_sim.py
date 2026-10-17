@@ -173,11 +173,13 @@ def test_pack_waits_for_math(chip):
   a, b = ([[float((r * c + k) % 9 - 4) for c in range(64)] for r in range(128)] for k in (1, 2))
   ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
   out = Tensor(rt, 128, 64)
-  out._run(compiler.fused_kernel(("add", 0, 1), order="pack_first"), out.addr, ta.addr, tb.addr)
+  out._run(compiler.fused_kernel(("add", 0, 1), 2, order="pack_first"), out.addr, ta.addr, tb.addr)
   assert out.tolist() == [[x + y for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
 
 def unfused(t):  # the same tree of ops, realized one launch per op
-  return t if t.op is None else unfused(t.srcs[0])._elementwise(t.op, unfused(t.srcs[1])).realize()
+  if t.op is None: return t
+  x, y = unfused(t.srcs[0]), unfused(t.srcs[1])
+  return (x @ y if t.op == "matmul" else x._elementwise(t.op, y)).realize()
 
 def test_fusion(chip):
   # a fused chain is one launch, its intermediates never get DRAM, and it is bit for bit the same as running each op on
@@ -200,5 +202,17 @@ def test_fusion_waits(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
   a, b, c, d = (Tensor.of(rt, [[float((r * 3 + c * k) % 7 - 3) for c in range(64)] for r in range(64)]) for k in (1, 2, 5, 6))
   out = Tensor(rt, 64, 64)
-  out._run(compiler.fused_kernel(("add", ("add", 0, 1), ("add", ("sub", 2, 3), ("mul", 0, 1))), order="thread"), out.addr, a.addr, b.addr, c.addr, d.addr)
+  out._run(compiler.fused_kernel(("add", ("add", 0, 1), ("add", ("sub", 2, 3), ("mul", 0, 1))), 2, order="thread"), out.addr, a.addr, b.addr, c.addr, d.addr)
   assert out.tolist() == unfused((a + b) + ((c - d) + a * b)).tolist()
+
+def test_matmul_fusion(chip):
+  # matmuls inside elementwise trees, as one kernel: the matmul's result tile is packed into L1 and read from there.
+  # Bit for bit the same as one launch per op, since it is rounded to bf16 on its way to L1 as it would be to DRAM
+  rnd = lambda r, c: [[from_bf16(to_bf16(random.uniform(-1, 1))) for _ in range(c)] for _ in range(r)]
+  for workers in (chip.tensix[1], chip.tensix[-1]):  # one worker cycling through 8 tiles, then a tile per worker
+    rt = Runtime(chip, chip.tensix[0], workers)
+    a, b, c, d, e, f = (Tensor.of(rt, rnd(*shape)) for shape in ((64, 96), (96, 128), (64, 128), (64, 128), (64, 64), (64, 128)))
+    for build in (lambda: (a @ b) + c, lambda: (a @ b) * d - c, lambda: (a @ b) + (e @ f)):
+      launches, got = rt.launches, build().tolist()
+      assert rt.launches == launches + 1, "one kernel"
+      assert got == unfused(build()).tolist()
