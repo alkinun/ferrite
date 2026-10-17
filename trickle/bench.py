@@ -13,7 +13,8 @@ def bench(chip, m, k, n, repeat=3):
   a, b = (Tensor.frombytes(rt, r, c, b"\x80\x3f" * (r * c)) for r, c in ((m, k), (k, n)))  # bf16 1.0
   assert (a @ b).tolist()[0][0] == k  # compiled, and right
   start = chip.pci.now()
-  for _ in range(repeat): (a @ b).realize()
+  for _ in range(repeat): (a @ b).realize()  # queued back to back
+  rt.wait()
   seconds = (chip.pci.now() - start) / repeat
   return seconds, 2 * m * k * n / seconds / 1e12
 

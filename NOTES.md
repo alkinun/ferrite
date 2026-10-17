@@ -182,9 +182,9 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 **Launch cost.** The dispatcher spends about 85 cycles per worker on a launch (arguments, go, done), work or not, on top of about 300. A command names how many workers it goes to (the first n), and `Tensor._run` sends it to no more workers than it has units: a GPT-2 attention head's kernels have one or two tiles of work, and sending them to all 118 workers cost more than the work.
 
-**Waiting** (`Runtime.wait`) polls the status words in host memory, never the chip. On timeout it reads the dispatcher's current launch and done slots and names the workers that have not finished.
+**Waiting** (`Runtime.wait`) polls the status words in host memory, never the chip. `Tensor` does not wait for its launches: they run in order, so each kernel sees the results of those before it, and only reading a result back (`tobytes`, `tolist`) waits. A timeout counts from the last launch that finished (`until`): a long queue is not a hang, a launch that never finishes is. On timeout it reads the dispatcher's current launch and done slots and names the workers that have not finished.
 
-**DRAM** (`Runtime.dram_alloc`, `dram_free`). A tensor takes the same address range in all 8 banks (tile i in bank i % 8). First fit over a sorted list of holes, 64-byte aligned; a freed block merges with the holes beside it. A `Tensor` frees its DRAM in `__del__`, which CPython runs as soon as the last reference goes, so intermediates and old results go back right away (a reference cycle would hold them until the garbage collector runs: `realize`'s walk is a plain function, not a closure, for that reason). Freeing is safe because every launch is waited for; queued launches will need frees deferred until they finish. ttsim models 4080 MiB a bank.
+**DRAM** (`Runtime.dram_alloc`, `dram_free`). A tensor takes the same address range in all 8 banks (tile i in bank i % 8). First fit over a sorted list of holes, 64-byte aligned; a freed block merges with the holes beside it. A `Tensor` frees its DRAM in `__del__`, which CPython runs as soon as the last reference goes, so intermediates and old results go back right away (a reference cycle would hold them until the garbage collector runs: `realize`'s walk is a plain function, not a closure, for that reason). A freed block goes back only once every launch queued before the free is done (`reclaim`), since those may still read or write it; an allocation that finds no room waits for the queue first. ttsim models 4080 MiB a bank.
 
 **Device API**, prepended to every program (`DEVICE`): `noc_me()` (own translated coordinates, `NOC_ID_LOGICAL`), `noc_read`, `noc_write`, `noc_wait`, `l1_settle`. All requests go through NIU 0, request initiator 0, transaction ID 0. They are acknowledged (`RESP_MARKED`), so `NIU_MST_REQS_OUTSTANDING_ID(0)` counts them, on a dynamic VC. Rules (ISA `NoC/MemoryMap.md`, `NoC/Counters.md`, enforced by ttsim):
 
@@ -196,7 +196,7 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 **Not built yet:**
 
-1. **Overlap.** The dispatcher waits for one launch to finish before starting the next, and the host waits for every launch. Kernels are loaded already, so the dispatcher could send launch n+1's arguments while n runs, and `Tensor` could queue launches and defer frees.
+1. **Overlap on the chip.** The dispatcher waits for one launch to finish before starting the next. Kernels are loaded already, so it could send launch n+1's arguments while n runs.
 2. **Commands other than "launch":** host-to-DRAM copies, events, waiting on another queue.
 3. **NCRISC**, a second data mover, stays in reset. It could take the sends home off BRISC, or fetch for a second NoC.
 5. **Hang reports from silicon.** The host should also read each stuck core's PC snapshot (`0xFFB1_3138`...); ttsim does not model those registers.

@@ -194,7 +194,8 @@ class Runtime:
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
     self.chip, self.launches, self.wptr, self.workers = chip, 0, 0, []  # workers: how many each launch went to
-    self.holes, self.used = [(0, bh.DRAM_BANK_SIZE)], {}  # DRAM: free (address, size) in order, and address -> size
+    self.holes, self.used, self.freed = [(0, bh.DRAM_BANK_SIZE)], {}, []  # DRAM: free (address, size) in order,
+    # address -> size, and (launches queued, address) of what was freed while launches queued before might still use it
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS  # kernels in L1: image -> address; where the next goes
     *self.cores, self.dispatcher = cores
     buf, bus = chip.pci.alloc(64 + ring)
@@ -229,7 +230,7 @@ class Runtime:
     return self.loaded[kernel]
 
   def evict(self):  # forget every loaded kernel, once the launches that use them are done
-    self.wait(60)
+    self.wait()
     self.loaded, self.room = {}, KERNELS
 
   def launch(self, kernel, args=lambda x, y: (), workers=None):
@@ -245,7 +246,7 @@ class Runtime:
     size, at = len(self.ring), self.wptr % len(self.ring)
     skip = size - at if at + length > size else 0  # commands never wrap: mark the tail unused and start over
     assert length <= STAGING_ROOM and length + skip <= size, f"a {length}-byte command does not fit"
-    self.chip.wait(lambda: (self.wptr - self.read_status(0)) % 2**32 + skip + length <= size, "free space in the ring")
+    self.until(lambda: (self.wptr - self.read_status(0)) % 2**32 + skip + length <= size, "free space in the ring")
     if skip:
       self.ring[at:at + 4] = bytes(4)
       self.wptr, at = self.wptr + skip, 0
@@ -263,23 +264,41 @@ class Runtime:
         self.holes[i:i + 1] = [(addr + size, room - size)] if room > size else []
         self.used[addr] = size
         return addr
+    if self.freed:  # what queued launches still hold may be enough
+      self.wait()
+      return self.dram_alloc(size)
     raise MemoryError(f"no {size} bytes free in DRAM")
 
   def dram_free(self, addr):
-    """Give back what dram_alloc returned; it merges with the holes on either side. Nothing may still be using it: launches
-    are waited for, so that holds."""
-    self.holes = sorted(self.holes + [(addr, self.used.pop(addr))])
-    for i in range(len(self.holes) - 1, 0, -1):
-      (a, n), (b, m) = self.holes[i - 1], self.holes[i]
-      if a + n == b: self.holes[i - 1:i + 1] = [(a, n + m)]
+    """Give back what dram_alloc returned, once the launches queued so far, which may still read or write it, are done;
+    it merges with the holes on either side."""
+    self.freed.append((self.launches, addr))
+    self.reclaim()
+
+  def reclaim(self):  # the freed DRAM no unfinished launch can use goes back into the holes
+    done = self.launches - (self.launches - self.read_status(1)) % 2**32
+    for launches, addr in [f for f in self.freed if f[0] <= done]:
+      self.freed.remove((launches, addr))
+      self.holes = sorted(self.holes + [(addr, self.used.pop(addr))])
+      for i in range(len(self.holes) - 1, 0, -1):
+        (a, n), (b, m) = self.holes[i - 1], self.holes[i]
+        if a + n == b: self.holes[i - 1:i + 1] = [(a, n + m)]
 
   def read_status(self, i): return int.from_bytes(self.status[4 * i:4 * i + 4], "little")
 
-  def wait(self, timeout=2.0):
+  def until(self, cond, what, timeout=60):
+    """Until cond(), so long as launches keep finishing: none in timeout seconds means the chip hangs. (A launch can take
+    seconds on the simulator.)"""
+    while not cond():
+      done = self.read_status(1)
+      self.chip.wait(lambda: cond() or self.read_status(1) != done, what, timeout)
+
+  def wait(self, timeout=60):
     """Until every queued launch has finished on every worker: polls host memory, not the chip. On timeout, asks the
-    dispatcher which launch it is on and which workers have not reported it."""
-    try: self.chip.wait(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
+    dispatcher which launch it is on and which workers have not reported it. Then frees what was waiting for them."""
+    try: self.until(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
     except TimeoutError as e:
       current, done = self.chip.read32(*self.dispatcher, OUTBOX), self.chip.read(*self.dispatcher, DONE, 16 * len(self.cores))
       stuck = [c for i, c in enumerate(self.cores[:self.workers[current - 1]]) if int.from_bytes(done[16 * i:16 * i + 4], "little") != current]
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}") from None
+    self.reclaim()

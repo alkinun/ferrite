@@ -145,6 +145,12 @@ def test_dram_is_freed(chip):
   assert len(rt.used) == 2, "x and the last y"
   del x, y
   assert rt.holes == [(0, bh.DRAM_BANK_SIZE)] and not rt.used
+  # launches are queued, not waited for: DRAM freed while one may still read it waits for that launch to be done
+  x = Tensor.of(rt, [[float(r - c) for c in range(64)] for r in range(64)])
+  y, at = (x * 3.0).realize(), x.addr  # queued; on ttsim nothing runs until the host waits
+  del x
+  z = Tensor.of(rt, [[1.0] * 64] * 64)
+  assert z.addr != at and y.tolist()[1][0] == 3.0
 
 def test_tile_math(chip):
   # one tile of small integers through unpack -> FPU -> pack: add, sub and mul must be exact

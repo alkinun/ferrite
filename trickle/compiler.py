@@ -590,7 +590,7 @@ class Tensor:
     self.tiles, self.stride, self.offset, self.owner = -(-rows // 32) * -(-cols // 32), -(-cols // 32), 0, None
     self.addr = None if op else rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
 
-  def __del__(self):  # its DRAM goes back once nothing refers to it (launches are waited for, so none still reads it)
+  def __del__(self):  # its DRAM goes back once nothing refers to it (and no queued launch can still use it)
     if self.addr is not None and self.owner is None: self.rt.dram_free(self.addr)
 
   def _where(self, i, j):  # tile (i, j) in DRAM: (x, y, address)
@@ -624,8 +624,9 @@ class Tensor:
     return t
 
   def tobytes(self):
-    """bf16 in row-major order, as frombytes takes it."""
+    """bf16 in row-major order, as frombytes takes it. Waits for the launches queued so far."""
     self.realize()
+    self.rt.wait()
     out, ct = bytearray(2 * self.rows * self.cols), -(-self.cols // 32)
     for i in range(self.tiles):
       r0, c0, tile = i // ct * 32, i % ct * 32, self.rt.chip.read(*self._where(i // ct, i % ct), TILE)
@@ -674,12 +675,13 @@ class Tensor:
     rowwise = any(isinstance(x, tuple) and x[0] in COMBINE for x in _subexprs(e))  # units are whole rows
     return self._run(kernel, self.addr, *[v for t in inputs for v in (t.addr, t.stride, t.offset)], units=-(-self.rows // 32) if rowwise else None)
 
-  def _run(self, kernel, *args, units=None):  # this tensor's tiles, or rows, split evenly over as many workers as have any
+  def _run(self, kernel, *args, units=None):
+    """Queue kernel over this tensor's tiles, or rows, split evenly over as many workers as have any. Nothing waits for
+    it: launches run in order, so the next kernel reads this result, and reading it back (tobytes) waits."""
     units = units or self.tiles
     cores = self.rt.cores[:units]
     share = {xy: (i * units // len(cores), (i + 1) * units // len(cores)) for i, xy in enumerate(cores)}
     self.rt.launch(kernel, lambda x, y: (share[x, y][0], share[x, y][1] - share[x, y][0], *args), len(cores))
-    self.rt.wait(60)  # a model's biggest kernels take seconds on the simulator (milliseconds on a chip)
     return self
 
   def _elementwise(self, op, other):
