@@ -272,14 +272,18 @@ def test_matmul_fidelity(chip):
 def test_bfp8(chip):
   # a cast to bfp8 is bit for bit numpy's model of it (bfp8 above), exponents spread wide within each run; and a matmul by
   # a bfp8 B (read at 1088 bytes a tile, not 2048) is bit for bit the bf16 matmul by its values, whichever way B comes in:
-  # streamed beside A (K past 256 tiles), with A's row kept, a block's column kept, and K split
+  # streamed beside A (K past 256 tiles), with A's row kept, a block's column kept, and K split; and fused with what
+  # follows it and with a bf16 matmul, unpacker 0 switched to bfp8 for its steps and back
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   rng = np.random.default_rng(5)
   a = bf16(rng.normal(0, 1, (64, 96)) * np.exp(rng.normal(0, 2, (64, 96))))
   assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast("bfp8"))[0], bfp8(a))
+  on = lambda *shape: Tensor.of(rt, rng.normal(0, 1, shape).tolist())
   for m, k, n in ((64, 9000, 40), (1, 768, 2304), (100, 256, 200), (32, 2048, 64)):
-    x, w = Tensor.of(rt, rng.normal(0, 1, (m, k)).tolist()), Tensor.of(rt, rng.normal(0, 1, (k, n)).tolist()).cast("bfp8")
+    x, w = on(m, k), on(k, n).cast("bfp8")
     assert (x @ w).tolist() == (x @ Tensor.of(rt, w.tolist())).tolist(), (m, k, n)
+  x, w, v, bias = on(64, 192), on(192, 96).cast("bfp8"), on(192, 96), on(1, 96)  # K too short to split: one kernel
+  assert (x @ w + x @ v + bias).relu().tolist() == (x @ Tensor.of(rt, w.tolist()) + x @ v + bias).relu().tolist()
 
 def test_matmul_multicast(chip):
   # with a grid of workers (Runtime.grid), a matmul of more than one row of tiles reads each input tile from DRAM

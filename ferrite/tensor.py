@@ -333,7 +333,7 @@ class Tensor:
     if either operand is, unless said. fp32 operands go as bf16x3: each is hi + lo, both bf16, and hi@hi + hi@lo + lo@hi
     sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24. fidelity: the
     phases a bf16 product takes (FIDELITY unless said; compiler.matmul says what each leaves out); fp32's take all four.
-    x may be bfp8 (a weight cast once, read at about half a bf16's bytes), times bf16, in a kernel of its own."""
+    x may be bfp8 (a weight cast once, read at about half a bf16's bytes) when self is bf16."""
     fidelity = fidelity or FIDELITY
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
@@ -518,7 +518,7 @@ def _expr(t, shape, inputs, kernel):
     assert t.dtype == kernel[3], f"a {t.dtype} input to a {kernel[3]} kernel"
     return _input(t, inputs)
   if t is kernel[4] and t.op == "cast": return ("cast", _expr(t.srcs[0].realize(), shape, inputs, kernel))
-  if t is not kernel[4] and (t.dtype != kernel[3] or t.op == "cast" or (t.op == "matmul" and (kernel[3] != "bf16" or t.srcs[1].dtype == "bfp8"))):
+  if t is not kernel[4] and (t.dtype != kernel[3] or t.op == "cast" or (t.op == "matmul" and kernel[3] != "bf16")):
     return _expr(t.realize(), shape, inputs, kernel)
   axis = kernel[0]
   if any(t.shape[ax] != shape[ax] for ax in range(3) if ax != axis): return _expr(t.realize(), shape, inputs, kernel)
