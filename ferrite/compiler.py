@@ -340,7 +340,7 @@ def allocate(names):
   """{run: replay index} for the math thread: SFPU bodies (32 replays a tile, longest first), then matmul and mul
   phases (4). What does not fit is pushed word by word."""
   slots, at = {}, 0
-  for name in sorted(names, key=lambda n: (n in ("mm", "mul"), -len(MATH_RUNS[n]))):
+  for name in sorted(names, key=lambda n: (n in ("mm", "mul"), -len(MATH_RUNS[n]), n)):  # by name last: the same kernel in every process
     if at + len(MATH_RUNS[name]) <= 32: slots[name], at = at, at + len(MATH_RUNS[name])
   return slots
 def run(slots, name, count=None):  # the first count words of a run: one REPLAY if it was recorded, else the words
