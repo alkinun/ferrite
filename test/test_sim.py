@@ -208,6 +208,18 @@ def test_tensor_math(chip):
         x, y = a[r][c], b[r][c]
         assert abs(got[r][c] - f(x, y)) <= max(abs(x), abs(y)) * 2**-7, (r, c, x, y, got[r][c])
 
+def test_numbers_once(chip):
+  # a number in an elementwise kernel is a tile, read once by each worker into a slot of its own, not once a tile:
+  # x * 0.5 + 1.5 over 768 tiles reads x and two tiles a worker
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
+  a = bf16(np.random.default_rng(6).normal(0, 1, (1024, 768)))
+  x = Tensor.of(rt, a.tolist())
+  y, before = x * 0.5 + 1.5, reads()
+  y.realize(), rt.wait()
+  assert reads() - before == x.tiles + 2 * len(rt.cores), reads() - before
+  close(y, a * 0.5 + 1.5, 1e-2)
+
 def test_matmul_exact(chip):
   # small integers, K = 2 tiles so Dst accumulates across them; then A @ I == A bit for bit, which pins the tile layout
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])

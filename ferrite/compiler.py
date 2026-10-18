@@ -777,8 +777,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     if narrow(r) and passes_of(r) and top < UNPACKABLE: kept[r], top = top, top + 1
     elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= UNPACKABLE: kept[r], top = top, top + L
   last_read = lambda keep: max([passes_of(r)[-1] for r in kept if narrow(r) == keep], default=None)  # the last pass reading such
+  single = {}  # without passes, an input of one tile in all (a number) gets a slot of its own too, fetched once a worker
+  if kept_b is not None: top = max(top, kept_b + (3 if mc else 1) * ops[matmuls[0]]["kt"])  # past A's rows and B's buffers
+  for r in range(inputs) if not reducing else ():
+    if all(ext(shapes[r], ax) == 1 for ax in range(3)) and top < UNPACKABLE: single[r], top = top, top + 1
   def slot(f, r):  # an input or swept op lives in the frame (or where it is kept), a narrow op in its own slot after both frames
     if r == "zero": return ZERO_SLOT
+    if r in single: return single[r]
     if isinstance(r, int): return FRAMES + f * frame + r if r not in kept else kept[r] if narrow(r) else f"{kept[r]} + k"
     return FRAMES + (f * frame + inputs + r[1] if swept(r) else 2 * frame + r[1])
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
@@ -799,6 +804,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
     return f"output({f if swept(me) else 0}, {pslot(f, me)}, {where(me, 2)}); " if j == root else ""
   def fetch(f, p, r):  # BRISC's fetch of input r in pass p: into the frame, or into its kept slot in the first pass reading it,
+    if r in single: return f"if (tiles == 1) get(a[{arg(r)}], {tile(r)}, {single[r]});"  # with the first tile (tiles counts it already)
     if r not in kept: return f"get(a[{arg(r)}], {tile(r)}, {slot(f, r)});"  # once the line before has been read there
     if p != passes_of(r)[0]: return ""
     return (f"if (k == 0) {{ reached(narrow_done); get(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
