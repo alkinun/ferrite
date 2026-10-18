@@ -115,7 +115,7 @@ def materialize(v, groups=None):
   if m is not None:
     return t._move(shape3, v.view.offset, [s for _, s, _, _ in m], [lo for _, _, lo, _ in m], [hi for _, _, _, hi in m])
   if (p := transposes(v)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
-  return upload(host(v).reshape(shape3), v.dtype)
+  return upload(download(v).reshape(shape3), v.dtype)
 
 def transposes(v):
   """A view that only reorders its tensor's axes (attention's heads: (B, T, H, D) as (B, H, T, D)) in moves that each
@@ -135,7 +135,7 @@ def transposes(v):
     order = order[:i] + order[j:] + order[i:j]
   return t
 
-def host(v):  # a chip value as numpy, in its shape
+def download(v):  # a chip value as numpy, in its shape (bf16 as its bits)
   a = np.frombuffer(v.t.tobytes(), NP[v.t.dtype])
   view = v.view
   idx = view.offset + sum(np.arange(n).reshape([-1 if j == k else 1 for j in range(len(view.shape))]) * s
@@ -147,7 +147,7 @@ def host(v):  # a chip value as numpy, in its shape
       out = out * keep.reshape([-1 if j == k else 1 for j in range(len(view.shape))])
   return out
 
-def hosted(a):  # numpy (bf16 as its bits) as a lazy tinygrad tensor on its CPU device
+def cpu(a):  # numpy (bf16 as its bits) as a tinygrad tensor on its CPU device
   t = Tensor(np.ascontiguousarray(a), device="CPU")
   return t.bitcast(dtypes.bfloat16) if a.dtype == np.uint16 else t
 def array(t):  # a host value as numpy (bf16 as its bits), computed now, once
@@ -156,25 +156,18 @@ def array(t):  # a host value as numpy (bf16 as its bits), computed now, once
 def constant(t):  # a host value that is one number spread over a shape: the number, else None
   return t.uop.base.arg if t.uop.base.op is Ops.CONST else None
 
+def flat(a, n, npd):  # a host value as n values' bytes
+  a = np.asarray(a)
+  return np.ascontiguousarray(np.broadcast_to(a, (n,)) if a.ndim == 0 else a.reshape(-1), npd).tobytes()
+
+def to_chip(v, dtype):  # a host value (a tinygrad CPU tensor) as a chip value, in its own shape
+  return Value(upload(array(v), dtype), View(v.shape), dtype)
+
 def upload(a, dtype, shape3=None):
   """numpy a (bf16 as its bits) onto the chip, shape3 or folded."""
   d = DTYPES[dtype] or ("int32" if a.dtype.kind in "iub" else "fp32")
   a = np.ascontiguousarray(a, NP[d])
   return tensor.Tensor.frombytes(runtime(), *(shape3 or fold(a.shape))[1:], a.tobytes(), (shape3 or fold(a.shape))[0], d)
-
-class Holder:  # a FERRITE buffer's contents: bytes from the host, or a chip value (its own view and dtype)
-  def __init__(self): self.bytes, self.value = None, None
-
-class FerriteAllocator(Allocator):
-  def _alloc(self, size, options): return BufferStorage(Holder())
-  def _copyin(self, dest, src): dest.bytes, dest.value = bytes(src), None
-  def _copyout(self, dest, src):
-    if src.value is not None: dest[:] = np.ascontiguousarray(host(src.value)).tobytes()[:len(dest)]
-    else: dest[:] = src.bytes[:len(dest)] if src.bytes is not None else bytes(len(dest))
-
-class FerriteDevice(Compiled):
-  def __init__(self, device): super().__init__(device, FerriteAllocator(self), [], None)
-  def synchronize(self, timeout=None): pass  # reading a chip value back waits for what it needs
 
 def on_ferrite(u): return isinstance(u.device, str) and u.device.startswith("FERRITE")
 
@@ -187,7 +180,6 @@ BINARY = {Ops.ADD: lambda a, b: a + b, Ops.SUB: lambda a, b: a - b, Ops.MUL: lam
           Ops.CMPEQ: lambda a, b: a.eq(b) if chip(a) else b.eq(a), Ops.FDIV: lambda a, b: a * b.reciprocal() if chip(b) else a / b,
           Ops.AND: lambda a, b: a * b, Ops.OR: lambda a, b: a.maximum(b) if chip(a) else b.maximum(a)}  # AND and OR of bools only
 ELEMENTWISE = {*UNARY, *BINARY, Ops.WHERE, Ops.CAST}
-CHIP = {*ELEMENTWISE, Ops.REDUCE}  # what ferrite computes
 
 def broadcast(v, shape):  # an operand of a binary op, numpy's way: axes aligned at the end, a dimension of 1 spread (as a view)
   if isinstance(v, Tensor): return v.reshape((1,) * (len(shape) - v.ndim) + v.shape).expand(shape)
@@ -245,8 +237,8 @@ class Evaluator:
     return None
 
   def reduce(self, u, x):
-    """REDUCE(op, n) folds x's first n axes. A sum of a product whose operands are broadcast against each other is a
-    matmul; otherwise the folded axes go where ferrite folds them, last, and one move puts them there if need be."""
+    """REDUCE(op, n) folds x's first n axes: along an axis (or two) of x's tensor when they are one, else after one move
+    that puts them last."""
     op, n = u.arg
     kept, folded = list(range(n, len(x.shape))), list(range(n))
     w = x.view.permute(kept + folded)
@@ -267,8 +259,8 @@ class Evaluator:
     order = p.arg if p.op is Ops.PERMUTE else tuple(range(len(p.shape)))
     m = p.src[0] if p.op is Ops.PERMUTE else p
     if m.op is not Ops.MUL: return None
-    up = lambda s, v: Value(upload(array(v), s.dtype), View(v.shape), s.dtype) if isinstance(v, Tensor) and constant(v) is None else v
-    a, b = (broadcast(up(s, self.read(s, self.values.get(s))), m.shape) for s in m.src)  # a weight still on the host goes up
+    up = lambda s, v: to_chip(v, s.dtype) if isinstance(v, Tensor) and constant(v) is None else v  # a weight still on the host goes up
+    a, b = (broadcast(up(s, self.read(s, self.values.get(s))), m.shape) for s in m.src)
     if not (isinstance(a, Value) and isinstance(b, Value)): return None
     if a.view.mask or b.view.mask or a.dtype not in DTYPES or b.dtype not in DTYPES: return None
     shape, summed = m.shape, list(order[:u.arg[1]])
@@ -289,14 +281,13 @@ class Evaluator:
     return Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)
 
   def movement(self, u, x):
-    """A view of x (one move or none, later), or None if the view cannot follow (a reshape of a strided view)."""
+    """A view of x, to become one move or none when an op needs the data; x moves first for a reshape its view cannot follow."""
     shape = tuple(u.shape)
     if u.op is Ops.RESHAPE: view = x.view.reshape(shape)
     elif u.op is Ops.PERMUTE: view = x.view.permute(u.arg)
     elif u.op is Ops.EXPAND: view = broadcast(x, shape).view
     elif u.op is Ops.SHRINK: view = x.view.shrink(self.marg(u))
-    elif u.op is Ops.PAD: view = x.view.pad(self.marg(u))
-    else: return None
+    else: view = x.view.pad(self.marg(u))
     if view is None:  # a reshape the view cannot follow: moved first, straight into the three axes the new shape folds to
       x, view = Value(materialize(x, grouping(x.shape, fold(shape))), View(x.shape), x.dtype), View(shape)
     return Value(x.t, view, x.dtype)
@@ -310,33 +301,24 @@ class Evaluator:
   def on_host(self, u, srcs):
     """u by tinygrad on its CPU device, lazily, so tinygrad fuses what runs there (its random numbers sum a padded view it
     never makes whole) and computes it only when the chip needs it."""
-    def cpu(s, v):
-      if isinstance(v, Value): v = hosted(host(v))
-      return v.cast(s.dtype).uop if isinstance(v, Tensor) else s
-    return Tensor(u.replace(src=tuple(cpu(s, v) for s, v in zip(u.src, srcs))))
+    there = lambda s, v: (cpu(download(v)) if isinstance(v, Value) else v).cast(s.dtype).uop if isinstance(v, (Value, Tensor)) else s
+    return Tensor(u.replace(src=tuple(there(s, v) for s, v in zip(u.src, srcs))))
 
   def eval(self, u, defer=True):
     if defer and (u.op is Ops.MUL or u.op is Ops.PERMUTE and self.values.get(u.src[0]) is DEFER) and self.summed(u): return DEFER
-    srcs = [self.force(s) if self.values.get(s) is DEFER else self.values.get(s) for s in u.src] if not defer or u.op is not Ops.REDUCE else \
-           [self.values.get(s) for s in u.src]
+    srcs = [self.values.get(s) for s in u.src]
+    if u.op is not Ops.REDUCE: srcs = [self.force(s) if v is DEFER else v for s, v in zip(u.src, srcs)]  # a sum may make a matmul of them
     if u.op is Ops.CONST: return u.arg
     if u.op is Ops.STACK and all(isinstance(v, (bool, int, float)) for v in srcs): return tuple(srcs)  # a shape; else values, stacked on the host
     if u.op in (Ops.BUFFER, Ops.ALLOC): return self.read(u, u)  # as it is before any STORE in this graph
     if u.op is Ops.COPY and on_ferrite(u) and isinstance(v := self.read(u.src[0], srcs[0]), Tensor) and u.dtype in DTYPES and v.ndim:
-      return Value(upload(array(v), u.dtype), View(v.shape), u.dtype)  # onto the chip
+      return to_chip(v, u.dtype)
     if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return self.read(u.src[0], srcs[0])
     if u.op is Ops.AFTER: return self.now(u.src[0])
     if u.op is Ops.STORE: return self.store(u.src[0], self.read(u.src[1], srcs[1]))
     if u.op is Ops.SINK: return None
     x = [self.read(s, v) for s, v in zip(u.src, srcs)]
-    if u.op is Ops.RESHAPE and u.src[0].op is Ops.BUFFER and on_ferrite(u.src[0]) and isinstance(x[0], Tensor) and constant(x[0]) is None:
-      h = u.src[0].buffer._buf  # bytes from the host: up in the shape they are first used in, and kept so
-      if h.value is None and u.dtype in DTYPES: h.value = Value(upload(array(x[0]).reshape(u.shape), u.dtype), View(x[0].shape), u.dtype)
-      if h.value is not None: return Value(h.value.t, View(u.shape), u.dtype)
-    if u.op is Ops.RESHAPE and u.src[0].op is Ops.BUFFER and isinstance(x[0], Value) and x[0].view.contiguous() and x[0].t.shape != fold(u.shape):
-      h = u.src[0].buffer._buf  # kept in a shape its uses do not fold to (a weight made flat): laid out again once, as they use it
-      h.value = Value(materialize(Value(x[0].t, View(u.shape), x[0].dtype)).realize(), x[0].view, x[0].dtype)
-      return Value(h.value.t, View(u.shape), u.dtype)
+    if u.op is Ops.RESHAPE and u.src[0].op is Ops.BUFFER and on_ferrite(u.src[0]) and (v := self.lay_out(u, x[0])) is not None: return v
     if u.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.PAD):
       return self.movement(u, x[0]) if isinstance(x[0], Value) else self.on_host(u, x)
     if u.op in BINARY or u.op is Ops.WHERE: x = [broadcast(v, u.shape) for v in x]
@@ -346,6 +328,17 @@ class Evaluator:
     if u.op is Ops.REDUCE and isinstance(x[0], Value) and x[0].dtype in DTYPES and u.arg[0] in (Ops.ADD, Ops.MAX): return self.reduce(u, x[0])
     if any(isinstance(v, Value) for v in x) and (v := self.chip_op(u, x)) is not None: return v
     return self.on_host(u, x)
+
+  def lay_out(self, u, x):
+    """A FERRITE buffer as a use reshapes it, laid out on the chip in that shape and kept so: bytes from the host go up in
+    it, and a tensor kept in a shape its uses do not fold to (tinygrad makes weights flat) moves into it once. Else None."""
+    h = u.src[0].buffer._buf
+    if isinstance(x, Tensor) and constant(x) is None and u.dtype in DTYPES and h.value is None:
+      h.value = Value(upload(array(x).reshape(u.shape), u.dtype), View(x.shape), u.dtype)
+    elif isinstance(x, Value) and x.view.contiguous() and x.t.shape != fold(u.shape):
+      h.value = Value(materialize(Value(x.t, View(u.shape), x.dtype)).realize(), x.view, x.dtype)
+    else: return None
+    return Value(h.value.t, View(u.shape), u.dtype)
 
   def now(self, x):  # x (a buffer, or a view of one) as the buffers hold it now, after the STOREs so far
     if x.op in (Ops.BUFFER, Ops.ALLOC): return self.read(x, x)
@@ -361,8 +354,8 @@ class Evaluator:
       h = buf.ensure_allocated()._buf
       if h.value is not None: return Value(h.value.t, h.value.view, h.value.dtype)
       if h.bytes is None: return Tensor.zeros(buf.nbytes // v.dtype.itemsize, dtype=v.dtype, device="CPU")  # nothing stored yet
-      return hosted(np.frombuffer(h.bytes, npdtype(v.dtype)))  # on the host until a use gives it a shape
-    return hosted(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape))
+      return cpu(np.frombuffer(h.bytes, npdtype(v.dtype)))  # on the host until a use gives it a shape
+    return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape))
 
   def store(self, target, value):
     """value into the buffer target (a whole one, perhaps reshaped)."""
@@ -370,7 +363,7 @@ class Evaluator:
     assert target.op in (Ops.BUFFER, Ops.ALLOC), f"a store into {target.op}"
     buf = target.buffer.ensure_allocated()
     n, npd = buf.nbytes // target.dtype.itemsize, npdtype(target.dtype)
-    data = lambda: host(value) if isinstance(value, Value) else array(value) if isinstance(value, Tensor) else value
+    data = lambda: download(value) if isinstance(value, Value) else array(value) if isinstance(value, Tensor) else value
     if not on_ferrite(target): buf.copyin(memoryview(flat(data(), n, npd)))
     elif isinstance(value, Value):  # kept in whatever three axes it has, if its view is it as it lies
       t = value.t if value.view.contiguous() else materialize(value)
@@ -378,9 +371,20 @@ class Evaluator:
     else: buf._buf.bytes, buf._buf.value = flat(data(), n, npd), None
     return None
 
-def flat(a, n, npd):  # a host value as n values' bytes
-  a = np.asarray(a)
-  return np.ascontiguousarray(np.broadcast_to(a, (n,)) if a.ndim == 0 else a.reshape(-1), npd).tobytes()
+# tinygrad's side: the FERRITE device, its buffers, and the graphs it hands over
+class Holder:  # a FERRITE buffer's contents: bytes from the host, or a chip value (its own view and dtype)
+  def __init__(self): self.bytes, self.value = None, None
+
+class FerriteAllocator(Allocator):
+  def _alloc(self, size, options): return BufferStorage(Holder())
+  def _copyin(self, dest, src): dest.bytes, dest.value = bytes(src), None
+  def _copyout(self, dest, src):
+    if src.value is not None: dest[:] = np.ascontiguousarray(download(src.value)).tobytes()[:len(dest)]
+    else: dest[:] = src.bytes[:len(dest)] if src.bytes is not None else bytes(len(dest))
+
+class FerriteDevice(Compiled):
+  def __init__(self, device): super().__init__(device, FerriteAllocator(self), [], None)
+  def synchronize(self, timeout=None): pass  # reading a chip value back waits for what it needs
 
 def run(sink):
   users = collections.defaultdict(list)
