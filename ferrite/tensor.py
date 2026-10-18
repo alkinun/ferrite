@@ -290,24 +290,6 @@ class Tensor:
   def eq(self, x): return 1 - self.ne(x)
   __ne__, __eq__ = ne, eq
   def __hash__(self): return id(self)  # == is elementwise, so a tensor hashes by identity, as in tinygrad
-  # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
-  def conv2d(self, w, padding=0):
-    """By w (out channels, in channels, k * k): a k x k kernel, im2col's way, as one matmul. With each channel flattened
-    into a row, tap (ky, kx) of the kernel reads those rows from ky W + kx on; the k * k taps stacked are the patches,
-    column y W + x the patch at (y, x) (those with x past the last wrap around, and are dropped from the result). Each
-    tap is one move: the flattening, its slice and its place in the stack composed."""
-    k = math.isqrt(w.cols)
-    assert k * k == w.cols and w.rows == self.batch, f"{self.shape} by {w.shape}: (out, in, k * k)"
-    x = self.pad(((padding, padding), (padding, padding))) if padding else self
-    (c, h, wd), ho, wo = x.shape, x.rows - k + 1, x.cols - k + 1
-    rows = x.reshape(1, c, h * wd).pad(((0, 0), (0, k - 1)))  # k - 1 zeros on the end, for the last tap's wrapped columns
-    taps = [rows[:, :, ky * wd + kx:ky * wd + kx + ho * wd] for ky in range(k) for kx in range(k)]
-    out = w.permute(0, 2, 1).reshape(1, w.batch, k * k * c) @ taps[0].cat(*taps[1:], axis=1)
-    return out.reshape(w.batch, ho, wd)[:, :, :wo]
-  def max_pool2d(self, k=2):  # the largest of each k x k block: of each k rows, then of each k columns
-    c, h, w = self.shape
-    assert h % k == 0 and w % k == 0, f"{self.shape} in {k} x {k} blocks"
-    return self.reshape(c * h // k, k, w).max(1).reshape(1, c * h * w // (k * k), k).max(2).reshape(c, h // k, w // k)
   def sigmoid(self): return (1 + (-self).exp()).reciprocal()
   def silu(self): return self * self.sigmoid()
   def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
@@ -357,6 +339,25 @@ class Tensor:
       parts = self.split(s).matmul(x.split(s, 0), dtype)
       return sum((parts[i] for i in range(1, s)), parts[0])
     return Tensor(self.rt, self.rows, x.cols, "matmul", (self, x), max(self.batch, x.batch), dtype)
+
+  # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
+  def conv2d(self, w, padding=0):
+    """By w (out channels, in channels, k * k): a k x k kernel, im2col's way, as one matmul. With each channel flattened
+    into a row, tap (ky, kx) of the kernel reads those rows from ky W + kx on; the k * k taps stacked are the patches,
+    column y W + x the patch at (y, x) (those with x past the last wrap around, and are dropped from the result). Each
+    tap is one move: the flattening, its slice and its place in the stack composed."""
+    k = math.isqrt(w.cols)
+    assert k * k == w.cols and w.rows == self.batch, f"{self.shape} by {w.shape}: (out, in, k * k)"
+    x = self.pad(((padding, padding), (padding, padding))) if padding else self
+    (c, h, wd), ho, wo = x.shape, x.rows - k + 1, x.cols - k + 1
+    rows = x.reshape(1, c, h * wd).pad(((0, 0), (0, k - 1)))  # k - 1 zeros on the end, for the last tap's wrapped columns
+    taps = [rows[:, :, ky * wd + kx:ky * wd + kx + ho * wd] for ky in range(k) for kx in range(k)]
+    out = w.permute(0, 2, 1).reshape(1, w.batch, k * k * c) @ taps[0].cat(*taps[1:], axis=1)
+    return out.reshape(w.batch, ho, wd)[:, :, :wo]
+  def max_pool2d(self, k=2):  # the largest of each k x k block: of each k rows, then of each k columns
+    c, h, w = self.shape
+    assert h % k == 0 and w % k == 0, f"{self.shape} in {k} x {k} blocks"
+    return self.reshape(c * h // k, k, w).max(1).reshape(1, c * h * w // (k * k), k).max(2).reshape(c, h // k, w // k)
 
   # Autograd: tinygrad's, a rule per op (_backward) applied from the result back, each made of the same lazy ops, so
   # the backward fuses into kernels as the forward does (and recomputes what the forward fused, rather than store it)
@@ -501,7 +502,7 @@ def _expr(t, shape, inputs, kernel):
     return ("matmul", _expr(a.realize(), shape, inputs, kernel), b)
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
-kernels = {}  # (expression, input shapes) -> (image, units a matrix), or a kernel's name and shape -> image
+kernels = {}  # (expression, input shapes, dtype, result dtype) -> (image, units), or a data movement kernel's name and shape -> image
 def _cached(key, compile):
   if key not in kernels: kernels[key] = compile()
   return kernels[key]

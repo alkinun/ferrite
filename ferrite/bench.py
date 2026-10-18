@@ -1,4 +1,4 @@
-# Goal 3's number: how fast a bf16 matmul runs on every worker. On a card the time is wall time; on ttsim it is
+# How fast a bf16 matmul runs on every worker (ROADMAP, stage 3). On a card the time is wall time; on ttsim it is
 # simulated cycles at the chip's clock, which tracks how much work the kernels do but not how fast silicon does it
 # (ttsim runs each instruction at once, and its DRAM answers at once). So it also counts what the workers read from
 # DRAM, against reading each input once: on silicon a big matmul waits on DRAM more than on its MVMULs.

@@ -11,7 +11,7 @@ numpy (which matches Hugging Face's GPT-2):
     TTSIM=/path/to/libttsim.so python3 test/gpt2.py model.safetensors "The meaning of life is" 8
     The meaning of life is not the same as the meaning of death
 
-Each word's scores stay within about 1 of numpy's (they span about 100); where numpy's top two are closer than that,
+Each word's scores stay within about 1.5 of numpy's (they span about 100); where numpy's top two are closer than that,
 bf16 can pick the other one. A Llama-family model too, SmolLM-135M (grouped-query attention, RoPE, SwiGLU, a KV cache):
 
     TTSIM=/path/to/libttsim.so python3 test/llama.py SmolLM-135M "The meaning of life is" 6
@@ -34,7 +34,7 @@ each step's loss and gradients PyTorch's for the same weights, its loss falling 
   each: elementwise ops (tinygrad's primitives and what it builds from them: exp, log, sin, cos, sqrt, comparisons,
   where), matmul, sums and maxes along any axis (so softmax and layer norm are one launch), transpose, views,
   reshape, permute, expand, pad and slicing at any offset (a chain of them one copy), convolution and max pooling, and
-  autograd (tinygrad's rules) for all of it.
+  autograd (tinygrad's rules) for all of it but slices with a step.
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: every Blackhole fact the code uses, as data. `NOTES.md` says where each comes from.

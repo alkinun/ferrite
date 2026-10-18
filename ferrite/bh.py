@@ -25,6 +25,9 @@ ARC_QUEUES = 0x8003042C  # SCRATCH_RAM[11]: address of the message queue control
 ARC_IRQ = 0x80030100, 1 << 16  # ARC_MISC_CNTL IRQ0: tells ARC to look at its queues
 ARC_TELEMETRY = 0x80030434, 0x80030430  # SCRATCH_RAM[13], [12]: addresses of {version, count, tag | index << 16}, values
 APP_QUEUE = 3  # queues 0..3 are for kmd, monitoring, tools, applications
+ARC_QUEUE_ENTRY = 32  # bytes: a queue is a header, then n requests and n responses, each an entry
+ARC_QUEUE_PTRS = (0x0, 0x4, 0x10, 0x14)  # in its header: our request write and response read pointers, then ARC's request
+                                         # read and response write pointers, each counting to 2n so full and empty differ
 # POWER_SETTING with all 15 flags valid and set: max AI clock, GDDR PHY awake, Tensix and L2CPU clocks on
 POWER_ON = 0x21 | 15 << 8 | 0x7FFF << 16
 TAG_AICLK, TAG_GDDR_STATUS, TAG_TENSIX_COLS, TAG_GDDR_ENABLED = 14, 22, 34, 36  # telemetry; GDDR_STATUS: 2 bits a bank
@@ -40,8 +43,17 @@ BRISC_STACK_TOP = 0xFFB00000 + 8 * 1024  # end of BRISC's private data RAM; BRIS
 TRISC_STACK_TOP = 0xFFB00000 + 4 * 1024  # each TRISC's is 4 KiB, at the same address
 TRISC_RESET_PC = 0xFFB12228  # RISCV_DEBUG_REG_TRISC0_RESET_PC, then TRISC1's and TRISC2's
 TRISC_RESET_PC_OVERRIDE = 0xFFB12234  # bit i: TRISC i starts at its RESET_PC rather than 0x6000 / 0xA000 / 0xE000
-NIU = 0xFFB20000  # NoC 0 interface: request initiators at +0x800*i, counters at +0x200, translated id at +0x148
-NIU_READS = NIU + 0x208  # NIU_MST_RD_RESP_RECEIVED: read responses this tile has had (the one counter ttsim keeps)
+NIU = 0xFFB20000  # NoC 0 interface (ISA NoC/MemoryMap.md): request initiator i's registers at +0x800 i, counters at +0x200
+NIU_REGS = {  # offsets from NIU. A request: target and return addresses (64 bits each, then the tile's x | y << 6), a tag,
+  # control bits (NOC_CMD), a length, and CMD = 1 to send it; AT_DATA is an atomic's operand
+  "TARG_LO": 0x0, "TARG_MID": 0x4, "TARG_HI": 0x8, "RET_LO": 0xC, "RET_MID": 0x10, "RET_HI": 0x14, "PACKET_TAG": 0x18, "CTRL": 0x1C,
+  "LEN": 0x20, "AT_DATA": 0x28, "CMD": 0x40, "CLEAR_OUTSTANDING": 0x60, "ID_LOGICAL": 0x148,  # this tile's translated x | y << 6
+  "WR_ACKS": 0x204, "READS": 0x208, "OUTSTANDING": 0x240}  # write acknowledgements and read responses had; requests in flight
+NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING counts them
+           "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,  # a write to a rectangle: broadcast, path reserve, static VC
+           "ATOMIC": 1, "INCREMENT": 1 << 12 | 31 << 2,  # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of word 0
+           "MAX_PACKET": 16384}
+NIU_READS = NIU + NIU_REGS["READS"]  # NIU_MST_RD_RESP_RECEIVED: read responses this tile has had (the one counter ttsim keeps)
 TENSIX_CFG = 0xFFEF0000  # Tensix backend config bank 0, one word per register; BRISC and TRISCs only, not the NoC
 CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: writing bit 0 (BRISC) .. bit 4 (NCRISC) drops that core's instruction cache
 
@@ -104,7 +116,7 @@ UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC 
 # unpackers, packer, FPU or SFPU, or the config unit, are idle (ISA STALLWAIT.md: B and C bits)
 STALL_SYNC, STALL_PACK, STALL_UNPACK, STALL_CFG, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 3, 1 << 7, 1 << 8, 0x1FF
 WAIT_UNPACK0, WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU, WAIT_CFG = 1 << 1, 0b110, 1 << 3, 1 << 4, 1 << 11, 1 << 12
-FP32, TF32, BF16, INT32 = 0, 4, 5, 8  # data format codes (ISA Unpackers/FormatConversion.md)
+FP32, BF16, INT32 = 0, 5, 8  # data format codes (ISA Unpackers/FormatConversion.md)
 
 # Backend config: field -> (32-bit word index at TENSIX_CFG, first bit, width). The ISA docs defer these numbers to
 # tt-metal's cfg_defines.h; these are from ttsim's data/bh/tensix_regs.json and still need checking against silicon.

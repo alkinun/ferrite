@@ -20,6 +20,11 @@ def close(t, want, tol):  # a tensor's values within tol (relative, and absolute
   got = np.array(t.tolist())
   assert got.shape == want.shape and np.allclose(got, want, rtol=tol, atol=tol), f"off by up to {np.abs(got - want).max()}"
 
+def value(t): return np.array(t.tolist()).reshape(t.shape)  # a tensor as numpy, in its shape
+def bf(v): return from_bf16(to_bf16(v))  # a float rounded to bf16, as uploads round
+def packed(v): return from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)  # rounded half up, as the packer does
+def gelu(a): return 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))  # GPT-2's, in numpy
+
 def conv(x, w, padding=0):  # numpy's convolution of x (channels, height, width) by w (out, in, k * k), tap by tap
   k = math.isqrt(w.shape[2])
   x = np.pad(x, ((0, 0), (padding, padding), (padding, padding)))
@@ -172,9 +177,8 @@ def test_tensor_math(chip):
   # random bf16 over 8 tiles on 8 workers. mul runs all four fidelity phases into fp32 Dst, so it is the exact product
   # rounded once by the packer; add and sub align mantissas at 11 bits first, so allow one bf16 step of the larger input
   rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 128
-  a, b = ([[from_bf16(to_bf16(random.uniform(-4, 4))) for _ in range(cols)] for _ in range(rows)] for _ in range(2))
+  a, b = ([[bf(random.uniform(-4, 4)) for _ in range(cols)] for _ in range(rows)] for _ in range(2))
   ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
-  packed = lambda v: from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)  # the packer's rounding
   assert (ta * tb).tolist() == [[packed(x * y) for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
   for got, f in (((ta + tb).tolist(), float.__add__), ((ta - tb).tolist(), float.__sub__)):
     for r in range(rows):
@@ -188,13 +192,12 @@ def test_matmul_exact(chip):
   a = [[float((r * 7 + c * 3) % 3 - 1) for c in range(64)] for r in range(32)]
   b = [[float((r * 5 + c) % 3 - 1) for c in range(32)] for r in range(64)]
   assert (Tensor.of(rt, a) @ Tensor.of(rt, b)).tolist() == [[sum(a[i][k] * b[k][j] for k in range(64)) for j in range(32)] for i in range(32)]
-  x = [[from_bf16(to_bf16(random.uniform(-8, 8))) for _ in range(64)] for _ in range(96)]
+  x = [[bf(random.uniform(-8, 8)) for _ in range(64)] for _ in range(96)]
   eye = [[float(r == c) for c in range(64)] for r in range(64)]
   assert (Tensor.of(rt, x) @ Tensor.of(rt, eye)).tolist() == x
   # X @ diag(d) with full-mantissa d: every output is one product, exact in fp32 Dst only if all four fidelity phases
   # ran (each holds a different slice of the mantissas), then rounded once by the packer
-  d = [from_bf16(to_bf16(random.uniform(1, 2))) for _ in range(64)]
-  packed = lambda v: from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)
+  d = [bf(random.uniform(1, 2)) for _ in range(64)]
   diag = [[d[c] if r == c else 0.0 for c in range(64)] for r in range(64)]
   assert (Tensor.of(rt, x) @ Tensor.of(rt, diag)).tolist() == [[packed(v * d[c]) for c, v in enumerate(row)] for row in x]
 
@@ -202,8 +205,8 @@ def test_matmul_random(chip):
   # 64x96 @ 96x128: 8 output tiles on 8 workers, 3 K tiles each. Four fidelity phases make every product exact, Dst sums
   # in fp32, the packer rounds once to bf16: the error stays under one bf16 step of sum |a*b|
   rt, (m, k, n) = Runtime(chip, chip.tensix[0], chip.tensix[-1]), (64, 96, 128)
-  a = [[from_bf16(to_bf16(random.uniform(-1, 1))) for _ in range(k)] for _ in range(m)]
-  b = [[from_bf16(to_bf16(random.uniform(-1, 1))) for _ in range(n)] for _ in range(k)]
+  a = [[bf(random.uniform(-1, 1)) for _ in range(k)] for _ in range(m)]
+  b = [[bf(random.uniform(-1, 1)) for _ in range(n)] for _ in range(k)]
   got = (Tensor.of(rt, a) @ Tensor.of(rt, b)).tolist()
   for i in range(m):
     for j in range(n):
@@ -232,8 +235,7 @@ def test_stream_on_one_worker(chip):
   # tiles along by semaphore, and BRISC fetches and writes back around them. 32 elementwise tiles, then a 128x96 @ 96x128
   # matmul: 16 output tiles of 3 steps each
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
-  a, b = ([[from_bf16(to_bf16(random.uniform(-2, 2))) for _ in range(128)] for _ in range(256)] for _ in range(2))
-  packed = lambda v: from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)
+  a, b = ([[bf(random.uniform(-2, 2)) for _ in range(128)] for _ in range(256)] for _ in range(2))
   assert (Tensor.of(rt, a) * Tensor.of(rt, b)).tolist() == [[packed(x * y) for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
   x = [[float((r + 2 * c) % 5 - 2) for c in range(96)] for r in range(128)]
   y = [[float((3 * r + c) % 3 - 1) for c in range(128)] for r in range(96)]
@@ -250,7 +252,7 @@ def test_fusion(chip):
   # have ops that read two intermediates, and in the second one an op reads an intermediate made two ops earlier
   for workers in (chip.tensix[1], chip.tensix[-1]):  # one worker cycling through 12 tiles, then a tile per worker
     rt = Runtime(chip, chip.tensix[0], workers)
-    a, b, c, d = (Tensor.of(rt, [[from_bf16(to_bf16(random.uniform(-3, 3))) for _ in range(96)] for _ in range(128)]) for _ in range(4))
+    a, b, c, d = (Tensor.of(rt, [[bf(random.uniform(-3, 3)) for _ in range(96)] for _ in range(128)]) for _ in range(4))
     for build in (lambda a, b, c, d: (a + b) * c - d * a, lambda a, b, c, d: (a + b) * ((c - d) + a * a)):
       fused, launches = build(a, b, c, d), rt.launches
       lazy = [t for t in (fused, *fused.srcs, *fused.srcs[0].srcs, *fused.srcs[1].srcs) if t.op]
@@ -271,7 +273,7 @@ def test_threads_wait(chip):
 def test_matmul_fusion(chip):
   # matmuls inside elementwise trees, as one kernel: the matmul's result tile is packed into L1 and read from there.
   # Bit for bit the same as one launch per op, since it is rounded to bf16 on its way to L1 as it would be to DRAM
-  rnd = lambda r, c: [[from_bf16(to_bf16(random.uniform(-1, 1))) for _ in range(c)] for _ in range(r)]
+  rnd = lambda r, c: [[bf(random.uniform(-1, 1)) for _ in range(c)] for _ in range(r)]
   for workers in (chip.tensix[1], chip.tensix[-1]):  # one worker cycling through 8 tiles, then a tile per worker
     rt = Runtime(chip, chip.tensix[0], workers)
     a, b, c, d, e, f = (Tensor.of(rt, rnd(*shape)) for shape in ((64, 96), (96, 128), (64, 128), (64, 128), (64, 64), (64, 128)))
@@ -298,7 +300,6 @@ def test_sfpu(chip):
   # exp(-100) is 0. On an input (through x + 0), and in place after an add, where exp sees the add's fp32 result: no
   # bf16 rounding in between, so the reference is exp of the exact sum
   rt = Runtime(chip, chip.tensix[0], chip.tensix[2])
-  bf = lambda v: from_bf16(to_bf16(v))
   flush = lambda v: 0.0 if abs(v) < 2**-126 else v
   x = [[bf(random.uniform(-6, 6)) for _ in range(64)] for _ in range(64)]
   x[0][:10] = map(bf, [0.0, -0.0, 1.0, -1.0, -100.0, 3.0e-39, 1e30, -1e30, math.inf, -math.inf])
@@ -370,7 +371,6 @@ def test_reductions(chip):
   # row max exactly, row sum to a bf16 step of the sum of magnitudes, each a column; then broadcast back:
   # x - max(x) along rows, and a column times a number, all against Python
   rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 96
-  bf = lambda v: from_bf16(to_bf16(v))
   x = [[bf(random.uniform(-4, 4)) for _ in range(cols)] for _ in range(rows)]
   tx = Tensor.of(rt, x)
   assert tx.max(2).tolist() == [[max(row)] for row in x]
@@ -386,6 +386,29 @@ def test_reductions(chip):
   for (got,), a, b in zip((tx.max(2) + ty.max(2)).tolist(), x, y): assert abs(got - (max(a) + max(b))) <= 2**-6 * 8, (got, a, b)
   for (got,), a in zip((tx.max(2) + tx.sum(2) * 0.0 + (tx * 2.0).max(2)).tolist(), x): assert abs(got - 3 * max(a)) <= 2**-6 * 12
 
+def test_softmax_and_layernorm(chip):
+  # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
+  # staying in Dst and their results in L1. softmax(x) = e / sum(e) with e = exp(x - max(x)), along each row, three passes;
+  # layernorm(x) = (x - mean) * rsqrt(var + eps) * gamma + beta, gamma and beta rows, repeated down.
+  # On one worker (3 rows in a row, slots and accumulators reused) and on many
+  for workers, rows, cols in ((chip.tensix[1], 96, 128), (chip.tensix[-1], 64, 160)):
+    rt = Runtime(chip, chip.tensix[0], workers)
+    x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
+    tx = Tensor.of(rt, x)
+    launches, got = rt.launches, tx.softmax().tolist()
+    assert rt.launches == launches + 1
+    for g, row in zip(got, x):
+      want = [math.exp(v - max(row)) for v in row]
+      assert all(abs(gv - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for gv, w in zip(g, want))
+    gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
+    tg, tb = Tensor.of(rt, [gamma]), Tensor.of(rt, [beta])
+    launches, got = rt.launches, (tx.layernorm() * tg + tb).tolist()
+    assert rt.launches == launches + 1
+    for g, row in zip(got, x):
+      mean = sum(row) / cols
+      sd = math.sqrt(sum((v - mean) ** 2 for v in row) / cols + 1e-5)
+      assert all(abs(gv - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for gv, v, gm, bt in zip(g, row, gamma, beta))
+
 def test_reduce_axes(chip):
   # sum and max down the rows (one row) and through the batch (one matrix), as along each row: one launch each, the
   # padding past the last tile row masked (every value negative, so an unmasked 0 would win a max, and padding rows
@@ -396,7 +419,6 @@ def test_reduce_axes(chip):
     rt = Runtime(chip, chip.tensix[0], workers)
     x = bf16(rng.uniform(-6, -1, (3, 45, 70)))
     tx = Tensor.of(rt, x.tolist())
-    value = lambda t: np.array(t.tolist()).reshape(t.shape)
     for axis in (0, 1, 2):
       launches, top, total = rt.launches, value(tx.max(axis)), value(tx.sum(axis))
       assert rt.launches == launches + 2 and top.tolist() == x.max(axis, keepdims=True).tolist()
@@ -456,7 +478,6 @@ def test_views_transpose_gelu(chip):
   close(q @ k.T, y[:, 64:128] @ y[:, 128:192].T, 2**-6)
   assert tx.gather([5, 0, 69, 37, 5]).tolist() == x[[5, 0, 69, 37, 5]].tolist()  # rows from both tile rows, one twice
   close(tx + tx.gather([7]), x + x[7], 2**-7)  # a single row fills its tile, so it broadcasts
-  gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
   close(tx.gelu(), gelu(x), 0.02)
 
 def test_batch(chip):
@@ -499,7 +520,6 @@ def test_movement(chip):
   # with tidy padding, so a matmul and a reduction can read it. Then random chains of moves, on one worker, whose cache
   # of tiles cycles
   rng = np.random.default_rng(7)
-  value = lambda t: np.array(t.tolist()).reshape(t.shape)
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   x = bf16(rng.uniform(-2, 2, (3, 45, 70)))
   tx = Tensor.of(rt, x.tolist())
@@ -559,7 +579,6 @@ def test_fp32(chip):
   # adds each group of 8 products at 12 bits (ttsim's model of it): fp32 results are good to about 2^-11, and fp32
   # operands (bf16x3) reach that too rather than bf16's 2^-8. On one worker (the pipeline cycles) and on many
   rng = np.random.default_rng(9)
-  value = lambda t: np.array(t.tolist()).reshape(t.shape)
   f32 = lambda *shape: rng.uniform(-2, 2, shape).astype(np.float32)
   for workers in (chip.tensix[1], chip.tensix[-1]):
     rt = Runtime(chip, chip.tensix[0], workers)
@@ -594,7 +613,6 @@ def test_int32(chip):
   # an integer toward zero), a float number makes fp32, a float condition picks ints, and gather reads its indices
   # from an int32 tensor on the chip, so they can be computed there. On one worker and on many
   rng = np.random.default_rng(10)
-  value = lambda t: np.array(t.tolist()).reshape(t.shape)
   wrap = lambda a: (a + 2**31) % 2**32 - 2**31
   for workers in (chip.tensix[1], chip.tensix[-1]):
     rt = Runtime(chip, chip.tensix[0], workers)
@@ -618,8 +636,6 @@ def test_autograd(chip):
   # 2^-12, the rest to fp32's rounding. Then a bf16 leaf (its gradient comes back through the cast), a tensor read twice
   # (gradients add), and .grad adding up over two backward passes
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(11)
-  value = lambda t: np.array(t.tolist()).reshape(t.shape)
-  gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
   softmax = lambda a, ax: np.exp(a - a.max(ax, keepdims=True)) / np.exp(a - a.max(ax, keepdims=True)).sum(ax, keepdims=True)
   norm = lambda a: (a - a.mean(2, keepdims=True)) / np.sqrt(a.var(2, keepdims=True) + 1e-5)
   ew, row, col, pos = ((2, 20, 40), (-1, 1)), ((1, 1, 40), (-1, 1)), ((1, 20, 1), (-1, 1)), ((2, 20, 40), (0.5, 2))
@@ -678,11 +694,9 @@ def test_autograd(chip):
 
 def test_fuzz(chip, monkeypatch):
   # random expressions (elementwise ops with broadcasting, unary ops, reductions along any axis, matmuls; odd shapes,
-  # batches), and
-  # every kernel they turn into checked against numpy on the same inputs, read back from the chip: whatever bf16 rounding
-  # piles up through a tree, each kernel must be right about its own inputs
+  # batches), and every kernel they turn into checked against numpy on the same inputs, read back from the chip:
+  # whatever bf16 rounding piles up through a tree, each kernel must be right about its own inputs
   rt, checked = Runtime(chip, chip.tensix[0], chip.tensix[-1]), []
-  def value(t): return np.array(t.tolist()).reshape(t.shape)
   def numpy(e, xs):
     if isinstance(e, int): return xs[e]
     v = [numpy(s, xs) for s in e[1:]]
@@ -746,7 +760,7 @@ def test_fuzz(chip, monkeypatch):
   assert len(checked) >= 20 and any(e[0] == "matmul" or "sum" in str(e) for e in checked)
 
 def test_mnist_mlp(chip):
-  # goal 1's halfway mark: an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
+  # an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
   # numpy in float64. Two launches: matmul + bias + relu, then matmul + bias. Random weights (no dataset here); the
   # logits must match closely and so must the predicted classes, wherever the top two are not a near tie. K = 784 is
   # 25 tiles, more than the result is wide (which once made the kernel sweep the wrong tiles)
@@ -795,7 +809,7 @@ def test_train(chip):
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_gpt2_layer(chip, n):
-  # goal 1's finish line: a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so
+  # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so
   # attention spans tiles), against the same code (test/gpt2.py) in numpy, float64, with the same bf16 weights. Weights
   # as GPT-2 initialises them; the attention is causal and not uniform (scores of a few units). Every intermediate is
   # bf16 here, so the block's change to x (up to ~2) must match to within 3% of its size
@@ -813,7 +827,7 @@ def test_gpt2_layer(chip, n):
 
 @pytest.mark.skipif("GPT2" not in os.environ, reason="GPT2=/path/to/model.safetensors (Hugging Face openai-community/gpt2) runs it")
 def test_gpt2_model(chip):
-  # goal 1, bigger: GPT-2 small's real weights, all 12 blocks, the embeddings (gathered on the chip) and the output layer
+  # stage 0's finish line: GPT-2 small's real weights, all 12 blocks, the embeddings (gathered on the chip) and the output layer
   # (the token embedding transposed on the chip). After "The meaning of life is", the next token's 50257 logits against
   # the same model in numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and a pick numpy
   # rates as good: " not" (407) by numpy, and " to" just 0.36 behind, closer than bf16's rounding through 12 blocks can
@@ -878,27 +892,3 @@ def test_llama_model(chip):
     assert np.abs(got - want).max() < 1 and got.argmax() == want.argmax(), (np.abs(got - want).max(), got.argmax(), want.argmax())
     new = [int(want.argmax())]
   assert new == [1962], "a [question]"
-
-def test_softmax_and_layernorm(chip):
-  # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
-  # staying in Dst and their results in L1. softmax(x) = e / sum(e) with e = exp(x - max(x)), along each row, three passes;
-  # layernorm(x) = (x - mean) * rsqrt(var + eps) * gamma + beta, gamma and beta rows, repeated down.
-  # On one worker (3 rows in a row, slots and accumulators reused) and on many
-  bf = lambda v: from_bf16(to_bf16(v))
-  for workers, rows, cols in ((chip.tensix[1], 96, 128), (chip.tensix[-1], 64, 160)):
-    rt = Runtime(chip, chip.tensix[0], workers)
-    x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
-    tx = Tensor.of(rt, x)
-    launches, got = rt.launches, tx.softmax().tolist()
-    assert rt.launches == launches + 1
-    for g, row in zip(got, x):
-      want = [math.exp(v - max(row)) for v in row]
-      assert all(abs(gv - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for gv, w in zip(g, want))
-    gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
-    tg, tb = Tensor.of(rt, [gamma]), Tensor.of(rt, [beta])
-    launches, got = rt.launches, (tx.layernorm() * tg + tb).tolist()
-    assert rt.launches == launches + 1
-    for g, row in zip(got, x):
-      mean = sum(row) / cols
-      sd = math.sqrt(sum((v - mean) ** 2 for v in row) / cols + 1e-5)
-      assert all(abs(gv - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for gv, v, gm, bt in zip(g, row, gamma, beta))

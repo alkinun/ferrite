@@ -7,24 +7,22 @@ from ferrite import bh
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
 # (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for
 # the kernel's cores to talk through), two buffers of kernel arguments (launches alternate between them, so the next
-# launch's arguments go in while this one runs), the kernels it holds, a tile of zeros (4 KiB, an fp32 tile, for kernels
-# to read and never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the
-# workers' rectangle, how many], an outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the
-# workers' reports, and staging for one command, both above the kernels (loading a kernel writes the dispatcher's
-# tile too).
+# launch's arguments go in while this one runs), the kernels it holds, a tile of zeros (4 KiB, an fp32 tile, for
+# kernels to read and never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size,
+# status lo, hi, the workers' rectangle, how many], an outbox [go, kernel, arguments, workers] [rptr, launches done],
+# the count of the workers' reports, and staging for one command, both above the kernels (loading a kernel writes the
+# dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
 STAGING_ROOM = bh.L1_SIZE - STAGING
 
-# Prepended to every device program: NoC transfers through request initiator 0 of NIU 0 (ISA NoC/MemoryMap.md).
+# Prepended to every device program: NoC transfers through request initiator 0 of NIU 0 (bh.NIU_REGS, bh.NOC_CMD).
 DEVICE = f"""
 #define L1_DATA {DATA:#x}
 #define NIU(reg) (((volatile unsigned *){bh.NIU:#x})[(reg) / 4])
-enum {{ TARG_LO = 0x0, TARG_MID = 0x4, TARG_HI = 0x8, RET_LO = 0xC, RET_MID = 0x10, RET_HI = 0x14, PACKET_TAG = 0x18,
-        CTRL = 0x1C, LEN = 0x20, CMD = 0x40, ID_LOGICAL = 0x148, OUTSTANDING = 0x240 }};
-enum {{ READ = 0x10, WRITE = 0x12, MAX_PACKET = 16384 }};  // both acknowledged, so OUTSTANDING counts them
+enum {{ {", ".join(f"{k} = {v:#x}" for k, v in (bh.NIU_REGS | bh.NOC_CMD).items())} }};
 static inline unsigned noc_me(void) {{ return NIU(ID_LOGICAL) & 0xFFF; }}  // this tile's translated x | y << 6
 static inline void noc_issue(unsigned long long targ, unsigned targ_xy, unsigned long long ret, unsigned ret_xy,
                              unsigned ctrl, unsigned n) {{
@@ -124,7 +122,6 @@ FIRMWARE = f"""
 #define MAILBOX ((volatile unsigned *){MAILBOX:#x})
 #define TRISCS ((volatile unsigned *){TRISCS:#x})
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
-enum {{ AT_DATA = 0x28, ATOMIC = 1, INCREMENT = 1 << 12 | 31 << 2 }};  // NOC_AT_LEN_BE: add NOC_AT_DATA to all 32 bits of word 0
 {start("brisc", "trisc0", "trisc1", "trisc2")}
 __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\n j brisc_loop"); }}
 __attribute__((naked)) void trisc0(void) {{ asm("li sp, {bh.TRISC_STACK_TOP:#x}\\n li a0, 0\\n j trisc_loop"); }}
@@ -177,11 +174,10 @@ void trisc_loop(unsigned i) {{
 # (Runtime.load). The arguments and the go are each one multicast to every worker, whether the launch is for all of
 # them or for the first `workers`, and the workers count themselves done in one word. A multicast's acknowledgements
 # come one per worker, so they are counted on the acknowledgement counter, and the request counter (up once, down once
-# per worker) is cleared after. One launch runs at a time, but the next one's command is read and its arguments written while it
-# runs (into the other argument buffer), so it goes the moment the last worker reports.
+# per worker) is cleared after. One launch runs at a time, but the next one's command is read and its arguments
+# written while it runs (into the other argument buffer), so it goes the moment the last worker reports.
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
-enum {{ WR_ACKS = 0x204, CLEAR_OUTSTANDING = 0x60, MULTICAST = WRITE | 1 << 5 | 1 << 7 | 1 << 8 | {bh.MCAST_VC} << 14 }};
 #define OUT ((volatile unsigned *){OUTBOX:#x})
 {start("brisc", "park", "park", "park")}  // its TRISCs have nothing to do
 __attribute__((naked)) void park(void) {{ asm("1: j 1b"); }}
@@ -189,7 +185,7 @@ __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\
 static void multicast(unsigned l1, unsigned addr, unsigned n) {{  // n bytes from l1 to addr in every worker; until all have them
   unsigned acks = NIU(WR_ACKS) + CONFIG[7];
   l1_settle(l1);
-  noc_issue(l1, noc_me(), addr, CONFIG[6], MULTICAST, n);  // the rectangle less this tile, which is in it
+  noc_issue(l1, noc_me(), addr, CONFIG[6], MCAST, n);  // the rectangle less this tile, which is in it
   while (NIU(WR_ACKS) != acks) {{}}
   NIU(CLEAR_OUTSTANDING) = 0xFFFF;  // nothing else is in flight
 }}

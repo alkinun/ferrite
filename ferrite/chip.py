@@ -62,18 +62,19 @@ class Chip:
 
   def arc_msg(self, header, *payload, timeout=1.0):
     """Send ARC one message (the low byte of header is its code) and return the 8-word response."""
-    (x, y), entry = bh.ARC, 32
+    (x, y), entry = bh.ARC, bh.ARC_QUEUE_ENTRY
     qcb = self.read32(x, y, bh.ARC_QUEUES)
     base, n = self.read32(x, y, qcb), self.read32(x, y, qcb + 4) & 0xFF
-    q = base + bh.APP_QUEUE * (entry + 2 * n * entry)  # each queue: header, n requests, n responses
-    wptr, rptr = self.read32(x, y, q), self.read32(x, y, q + 4)  # pointers count to 2n so full and empty differ
-    assert (wptr - self.read32(x, y, q + 0x10)) % (2 * n) < n, "ARC message queue full"
+    q = base + bh.APP_QUEUE * (entry + 2 * n * entry)
+    req_w, resp_r, req_r, resp_w = (q + at for at in bh.ARC_QUEUE_PTRS)
+    wptr, rptr = self.read32(x, y, req_w), self.read32(x, y, resp_r)
+    assert (wptr - self.read32(x, y, req_r)) % (2 * n) < n, "ARC message queue full"
     self.write(x, y, q + entry + wptr % n * entry, struct.pack("<8I", header, *payload, *[0] * (7 - len(payload))))
-    self.write32(x, y, q, (wptr + 1) % (2 * n))
+    self.write32(x, y, req_w, (wptr + 1) % (2 * n))
     self.write32(x, y, *bh.ARC_IRQ)
-    self.wait(lambda: self.read32(x, y, q + 0x14) != rptr, f"answer ARC message {header & 0xFF:#x}", timeout)
+    self.wait(lambda: self.read32(x, y, resp_w) != rptr, f"answer ARC message {header & 0xFF:#x}", timeout)
     resp = struct.unpack("<8I", self.read(x, y, q + entry * (1 + n + rptr % n), entry))
-    self.write32(x, y, q + 4, (rptr + 1) % (2 * n))
+    self.write32(x, y, resp_r, (rptr + 1) % (2 * n))
     assert resp[0] & 0xFF < 240, f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}"
     return resp
 
