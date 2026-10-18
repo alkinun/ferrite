@@ -72,8 +72,9 @@ append a correction.
    Blackhole's. Silicon still has the last word. (NOTES: "Where the docs and ttsim disagree")
 6. **Know how a number was measured.** Every wait on ttsim ran it 1000 clocks at a time, so each was rounded up to the
    next 1000; a profile that waited after every launch put a training step at 766k cycles when it was 444k, and a
-   one-tile add at 700 cycles when it was 390. Polling every 10 clocks costs a tenth more wall time. (NOTES: "How ttsim
-   counts")
+   one-tile add at 700 cycles when it was 390. Polling every 10 clocks costs a tenth more wall time. And a counter two
+   runs share counts both: TT-NN's matmul, run beside another TT-NN run, read 11.2k cycles, and 7.9k alone. (NOTES:
+   "How ttsim counts"; COMPARE.md)
 7. **Read the simulator's clock before optimizing for it.** ttsim runs queued Tensix instructions at no cost and
    counts only the clocks where a tile's pipes all wait, one RISC-V instruction each. The MOP expander, planned as the
    next step, only saves pushes, which it does not count; a PC profile of the idle clocks showed the cores waiting on
