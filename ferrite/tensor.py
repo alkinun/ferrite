@@ -320,15 +320,17 @@ class Tensor:
     return c * ((c * c).mean(axis) + eps).rsqrt()
 
   def __matmul__(self, x): return self.matmul(x)
-  def matmul(self, x, dtype=None):
+  def matmul(self, x, dtype=None, fidelity=None):
     """Matrix by matrix through a batch (a batch of 1 repeats), summed in fp32 in Dst and written as dtype: bf16, or fp32
     if either operand is, unless said. fp32 operands go as bf16x3: each is hi + lo, both bf16, and hi@hi + hi@lo + lo@hi
-    sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24."""
+    sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24. fidelity: the
+    phases a bf16 product takes (FIDELITY unless said; compiler.matmul says what each leaves out); fp32's take all four."""
+    fidelity = fidelity or FIDELITY
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
     if "fp32" in (self.dtype, x.dtype):  # one op to backward, which is two more fp32 matmuls, not through its bf16 parts
       (ah, al), (bh, bl) = _parts(self), _parts(x)
-      out, lo = ah.matmul(bh, "fp32"), [a.matmul(b, "fp32") for a, b in ((ah, bl), (al, bh)) if a is not None and b is not None]
+      out, lo = ah.matmul(bh, "fp32", 4), [a.matmul(b, "fp32", 4) for a, b in ((ah, bl), (al, bh)) if a is not None and b is not None]
       return (out + sum(lo[1:], lo[0]) if lo else out)._track("matmul", (self, x)).cast(dtype)
     assert self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch)), f"{self.shape} @ {x.shape}"
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
@@ -336,9 +338,11 @@ class Tensor:
     s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and self.cols % (32 * s) == 0 and kt // s >= 4 and
              s * tiles <= len(self.rt.cores)], default=1)
     if s > 1:  # too few result tiles to keep the workers busy (a token's MLP): K cut in s, a batch, and the parts summed
-      parts = self.split(s).matmul(x.split(s, 0), dtype)
+      parts = self.split(s).matmul(x.split(s, 0), dtype, fidelity)
       return sum((parts[i] for i in range(1, s)), parts[0])
-    return Tensor(self.rt, self.rows, x.cols, "matmul", (self, x), max(self.batch, x.batch), dtype)
+    out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x), max(self.batch, x.batch), dtype)
+    out.fidelity = fidelity
+    return out
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
   def conv2d(self, w, padding=0):
@@ -451,6 +455,7 @@ def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (fi
   first, end = max(-((o - lo) // s), 0), min(-((o - hi) // s), n)
   return (first, end) if first < end else (0, 0)
 
+FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4, exact products (see compiler.matmul for fewer)
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are whole tensors, realized first, not tiles in the same kernel
 def _lazy(t, seen):  # the unrealized ops under t, t first
   if t.op is None or id(t) in seen: return
@@ -499,7 +504,7 @@ def _expr(t, shape, inputs, kernel):
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = t.srcs
     b = ("T", _expr(b.srcs[0].realize(), shape, inputs, kernel)) if b.op == "T" else _expr(b.realize(), shape, inputs, kernel)
-    return ("matmul", _expr(a.realize(), shape, inputs, kernel), b)
+    return ("matmul", _expr(a.realize(), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
 kernels = {}  # (expression, input shapes, dtype, result dtype, workers' grid) -> (image, units), or a data movement kernel's name and shape -> image

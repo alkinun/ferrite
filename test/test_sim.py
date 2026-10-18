@@ -230,6 +230,21 @@ def test_matmul_blocks(chip):
   y = Tensor.of(rt, a) @ Tensor.of(rt, b)
   assert y.op == "add" and y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(1024)) for j in range(64)] for i in range(5)]
 
+def test_matmul_fidelity(chip):
+  # fewer fidelity phases leave out just the bits compiler.matmul says: A's last significand bit below three phases, B's
+  # last three below two. 1 + 2^-7 is 1 and bf16's last bit, so X @ I keeps it from three phases up, I @ X from two;
+  # and on random values, three phases stay within the bf16 rounding of four, two within that and 2^-7
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  x, eye = Tensor.full(rt, 64, 64, 1 + 2**-7), Tensor.of(rt, np.eye(64).tolist())
+  for phases in (4, 3, 2, 1):
+    assert x.matmul(eye, fidelity=phases).tolist()[0][0] == (1 + 2**-7 if phases >= 3 else 1.0), phases
+    assert eye.matmul(x, fidelity=phases).tolist()[0][0] == (1 + 2**-7 if phases >= 2 else 1.0), phases
+  rng = np.random.default_rng(4)
+  a, b = bf16(rng.normal(0, 1, (96, 256))), bf16(rng.normal(0, 1, (256, 64)))
+  ta, tb = Tensor.of(rt, a.tolist()), Tensor.of(rt, b.tolist())
+  for phases, bound in ((3, 2**-8), (2, 2**-8 + 2**-7)):
+    assert np.all(np.abs(value(ta.matmul(tb, fidelity=phases))[0] - a @ b) <= bound * (np.abs(a) @ np.abs(b))), phases
+
 def test_matmul_multicast(chip):
   # with a grid of workers (Runtime.grid), a matmul of more than one row of tiles reads each input tile from DRAM
   # once: worker (gy, gx) computes one block, each worker of a grid row reads its share of the block row's rows of A

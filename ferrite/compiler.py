@@ -352,8 +352,12 @@ def runs(slots, name, times): return run(slots, name) * times if name in slots e
 def math_runs(slots): return [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]  # recorded at setup
 
 def release(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
-def matmul(slots):  # one matmul step: four phases (SrcA gives 5 mantissa bits a phase, SrcB 7: four make the whole product)
-  return [ins("SETRWC", bit_mask=0b1111)] + run(slots, "mm") * 3 + run(slots, "mm", 15) + [release(matmul_phase()[-1])]
+def matmul(slots, phases=4):
+  """One matmul step: its first `phases` fidelity phases (SETRWC starts each step at phase 0). A phase multiplies 7 of
+  A's 8 significand bits (SrcB) or its last one by 5 of B's (SrcA) or its last 3 (ISA SrcASrcB.md): phase 0 is A's top 7
+  by B's top 5, 1 the same by B's last 3, 2 A's last bit by B's top 5, 3 the last by the last. So four make the whole
+  product, three leave out under 2^-11 of it, two drop A's last bit (truncating, 2^-7 at most), one keeps 5 bits of B."""
+  return [ins("SETRWC", bit_mask=0b1111)] + run(slots, "mm") * (phases - 1) + run(slots, "mm", 15) + [release(matmul_phase()[-1])]
 
 def elementwise(op, slots, dst=0):
   """Math for one tile of SrcA op SrcB at Dst row dst: 8 rows of 16 per instruction, address mode 0 steps 8 rows.
@@ -555,11 +559,12 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
 
 def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub, mul and the binary SFPU ops, (op, x) for the
-  unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, ("matmul", a, b) where a is an input and b an input or
-  ("T", input), read transposed, and plain numbers for inputs. shapes: each input's (batch, rows, columns), laid out as
-  Tensor says; a dimension of 1 repeats across the others (broadcasting). dtype: what the inputs are and the kernel
-  computes in; out: what it writes (only a kernel of one op, a cast or a matmul, writes another); grid: the workers as
-  Runtime.grid has them, for a matmul to share its tiles between them.
+  unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, ("matmul", a, b[, phases]) where a is an input and b
+  an input or ("T", input), read transposed, run at `phases` fidelity phases (4 unless said), and plain numbers for
+  inputs. shapes: each input's (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the
+  others (broadcasting). dtype: what the inputs are and the kernel computes in; out: what it writes (only a kernel of
+  one op, a cast or a matmul, writes another); grid: the workers as Runtime.grid has them, for a matmul to share its
+  tiles between them.
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
@@ -602,7 +607,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     if e[0] == "matmul":  # B is an input, or ("T", input): that input transposed
       bt, y = (True, e[2][1]) if isinstance(e[2], tuple) else (False, e[2])
       a = shapes[e[1]]
-      op = dict(kind="matmul", x=e[1], y=y, bt=bt, kt=ext(a, 2), shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if bt else 2]))
+      op = dict(kind="matmul", x=e[1], y=y, bt=bt, kt=ext(a, 2), shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if bt else 2]),
+                phases=e[3] if len(e) > 3 else 4)
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
@@ -781,7 +787,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
                         f"step({bt}, a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
                         f"if (steps++ & 1) {{ {tt(step_unpack(2))} }} else {{ {tt(step_unpack(1))} }} }} {off}{posted} }}")
-          c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots))} }} "
+          c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} "
+                      f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases']))} }} "
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
           continue
         drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
