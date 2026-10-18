@@ -571,6 +571,31 @@ def test_fp32(chip):
     want = a.astype(np.float64) @ w
     assert np.abs(value(ta @ tw) - want).max() <= 2**-11 * np.abs(want).max()
 
+def test_int32(chip):
+  # int32 tensors, two's complement through L1, Dst and the SFPU (which move it raw: stored as INT32, since the FP32
+  # store flushes denormals, the small positive integers). add and sub wrap as int32 does; max, min, comparisons (1 or 0)
+  # and where are exact over all of int32; multiplies and sums go through fp32, exact below 2^24. Casts both ways (to
+  # an integer toward zero), a float number makes fp32, a float condition picks ints, and gather reads its indices
+  # from an int32 tensor on the chip, so they can be computed there. On one worker and on many
+  rng = np.random.default_rng(10)
+  value = lambda t: np.array(t.tolist()).reshape(t.shape)
+  wrap = lambda a: (a + 2**31) % 2**32 - 2**31
+  for workers in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, chip.tensix[0], workers)
+    x, y, s = rng.integers(-2**31 + 1, 2**31, (45, 70)), rng.integers(-2**31 + 1, 2**31, (45, 70)), rng.integers(-99, 100, (45, 70))
+    x[0, :5], s[0, :3] = [0, -1, 1, 2**31 - 1, -2**31 + 1], [3, 0, -3]
+    tx, ty, ts = (Tensor.of(rt, a.tolist(), "int32") for a in (x, y, s))
+    f = rng.uniform(-2**30, 2**30, (45, 70)).astype(np.float32)
+    f[0, :6] = [0.0, -0.0, 0.7, -0.7, 2.5, -1e9]
+    tf = Tensor.of(rt, f.tolist(), "fp32")
+    for got, want in [(tx, x), (tx + ty, wrap(x + y)), (tx - ty, wrap(x - y)), (tx.maximum(ty), np.maximum(x, y)), (tx.minimum(ty), np.minimum(x, y)),
+                      (tx < ty, x < y), (tx != ts, x != s), (ts == 3, s == 3), (ts >= 0, s >= 0), ((ts > 0).where(tx, ty), np.where(s > 0, x, y)),
+                      (ts * ts - 1, s * s - 1), (ts.sum(1), s.sum(0, keepdims=True)), (ts.max(), s.max(keepdims=True)), (ts.relu(), np.maximum(s, 0)),
+                      (ts.float(), s), (ts.bfloat16(), s), (tf.cast("int32"), np.trunc(f)), ((tf > 0).where(ts, 0), np.where(f > 0, s, 0)),
+                      (tf.gather(Tensor.of(rt, [[44, 0, 3, 44]], "int32")), f[[44, 0, 3, 44]])]:
+      assert value(got).tolist() == np.asarray(want, np.float64).reshape(got.shape).tolist(), (got.shape, got.dtype)
+    assert (ts * 0.5).dtype == "fp32" and (ts > 0).dtype == "int32" and value(ts * 0.5).tolist() == (s * 0.5).reshape(1, 45, 70).tolist()
+
 def test_fuzz(chip, monkeypatch):
   # random expressions (elementwise ops with broadcasting, unary ops, reductions along any axis, matmuls; odd shapes,
   # batches), and

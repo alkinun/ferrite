@@ -77,7 +77,8 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPLOAD": (0x70, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPLOADI": (0x71, {"imm16": (0, 16), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPSTORE": (0x72, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
-  "SFPEXEXP": (0x77, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 1: the biased exponent, as an integer
+  "SFPEXEXP": (0x77, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 0: the exponent, 1: biased, as an integer
+  "SFPEXMAN": (0x78, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 0: the mantissa with its hidden bit, as an integer
   "SFPIADD": (0x79, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
   "SFPSHFT": (0x7A, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
   "SFPSETCC": (0x7B, {"mod1": (0, 4), "vc": (8, 4)}),  # lane flags from vc: mod1 0, where its sign is set
@@ -93,7 +94,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPSWAP": (0x92, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
   "SFPSHFT2": (0x94, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 3: rotate each 8-lane group (a Dst row) by one
   "SFPTRANSP": (0x8C, {}),  # LRegs 0-3 (and 4-7) as a 4 x 4 of 8-lane groups, transposed: group j of LReg i swaps with group i of LReg j
-  "SFPCAST": (0x90, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 0: a sign-magnitude integer to float
+  "SFPCAST": (0x90, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 0: sign-magnitude int to float, 3: two's complement <-> sign-magnitude
   "SFPGT": (0x97, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 8: vd = all ones if vd > vc (as ordered floats), else 0
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }

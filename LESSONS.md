@@ -42,7 +42,10 @@ append a correction.
     the unpacker must write Dst directly and the SFPU must do the math. And the FPU's own sums are not fp32 either: it
     adds each group of 8 products at 12 bits, so a matmul is good to 2^-12 whatever Dst holds. (NOTES: "fp32 tensors",
     "Matmul precision")
-11. **Moving data across SFPU lanes is scarce.** `SFPSHFT2` rotates within groups of 8 lanes and `SFPTRANSP` moves
+11. **The same bits mean different things to different instructions.** An int32 is a valid fp32 bit pattern, and
+    the small positive ones are denormals, which the FP32 store mode flushes to zero; only the INT32 mode stores bits
+    as they are. Every instruction that touches a datum has a dtype in mind; find out which. (NOTES: "int32 tensors")
+12. **Moving data across SFPU lanes is scarce.** `SFPSHFT2` rotates within groups of 8 lanes and `SFPTRANSP` moves
     groups between four registers; nothing else crosses lanes. Folding a tile's rows or columns costs 120 to 168
     instructions because of it. (NOTES: "Reductions")
 

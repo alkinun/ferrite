@@ -13,7 +13,7 @@ import array, math, struct
 from ferrite import bh
 from ferrite.runtime import DATA, SYNC, ZEROS, compile_kernel
 
-ITEMSIZE = {"bf16": 2, "fp32": 4}  # the dtypes, by bytes a value; a tile is 1024 values
+ITEMSIZE = {"bf16": 2, "fp32": 4, "int32": 4}  # the dtypes, by bytes a value; a tile is 1024 values
 def tile_bytes(dtype): return 1024 * ITEMSIZE[dtype]  # a bf16 tile is one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
 def slot_base(dtype): return DATA - tile_bytes(dtype)  # L1 tile slots of a kernel computing in dtype: slot i at base + i *
                                                         # its tile, so slot 0 is (part of) the runtime's zeros. The unpackers'
@@ -43,7 +43,7 @@ def config(**fields):  # backend config {word index: value}, every bit of a touc
     regs[index] = regs.get(index, 0) | v << first
   return regs
 
-FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32}
+FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32, "int32": bh.INT32}
 def kernel_config(dtype="bf16", out="bf16", transposing=False):
   """A kernel's backend config. Unpackers read one whole tile each (1024 datums): bf16 into a SrcA/SrcB bank; fp32
   straight into Dst (unpacker 0 in context 1, where the 32-bit Dst row is channel 1's Y). Z picks the slot (the Z stride
@@ -149,7 +149,8 @@ def from_bf16(b): return struct.unpack("<f", struct.pack("<I", b << 16))[0]
 # SFPU programs: a setup, then a body run 32 times; each pass loads 32 datums of the Dst half (4 rows x 8 even or odd
 # columns) into LReg 0 and stores the result back, the store stepping Dst by 2 (address modes 2 and 3; fp32 Dst, mod0 3).
 def sfp_load(r=0, at=0): return ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=at)
-def sfp_store(r): return ins("SFPSTORE", vd=r, mod0=3, addr_mode=3)
+def sfp_store(r, mod0=3): return ins("SFPSTORE", vd=r, mod0=mod0, addr_mode=3)
+RAW = 4  # SFPSTORE's INT32 mode stores the bits as they are; its FP32 mode flushes denormals, the small positive integers
 def sfp_bits(r, bits): return [ins("SFPLOADI", vd=r, mod0=8, imm16=bits >> 16), ins("SFPLOADI", vd=r, mod0=10, imm16=bits & 0xFFFF)]
 def sfp_const(r, x): return sfp_bits(r, struct.unpack("<I", struct.pack("<f", x))[0])  # a full fp32 constant into LReg r
 def sfp_bf16(r, x):  # one word, for a constant bf16 holds exactly
@@ -193,8 +194,8 @@ def sin(phase):
            mul(4, 4, 2), sfp_store(4)])
 
 SFPU = {
-  # max(x, 0): SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc
-  "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0)]),
+  # max(x, 0): SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc; a pick, stored raw for int32
+  "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, RAW)]),
   "exp": exp(1, -104.0), "exp2": exp(math.log(2), -150.0), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.25),
   # 1/x: SFPARECIP's 7-bit estimate, then two Newton steps y += y * (1 - x * y). Only where x is a normal number:
   # 0 and denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate
@@ -217,16 +218,34 @@ SFPU = {
 def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
 BINARY = {"max", "cmplt", "cmpne", "keep", "drop"}
 FP32 = {"add": "fadd", "sub": "fsub", "mul": "fmul"}  # in an fp32 kernel the SFPU does these too, one rounding each, as fp32 does
+INT32 = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne", "keep": "keep", "drop": "drop"}  # what int32 does itself
+CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # SFPU programs of a cast
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
   "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
   "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
                        ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1))),
+  "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
-                      ins("SFPAND", vd=1, vc=2), sfp_store(1))),
+                      ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
   "fadd": ([], binary(mad(0, 0, ONE, 1), sfp_store(0))), "fsub": ([], binary(mad(0, 1, ONE, 0, neg=1), sfp_store(0))),
   "fmul": ([], binary(mul(0, 0, 1), sfp_store(0))),
+  # int32, two's complement in L1, Dst and LRegs alike (they move it raw). Ordering goes through sign-magnitude
+  # (SFPCAST 3, its own inverse), the order SFPGT and SFPSWAP use; a comparison is 1, not 1.0
+  "iadd": ([], binary(ins("SFPIADD", vd=0, vc=1, mod1=4), sfp_store(0, RAW))),
+  "isub": ([], binary(ins("SFPIADD", vd=1, vc=0, mod1=6), sfp_store(1, RAW))),
+  "imax": ([], binary(*[ins("SFPCAST", vd=r, vc=r, mod1=3) for r in (0, 1)], ins("SFPSWAP", vd=1, vc=0, mod1=1), ins("SFPCAST", vd=0, vc=0, mod1=3),
+                      sfp_store(0, RAW))),
+  "icmplt": ([], binary(*[ins("SFPCAST", vd=r, vc=r, mod1=3) for r in (0, 1)], ins("SFPGT", vd=1, vc=0, mod1=8),
+                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
+  "icmpne": ([], binary(ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2),
+                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
+  # casts: an integer to sign-magnitude, then to float (to nearest, exact below 2^24); a float to the integer toward 0,
+  # by shifting its mantissa (hidden bit in) by its exponent - 23: 0 where the exponent is negative, negated if negative
+  "itof": ([], [sfp_load(), ins("SFPCAST", vd=0, vc=0, mod1=3), ins("SFPCAST", vd=0, vc=0), sfp_store(0)]),
+  "ftoi": ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0), ins("SFPEXMAN", vd=2, vc=0), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=-23 & 0xFFF),
+                ins("SFPSHFT", vd=2, vc=1), FLAGS_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), FLAGS_RESET, ins("SFPSETCC", vc=0),
+                ins("SFPIADD", vd=2, vc=ZERO, mod1=6), FLAGS_OFF, sfp_store(2, RAW)]),
 }
 # Reductions along an axis (0: the batch, to one matrix; 1: rows, to one row; 2: columns, to one column): each tile
 # along it is x + 0 into Dst (the first in the result's half, the rest 128 rows further on, where the SFPU folds them
@@ -478,8 +497,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None):
   ("T", input), read transposed, and plain numbers for inputs. shapes: each input's (batch, rows, columns), laid out as
   Tensor says; a dimension of 1 repeats across the others (broadcasting). dtype: what the inputs are and the kernel
   computes in; out: what it writes (only a kernel of one op, a cast or a matmul, writes another).
-  bf16 goes through SrcA and SrcB and the FPU. fp32 cannot (they hold 19 bits), so the math thread puts each operand
-  straight into Dst (fill) and the SFPU does all the math, add, sub and mul too, in fp32; there is no matmul.
+  bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
+  operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
   offset (Tensor's)]. A unit is a tile of the result, or a block of up to 4 x 4 of them (one matmul and nothing that
   reduces), or, if the expression reduces along an axis, a whole line of tiles along it (a row, a column, or one tile
@@ -506,6 +525,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None):
       uses[c] = uses.get(c, 0) + 1
       count(c)
   count(expr)
+  out, dst = out or dtype, dtype != "bf16"  # dst: the math thread fills Dst itself and the SFPU does the math
   ext = lambda s, ax: s[ax] if ax == 0 else -(-s[ax] // 32)  # a shape's extent along an axis: matrices, or tiles
   ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, shape; refs: expr -> input number or ("op", j)
   size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (batch, rows, columns)
@@ -519,9 +539,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None):
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
-    elif e[0] == "cast":  # into Dst and out again in the other format
+    elif e[0] == "cast":  # into Dst and out again in the other format, through an SFPU program between floats and ints
       x = visit(e[1])
-      op = dict(kind="add", x=x, y="zero", shape=size(x))
+      op = dict(kind="add", x=x, y="zero", shape=size(x), posts=[CASTS[dtype, out]] if (dtype, out) in CASTS else [])
     elif e[0] in SFPU and e[0] not in BINARY:
       x = visit(e[1])
       if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below
@@ -536,7 +556,6 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None):
     refs[e] = ("op", len(ops) - 1)
     return refs[e]
   root = visit(expr)[1]
-  out, dst = out or dtype, dtype == "fp32"  # dst: the math thread fills Dst itself and the SFPU does the math
   assert out == dtype or len(ops) == 1, "only a kernel of one op packs in another dtype"
   operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
@@ -559,13 +578,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None):
     if op["kind"] in COMBINE: sweep[j] = max(deps, default=0); ready[j] = sweep[j] + 1
     else: ready[j] = max(deps, default=0)
   last = sweep[root] if root in sweep else ready[root]
-  sfpu_name = lambda op: FP32.get(op["kind"], op["kind"]) if dst else op["kind"]  # the SFPU program a binary op runs, if any
+  sfpu_name = lambda op: {"fp32": FP32.get(op["kind"], op["kind"]), "int32": INT32.get(op["kind"])}.get(dtype, op["kind"])  # a binary op's program
   sfpu_op = lambda op: op["kind"] in BINARY or (dst and op.get("y", "zero") != "zero")
+  assert dtype != "int32" or all(sfpu_name(op) for op in ops if sfpu_op(op)), "an int32 kernel adds, subtracts, compares and picks"
   slots = allocate({"mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul" and not dst} |
                    {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE} |
                    {sfpu_name(op) for op in ops if sfpu_op(op)})
   frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
-  assert not (dst and matmuls), "an fp32 kernel has no matmul (its operands are bf16)"
+  assert not (dst and matmuls), "only bf16 kernels have matmuls"
   rows_at, top = [], FRAMES + 2 * frame + len(ops)  # each matmul's row of A in L1, while they fit; else A streams too
   assert top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS and len(matmuls) <= 16, "too many tiles in a kernel"
   for j in matmuls:
@@ -721,19 +741,23 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None):
 
 def gather_kernel(dtype):
   """Rows of a tensor into a new one, args [first unit, units, out, the tensor's address, tile stride, tile offset, the
-  result's tile columns, rows, their indices...]. BRISC alone: for each result tile, each row's two 16-datum runs (left
-  and right face) come from wherever that row sits in the tensor's tiles. A NoC read from DRAM must keep its address's
+  result's tile columns, rows, the int32 row of their indices' address and tile offset]. BRISC alone: for each result
+  tile, the indices' tile in, then each row's two 16-datum runs (left and right face) from wherever that row sits in
+  the tensor's tiles. A NoC read from DRAM must keep its address's
   low 6 bits, so each run comes in as the 64-byte block holding it and is copied into place from there. One row fills
   its tile: it comes in once and is doubled up inside L1 by NoC copies from the tile to itself."""
   t, face, run = tile_bytes(dtype), tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a tile, a face, a face's row
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
 #define BLOCK {DATA + t:#x}
+#define IDS {DATA + t + 64:#x}
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
 static void copy(unsigned from, unsigned to, unsigned n) {{ noc_read(noc_me() & 63, noc_me() >> 6, from, to, n); }}
+static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // index r of this tile's 32, in row 0
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] == 1 ? 1 : 32;
+    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] == 1 ? 1 : 32, it = a[9] + i;  // it: the indices' tile
+    noc_read(bank[it % 8] & 63, bank[it % 8] >> 6, a[8] + it / 8 * 4096, IDS, 4096);
     copy({ZEROS:#x}, SLOT, {t});  // the rows past the end stay zero
     noc_wait();
     for (unsigned r = 0; r < rows; r++) {{
@@ -741,7 +765,7 @@ void kmain(volatile unsigned *a) {{
       for (unsigned face = r / 16 * 2; face < r / 16 * 2 + 2; face++) {{
         volatile unsigned *to = (volatile unsigned *)(SLOT + face * {face} + r % 16 * {run});
         if (row >= a[7]) continue;
-        unsigned id = a[8 + row], from = id / 32 * a[4] + j + a[5], at = (id % 32 / 16 * 2 + face % 2) * {face} + id % 16 * {run};
+        unsigned n = id(r), from = n / 32 * a[4] + j + a[5], at = (n % 32 / 16 * 2 + face % 2) * {face} + n % 16 * {run};
         noc_read(bank[from % 8] & 63, bank[from % 8] >> 6, a[3] + from / 8 * {t} + at / 64 * 64, BLOCK, 64);
         noc_wait();
         for (unsigned k = 0; k < {run // 4}; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
@@ -841,7 +865,7 @@ void kmain(volatile unsigned *a) {{
 }}""")
 
 class Tensor:
-  """batch x rows x cols of bf16 or fp32 (dtype; batch 1 unless said): in DRAM as 32x32 tiles, matrix after matrix, each in row-major
+  """batch x rows x cols of bf16, fp32 or int32 (dtype; batch 1 unless said): in DRAM as 32x32 tiles, matrix after matrix, each in row-major
   tile order, tile i in bank i % 8; or, until realized, an op on other tensors. Realizing compiles the whole tree of
   unrealized ops under it into one kernel; a matmul's own operands are realized first, since each of its output tiles
   needs a whole row and column of them (a transposed B is read transposed rather than realized).
@@ -872,7 +896,7 @@ class Tensor:
   def of(cls, rt, data, dtype="bf16"):
     """From a list of rows of numbers, or a list of those (a batch), rounded to dtype (bf16: to nearest even)."""
     matrices = data if isinstance(data[0][0], (list, tuple)) else [data]
-    values = array.array("f", [v for m in matrices for row in m for v in row])
+    values = array.array("i" if dtype == "int32" else "f", [v for m in matrices for row in m for v in row])
     if dtype == "bf16": values = array.array("H", [(b + 0x7FFF + (b >> 16 & 1)) >> 16 for b in array.array("I", values.tobytes())])
     return cls.frombytes(rt, len(matrices[0]), len(matrices[0][0]), values, len(matrices), dtype)
 
@@ -912,16 +936,21 @@ class Tensor:
 
   def tolist(self):  # rows of numbers, or a list of those if this is a batch
     raw = self.tobytes()
-    values = array.array("f", raw if self.dtype == "fp32" else array.array("I", [b << 16 for b in array.array("H", raw)]).tobytes()).tolist()
+    if self.dtype == "bf16": raw = array.array("I", [b << 16 for b in array.array("H", raw)]).tobytes()
+    values = array.array("i" if self.dtype == "int32" else "f", raw).tolist()
     m = [[values[(b * self.rows + r) * self.cols:(b * self.rows + r + 1) * self.cols] for r in range(self.rows)] for b in range(self.batch)]
     return m if self.batch > 1 else m[0]
 
   def gather(self, ids):
-    """Rows ids of this tensor, as a tensor: an embedding lookup. A data-movement kernel (see gather_kernel)."""
-    assert self.batch == 1 and all(0 <= i < self.rows for i in ids)
-    out, d = Tensor(self.rt, len(ids), self.cols, dtype=self.dtype), self.dtype
+    """Rows ids of this tensor, as a tensor: an embedding lookup, by a data-movement kernel (see gather_kernel). ids is
+    an int32 tensor of one row, read on the chip (so it can be computed there; nothing checks its bounds), or a list."""
+    if not isinstance(ids, Tensor):
+      assert all(0 <= i < self.rows for i in ids)
+      ids = Tensor.of(self.rt, [list(ids)], "int32")
+    assert self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1), "rows of a matrix, by a row of int32"
+    out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     return out._run(_cached(("gather", d), lambda: gather_kernel(d)), out.addr, self.realize().addr, self.stride, self.offset,
-                    -(-self.cols // 32), len(ids), *ids)
+                    -(-self.cols // 32), ids.cols, ids.addr, ids.offset)
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
@@ -1036,13 +1065,16 @@ class Tensor:
   # Elementwise: tinygrad's primitives (exp2, log2, sin, sqrt, reciprocal; add, mul, max, cmplt, cmpne; where), and the
   # rest built from them. exp, log and cos are SFPU programs too, with log2(e), ln 2 and the quarter turn kept in fp32
   # inside: as numbers they would be bf16 tensors, and exp(10) as exp2(10 * log2(e)) would be 2% off.
-  def _unary(self, op): return Tensor(self.rt, self.rows, self.cols, op, (self,), self.batch, self.dtype)
+  def _unary(self, op):  # int32 goes through fp32, but for relu (a max with 0)
+    if self.dtype == "int32" and op != "relu": return self.float()._unary(op)
+    return Tensor(self.rt, self.rows, self.cols, op, (self,), self.batch, self.dtype)
   def _binop(self, op, x, reverse=False):
     """numpy's broadcasting: shapes match, or one side has 1 where the other does not. A number is a 1 x 1 tensor of
-    this one's dtype; bf16 with fp32 is fp32, as in tinygrad."""
-    if not isinstance(x, Tensor): x = Tensor.full(self.rt, 1, 1, x, self.dtype)
+    this one's dtype (fp32 for a float with int32). Different dtypes meet in fp32, and so does int32 for what it does
+    not do itself (mul: exact below 2^24)."""
+    if not isinstance(x, Tensor): x = Tensor.full(self.rt, 1, 1, x, "fp32" if self.dtype == "int32" and isinstance(x, float) else self.dtype)
     a, b = (x, self) if reverse else (self, x)
-    if a.dtype != b.dtype: a, b = a.float(), b.float()
+    if a.dtype != b.dtype or (a.dtype == "int32" and op not in INT32): a, b = a.float(), b.float()
     assert all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)), f"cannot broadcast {a.shape} with {b.shape}"
     batch, rows, cols = map(max, a.shape, b.shape)
     return Tensor(self.rt, rows, cols, op, (a, b), batch, a.dtype)
@@ -1061,20 +1093,23 @@ class Tensor:
   def rsqrt(self): return self.sqrt().reciprocal()
   def maximum(self, x): return self._binop("max", x)
   def minimum(self, x): return -((-self).maximum(-x))
-  def where(self, x, y): return self._binop("keep", x) + self._binop("drop", y)  # x where self is not 0, else y
+  def where(self, x, y):  # x where self is not 0, else y; the condition, if of another dtype, as 0 or 1 of theirs
+    dtype = next((t.dtype for t in (x, y) if isinstance(t, Tensor)), self.dtype)
+    c = self if self.dtype == dtype else self.ne(0).cast(dtype)
+    return c._binop("keep", x) + c._binop("drop", y)
   def __add__(self, x): return self._binop("add", x)
   def __sub__(self, x): return self._binop("sub", x)
   def __mul__(self, x): return self._binop("mul", x)
   def __rsub__(self, x): return self._binop("sub", x, True)
   __radd__, __rmul__ = __add__, __mul__
   def __truediv__(self, x): return self * (1 / x if isinstance(x, (int, float)) else x.reciprocal())
-  def __neg__(self): return self * -1.0
+  def __neg__(self): return 0 - self if self.dtype == "int32" else self * -1  # int32 subtracts exactly, multiplies through fp32
   def __lt__(self, x): return self._binop("cmplt", x)
   def __gt__(self, x): return self._binop("cmplt", x, True)
-  def __ge__(self, x): return 1.0 - (self < x)
-  def __le__(self, x): return 1.0 - (self > x)
+  def __ge__(self, x): return 1 - (self < x)
+  def __le__(self, x): return 1 - (self > x)
   def ne(self, x): return self._binop("cmpne", x)
-  def eq(self, x): return 1.0 - self.ne(x)
+  def eq(self, x): return 1 - self.ne(x)
   __ne__, __eq__ = ne, eq
   def __hash__(self): return id(self)  # == is elementwise, so a tensor hashes by identity, as in tinygrad
   def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
@@ -1087,6 +1122,7 @@ class Tensor:
   def _reduce(self, f, axis):
     """numpy's, keeping the axis as 1: over the batch (0, one matrix), down the rows (1, one row) or along each row
     (2, one column); over all three if None. Each axis is a kernel of its own, sweeping lines of tiles along it."""
+    if self.dtype == "int32": return self.float()._reduce(f, axis).cast("int32")  # exact below 2^24
     if axis is None: return self._reduce(f, 0)._reduce(f, 1)._reduce(f, 2)
     shape = [1 if ax == axis % 3 else s for ax, s in enumerate(self.shape)]
     return self if shape == list(self.shape) else Tensor(self.rt, shape[1], shape[2], f"{f}{axis % 3}", (self,), shape[0], self.dtype)
@@ -1105,6 +1141,7 @@ class Tensor:
     """Matrix by matrix through a batch (a batch of 1 repeats), summed in fp32 in Dst and written as dtype: bf16, or fp32
     if either operand is, unless said. fp32 operands go as bf16x3: each is hi + lo, both bf16, and hi@hi + hi@lo + lo@hi
     sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24."""
+    assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
     if "fp32" in (self.dtype, x.dtype):
       (ah, al), (bh, bl) = ((t.bfloat16(), (t.float() - t.bfloat16()).bfloat16()) for t in (self, x))

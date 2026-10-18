@@ -24,7 +24,7 @@ backwards.
 - [x] Reductions along any axis (sum, max), not only rows (`test_reduce_axes`)
 - [x] Movement at any granularity: reshape, permute, expand, pad, slice, not only on tile boundaries (`test_movement`)
 - [x] More elementwise ops: log, sqrt, sin, cos, compare, where (`test_elementwise`)
-- [ ] More dtypes: fp32 tensors (accuracy, gradients), integers (indices)
+- [x] More dtypes: fp32 tensors (accuracy, gradients), integers (indices) (`test_fp32`, `test_int32`)
 - [ ] Autograd: a backward for every primitive, checked against numpy's gradients
 - [ ] A Llama-family model: RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache
 - [ ] A small CNN: convolution as an unfolded matmul
