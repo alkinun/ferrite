@@ -231,14 +231,15 @@ def test_matmul_blocks(chip):
   assert y.op == "add" and y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(1024)) for j in range(64)] for i in range(5)]
 
 def test_matmul_multicast(chip):
-  # with a grid of workers (Runtime.grid), a matmul of more than one row of tiles reads each input tile from DRAM once:
-  # worker (gy, gx) computes one block, the first of each grid row multicasts its rows of A along the row, the first of
-  # each grid column each of its columns of B down it. Odd edges; a K so long that B's columns get one buffer, not two;
-  # B read transposed (four quarter-tile reads a tile); and an epilogue fused after, bit for bit the same as unfused
+  # with a grid of workers (Runtime.grid), a matmul of more than one row of tiles reads each input tile from DRAM
+  # once: worker (gy, gx) computes one block, each worker of a grid row reads its share of the block row's rows of A
+  # and multicasts it along the row, each of a grid column its share of each column of B down it. Odd edges; a K so
+  # long that B's three buffers nearly fill the slots below 256; B read transposed (four quarter-tile reads a tile);
+  # and an epilogue fused after, bit for bit the same as unfused
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   rng = np.random.default_rng(3)
-  for m, k, n, bt in ((320, 96, 416, False), (288, 3200, 224, False), (352, 64, 200, True)):
+  for m, k, n, bt in ((320, 96, 416, False), (288, 1920, 224, False), (352, 64, 200, True)):
     a, b = bf16(rng.uniform(-1, 1, (m, k))), bf16(rng.uniform(-1, 1, (k, n)))
     tb = Tensor.of(rt, b.T.tolist()).T if bt else Tensor.of(rt, b.tolist())
     y, before = Tensor.of(rt, a.tolist()) @ tb, reads()

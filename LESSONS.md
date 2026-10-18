@@ -165,6 +165,10 @@ append a correction.
     the fewest reads a worker can make alone, so only sharing between workers could go lower. Multicast took it to 1.0,
     and the grid it needed put idle workers to use as well (a 4-row matmul went from 6 workers to 48). (NOTES: "Tiles
     shared between workers")
+27. **Whoever everyone waits on sets the pace.** A leader per grid row and column read every shared tile while the rest
+    waited for its flag: its 24 reads a column, about 36 instructions each, were the whole of a matmul's time on ttsim.
+    Cheaper requests took it from 8.9k cycles to 7.0k; a share of the reads for every worker, to 1.7k. (NOTES: "Cutting
+    the critical path")
 
 ## Working method
 

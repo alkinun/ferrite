@@ -43,11 +43,12 @@ BRISC_STACK_TOP = 0xFFB00000 + 8 * 1024  # end of BRISC's private data RAM; BRIS
 TRISC_STACK_TOP = 0xFFB00000 + 4 * 1024  # each TRISC's is 4 KiB, at the same address
 TRISC_RESET_PC = 0xFFB12228  # RISCV_DEBUG_REG_TRISC0_RESET_PC, then TRISC1's and TRISC2's
 TRISC_RESET_PC_OVERRIDE = 0xFFB12234  # bit i: TRISC i starts at its RESET_PC rather than 0x6000 / 0xA000 / 0xE000
-NIU = 0xFFB20000  # NoC 0 interface (ISA NoC/MemoryMap.md): request initiator i's registers at +0x800 i, counters at +0x200
+NIU = 0xFFB20000  # NoC 0 interface (ISA NoC/MemoryMap.md): request initiator i's registers at +INITIATOR i, counters at +0x200
 NIU_REGS = {  # offsets from NIU. A request: target and return addresses (64 bits each, then the tile's x | y << 6), a tag,
   # control bits (NOC_CMD), a length, and CMD = 1 to send it; AT_DATA is an atomic's operand
   "TARG_LO": 0x0, "TARG_MID": 0x4, "TARG_HI": 0x8, "RET_LO": 0xC, "RET_MID": 0x10, "RET_HI": 0x14, "PACKET_TAG": 0x18, "CTRL": 0x1C,
   "LEN": 0x20, "AT_DATA": 0x28, "CMD": 0x40, "CLEAR_OUTSTANDING": 0x60, "ID_LOGICAL": 0x148,  # this tile's translated x | y << 6
+  "INITIATOR": 0x800,  # four request initiators, each keeping its registers between requests
   "WR_ACKS": 0x204, "READS": 0x208, "OUTSTANDING": 0x240}  # write acknowledgements and read responses had; requests in flight
 NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING counts them
            "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,  # a write to a rectangle: broadcast, path reserve, static VC

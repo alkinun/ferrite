@@ -401,6 +401,7 @@ def tt(words):
     elif w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
   return " ".join(c)
 
+FLAGS_B = 16  # FLAGS: a grid row's workers' flags, then from here a grid column's
 ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, row values, A's rows
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
 
@@ -421,6 +422,9 @@ static inline void push_word(unsigned w) {{ *(volatile unsigned *){bh.TENSIX_PUS
 static unsigned posted, drained;  // intermediates owed to L1, and those waited for
 static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} }} }}  // until everything packed so far has landed
 """
+# A fused kernel's programs read their arguments through a plain pointer: they are fixed for the launch (and in this
+# core's view once the firmware has fenced), so the compiler may keep them in registers and out of loops
+KMAIN = "void kmain(volatile unsigned *args) {\n  const unsigned *a = (const unsigned *)args;"
 def _pushes(words): return " ".join(f"push_word({w:#x});" for w in words)  # straight-line, with no table to load from
 
 def _brisc(total, body, dtype="bf16", out="bf16", decls=""):  # moves tiles: inputs into L1 ahead of the unpackers, results home behind the packer
@@ -431,17 +435,17 @@ def _brisc(total, body, dtype="bf16", out="bf16", decls=""):  # moves tiles: inp
 {BANKS}
 static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out, rows[16];  // rows: i + 1 of what each place in L1 holds (fresh)
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
-static void get(unsigned base, unsigned t, unsigned slot) {{ noc_read(BANK(t), base + t / 8 * {tb}, SLOT(slot), {tb}); }}
+static void get(unsigned base, unsigned t, unsigned slot) {{ noc_get(BANK(t), base + t / 8 * {tb}, SLOT(slot), {tb}); }}
 // the same with its two off-diagonal faces swapped, half of transposing it (unpacker 0 does the rest)
 static void flipped(unsigned base, unsigned t, unsigned slot) {{
   for (unsigned f = 0; f < 4; f++)
-    noc_read(BANK(t), base + t / 8 * {tb} + f * {tb // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {tb // 4}, {tb // 4});
+    noc_get(BANK(t), base + t / 8 * {tb} + f * {tb // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {tb // 4}, {tb // 4});
 }}
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
 static void send(void) {{  // the results packed so far go home, in the order they were packed
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1);
-    noc_write(OUT_SLOT(slot), BANK(t), out + t / 8 * {to}, {to}); noc_wait();
+    noc_put(OUT_SLOT(slot), BANK(t), out + t / 8 * {to}, {to}); noc_wait();
   }}
 }}
 // A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, B's slot two steps
@@ -465,12 +469,14 @@ static unsigned fresh(unsigned q, unsigned i) {{
   return rows[q] = i + 1;
 }}
 static void kept(void) {{ SYNC[FETCHED] = ++fetched; ++events; }}  // a matmul step whose tiles are in L1 already
-// Tiles shared between workers by multicast. FLAGS: [a count of B buffers freed, A's rows here, B's column here, scratch]
+// Tiles shared between workers by multicast. FLAGS: a flag for each worker of a grid row (its part of A's rows is here),
+// then for each worker of a grid column (its part of B's column is)
 #define FLAGS ((volatile unsigned *){FLAGS:#x})
-static unsigned stamp, col_end[2];  // this launch << 12, in every flag, so none from an earlier launch counts; events at
+static unsigned stamp, col_end[3];  // this launch << 12, in every flag, so none from an earlier launch counts; events at
                                     // the end of the last column in each B buffer
-static void await(unsigned i, unsigned v) {{  // until flag i reaches v; results go home meanwhile
-  for (;;) {{ asm volatile("fence" ::: "memory"); if ((int)(FLAGS[i] - v) >= 0) return; send(); }}
+static void await(unsigned i, unsigned n, unsigned v) {{  // until flags i to i + n - 1 reach v; results go home meanwhile
+  for (unsigned k = i; k < i + n; k++)
+    for (;;) {{ asm volatile("fence" ::: "memory"); if ((int)(FLAGS[k] - v) >= 0) break; send(); }}
 }}
 // n bytes of this L1 to the same place in the `tiles` other tiles of rect (end | start << 12), until all have them. A
 // multicast leaves the outstanding count wrong (up once, down once a tile), so nothing else may be in flight: cleared after
@@ -482,14 +488,16 @@ static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles) {{
   while (NIU(WR_ACKS) != acks) {{}}
   NIU(CLEAR_OUTSTANDING) = 0xFFFF;
 }}
-static void post(unsigned i, unsigned v, unsigned rect, unsigned tiles) {{ FLAGS[i] = v; mcast((unsigned)&FLAGS[i], 4, rect, tiles); }}
-static void freed(unsigned xy) {{  // a B buffer free here: 1 onto the count of the worker at xy, which multicasts B
-  while (NIU(CMD) & 1) {{}}
-  NIU(AT_DATA) = 1;
-  noc_issue({FLAGS:#x}, xy, {FLAGS + 12:#x}, noc_me(), ATOMIC, INCREMENT);
+// This worker's part of a run of slots shared by a row or column of the grid, slots slot + from to slot + to - 1 (read in
+// already): to the same place in the `tiles` other tiles of rect, then flag, set to v, the same way. Alone, it waits for the reads
+static void share(unsigned slot, unsigned from, unsigned to, unsigned rect, unsigned tiles, unsigned flag, unsigned v) {{
+  if (tiles && to > from) mcast(SLOT(slot + from), (to - from) * {tb}, rect, tiles);
+  else noc_wait();
+  FLAGS[flag] = v;
+  if (tiles) mcast((unsigned)&FLAGS[flag], 4, rect, tiles);
 }}
 {decls}
-void kmain(volatile unsigned *a) {{
+{KMAIN}
   out = a[2];
   unsigned tiles = 0;
 {body}
@@ -502,7 +510,7 @@ def _unpacker(body, cfg):  # TRISC0: the backend config and semaphores, then unp
 static unsigned needed, relayed, steps;
 static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // the unpack reports, for BRISC
 static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next tiles
-void kmain(volatile unsigned *a) {{
+{KMAIN}
   {" ".join(f"CFG[{i}] = {v:#x};" for i, v in cfg.items())}
   asm volatile("fence" ::: "memory");  // the config writes are out; a read from the same block is processed after them
   (void)CFG[{next(iter(cfg))}];
@@ -519,7 +527,7 @@ def _math(slots, body, dst=False):  # TRISC1; dst: it unpacks into Dst itself, s
   return TRISC + f"""
 static unsigned arrived_;
 static void arrived(void) {{ arrived_++; while (peek(FETCHED) < arrived_) {{}} }}  // until BRISC has fetched the next tiles
-void kmain(volatile unsigned *a) {{
+{KMAIN}
   {_pushes(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + setup_math(slots))}
   while (!peek(READY)) {{}}  // the backend config and the semaphores
   unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
@@ -537,7 +545,7 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
   SYNC[RING + outputs % 4 * 2] = slot; SYNC[RING + outputs % 4 * 2 + 1] = t;
   used[s] = ++outputs;
 }}
-void kmain(volatile unsigned *a) {{
+{KMAIN}
   {_pushes(thread() + SETUP_PACK)}
   while (!peek(READY)) {{}}
   unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
@@ -660,8 +668,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   if grid and len(matmuls) == 1 and not reducing and nb == 1 and rt > 1 and ext(ops[matmuls[0]]["shape"], 2) == w:
     kt = ops[matmuls[0]]["kt"]
     bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
-    nbuf, n_grid = 2 if base + (bp + 2) * kt <= UNPACKABLE else 1, (-(-w // bq), -(-rt // bp))
-    if base + (bp + nbuf) * kt <= UNPACKABLE and n_grid[0] * n_grid[1] > 1: mc = (*n_grid, nbuf)
+    n_grid = (-(-w // bq), -(-rt // bp))
+    if base + (bp + 3) * kt <= UNPACKABLE and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B: mc = n_grid
   if not mc:
     bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
     while bp > 1 and base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE: bp -= 1
@@ -735,28 +743,24 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
           on, off = (tt(haloize(1)), tt(haloize(0))) if bt else ("", "")
           a_tile = f"{f'b * a[{x + 1}] + ' if shapes[op['x']][0] > 1 else ''}i_ * a[{x + 2}] + m + a[{x + 3}]"
-          if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % nbuf
-            gx_n, gy_n, nbuf = mc
-            gx, gy, buf, col = f"unit % {bc}", f"unit / {bc}", f"{kept_b} + jj % {nbuf} * {kt}", kt * tile_bytes(dtype)
-            rows_a = f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0)"  # the block's rows
-            get_a = (f"for (unsigned r = 0; r < {rows_a}; r++) for (unsigned m = 0; m < {kt}; m++) "
-                     f"{{ unsigned i_ = i0 + r; get(a[{x}], {a_tile}, {rows_at[q]} + r * {kt} + m); }} ")
-            get_a += (f"mcast(SLOT({rows_at[q]}), {rows_a} * {col}, row_rect[{gy}], {gx_n - 1}); "
-                      f"post(1, stamp | 1, row_rect[{gy}], {gx_n - 1});" if gx_n > 1 else "noc_wait();")
-            get_b = f"for (unsigned m = 0; m < {kt}; m++) {'flipped' if bt else 'get'}(a[{y}], {b_tile}, {buf} + m); "
-            get_b += (f"mcast(SLOT({buf}), {col}, col_rect[{gx}], {gy_n - 1}); "
-                      f"post(2, stamp | (jj + 1), col_rect[{gx}], {gy_n - 1});" if gy_n > 1 else "noc_wait();")
+          if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
+            gx_n, gy_n = mc
+            gx, gy, buf, a_n = f"unit % {bc}", f"unit / {bc}", f"{kept_b} + jj % 3 * {kt}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {kt}"
+            part = lambda n, k, parts: (f"{k} * {n} / {parts}", f"({k} + 1) * {n} / {parts}")  # worker k's share of n tiles
+            (a0, a1), (b0, b1) = part(a_n, gx, gx_n), part(kt, gy, gy_n)
+            get_a = (f"for (unsigned e = {a0}; e < {a1}; e++) "
+                     f"{{ unsigned i_ = i0 + e / {kt}, m = e % {kt}; get(a[{x}], {a_tile}, {rows_at[q]} + e); }} "
+                     f"share({rows_at[q]}, {a0}, {a1}, row_rect[{gy}], {gx_n - 1}, {gx}, stamp | 1);")
+            get_b = (f"for (unsigned m = {b0}; m < {b1}; m++) {'flipped' if bt else 'get'}(a[{y}], {b_tile}, {buf} + m); "
+                     f"share({buf}, {b0}, {b1}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, stamp | (jj + 1));")
             c[B].append(f"{{ if (ii == 0) {{ "  # a column's first tile: its column of B, and in the first column A's rows
-                        f"if (jj == 0) {{ stamp = *(volatile unsigned *){MAILBOX:#x} << 12; FLAGS[0] = 0; if ({gx} == 0) {{ {get_a} }} }} "
-                        f"if (jj >= {nbuf}) reached(col_end[jj % {nbuf}]); "  # done with the buffer here; its leader waits for all
-                        f"if ({gy} == 0) {{ if (jj >= {nbuf}) await(0, (jj - {nbuf - 1}) * {gy_n - 1}); {get_b} }} "
-                        f"else {{ if (jj >= {nbuf}) freed(b_leader[{gx}]); await(2, stamp | (jj + 1)); }} "
-                        f"if (jj == 0 && {gx} != 0) await(1, stamp | 1); }} "
-                        f"for (unsigned m = 0; m < {kt}; m++) kept(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % {nbuf}] = events; }}")
+                        f"if (jj == 0) {{ stamp = *(volatile unsigned *){MAILBOX:#x} << 12; {get_a} }} "
+                        f"if (jj >= 2) reached(col_end[(jj + 1) % 3]); "  # done with column jj - 2, so others may fill jj - 3's buffer
+                        f"{get_b} await({FLAGS_B}, {gy_n}, stamp | (jj + 1)); if (jj == 0) await(0, {gx_n}, stamp | 1); }} "
+                        f"for (unsigned m = 0; m < {kt}; m++) kept(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
             xs, ys = grid
             decls = (_array("row_rect", [xs[gx_n - 1] | y << 6 | (xs[0] | y << 6) << 12 for y in ys[:gy_n]]) +
-                     _array("col_rect", [x | ys[gy_n - 1] << 6 | (x | ys[0] << 6) << 12 for x in xs[:gx_n]]) +
-                     _array("b_leader", [x | ys[0] << 6 for x in xs[:gx_n]]))
+                     _array("col_rect", [x | ys[gy_n - 1] << 6 | (x | ys[0] << 6) << 12 for x in xs[:gx_n]]))
           elif kept_b is not None:  # A's bp rows and B's column in L1
             c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
                         f"for (unsigned m = 0; m < {kt}; m++) step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, "
@@ -764,7 +768,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
             walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
                     ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
-            column = f"{kept_b} + jj % {mc[2]} * {kt}" if mc else kept_b
+            column = f"{kept_b} + jj % 3 * {kt}" if mc else kept_b
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
                         f"{on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
@@ -823,13 +827,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   def program(c):  # the loops all four programs share, around each one's part of a tile
     tile_c = lambda b: f"if (tiles++ & 1) {{ {' '.join(b[1][c])} }} else {{ {' '.join(b[0][c])} }}"
     if not reducing:  # a unit is a block: its tiles column by column, those past the matrix's edge left out
-      return f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = unit % {bc} * {bq};
+      return f"""  unsigned unit = a[0], b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = unit % {bc} * {bq};
+  for (unsigned u = 0; u < a[1]; u++, unit++) {{
     for (unsigned jj = 0; jj < {bq}; jj++) for (unsigned ii = 0; ii < {bp}; ii++) {{
       unsigned i_ = i0 + ii, j = j0 + jj, k = 0;
       if (i_ >= {rt} || j >= {w}) continue;
       {tile_c(passes[0][1])}
     }}
+    if ((j0 += {bq}) == {bc * bq}) {{ j0 = 0; if ((i0 += {bp}) == {br * bp}) {{ i0 = 0; b++; }} }}  // the next unit, without dividing
   }}"""
     index = ("b", "i_", "j")  # a tile's place: matrix, row, column. A unit fixes the two the sweep does not walk
     (outer, _), (inner, m) = [(index[ax], n[ax]) for ax in range(3) if ax != axis]
@@ -848,7 +853,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
 def _rows(dtype):  # C shared by gather and move: the banks, copies inside this L1, and a row filling its tile
   face, run = tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a face, and in a face's row
   return BANKS + f"""
-static void copy(unsigned from, unsigned to, unsigned n) {{ noc_read(noc_me() & 63, noc_me() >> 6, from, to, n); }}
+static void copy(unsigned from, unsigned to, unsigned n) {{ noc_get(noc_me() & 63, noc_me() >> 6, from, to, n); }}
 static void row_down(unsigned tile) {{  // row 0 of faces 0 and 1 down their 16 rows, then faces 0-1 onto 2-3
   l1_settle(tile);
   for (unsigned n = {run}; n < {face}; n *= 2) {{ copy(tile, tile + n, n); copy(tile + {face}, tile + {face} + n, n); noc_wait(); }}
@@ -873,7 +878,7 @@ static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] == 1 ? 1 : 32, it = a[9] + i;  // it: the indices' tile
-    noc_read(BANK(it), a[8] + it / 8 * 4096, IDS, 4096);
+    noc_get(BANK(it), a[8] + it / 8 * 4096, IDS, 4096);
     copy({ZEROS:#x}, SLOT, {t});  // the rows past the end stay zero
     noc_wait();
     for (unsigned r = 0; r < rows; r++) {{
@@ -882,7 +887,7 @@ void kmain(volatile unsigned *a) {{
         volatile unsigned *to = (volatile unsigned *)(SLOT + face * {face} + r % 16 * {run});
         if (row >= a[7]) continue;
         unsigned n = id(r), from = n / 32 * a[4] + j + a[5], at = (n % 32 / 16 * 2 + face % 2) * {face} + n % 16 * {run};
-        noc_read(BANK(from), a[3] + from / 8 * {t} + at / 64 * 64, BLOCK, 64);
+        noc_get(BANK(from), a[3] + from / 8 * {t} + at / 64 * 64, BLOCK, 64);
         noc_wait();
         for (unsigned k = 0; k < {run // 4}; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
       }}
@@ -938,7 +943,7 @@ static unsigned held[{MOVE_SLOTS}];  // tile number + 1 of what each cache slot 
 static volatile datum *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
   unsigned s = t % {MOVE_SLOTS};
   if (held[s] == t + 1) return (volatile datum *)(CACHE + s * {tb});
-  noc_read(BANK(t), base + t / 8 * {tb}, CACHE + s * {tb}, {tb});
+  noc_get(BANK(t), base + t / 8 * {tb}, CACHE + s * {tb}, {tb});
   noc_wait();
   held[s] = t + 1;
   return (volatile datum *)(CACHE + s * {tb});
@@ -972,7 +977,7 @@ void kmain(volatile unsigned *a) {{
     unsigned e = e0 + b * sb + i * 32 * sr + j * 32 * sc, row = e / xc % xr, col = e % xc;  // where the tile starts in x
     unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
     if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32 && row % 32 == 0 && row + 32 <= xr && col % 32 == 0 && col + 32 <= xc) {{
-      if (whole) {{ noc_read(BANK(src), base + src / 8 * {tb}, OUT, {tb}); noc_wait(); }}  // x's tile src as it is
+      if (whole) {{ noc_get(BANK(src), base + src / 8 * {tb}, OUT, {tb}); noc_wait(); }}  // x's tile src as it is
       else {{  // x's tile src transposed: face (fr, fc) is its face (fc, fr) transposed
         volatile datum *x = fetch(base, src);
         held_t = src;

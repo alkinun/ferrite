@@ -5,15 +5,15 @@ from ferrite import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
-# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], FLAGS (for a kernel's workers to tell
-# each other things over the NoC: a count other workers add to, two flags they write, scratch; never zeroed, so flags
-# carry the launch's number), SYNC (zeroed before each launch, for the kernel's cores to talk through), two buffers of
-# kernel arguments (launches alternate between them, so the next launch's arguments go in while this one runs), the
-# kernels it holds, a tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The
-# dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an
-# outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for
-# one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
-MAILBOX, TRISCS, FLAGS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1030, 0x1040, 0x1100, 0x2000, 0x7F000, 0x80000
+# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for
+# the kernel's cores to talk through), FLAGS (32 words for a kernel's workers to signal each other over the NoC, each
+# written by one of them; never zeroed, so a flag carries the launch's number), two buffers of kernel arguments
+# (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds, a
+# tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The dispatcher: its
+# config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an outbox [go, kernel,
+# arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for one command, both
+# above the kernels (loading a kernel writes the dispatcher's tile too).
+MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
@@ -42,6 +42,23 @@ static inline void l1_settle(unsigned addr) {{
 // Copy n bytes between (x, y, addr) and this tile's L1. The low 4 bits of the two addresses must match (6 for DRAM).
 static inline void noc_read(unsigned x, unsigned y, unsigned long long addr, unsigned l1, unsigned n) {{
   for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(addr, x | y << 6, l1, noc_me(), READ, k = n < MAX_PACKET ? n : MAX_PACKET);
+}}
+// A read into this L1 or a write from it, of at most MAX_PACKET bytes, through request initiator 1 or 2, which the
+// firmware sets up once for them (noc_setup): each writes only what changes, four registers and the go, where noc_read
+// and noc_write write all nine. noc_put does not settle this core's stores: for data the Tensix wrote, there are none
+#define NIU1(reg) NIU(INITIATOR + (reg))
+#define NIU2(reg) NIU(2 * INITIATOR + (reg))
+static inline void noc_setup(void) {{
+  NIU1(TARG_MID) = 0; NIU1(RET_MID) = 0; NIU1(RET_HI) = noc_me(); NIU1(PACKET_TAG) = 0; NIU1(CTRL) = READ;
+  NIU2(TARG_MID) = 0; NIU2(TARG_HI) = noc_me(); NIU2(RET_MID) = 0; NIU2(PACKET_TAG) = 0; NIU2(CTRL) = WRITE;
+}}
+static inline void noc_get(unsigned x, unsigned y, unsigned addr, unsigned l1, unsigned n) {{
+  while (NIU1(CMD) & 1) {{}}
+  NIU1(TARG_LO) = addr; NIU1(TARG_HI) = x | y << 6; NIU1(RET_LO) = l1; NIU1(LEN) = n; NIU1(CMD) = 1;
+}}
+static inline void noc_put(unsigned l1, unsigned x, unsigned y, unsigned addr, unsigned n) {{
+  while (NIU2(CMD) & 1) {{}}
+  NIU2(TARG_LO) = l1; NIU2(RET_LO) = addr; NIU2(RET_HI) = x | y << 6; NIU2(LEN) = n; NIU2(CMD) = 1;
 }}
 static inline void noc_write(unsigned l1, unsigned x, unsigned y, unsigned long long addr, unsigned n) {{
   l1_settle(l1);  // the NIU reads L1 on its own; our stores must be there first
@@ -133,6 +150,7 @@ static void run(unsigned core) {{  // the kernel's program for this core, if it 
   if (entry) ((void (*)(volatile unsigned *))(kernel + entry))((volatile unsigned *)MAILBOX[2]);
 }}
 void brisc_loop(void) {{
+  noc_setup();
   for (unsigned seen = 0;;) {{
     while (MAILBOX[0] == seen) asm volatile("fence" ::: "memory");  // the L0 data cache never sees NoC writes; fence drops it
     seen = MAILBOX[0];
