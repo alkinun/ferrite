@@ -48,6 +48,19 @@ softmax reads 48 tiles, 1.00x, in 1.4k cycles, the layer norm 54, 1.12x (its con
 one-tile add is 0.27k (a queued launch alone, 220 cycles: NOTES, "Launch cost"). On ttsim these are RISC-V
 instructions on the critical path, not silicon time.
 
+A token's matmul, measured 2026-10-19 the same way (ferrite at ccf2610; the same tt-metal and ttsim): 32x768 @
+768x3072, one tile row, at HiFi4, with bf16 weights and with bfp8 (TT-NN's `BFLOAT8_B`, ferrite's `cast("bfp8")`).
+
+| op | ferrite | TT-NN, fast dispatch | TT-NN, slow dispatch | DRAM reads, both |
+|---|---|---|---|---|
+| matmul 32x768 @ 768x3072, bf16 weights | 0.58k cycles | 6.9k | 1.8k | 2,328 tiles, 1.00x |
+| the same, bfp8 weights | 1.50k | 6.9k | 1.8k | 2,328 tiles, 0.53x the bytes |
+
+Both read A's row once and share it (TT-NN multicasts it from one core, ferrite from the first grid row: NOTES, "A
+token's row, shared") and each weight tile once; TT-NN reads a bfp8 tile in one request, ferrite in two, its
+exponents and its values, the same 1,088 bytes. ferrite's bfp8 costs more ttsim cycles than its bf16 for that second
+request a tile (NOTES, "Weights in BFP8"); on silicon both stacks should wait on the same bytes from DRAM.
+
 ## What carries over to silicon
 
 - **DRAM traffic does.** A byte read from DRAM is a byte on the card too. At bc715ac TT-NN's matmul read every input
@@ -94,5 +107,8 @@ The shim (`sim/shim.c`, built to `sim/libttsim.so` beside a copy of `blackhole_1
 `~/Desktop/tt`, outside this repository:
 
     TTSIM=/path/to/libttsim.so python3 cmp/ferrite_ops.py
-    TT_METAL_HOME=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so TT_METAL_DISABLE_SFPLOADMACRO=1 cmp/build/ttnn_ops
+    TT_METAL_RUNTIME_ROOT=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so TT_METAL_DISABLE_SFPLOADMACRO=1 cmp/build/ttnn_ops
     TT_METAL_SLOW_DISPATCH_MODE=1 ... cmp/build/ttnn_ops    # the same, slow dispatch
+
+One at a time: the shim's count of clocks is one file in `/dev/shm`, so two runs at once each count both (run together,
+the matmul read 11.2k cycles for both modes).
