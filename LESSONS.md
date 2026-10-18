@@ -147,6 +147,10 @@ append a correction.
     sixty the adapter writes out, and a training run of its transformer layer reached the CPU for one op, attention's
     backward. A decomposition is code with its own purpose, though: the one for attention was written for export and
     returns the attention weights where the kernel returns their logsumexp. (NOTES: "PyTorch on ferrite")
+25. **Copy what is already together.** The move kernel found each datum on its own, though most moves are whole tiles (a
+    pad on tile boundaries), tiles transposed (an fp32 `.T`) or runs along a row or down a column. Copying those as they
+    are took a training step's moves from 450k cycles to 28k, and tinygrad's transformer step from 6.1M to 2.9M. Which
+    way to sweep mattered as much: attention's heads run 6 datums along a row and 32 down a column. (NOTES: "Movement")
 
 ## Working method
 

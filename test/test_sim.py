@@ -532,6 +532,16 @@ def test_movement(chip):
   launches, t = rt.launches, tx.reshape(135, 70)[:, 7:100:2, ::-1].pad(((1, 0), (3, 1), (2, 5))).permute(2, 1, 0)[:, 1:4, 1:2].expand(77, 3, 40)
   want = np.broadcast_to(np.pad(x.reshape(1, 135, 70)[:, 7:100:2, ::-1], ((1, 0), (3, 1), (2, 5))).transpose(2, 1, 0)[:, 1:4, 1:2], (77, 3, 40))
   assert value(t).tolist() == want.tolist() and rt.launches == launches + 1, "a chain of moves is one move"
+  # the move kernel's ways, in fp32 (a word a datum): whole tiles as they are (a pad on tile boundaries) or transposed, runs
+  # along x's rows (a reshape, an unaligned slice) and down its columns (attention's heads apart), datum by datum (a permute)
+  y = rng.uniform(-2, 2, (2, 64, 96)).astype(np.float32)
+  ty = Tensor.of(rt, y.tolist(), "fp32")
+  for t, want in [(ty.T, y.transpose(0, 2, 1)), (ty.pad(((0, 0), (32, 0), (0, 64))), np.pad(y, ((0, 0), (32, 0), (0, 64)))),
+                  (ty.reshape(4, 48, 64), y.reshape(4, 48, 64)), (ty[:, 3:50, 5:90], y[:, 3:50, 5:90]),
+                  (ty[:, :45, :70].T, y[:, :45, :70].transpose(0, 2, 1)),
+                  (ty.reshape(1, 128, 96)._move((16, 96, 8), 0, (768, 1, 96)), y.reshape(16, 8, 96).transpose(0, 2, 1)),
+                  (ty.permute(2, 0, 1), y.transpose(2, 0, 1))]:
+    assert value(t).tolist() == want.tolist(), t.shape
   launches, v = rt.launches, tx[1:3, 32:45, 32:64]
   assert rt.launches == launches and v.addr == tx.addr and value(v).tolist() == x[1:3, 32:45, 32:64].tolist(), "a view, no copy"
   w = bf16(rng.uniform(-1, 1, (50, 20)))

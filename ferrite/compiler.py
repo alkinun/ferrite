@@ -840,11 +840,13 @@ def move_kernel(dtype):
   strides for batch and row, tile offset, x's rows and columns, the result's rows and columns, then the map: an offset
   and strides for batch, row and column, and each axis's bounds lo and hi]. Element (b, r, c) of the result, inside
   the bounds, is element offset + b sb + r sr + c sc of x, counted in row-major order; outside them, 0.
-  BRISC alone, a datum at a time: a NoC read cannot put 2 bytes just anywhere, so x's tiles come whole into a cache in
-  L1 as they are needed. A result tile starts as a copy of the zero tile, gets the datums inside the bounds, and goes
-  home. Where a datum is in x takes two divisions, unless it is the element after the last one read (as in a reshape
-  or a slice of whole rows), which is a step. A result of one row fills its tile with copies of it: the row is made
-  once and doubled down the tile by NoC copies inside L1."""
+  BRISC alone: a NoC read cannot put 2 bytes just anywhere, so x's tiles come whole into a cache in L1 as they are
+  needed. A result tile inside the bounds that is one of x's tiles as it is (a pad, slice or cat on tile boundaries)
+  comes straight into place; one that is x's tile transposed is transposed face by face. Any other starts as a copy of
+  the zero tile and gets the datums inside the bounds, in lines along its rows or down its columns, whichever lie in x as
+  runs (along a row of x, or down a column): in runs as long as a face allows, else one at a time, stepping through x
+  without a division. A result of one column is made once and copied across; one of one row fills its tile with copies
+  of it, the row made once and doubled down the tile by NoC copies inside L1."""
   tb = tile_bytes(dtype)
   return compile_kernel(f"""
 #define OUT {DATA:#x}
@@ -872,27 +874,73 @@ void kmain(volatile unsigned *a) {{
   unsigned base = a[3], bstride = a[4], stride = a[5], offset = a[6], xr = a[7], xc = a[8], rows = a[9], cols = a[10];
   unsigned tr = (rows + 31) / 32, tc = (cols + 31) / 32;
   int e0 = a[11], sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18], hi_r = a[19], hi_c = a[20];
+  // The datums go in lines along the result's rows, or down its columns when that is where they lie in x as runs (along
+  // a row of x, or down a column) and the rows are not, or are shorter, and always for a single column: step is a line's,
+  // in x's elements, split into x's matrices, rows and columns so that stepping takes no division
+  int run_along = cols > 1 && (sc == 1 || sc == (int)xc), run_down = sr == 1 || sr == (int)xc;
+  int down = rows > 1 && (cols == 1 || run_down && (!run_along || (rows < 32 ? rows : 32) > (cols < 32 ? cols : 32)));
+  int step = down ? sr : cols == 1 ? 0 : sc;
+  unsigned sq = step >= 0 ? step / xc : 0, sm = step >= 0 ? step % xc : 0, qb = sq / xr, qi = sq % xr;
+  unsigned whole = rows > 1 && cols > 1 && sc == 1 && sr == (int)xc, turned = rows > 1 && cols > 1 && sr == 1 && sc == (int)xc;
   volatile datum *out = (volatile datum *)OUT, *tile = 0;
-  unsigned next = ~0u, row = 0, xj = 0, seen = ~0u, xb = 0, xi = 0, held_t = ~0u;  // the element after the last one read, and where it is
+  unsigned held_t = ~0u;
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u;
     int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;
-    copy({ZEROS:#x}, OUT, {tb});  // padding and what lies outside the bounds stay 0
-    noc_wait();
-    int r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c), c1 = to(j, cols, lo_c, hi_c);
-    if (rows == 1 && r1) r1 = 1;  // a single row: made once, doubled below
-    for (int r = from(i, rows, lo_r); r < r1; r++) {{
-      int y = rows == 1 ? 0 : i * 32 + r, e_row = e0 + b * sb + y * sr;
-      for (int c = c0; c < c1; c++) {{
-        unsigned e = e_row + (cols == 1 ? 0 : j * 32 + c) * sc, t = 0;
-        if (e != next) {{ row = e / xc; xj = e % xc; }} else if (++xj == xc) {{ xj = 0; row++; }}
-        if (row != seen) {{ seen = row; xb = row / xr; xi = row % xr; }}
-        next = e + 1;
-        if ((t = xb * bstride + xi / 32 * stride + xj / 32 + offset) != held_t) {{ tile = fetch(base, t); held_t = t; }}
-        out[at(r, c)] = tile[at(xi % 32, xj % 32)];
+    int r0 = from(i, rows, lo_r), r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c), c1 = to(j, cols, lo_c, hi_c);
+    unsigned e = e0 + b * sb + i * 32 * sr + j * 32 * sc, row = e / xc % xr, col = e % xc;  // where the tile starts in x
+    unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
+    if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32 && row % 32 == 0 && row + 32 <= xr && col % 32 == 0 && col + 32 <= xc) {{
+      if (whole) {{ noc_read(BANK(src), base + src / 8 * {tb}, OUT, {tb}); noc_wait(); }}  // x's tile src as it is
+      else {{  // x's tile src transposed: face (fr, fc) is its face (fc, fr) transposed
+        volatile datum *x = fetch(base, src);
+        held_t = src;
+        for (unsigned f = 0; f < 4; f++)
+          for (unsigned r = 0; r < 16; r++)
+            for (unsigned c = 0; c < 16; c++) out[f * 256 + r * 16 + c] = x[(f % 2 * 2 + f / 2) * 256 + c * 16 + r];
       }}
+    }} else {{
+      copy({ZEROS:#x}, OUT, {tb});  // padding and what lies outside the bounds stay 0
+      noc_wait();
+      if (rows == 1 && r1) r1 = 1;  // a single row: made once, doubled below
+      int lines0 = down ? c0 : r0, lines1 = down ? (cols == 1 && c1 ? 1 : c1) : r1, k0 = down ? r0 : c0, k1 = down ? r1 : c1;
+      for (int line = lines0; line < lines1; line++) {{
+        int r = down ? k0 : line, c = down ? line : k0;
+        unsigned e_line = e0 + b * sb + (rows == 1 ? 0 : i * 32 + r) * sr + (cols == 1 ? 0 : j * 32 + c) * sc;
+        unsigned xrow = e_line / xc, xb = xrow / xr, xi = xrow % xr, xj = e_line % xc;
+        for (int k = k0; k < k1;) {{
+          unsigned xt = xb * bstride + xi / 32 * stride + xj / 32 + offset;
+          if (xt != held_t) {{ tile = fetch(base, xt); held_t = xt; }}
+          if (step == 1 || step == (int)xc) {{  // a run along x's row or down its column, to the end of a face's line, or x's
+            unsigned in_row = step == 1, n = k1 - k, m = 16 - k % 16, f = 16 - (in_row ? xj : xi) % 16, left = in_row ? xc - xj : xr - xi;
+            n = n < m ? n : m; n = n < f ? n : f; n = n < left ? n : left;
+            volatile datum *d = out + at(r, c), *s = tile + at(xi % 32, xj % 32);
+            unsigned dd = down ? 16 : 1, ss = in_row ? 1 : 16;
+            for (volatile datum *end = d + n * dd; d != end; d += dd, s += ss) *d = *s;
+            k += n;
+            if (down) r += n; else c += n;
+            if (in_row && (xj += n) == xc) {{ xj = 0; xi++; }}
+            if (!in_row) xi += n;
+            if (xi == xr) {{ xi = 0; xb++; }}
+            continue;
+          }}
+          out[at(r, c)] = tile[at(xi % 32, xj % 32)];
+          if (++k >= k1) break;
+          if (down) r++; else c++;
+          if (step < 0) {{  // backwards: found again, by division
+            unsigned ek = e_line + (k - k0) * step;
+            xrow = ek / xc; xb = xrow / xr; xi = xrow % xr; xj = ek % xc;
+            continue;
+          }}
+          xj += sm; xi += qi; xb += qb;
+          if (xj >= xc) {{ xj -= xc; xi++; }}
+          if (xi >= xr) {{ xi -= xr; xb++; }}
+        }}
+      }}
+      if (down && cols == 1)  // a single column: made once, copied across
+        for (int r = r0; r < r1; r++) for (unsigned c = 1; c < 32; c++) out[at(r, c)] = out[at(r, 0)];
+      if (rows == 1 && r1) row_down(OUT);
     }}
-    if (rows == 1 && r1) row_down(OUT);
     noc_write(OUT, BANK(t), a[2] + t / 8 * {tb}, {tb});
     noc_wait();
   }}
