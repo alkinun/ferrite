@@ -1,13 +1,15 @@
 # A Llama-family model on ferrite (SmolLM-135M: RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache): the real
 # weights, greedy generation, each step checked against the same model in numpy (the same bf16 weights, float32 math).
 # The model is written once, for ferrite Tensors and numpy arrays alike, as test/gpt2.py is.
-#   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens]
-# The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors.
+#   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8]
+# The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors. bfp8:
+# the weight matrices in bfp8 on the chip (numpy then has them as the chip does).
 import json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ferrite.tensor import Tensor
+import gpt2
 
 def fns(x):  # what numpy and ferrite spell differently
   if isinstance(x, np.ndarray):
@@ -87,11 +89,15 @@ def load(folder):
   out["embed.T"] = tuple(np.ascontiguousarray(a.T) for a in out["embed"])  # tied: the output layer is the embedding
   return c, out
 
-def upload(rt, weights): return {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
-def arrays(weights): return {name: values for name, (_, values) in weights.items()}
+def upload(rt, weights, dtype="bf16"):  # the weights as ferrite Tensors, the matrices a matmul reads as its B (the
+  # blocks' and the output layer) cast to dtype on the chip
+  t = {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
+  return t | {k: x.cast(dtype).realize() for k, x in t.items() if k == "embed.T" or k.startswith("layers.") and x.rows > 1}
 
-def logits(f_out):  # a ferrite row of logits, as a numpy vector
-  return (np.frombuffer(f_out.tobytes(), np.uint16).astype(np.uint32) << 16).view(np.float32)
+def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip (upload), those not in bf16 as the chip has them
+  return {name: values for name, (_, values) in weights.items()} | {k: gpt2.values(x) for k, x in (t or {}).items() if x.dtype != "bf16"}
+
+def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector
 
 def tokenizer(folder):
   """tiktoken over tokenizer.json's byte-level BPE (ids in merge order, so they are the ranks), digits one at a time."""
@@ -110,11 +116,13 @@ def main():
   from ferrite.chip import Chip
   from ferrite.runtime import Runtime
   folder, prompt, steps = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "The meaning of life is", int(sys.argv[3]) if len(sys.argv) > 3 else 8
+  dtype = sys.argv[4] if len(sys.argv) > 4 else "bf16"
   enc, chip = tokenizer(folder), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   start = time.time()
   c, weights = load(folder)
-  w, t = arrays(weights), upload(rt, weights)
+  t = upload(rt, weights, dtype)
+  w = arrays(weights, t)
   print(f"{sum(bits.size for k, (bits, _) in weights.items() if k != 'embed.T') / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
   ids, agree = enc.encode(prompt), 0
   caches, np_caches, new = [[None, None] for _ in range(c.layers)], [[None, None] for _ in range(c.layers)], ids

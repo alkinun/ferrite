@@ -43,8 +43,8 @@ Done: everything from stage 1 runs correctly on the card.
 
 - [ ] Matmul near the chip's peak, decode near its DRAM bandwidth
 - [x] Tiles multicast between cores: a matmul reads each input tile from DRAM once (`test_matmul_multicast`)
-- [ ] What the simulator could not measure: several reads in flight, BFP8 weights, and what fewer fidelity phases gain
-      (`matmul(fidelity=)`, its accuracy measured on ttsim)
+- [ ] What the simulator could not measure: several reads in flight, BFP8 weights (`cast("bfp8")`, exact on ttsim), and
+      what fewer fidelity phases gain (`matmul(fidelity=)`, its accuracy measured on ttsim)
 - [ ] Benchmarks against Tenstorrent's own stack, published
 
 Done: competitive numbers, and for every gap, a known reason.

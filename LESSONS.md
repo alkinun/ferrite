@@ -48,6 +48,10 @@ append a correction.
 12. **Moving data across SFPU lanes is scarce.** `SFPSHFT2` rotates within groups of 8 lanes and `SFPTRANSP` moves
     groups between four registers; nothing else crosses lanes. Folding a tile's rows or columns costs 120 to 168
     instructions because of it. (NOTES: "Reductions")
+13. **A compressed format brings its own address map.** A bfp8 tile is half a bf16 one, but the unpacker finds slot z's
+    exponents at `base + 64 z` and its values past every slot's exponents, so bfp8 cannot share bf16's slots: it got a
+    region of its own, laid out the unpacker's way, each tile read in two pieces. How it is made matters too: packed
+    from a bfp8 intermediate each value is rounded twice, from fp32 once. (NOTES: "Weights in BFP8")
 
 ## The simulator
 
@@ -188,6 +192,8 @@ What Blackhole made hard to program, so that a design for simple software can de
   instruction cache) are the commonest source of subtle bugs here.
 - **One kind of configuration,** readable back, with documented reset values. Blackhole has backend config (stores),
   thread config (in-band `SETC16` only) and address counters, each written its own way.
+- **Compressed tiles that are still tiles,** each block's exponents beside its values, so a tile of any format sits in
+  any slot and comes in as one read.
 - **Counters wide enough never to be the limit.** An 8-bit Z, 4-bit semaphores and a 32-entry replay buffer each
   shaped the compiler.
 - **Full precision through the main datapath.** fp32 here cannot touch the matrix unit's inputs, and its dot products

@@ -12,8 +12,10 @@ import math, struct
 from ferrite import bh
 from ferrite.runtime import DATA, FLAGS, SYNC, ZEROS, compile_kernel
 
-ITEMSIZE = {"bf16": 2, "fp32": 4, "int32": 4}  # the dtypes, by bytes a value; a tile is 1024 values
-def tile_bytes(dtype): return 1024 * ITEMSIZE[dtype]  # a bf16 tile is one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
+ITEMSIZE = {"bf16": 2, "fp32": 4, "int32": 4, "bfp8": 1}  # the dtypes, by bytes a value; a tile is 1024 values
+# A bf16 tile is one SrcA/SrcB bank (64 rows of 16), 64 Dst rows. A bfp8 tile is 64 exponents, one for each 16 values
+# (a face's row), then the 1024 values, each a sign and 7 bits of magnitude: m * 2^(exponent - 133)
+def tile_bytes(dtype): return 1024 * ITEMSIZE[dtype] + (64 if dtype == "bfp8" else 0)
 def slot_base(dtype): return DATA - tile_bytes(dtype)  # L1 tile slots of a kernel computing in dtype: slot i at base + i *
                                                         # its tile, so slot 0 is (part of) the runtime's zeros. The unpackers'
                                                         # Z and the packer's channel 1 Y counters pick them
@@ -42,20 +44,24 @@ def config(**fields):  # backend config {word index: value}, every bit of a touc
     regs[index] = regs.get(index, 0) | v << first
   return regs
 
-FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32, "int32": bh.INT32}
-def kernel_config(dtype="bf16", out="bf16", transposing=False):
+FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32, "int32": bh.INT32, "bfp8": bh.BFP8}
+def kernel_config(dtype="bf16", out="bf16", transposing=False, b8=0):
   """A kernel's backend config. Unpackers read one whole tile each (1024 datums): bf16 into a SrcA/SrcB bank; fp32
   straight into Dst (unpacker 0 in context 1, where the 32-bit Dst row is channel 1's Y). Z picks the slot (the Z stride
   is one tile). The FPU writes Dst in fp32. The packer reads 4 Dst rows per PACR (its Dst row stride is in bytes of out)
   and writes them as out (fp32 to bf16 rounds); its channel 1 Y picks the slot (that Y stride is one tile of out). Base
   addresses are in 16-byte units, minus 1, and unpacker 0's rows are biased by 4 (64 datums). transposing: unpacker 0
-  transposes each 16x16 face into SrcA."""
+  transposes each 16x16 face into SrcA. b8: unpacker 0 reads bfp8 tiles from b8 slots at B8 instead (a matmul's B),
+  each value into SrcA as the bf16 it is; their exponents come first, a section as long as the slots are many."""
   base, fmt, pack = slot_base(dtype) // 16 - 1, FORMAT[dtype], FORMAT[out]
-  return config(Dstacc=pack, Fp32_enabled=1, Zero_Flag_disabled_src=0, Read_32b_data=1, Edge_mask=0xFFFF, pack_reads_per_xy_plane=16,
-                PCK0_Ystride=16 * ITEMSIZE[out], PCK0_ZW=0, PCK0_Ystride_1=tile_bytes(out), PCK0_ZW_1=0, PCK0_Base_1=0, PCK_dest_offset=0,
+  late = bh.FP32 if out == "bfp8" else pack  # the packer's own format: bfp8 from fp32 rounds each value once, from bfp8 twice
+  return config(Dstacc=late, Fp32_enabled=1, Zero_Flag_disabled_src=0, Read_32b_data=1, Edge_mask=0xFFFF, pack_reads_per_xy_plane=16,
+                PCK0_Ystride=16 * ITEMSIZE["fp32" if late == bh.FP32 else out], PCK0_ZW=0, PCK0_Ystride_1=tile_bytes(out), PCK0_ZW_1=0, PCK0_Base_1=0, PCK_dest_offset=0,
                 L1_Dest_addr=(slot_base(dtype) if out == dtype else OUTS) // 16 - 1, Disable_zero_compress=1, Pack_out_format=pack,
-                Pack_in_format=pack, UNP0_add_dest_addr_cntr=0, UNP0_Ystride_1=64, UNP0_ZW_1=0, UNP1_ZW_1=0,
-                SEC0_format=fmt, SEC0_x_dim=1024, SEC0_y_dim=1, SEC0_z_dim=1, SEC0_out_format=fmt, SEC0_uncompressed=1, SEC0_base=base,
+                Exp_section_size=4,  # a bfp8 tile's 64 exponents, in 16 bytes
+                Pack_in_format=late, UNP0_add_dest_addr_cntr=0, UNP0_Ystride_1=64, UNP0_ZW_1=0, UNP1_ZW_1=0,
+                SEC0_format=bh.BFP8 if b8 else fmt, SEC0_x_dim=1024, SEC0_y_dim=1, SEC0_z_dim=b8 or 1,
+                SEC0_out_format=bh.BFP8 if b8 else fmt, SEC0_uncompressed=1, SEC0_base=B8 // 16 - 1 if b8 else base,
                 SEC0_dest_addr=64, SEC0_tile_x_dim=1024, SEC0_offset=0, SEC0_Haloize_mode=int(transposing),
                 SEC0_uncompressed_1=1, SEC0_to_dst_1=1, SEC0_base_1=base, SEC0_dest_addr_1=64, SEC0_tile_x_dim_1=1024, SEC0_offset_1=0,
                 SEC1_format=fmt, SEC1_x_dim=1024, SEC1_y_dim=1, SEC1_z_dim=1, SEC1_out_format=fmt, SEC1_uncompressed=1, SEC1_base=base)
@@ -412,6 +418,8 @@ FLAGS_B = 16  # FLAGS: A's flags (a grid row's workers), then from here B's (a g
 ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, the narrow ops, and what
                           # stays in L1: A's rows, B's column or buffers, kept inputs
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
+B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")  # a matmul's bfp8 B, past the slots: the exponents of each of
+                                                           # its slots, then their values (the unpacker's layout)
 
 # SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
 # one of them: FETCHED, how many times BRISC has fetched tiles into L1 (a frame, or a matmul step's pair); UNPACKED, how
@@ -435,8 +443,8 @@ static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} 
 KMAIN = "void kmain(volatile unsigned *args) {\n  const unsigned *a = (const unsigned *)args;"
 def _pushes(words): return " ".join(f"push_word({w:#x});" for w in words)  # straight-line, with no table to load from
 
-def _brisc(total, body, dtype="bf16", out="bf16", decls="", tail=""):  # moves tiles: inputs into L1 ahead of the unpackers,
-  # results home behind the packer; decls: statics and tables the body needs; tail: its last words
+def _brisc(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0):  # moves tiles: inputs into L1 ahead of the
+  # unpackers, results home behind the packer; decls: statics and tables the body needs; tail: its last words; b8: slots at B8
   tb, to = tile_bytes(dtype), tile_bytes(out)
   return SYNC_WORDS + f"""
 #define SLOT(i) ({slot_base(dtype):#x} + (i) * {tb})  // where the unpackers read slot i
@@ -460,12 +468,18 @@ static void send(void) {{  // the results packed so far go home, in the order th
 // A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, B's slot two steps
 // back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
-// A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot (B 1-2, A 3-4) or its place in
-// the row or column kept in L1, unless it is there already (KEPT)
+// bfp8 tile t into slot z at B8: its 64 exponents among the slots' exponents, its values among theirs
+static void get8(unsigned base, unsigned t, unsigned z) {{
+  unsigned at = base + t / 8 * {tile_bytes("bfp8")};
+  noc_get(BANK(t), at, {B8:#x} + 64 * z, 64);
+  noc_get(BANK(t), at + 64, {B8 + 64 * b8:#x} + 1024 * z, 1024);
+}}
+// A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot (B 1-2, or 0-1 at B8; A 3-4) or
+// its place in the row or column kept in L1, unless it is there already (KEPT). how: B as it is (0), transposed (1), bfp8 (2)
 #define KEPT 0xFFFFFFFF
-static void step(unsigned bt, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
+static void step(unsigned how, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
   reached(stream_done[steps & 1]);
-  if (b_slot != KEPT) {{ if (bt) flipped(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}  // bt: B is read transposed
+  if (b_slot != KEPT) {{ if (how == 1) flipped(b, b_tile, b_slot); else if (how == 2) get8(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}
   if (a_slot != KEPT) get(a, a_tile, a_slot);
   ready();
   stream_done[steps++ & 1] = ++events;
@@ -570,12 +584,12 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
 
 def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub, mul and the binary SFPU ops, (op, x) for the
-  unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, ("matmul", a, b[, phases]) where a is an input and b
-  an input or ("T", input), read transposed, run at `phases` fidelity phases (4 unless said), and plain numbers for
-  inputs. shapes: each input's (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the
-  others (broadcasting). dtype: what the inputs are and the kernel computes in; out: what it writes (only a kernel of
-  one op, a cast or a matmul, writes another); grid: the workers as Runtime.grid has them, for a matmul to share its
-  tiles between them.
+  unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, ("matmul", a, b[, phases]) where a is an input and b an
+  input, ("T", input), read transposed, or ("bfp8", input), a bfp8 input (a kernel of its own: unpacker 0 makes it bf16
+  on its way into SrcA), run at `phases` fidelity phases (4 unless said), and plain numbers for inputs. shapes: each
+  input's (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
+  dtype: what the inputs are and the kernel computes in; out: what it writes (only a kernel of one op, a cast or a
+  matmul, writes another); grid: the workers as Runtime.grid has them, for a matmul to share its tiles between them.
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
@@ -611,16 +625,16 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   count(expr)
   out, dst = out or dtype, dtype != "bf16"  # dst: the math thread fills Dst itself and the SFPU does the math
   ext = lambda s, ax: s[ax] if ax == 0 else -(-s[ax] // 32)  # a shape's extent along an axis: matrices, or tiles
-  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also bt, kt, phases); refs: expr -> input number or ("op", j)
+  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also how, kt, phases); refs: expr -> input number or ("op", j)
   size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (batch, rows, columns)
   def visit(e):
     if isinstance(e, int): return e
     if e in refs: return refs[e]
-    if e[0] == "matmul":  # B is an input, or ("T", input): that input transposed
-      bt, y = (True, e[2][1]) if isinstance(e[2], tuple) else (False, e[2])
+    if e[0] == "matmul":  # B is an input, or (how, input): ("T", input) that input transposed, ("bfp8", input) a bfp8 one
+      how, y = e[2] if isinstance(e[2], tuple) else ("", e[2])
       a = shapes[e[1]]
-      op = dict(kind="matmul", x=e[1], y=y, bt=bt, kt=ext(a, 2), shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if bt else 2]),
-                phases=e[3] if len(e) > 3 else 4)
+      op = dict(kind="matmul", x=e[1], y=y, how=("", "T", "bfp8").index(how), kt=ext(a, 2),
+                shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if how == "T" else 2]), phases=e[3] if len(e) > 3 else 4)
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
@@ -671,6 +685,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
                    {sfpu_name(op) for op in ops if sfpu_op(op)})
   frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
   assert not (dst and matmuls), "only bf16 kernels have matmuls"
+  b8 = any(ops[j]["how"] == 2 for j in matmuls)  # unpacker 0 reads bfp8 then, so B is all it reads
+  assert not b8 or len(ops) == 1, "a matmul of a bfp8 B is a kernel of its own"
   base = FRAMES + 2 * frame + len(ops)  # the first slot past the frames and the narrow ops
   rows_at, top = [], base  # each matmul's row of A in L1, while they fit; else A streams too
   assert top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS and len(matmuls) <= 16, "too many tiles in a kernel"
@@ -688,7 +704,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     kt = ops[matmuls[0]]["kt"]
     bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
     n_grid = (-(-w // bq), -(-rt // bp))
-    if base + (bp + 3) * kt <= UNPACKABLE and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B: mc = n_grid
+    if base + (bp + 3) * kt <= UNPACKABLE and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B and not b8: mc = n_grid
   if not mc:
     bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
     while bp > 1 and base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE: bp -= 1
@@ -761,7 +777,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
         pk = halves([pack(DST_HALF * h, pslot(f, me_j), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])
         c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= 1; }}")
         if op["kind"] == "matmul":
-          kt, bw, q, bt = op["kt"], ext(op["shape"], 2), matmuls.index(j), int(op["bt"])  # B's width in tiles; which matmul
+          kt, bw, q, how = op["kt"], ext(op["shape"], 2), matmuls.index(j), op["how"]  # B's width in tiles; which matmul
+          bt, bs = how == 1, 0 if b8 else 1  # B transposed; B's first stream slot (bfp8's are at B8)
           x, y = arg(op["x"]), arg(op["y"])
           bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
           in_batch = f"b * a[{y + 1}] + " if shapes[op["y"]][0] > 1 else ""
@@ -786,24 +803,24 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
                         f"for (unsigned m = 0; m < {kt}; m++) kept_step(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
           elif kept_b is not None:  # A's bp rows and B's column in L1
             c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
-                        f"for (unsigned m = 0; m < {kt}; m++) step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, "
+                        f"for (unsigned m = 0; m < {kt}; m++) step({how}, a[{y}], {b_tile}, nb ? {0 if b8 else kept_b} + m : KEPT, "
                         f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
           if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
             walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
                     ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
-            column = f"{kept_b} + jj % 3 * {kt}" if mc else kept_b
+            column = f"{kept_b} + jj % 3 * {kt}" if mc else 0 if b8 else kept_b
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
                         f"{on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
             c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({bt}, a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
+                        f"step({how}, a[{y}], {b_tile}, {bs} + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
             c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(unpack(2, 4) + REPORT)} }} else {{ {tt(unpack(1, 3) + REPORT)} }} }} {off}{posted} }}")
+                        f"if (steps++ & 1) {{ {tt(unpack(bs + 1, 4) + REPORT)} }} else {{ {tt(unpack(bs, 3) + REPORT)} }} }} {off}{posted} }}")
           else:
             c[B].append(f"{cond}{{ unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({bt}, a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
+                        f"step({how}, a[{y}], {b_tile}, {bs} + (steps & 1), a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(step_unpack(2))} }} else {{ {tt(step_unpack(1))} }} }} {off}{posted} }}")
+                        f"if (steps++ & 1) {{ {tt(step_unpack(bs + 1))} }} else {{ {tt(step_unpack(bs))} }} }} {off}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} "
                       f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases']))} }} "
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
@@ -870,7 +887,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
 {sweeps}
   }}"""
   total = f"a[1] * {L if swept(me) else 1}" if reducing else "tiles"  # results this worker sends home
-  image = compile_kernel(_brisc(total, program(B), dtype, out, decls, tail), _unpacker(program(U), kernel_config(dtype, out)),
+  b8 = (ops[matmuls[0]]["kt"] if kept_b is not None else 2) if b8 else 0  # slots at B8: B's column, or two to stream through
+  image = compile_kernel(_brisc(total, program(B), dtype, out, decls, tail, b8), _unpacker(program(U), kernel_config(dtype, out, b8=b8)),
                          _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 

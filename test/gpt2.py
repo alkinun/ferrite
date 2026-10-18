@@ -1,7 +1,8 @@
 # GPT-2 small on ferrite: the real weights, greedy generation, each step checked against the same model in numpy (the
 # same bf16 weights, float32 math). The model is written once, for ferrite Tensors and numpy arrays alike.
-#   TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "prompt" [tokens]
-# The weights are Hugging Face's openai-community/gpt2 model.safetensors; the tokenizer is tiktoken's "gpt2".
+#   TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "prompt" [tokens] [bfp8]
+# The weights are Hugging Face's openai-community/gpt2 model.safetensors; the tokenizer is tiktoken's "gpt2". bfp8: the
+# weight matrices in bfp8 on the chip (numpy then has them as the chip does).
 import json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
@@ -67,21 +68,25 @@ def load(path):
     out[name] = (bits, (bits.astype(np.uint32) << 16).view(np.float32))
   return out
 
-def upload(rt, weights):  # the weights as ferrite Tensors, the output layer's transposed on the chip
+def upload(rt, weights, dtype="bf16"):  # the weights as ferrite Tensors, the output layer's transposed on the chip, and
+  # the matrices a matmul reads as its B (the blocks' and the output layer) cast to dtype there
   t = {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
   t["wte.T"] = t["wte.weight"].T.realize()  # once, rather than read transposed every token
-  return t
+  return t | {k: x.cast(dtype).realize() for k, x in t.items() if k == "wte.T" or k.startswith("h.") and x.rows > 1}
 
-def arrays(weights):  # the same as numpy arrays
-  return {name: values for name, (_, values) in weights.items()} | {"wte.T": weights["wte.weight"][1].T}
+def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip (upload), those not in bf16 as the chip has them
+  w = {name: values for name, (_, values) in weights.items()} | {"wte.T": weights["wte.weight"][1].T}
+  return w | {k: values(x) for k, x in (t or {}).items() if x.dtype != "bf16"}
+
+def values(x):  # a ferrite matrix as numpy float32 (bf16 bits, or bfp8's as bf16)
+  return (np.frombuffer(x.tobytes(), np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(x.rows, x.cols)
 
 def mask(n): return np.triu(np.full((n, n), -1e9, np.float32), 1)
 
 def logits(ids, w, rt=None):
   """The logits for the token after ids, as a numpy vector: on the chip if rt is given (w: from upload), else in numpy."""
   if rt is None: return forward(ids, w, mask(len(ids)))[0]
-  bits = np.frombuffer(forward(ids, w, Tensor.of(rt, mask(len(ids)).tolist())).tobytes(), np.uint16)
-  return (bits.astype(np.uint32) << 16).view(np.float32)
+  return values(forward(ids, w, Tensor.of(rt, mask(len(ids)).tolist())))[0]
 
 def main():
   import tiktoken
@@ -89,11 +94,13 @@ def main():
   from ferrite.chip import Chip
   from ferrite.runtime import Runtime
   path, prompt, steps = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "The meaning of life is", int(sys.argv[3]) if len(sys.argv) > 3 else 8
+  dtype = sys.argv[4] if len(sys.argv) > 4 else "bf16"
   enc, chip = tiktoken.get_encoding("gpt2"), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   start = time.time()
   weights = load(path)
-  w, t = arrays(weights), upload(rt, weights)
+  t = upload(rt, weights, dtype)
+  w = arrays(weights, t)
   print(f"{sum(bits.size for bits, _ in weights.values()) / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
   ids, agree = enc.encode(prompt), 0
   print(prompt, end="", flush=True)

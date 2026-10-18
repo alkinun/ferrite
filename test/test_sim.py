@@ -15,6 +15,15 @@ def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even a
   b = np.asarray(a, np.float32).view(np.uint32)
   return ((b + (0x8000 if packer else 0x7FFF + (b >> 16 & 1))) & 0xFFFF0000).view(np.float32).astype(np.float64)
 
+def bfp8(a):  # numpy's bfp8 of bf16 values, as the packer makes it: each run of 16 in a row shares its largest exponent,
+  bits = np.asarray(a, np.float32).view(np.uint32) >> 16  # each value keeps 7 bits of magnitude below it, rounded half up
+  s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
+  runs = lambda x: x.reshape(x.shape[0], -1, 16)
+  top = runs(e).max(2, keepdims=True)
+  shift = np.minimum(top - runs(e), 8)  # 8 and more leave 0
+  q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
+  return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(a.shape)
+
 def close(t, want, tol):  # a tensor's values within tol (relative, and absolute near 0) of numpy's
   got = np.array(t.tolist())
   assert got.shape == want.shape and np.allclose(got, want, rtol=tol, atol=tol), f"off by up to {np.abs(got - want).max()}"
@@ -259,6 +268,18 @@ def test_matmul_fidelity(chip):
   ta, tb = Tensor.of(rt, a.tolist()), Tensor.of(rt, b.tolist())
   for phases, bound in ((3, 2**-8), (2, 2**-8 + 2**-7)):
     assert np.all(np.abs(value(ta.matmul(tb, fidelity=phases))[0] - a @ b) <= bound * (np.abs(a) @ np.abs(b))), phases
+
+def test_bfp8(chip):
+  # a cast to bfp8 is bit for bit numpy's model of it (bfp8 above), exponents spread wide within each run; and a matmul by
+  # a bfp8 B (read at 1088 bytes a tile, not 2048) is bit for bit the bf16 matmul by its values, whichever way B comes in:
+  # streamed beside A (K past 256 tiles), with A's row kept, a block's column kept, and K split
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rng = np.random.default_rng(5)
+  a = bf16(rng.normal(0, 1, (64, 96)) * np.exp(rng.normal(0, 2, (64, 96))))
+  assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast("bfp8"))[0], bfp8(a))
+  for m, k, n in ((64, 9000, 40), (1, 768, 2304), (100, 256, 200), (32, 2048, 64)):
+    x, w = Tensor.of(rt, rng.normal(0, 1, (m, k)).tolist()), Tensor.of(rt, rng.normal(0, 1, (k, n)).tolist()).cast("bfp8")
+    assert (x @ w).tolist() == (x @ Tensor.of(rt, w.tolist())).tolist(), (m, k, n)
 
 def test_matmul_multicast(chip):
   # with a grid of workers (Runtime.grid), a matmul of more than one row of tiles reads each input tile from DRAM
@@ -951,19 +972,23 @@ def test_torch(chip, monkeypatch):
     assert np.allclose(got, want, atol=1e-3), (got, want)
   assert not fell_back, fell_back
 
-@pytest.mark.parametrize("n", [16, 40])
-def test_gpt2_layer(chip, n):
-  # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so
-  # attention spans tiles), against the same code (test/gpt2.py) in numpy, float64, with the same bf16 weights. Weights
-  # as GPT-2 initialises them; the attention is causal and not uniform (scores of a few units). Every intermediate is
-  # bf16 here, so the block's change to x (up to ~2) must match to within 3% of its size
+@pytest.mark.parametrize("n, dtype", [(16, "bf16"), (40, "bf16"), (40, "bfp8")])
+def test_gpt2_layer(chip, n, dtype):
+  # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so attention spans tiles),
+  # against the same code (test/gpt2.py) in numpy, float64, with the same weights: bf16, or the matrices cast to bfp8 on
+  # the chip (numpy then has them as the chip does). Weights as GPT-2 initialises them; the attention is causal and not
+  # uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to ~2) must match to
+  # within 3% of its size
   rt, rng, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 768
   shapes = {"ln_1.weight": (1, d, 1), "ln_1.bias": (1, d, 0), "attn.c_attn.weight": (d, 3 * d, 0), "attn.c_attn.bias": (1, 3 * d, 0),
             "attn.c_proj.weight": (d, d, 0), "attn.c_proj.bias": (1, d, 0), "ln_2.weight": (1, d, 1), "ln_2.bias": (1, d, 0),
             "mlp.c_fc.weight": (d, 4 * d, 0), "mlp.c_fc.bias": (1, 4 * d, 0), "mlp.c_proj.weight": (4 * d, d, 0), "mlp.c_proj.bias": (1, d, 0)}
   p = {k: bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, c))) for k, (r, c, mean) in shapes.items()}
   x = bf16(rng.normal(0, 1, (n, d)))
-  got = gpt2.layer(Tensor.of(rt, x.tolist()), {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}, Tensor.of(rt, gpt2.mask(n).tolist()))
+  t = {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}
+  t |= {k: v.cast(dtype).realize() for k, v in t.items() if v.rows > 1}
+  p |= {k: gpt2.values(v) for k, v in t.items() if v.dtype != "bf16"}
+  got = gpt2.layer(Tensor.of(rt, x.tolist()), t, Tensor.of(rt, gpt2.mask(n).tolist()))
   got = np.array(got.tolist())
   want = gpt2.layer(x, p, gpt2.mask(n))
   change = np.abs(want - x).max()
