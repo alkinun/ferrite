@@ -420,19 +420,20 @@ def tt(words):
   return " ".join(c)
 
 FLAGS_B = 16  # FLAGS: A's flags (a grid row's workers), then from here B's (a grid column's)
-ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, the narrow ops, and what
-                          # stays in L1: A's rows, B's column or buffers, kept inputs
+DEPTH = 4  # matmul steps whose reads may be in flight at once, each through a stream slot of B's (and of A's, if it streams)
+ZERO_SLOT, FRAMES = 0, 1 + 2 * DEPTH  # slot 0 is a zero tile, then B's stream slots and A's, two frames, the narrow ops, and
+                                      # what stays in L1: A's rows, B's column or buffers, kept inputs
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
 B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")  # a matmul's bfp8 B, past the slots: the exponents of each of
                                                            # its slots, then their values (the unpacker's layout)
 
 # SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
-# one of them: FETCHED, how many times BRISC has fetched tiles into L1 (a frame, or a matmul step's pair); UNPACKED, how
-# many of those thread 0 has unpacked, from TRISC0; READY, set by TRISC0 once the backend config and semaphores are
-# set up; PACKED, how many results the pack thread has packed, from TRISC2, with where each goes in RING (four
-# entries [slot, tile]); SENT, how many of those BRISC has sent home.
+# one of them: FETCHED, how many frames BRISC has fetched into L1; ISSUED, how many matmul steps it has issued the reads
+# of; UNPACKED, how many frames and steps thread 0 has unpacked, from TRISC0; READY, set by TRISC0 once the backend
+# config and semaphores are set up; PACKED, how many results the pack thread has packed, from TRISC2, with where each
+# goes in RING (four entries [slot, tile]); SENT, how many of those BRISC has sent home.
 SYNC_WORDS = f"""
-enum {{ FETCHED, UNPACKED, READY, PACKED, SENT, RING = 8 }};
+enum {{ FETCHED, UNPACKED, READY, PACKED, SENT, ISSUED, RING = 8 }};
 #define SYNC ((volatile unsigned *){SYNC:#x})
 static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return SYNC[i]; }}  // fresh: the L0 cache sees no other core's writes
 """
@@ -455,7 +456,7 @@ def _brisc(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0):  # m
 #define SLOT(i) ({slot_base(dtype):#x} + (i) * {tb})  // where the unpackers read slot i
 #define OUT_SLOT(i) ({slot_base(dtype) if out == dtype else OUTS:#x} + (i) * {to})  // and where the packer writes it
 {BANKS}
-static unsigned fetched, events, frame_done[2], stream_done[2], steps, sent, out, rows[16];  // rows: i + 1 of what each place in L1 holds (fresh)
+static unsigned fetched, events, frame_done[2], stream_done[{DEPTH}], steps, sent, out, rows[16];  // rows: i + 1 of what each place in L1 holds (fresh)
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_get(BANK(t), base + t / 8 * {tb}, SLOT(slot), {tb}); }}
 // the same with its two off-diagonal faces swapped, half of transposing it (unpacker 0 does the rest)
@@ -479,15 +480,22 @@ static void get8(unsigned base, unsigned t, unsigned z) {{
   noc_get(BANK(t), at, {B8:#x} + 64 * z, 64);
   noc_get(BANK(t), at + 64, {B8 + 64 * b8:#x} + 1024 * z, 1024);
 }}
-// A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot (B 1-2, or 0-1 at B8; A 3-4) or
-// its place in the row or column kept in L1, unless it is there already (KEPT). how: B as it is (0), transposed (1), bfp8 (2)
+// A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot or its place in the row or column
+// kept in L1, unless it is there already (KEPT). how: B as it is (0), transposed (1), bfp8 (2). Step k's reads carry
+// transaction id k % DEPTH + 1, its stream slots': BRISC counts the steps whose reads are out (ISSUED), and thread 0
+// waits for that id's reads to land itself, so up to DEPTH steps' reads are in flight. A frame's reads carry id 0
 #define KEPT 0xFFFFFFFF
+static unsigned read_id;  // the transaction id initiator 1 puts on reads
+static void tagged(unsigned id) {{ if (id != read_id) {{ while (NIU1(CMD) & 1) {{}} NIU1(PACKET_TAG) = (read_id = id) << 10; }} }}
 static void step(unsigned how, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
-  reached(stream_done[steps & 1]);
+  unsigned s = steps % {DEPTH};
+  reached(stream_done[s]);  // the step that last used slot s has been unpacked
+  tagged(s + 1);
   if (b_slot != KEPT) {{ if (how == 1) flipped(b, b_tile, b_slot); else if (how == 2) get8(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}
   if (a_slot != KEPT) get(a, a_tile, a_slot);
-  ready();
-  stream_done[steps++ & 1] = ++events;
+  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU has counted the reads before thread 0 hears of them
+  stream_done[s] = ++events;
+  SYNC[ISSUED] = ++steps;
 }}
 // A row of A (or column of B) stays in L1, in place q, while the result tiles use it; when tag i, which row, changes,
 // the new one comes in once the old is unpacked
@@ -496,7 +504,7 @@ static unsigned fresh(unsigned q, unsigned i) {{
   reached(events);
   return rows[q] = i + 1;
 }}
-static void kept_step(void) {{ SYNC[FETCHED] = ++fetched; ++events; }}  // a matmul step whose tiles are in L1 already
+static void kept_step(void) {{ SYNC[ISSUED] = ++steps; ++events; }}  // a matmul step whose tiles are in L1 already
 // Tiles shared between workers by multicast. FLAGS: how many shares each worker of this one's grid row (of A's rows),
 // then of its grid column (of B's columns) has sent it. Each worker zeroes its own at the end (unflag): by then it has
 // seen every flag of the launch, and none is written again before the next go
@@ -541,9 +549,15 @@ static void share(unsigned slot, unsigned from, unsigned to, unsigned rect, unsi
 def _unpacker(body, cfg):  # TRISC0: the backend config and semaphores, then unpacking, each tile once BRISC has fetched it
   return TRISC + f"""
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
-static unsigned needed, relayed, steps;
+static unsigned needed, relayed, stepped;
 static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // the unpack reports, for BRISC
-static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next tiles
+static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next frame
+static unsigned landed(void) {{  // until the next matmul step's tiles are in: BRISC has issued its reads, and those (its
+  unsigned z = stepped++ % {DEPTH};  // transaction id's) have landed. Its stream slot
+  do relay(); while (peek(ISSUED) < stepped);  // relaying at least once a step, as SEM_UNPACKED holds 15
+  while (NIU(OUTSTANDING + 4 + 4 * z)) relay();
+  return z;
+}}
 {KMAIN}
   {" ".join(f"CFG[{i}] = {v:#x};" for i, v in cfg.items())}
   asm volatile("fence" ::: "memory");  // the config writes are out; a read from the same block is processed after them
@@ -603,13 +617,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   along it (a row, a column, or one tile position through the batch), so the reduction can stay on chip.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
-  its K pairs of tiles, B's streamed through slots 1-2 and A's row kept in L1 while the result tiles stay in its row
-  (if it fits below slot 256, else streamed through slots 3-4). A matmul with more than one row of tiles, given a
-  grid, reads each input tile from DRAM once: worker (gy, gx) of the grid computes one block, each worker of a grid
-  row reads its share of the block row's rows of A and multicasts it along the row, and each of a grid column its
-  share of each of the column's columns of B, down the column into one of three buffers, flagging each share (FLAGS)
-  once every recipient has it. A unary op runs on the SFPU over Dst: in place, on the result of the op below it if
-  nothing else reads that, or else on its operand plus the zero tile (slot 0). A reduction folds each tile of its
+  its K pairs of tiles, B's streamed through DEPTH slots (up to DEPTH steps' reads in flight) and A's row kept in L1
+  while the result tiles stay in its row (if it fits below slot 256, else streamed too). A matmul with more than one row
+  of tiles, given a grid, reads each input tile from DRAM once: worker (gy, gx) of the grid computes one block, each
+  worker of a grid row reads its share of the block row's rows of A and multicasts it along the row, and each of a grid
+  column its share of each of the column's columns of B, down the column into one of three buffers, flagging each share
+  (FLAGS) once every recipient has it. A unary op runs on the SFPU over Dst: in place, on the result of the op below it
+  if nothing else reads that, or else on its operand plus the zero tile (slot 0). A reduction folds each tile of its
   operand along the axis into an accumulator in Dst, then across the tile (across_rows, across_cols), and packs one
   tile.
   A line is done in passes: a pass is a sweep over its tiles, and a reduction's result can only be read in the pass
@@ -715,8 +729,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     bq = min(4, w) if bp > 1 else 1
   if bp > 1 or mc: rows_at = [base]  # A's bp rows, then B's column (or its three buffers)
   kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 or mc else None
-  # a bfp8 B goes to slots of its own at B8 (B's column, or two to stream through), unpacker 0 switched to them for its steps
-  b8 = (ops[matmuls[0]]["kt"] if kept_b is not None else 2) if any(ops[j]["how"] == 2 for j in matmuls) else 0
+  # a bfp8 B goes to slots of its own at B8 (B's column, or DEPTH to stream through), unpacker 0 switched to them for its steps
+  b8 = (ops[matmuls[0]]["kt"] if kept_b is not None else DEPTH) if any(ops[j]["how"] == 2 for j in matmuls) else 0
   br, bc = (mc[1], len(grid[0])) if mc else (-(-rt // bp), -(-w // bq))  # blocks down and across a matrix (the grid's)
   decls, tail = "", ""  # BRISC's tables and statics for a multicast matmul or kept inputs, and its last words
   if mc:
@@ -810,23 +824,23 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           elif kept_b is not None:  # A's bp rows and B's column in L1
             c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
                         f"for (unsigned m = 0; m < {kt}; m++) step({how}, a[{y}], {b_tile}, nb ? {0 if how == 2 else kept_b} + m : KEPT, "
-                        f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
+                        f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); tagged(0); }}")
           if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
             walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
                     ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
             column = f"{kept_b} + jj % 3 * {kt}" if mc else 0 if how == 2 else kept_b
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
-                        f"{on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }} {off}{posted} }}")
+                        f"{on} for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(walk)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
-            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({how}, a[{y}], {b_tile}, {bs} + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
-            c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(unpack(bs + 1, 4) + REPORT)} }} else {{ {tt(unpack(bs, 3) + REPORT)} }} }} {off}{posted} }}")
+            c[B].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) "
+                        f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, {1 + DEPTH} + steps % {DEPTH}); tagged(0); }}")
+            c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
+                        f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
           else:
             c[B].append(f"{cond}{{ unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({how}, a[{y}], {b_tile}, {bs} + (steps & 1), a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); }}")
-            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
-                        f"if (steps++ & 1) {{ {tt(step_unpack(bs + 1))} }} else {{ {tt(step_unpack(bs))} }} }} {off}{posted} }}")
+                        f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
+            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ "
+                        f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
           c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} "
                       f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases']))} }} "
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")

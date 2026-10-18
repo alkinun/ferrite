@@ -174,6 +174,9 @@ append a correction.
     waited for its flag: its 24 reads a column, about 36 instructions each, were the whole of a matmul's time on ttsim.
     Cheaper requests took it from 8.9k cycles to 7.0k; a share of the reads for every worker, to 1.7k. (NOTES: "Cutting
     the critical path")
+28. **Wait where waiting is free.** Several reads in flight need someone to see each step's reads land. BRISC, which
+    everyone waits on, took 30 more instructions a step to watch them (a GPT-2 token 111k cycles to 147k); thread 0's
+    TRISC, which waits for those tiles anyway, watches them for 3k. (NOTES: "Reads in flight")
 
 ## Working method
 
