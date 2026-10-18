@@ -44,15 +44,15 @@ def adam(params, state, step, lr, b1=0.9, b2=0.999, eps=1e-8):  # PyTorch's Adam
     p.assign(p - m * (lr / (1 - b1**step)) / (v.sqrt() * (1 / math.sqrt(1 - b2**step)) + eps))
     p.grad = None
 
-def train(rt, steps, c=None, lr=3e-3, log=None):
+def train(rt, steps, c=None, lr=3e-3, log=None, data=None):
   """steps of training on ferrite, and PyTorch beside it. Each step, PyTorch takes ferrite's weights as they are and
   computes the same loss and gradients; and PyTorch also trains by itself, from the same first weights on the same text.
   The two runs part, though each step is right: Adam's first step moves every weight by lr times the sign of its
   gradient, so a weight whose gradient is below the matmul's 2^-11 moves either way, and the runs go on from there.
   Returns, each step: ferrite's loss, PyTorch's on the same weights, the gradients' worst error (relative to each
-  weight's largest), and PyTorch's own run's loss."""
+  weight's largest), and PyTorch's own run's loss. data: the text (README and LESSONS unless given)."""
   import torch
-  data = text()
+  data = data or text()
   chars = sorted(set(data))
   c = c or SimpleNamespace(ctx=64, dim=64, heads=2, layers=2)
   c.vocab, ids, rng = len(chars), np.array([chars.index(ch) for ch in data]), np.random.default_rng(1)
