@@ -87,6 +87,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPENCC": (0x8A, {"mod1": (0, 4), "vd": (4, 4), "imm2": (12, 2)}),
   "SFPSWAP": (0x92, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
   "SFPSHFT2": (0x94, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 3: rotate each 8-lane group (a Dst row) by one
+  "SFPTRANSP": (0x8C, {}),  # LRegs 0-3 (and 4-7) as a 4 x 4 of 8-lane groups, transposed: group j of LReg i swaps with group i of LReg j
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }
 UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets

@@ -322,23 +322,48 @@ def test_sfpu(chip):
 
 def test_reductions(chip):
   # row max exactly, row sum to a bf16 step of the sum of magnitudes, each a column; then broadcast back:
-  # x - rowmax(x), and a column times a number, all against Python
+  # x - max(x) along rows, and a column times a number, all against Python
   rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 96
   bf = lambda v: from_bf16(to_bf16(v))
   x = [[bf(random.uniform(-4, 4)) for _ in range(cols)] for _ in range(rows)]
   tx = Tensor.of(rt, x)
-  assert tx.rowmax().tolist() == [[max(row)] for row in x]
-  for (got,), row in zip(tx.rowsum().tolist(), x):
+  assert tx.max(2).tolist() == [[max(row)] for row in x]
+  for (got,), row in zip(tx.sum(2).tolist(), x):
     assert abs(got - sum(row)) <= 2**-8 * sum(map(abs, row)), (got, sum(row))
-  for got, row in zip((tx - tx.rowmax()).tolist(), x):
+  for got, row in zip((tx - tx.max(2)).tolist(), x):
     assert all(abs(g - (v - max(row))) <= 2**-7 * max(abs(v), abs(max(row))) for g, v in zip(got, row))
-  assert (tx.rowmax() * 0.5).tolist() == [[max(row) / 2] for row in x]
+  assert (tx.max(2) * 0.5).tolist() == [[max(row) / 2] for row in x]
   # a kernel sweeps its rows at one width and has two accumulators: reductions of a wider tensor, and a third, run first
   # on their own (found by test_fuzz's longer runs)
   y = [[bf(random.uniform(-4, 4)) for _ in range(200)] for _ in range(rows)]
   ty = Tensor.of(rt, y)
-  for (got,), a, b in zip((tx.rowmax() + ty.rowmax()).tolist(), x, y): assert abs(got - (max(a) + max(b))) <= 2**-6 * 8, (got, a, b)
-  for (got,), a in zip((tx.rowmax() + tx.rowsum() * 0.0 + (tx * 2.0).rowmax()).tolist(), x): assert abs(got - 3 * max(a)) <= 2**-6 * 12
+  for (got,), a, b in zip((tx.max(2) + ty.max(2)).tolist(), x, y): assert abs(got - (max(a) + max(b))) <= 2**-6 * 8, (got, a, b)
+  for (got,), a in zip((tx.max(2) + tx.sum(2) * 0.0 + (tx * 2.0).max(2)).tolist(), x): assert abs(got - 3 * max(a)) <= 2**-6 * 12
+
+def test_reduce_axes(chip):
+  # sum and max down the rows (one row) and through the batch (one matrix), as along each row: one launch each, the
+  # padding past the last tile row masked (every value negative, so an unmasked 0 would win a max, and padding rows
+  # would add in), the results broadcast back (a column softmax), a mean over everything, and a sum through the batch
+  # fused with what reads it. On one worker (a column of tiles cycling through the slots) and on many
+  rng = np.random.default_rng(6)
+  for workers in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, chip.tensix[0], workers)
+    x = bf16(rng.uniform(-6, -1, (3, 45, 70)))
+    tx = Tensor.of(rt, x.tolist())
+    value = lambda t: np.array(t.tolist()).reshape(t.shape)
+    for axis in (0, 1, 2):
+      launches, top, total = rt.launches, value(tx.max(axis)), value(tx.sum(axis))
+      assert rt.launches == launches + 2 and top.tolist() == x.max(axis, keepdims=True).tolist()
+      assert np.allclose(total, x.sum(axis, keepdims=True), rtol=2**-8, atol=2**-8), np.abs(total - x.sum(axis, keepdims=True)).max()
+    e = np.exp(x - x.max(1, keepdims=True))
+    close((tx - tx.max(1)).exp() / (tx - tx.max(1)).exp().sum(1), e / e.sum(1, keepdims=True), 0.02)
+    launches, got = rt.launches, tx.sum() * (1 / x.size)
+    assert abs(got.tolist()[0][0] - x.mean()) <= 2**-7 * abs(x.mean()) and rt.launches == launches + 3, "an axis a launch"
+    close(tx.sum(0) * tx[1] - 1.0, x.sum(0) * x[1] - 1, 2**-6)  # the batch sum, a view and a number in one kernel
+    narrow = bf16(rng.uniform(-3, -1, (20, 70)))  # one tile tall: reduced on its own, and inside a taller kernel
+    tnarrow = Tensor.of(rt, narrow.tolist())
+    assert tnarrow.max(1).tolist() == narrow.max(0, keepdims=True).tolist()
+    close(tnarrow.sum(1) + tx[2], narrow.sum(0, keepdims=True) + x[2], 2**-6)
 
 def test_any_shape(chip):
   # 45 x 70 is two tile rows by three tile columns, the last of each cut short; a dimension of 1 broadcasts. Results go
@@ -353,13 +378,13 @@ def test_any_shape(chip):
   close(tx + ty, x + y, 2**-7)
   close(tx * trow + tcol - 2.5, x * row + col - 2.5, 2**-6)
   neg, tneg = make(45, 70, -6, -1)
-  assert tneg.rowmax().tolist() == neg.max(1, keepdims=True).tolist()
-  close(tneg.rowsum(), neg.sum(1, keepdims=True), 2**-8)
+  assert tneg.max(2).tolist() == neg.max(1, keepdims=True).tolist()
+  close(tneg.sum(2), neg.sum(1, keepdims=True), 2**-8)
   e = np.exp(neg - neg.max(1, keepdims=True))
-  close((tneg - tneg.rowmax()).exp() / (tneg - tneg.rowmax()).exp().rowsum(), e / e.sum(1, keepdims=True), 0.02)
+  close((tneg - tneg.max(2)).exp() / (tneg - tneg.max(2)).exp().sum(2), e / e.sum(1, keepdims=True), 0.02)
   narrow, tnarrow = make(45, 20, -3, -1)  # one tile wide: reduced on its own, and inside a three-tile-wide kernel
-  assert tnarrow.rowmax().tolist() == narrow.max(1, keepdims=True).tolist()
-  close(tnarrow.rowsum() + tx, narrow.sum(1, keepdims=True) + x, 2**-6)
+  assert tnarrow.max(2).tolist() == narrow.max(1, keepdims=True).tolist()
+  close(tnarrow.sum(2) + tx, narrow.sum(1, keepdims=True) + x, 2**-6)
   (a, ta), (b, tb) = make(45, 50, -1, 1), make(50, 70, -1, 1)
   close(ta.exp() @ tb.exp(), bf16(np.exp(a)) @ bf16(np.exp(b)), 2**-6)
 
@@ -395,9 +420,9 @@ def test_batch(chip):
   assert tx.shape == (3, 40, 70) and ty.shape == (1, 40, 70) and np.array(tx.tolist()).tolist() == x.tolist()
   assert (tx * ty).tolist() == bf16(x * y, True).tolist() and (tx[1] * 2.0).tolist() == (x[1] * 2).tolist()
   close(tx - trow + 1.0, x - row + 1, 2**-6)
-  assert tx.rowmax().tolist() == x.max(2, keepdims=True).tolist()
+  assert tx.max(2).tolist() == x.max(2, keepdims=True).tolist()
   e = np.exp(x - x.max(2, keepdims=True))
-  close((tx - tx.rowmax()).exp() / (tx - tx.rowmax()).exp().rowsum(), e / e.sum(2, keepdims=True), 0.02)
+  close((tx - tx.max(2)).exp() / (tx - tx.max(2)).exp().sum(2), e / e.sum(2, keepdims=True), 0.02)
   (a, ta), (b, tb), (w, tw) = make(3, 40, 96), make(3, 96, 70), make(96, 70)
   close(ta @ tb, a @ b, 2**-6)
   close(ta @ tw + trow, a @ w + row, 2**-6)
@@ -418,7 +443,8 @@ def test_batch(chip):
   close(Tensor.of(one, a.tolist()) @ Tensor.of(one, b.tolist()), a @ b, 2**-6)  # tile row a matrix: A's row in L1 changes with the matrix
 
 def test_fuzz(chip, monkeypatch):
-  # random expressions (elementwise ops with broadcasting, unary ops, row reductions, matmuls; odd shapes, batches), and
+  # random expressions (elementwise ops with broadcasting, unary ops, reductions along any axis, matmuls; odd shapes,
+  # batches), and
   # every kernel they turn into checked against numpy on the same inputs, read back from the chip: whatever bf16 rounding
   # piles up through a tree, each kernel must be right about its own inputs
   rt, checked = Runtime(chip, chip.tensix[0], chip.tensix[-1]), []
@@ -426,9 +452,10 @@ def test_fuzz(chip, monkeypatch):
   def numpy(e, xs):
     if isinstance(e, int): return xs[e]
     v = [numpy(s, xs) for s in e[1:]]
-    return {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "T": lambda a: a.swapaxes(-1, -2), "relu": lambda a: np.maximum(a, 0),
-            "exp": np.exp, "recip": lambda a: 1 / a, "rsqrt": lambda a: 1 / np.sqrt(a),
-            "rowsum": lambda a: a.sum(-1, keepdims=True), "rowmax": lambda a: a.max(-1, keepdims=True)}[e[0]](*v)
+    f = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "T": lambda a: a.swapaxes(-1, -2), "relu": lambda a: np.maximum(a, 0),
+            "exp": np.exp, "recip": lambda a: 1 / a, "rsqrt": lambda a: 1 / np.sqrt(a)} | {
+            k: lambda a, k=k: getattr(a, k[:3])(int(k[3]), keepdims=True) for k in compiler.FOLDS}  # sum0, max2, ...
+    return f[e[0]](*v)
   realize = Tensor.realize
   def checked_realize(t):
     if t.op is None: return t
@@ -437,7 +464,7 @@ def test_fuzz(chip, monkeypatch):
       while compiler._ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: compiler._ops(s, set()))
       u.realize()
     inputs = []
-    e = compiler._expr(t, (t.batch, t.rows), inputs, [-(-t.cols // 32) if t.cols > 1 else None, set()])
+    e = compiler._tree(t, inputs)
     xs = [value(u) for u in inputs]
     realize(t)
     want, got = numpy(e, xs), value(t)
@@ -460,10 +487,11 @@ def test_fuzz(chip, monkeypatch):
     if kind == "unary":
       x = gen(shape, depth - 1)
       return rng.choice([x.relu, (x * 0.5).exp, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt])()
-    if kind == "red" and c == 1:  # values stay near 1 (means, not sums), or exp would turn rounding into large errors
-      n = int(rng.choice([20, 32, 70, 96, 192]))
-      x = gen((b, r, n), depth - 1)
-      return x.rowsum() * (1 / n) if rng.random() < 0.5 else x.rowmax()
+    if kind == "red" and 1 in shape:  # along an axis that is 1 here (the batch, rows or columns). Values stay near 1
+      axis = int(rng.choice([ax for ax, d in enumerate(shape) if d == 1]))  # (means, not sums), or exp would turn
+      n = int(rng.choice([2, 3] if axis == 0 else [20, 32, 70, 96, 192]))   # rounding into large errors
+      x = gen(tuple(n if ax == axis else d for ax, d in enumerate(shape)), depth - 1)
+      return x.sum(axis) * (1 / n) if rng.random() < 0.5 else x.max(axis)
     if kind == "mm" and r > 1 and c > 1:
       k = int(rng.choice([32, 50, 64]))
       bb = b if rng.random() < 0.5 else 1
@@ -472,7 +500,7 @@ def test_fuzz(chip, monkeypatch):
   for _ in range(30):  # sizes past 4 tiles make part-blocks of matmul results
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
     gen(shape, 4).realize()
-  assert len(checked) >= 20 and any(e[0] == "matmul" or "rowsum" in str(e) for e in checked)
+  assert len(checked) >= 20 and any(e[0] == "matmul" or "sum" in str(e) for e in checked)
 
 def test_mnist_mlp(chip):
   # goal 1's halfway mark: an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
@@ -527,7 +555,7 @@ def test_gpt2_model(chip):
 
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions
-  # staying in Dst and their results in L1. softmax(x) = e / rowsum(e) with e = exp(x - rowmax(x)), three passes;
+  # staying in Dst and their results in L1. softmax(x) = e / sum(e) with e = exp(x - max(x)), along each row, three passes;
   # layernorm(x) = (x - mean) * rsqrt(var + eps) * gamma + beta, gamma and beta rows, repeated down.
   # On one worker (3 rows in a row, slots and accumulators reused) and on many
   bf = lambda v: from_bf16(to_bf16(v))

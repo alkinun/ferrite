@@ -1,6 +1,6 @@
 # The compiler: tensor ops emitted as Tensix instructions straight from the ISA, no LLK. A tensor lives in DRAM as
 # bf16 32x32 tiles, tile i in bank i % 8. Ops are lazy: a tree of elementwise ops, matmuls, SFPU ops (relu, exp,
-# reciprocal, rsqrt) and row reductions becomes one fused kernel, which fetches each input tile once, keeps every
+# reciprocal, rsqrt) and reductions along an axis becomes one fused kernel, which fetches each input tile once, keeps every
 # intermediate in L1 and writes only the result to DRAM. A kernel is four programs for each worker tile: BRISC fetches
 # operand tiles into L1 over the NoC and sends results home, and each TRISC feeds one Tensix thread its instructions
 # (unpack, math, pack), the three running at the same time on different tiles.
@@ -20,7 +20,7 @@ DST_HALF = 64  # Dst rows of one result in fp32; Dst holds two, so math fills on
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2  # results in Dst to pack, outputs packed but not reported, and
                                                        # intermediates packed into L1 but not yet waited for
 SEM_UNPACKED = 1 << 5  # frames (and matmul steps) unpacked but not reported
-ACCS = ((256, 1 << 3), (320, 1 << 4))  # row reductions accumulate here in Dst (scratch 128 rows on), each with a
+ACCS = ((256, 1 << 3), (320, 1 << 4))  # reductions accumulate here in Dst (scratch 128 rows on), each with a
                                        # semaphore that is 1 while it is free: taken by the first step, given back by the pack
 
 def ins(name, **fields):
@@ -168,13 +168,15 @@ SFPU = {
              ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +  # LReg 1 = magic - LReg 1 as integers; LReg 5 = x/2
             [w for _ in range(2) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, negate_a=1), mul(1, 1, 6))] + [sfp_store(1)]),
 }
-# Reductions along rows: x + 0 lands in Dst (the first column tile in the result's half, the rest 128 rows further
-# on, where the SFPU folds them in). Then each row is folded across its 32 columns and the result written to all of
-# them, so the tile broadcasts along rows as is.
+# Reductions along an axis (0: the batch, to one matrix; 1: rows, to one row; 2: columns, to one column): each tile
+# along it is x + 0 into Dst (the first in the result's half, the rest 128 rows further on, where the SFPU folds them
+# in). Then each row or column of the tile is folded across its 32 and the result written to all of them, so the tile
+# broadcasts along that axis as is (over the batch, the tiles were folded as they came and there is nothing left).
+FOLDS = {f"{f}{ax}": ax for f in ("sum", "max") for ax in range(3)}  # kind -> the axis it folds
 def fold(kind, d, t):  # LReg d = d op t (for max, t is left with the min)
-  return ins("SFPSWAP", vd=t, vc=d, mod1=1) if kind == "rowmax" else mad(d, t, ONE, d)
+  return ins("SFPSWAP", vd=t, vc=d, mod1=1) if kind[:3] == "max" else mad(d, t, ONE, d)
 COMBINE = {k: [ins("SFPLOAD", vd=0, mod0=3, addr_mode=2), ins("SFPLOAD", vd=1, mod0=3, addr_mode=2, imm10=128), fold(k, 0, 1), sfp_store(0)]
-           for k in ("rowsum", "rowmax")}
+           for k in FOLDS}
 def across_rows(kind):
   """Fold every tile row across its 32 columns. Row r of a tile is Dst row (r // 16) * 32 + r % 16 (columns 0-15)
   and 16 rows on (16-31); an SFPLOAD takes 4 such rows' even or odd columns, one row per 8-lane group. Folding the
@@ -189,28 +191,45 @@ def across_rows(kind):
     p += [rot(1, 0), fold(kind, 0, 1), rot(1, 0), rot(1, 1), fold(kind, 0, 1), rot(1, 0), rot(1, 1), rot(1, 1), rot(1, 1), fold(kind, 0, 1)]
     p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
   return p
-def mask_columns(kind, n, d):
+def across_cols(kind):
+  """Fold every tile column across its 32 rows. Column c of a tile is lane c % 16 // 2 of the loads at the even (c even)
+  or odd addresses of its two faces (the left ones for c < 16), a row of it in each 8-lane group: the 8 loads fold into
+  one register, three copies and SFPTRANSP put each of its lane groups across a register of its own, and folding those
+  leaves the column's result in every lane, which goes back to all 8 places."""
+  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+  for half, odd in [(h, o) for h in (0, 16) for o in (0, 2)]:
+    at = [half + odd + base for base in (0, 4, 8, 12, 32, 36, 40, 44)]  # top face rows 0-15, bottom face
+    p += [ins("SFPLOAD", vd=0, mod0=3, addr_mode=2, imm10=at[0])]
+    p += [w for a in at[1:] for w in (ins("SFPLOAD", vd=1, mod0=3, addr_mode=2, imm10=a), fold(kind, 0, 1))]
+    p += [ins("SFPMOV", vd=r, vc=0) for r in (1, 2, 3)] + [ins("SFPTRANSP")] + [fold(kind, 0, r) for r in (1, 2, 3)]
+    p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
+  return p
+ACROSS = {0: lambda kind: [], 1: across_cols, 2: across_rows}
+def masking(kind):  # the SFPU after the FPU, and the reduction's identity in a register: 0 (LReg 9), or -inf in LReg 5 for max
+  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+  return (p, ZERO) if kind[:3] == "sum" else (p + sfp_const(5, -math.inf), 5)
+def mask_columns(kind, n, d=0):
   """Columns n and on of the tile at Dst row d to the reduction's identity (0, or -inf for max), so the padding past a
   tensor's last column does not count. An SFPSTORE writes 4 rows of 8 even or odd columns, lane l at column 2 (l % 8)
   (+ 1 if odd); LReg 15 holds 2l, so LReg 7 = LReg 15 & 14 is twice the lane's place in its row, and each store goes to
   the lanes whose column is n or more."""
-  fill = ZERO if kind == "rowsum" else 5
-  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
-  p += ([] if kind == "rowsum" else sfp_const(5, -math.inf)) + sfp_bits(7, 14) + [ins("SFPAND", vd=7, vc=15)]
+  p, fill = masking(kind)
+  p += sfp_bits(7, 14) + [ins("SFPAND", vd=7, vc=15)]
   for base, right, odd in [(b, r, o) for b in (0, 4, 8, 12, 32, 36, 40, 44) for r in (0, 1) for o in (0, 1)]:
     t = max(0, min(8, -(-(n - 16 * right - odd) // 2)))  # the first lane (of 8) at column n or more
     if t < 8: p += [ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=7, mod1=9, imm12=-2 * t & 0xFFF),  # lanes t+
                     ins("SFPSTORE", vd=fill, mod0=3, addr_mode=2, imm10=d + base + 16 * right + 2 * odd)]  # right faces: 16 rows on
   return p + [ins("SFPENCC", mod1=10, imm2=2)]
-def mask_rows(m):
-  """Rows m and on of the tile at the math thread's Dst half to 0, past a result's last row. A store covers 4 rows, lane l
-  in row l // 8 of them, and LReg 15 holds 2l, so LReg 15 - 16k >= 0 picks the rows from k on."""
-  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+def mask_rows(kind, m, d=0):
+  """Rows m and on of the tile at Dst row d to the identity, past a tensor's last row. A store covers 4 rows, lane l in
+  row l // 8 of them, and LReg 15 holds 2l, so LReg 15 - 16k >= 0 picks the rows from k on."""
+  p, fill = masking(kind)
   for r in range(0, 32, 4):  # tile rows r..r+3: Dst rows (r // 16) * 32 + r % 16 on, left face, and 16 more, right face
     k = max(0, m - r)
-    if k < 4: p += [w for d in (0, 2, 16, 18) for w in (ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=15, mod1=9, imm12=-16 * k & 0xFFF),
-                                                     ins("SFPSTORE", vd=ZERO, mod0=3, addr_mode=2, imm10=r // 16 * 32 + r % 16 + d))]
+    if k < 4: p += [w for o in (0, 2, 16, 18) for w in (ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=15, mod1=9, imm12=-16 * k & 0xFFF),
+                                                     ins("SFPSTORE", vd=fill, mod0=3, addr_mode=2, imm10=d + r // 16 * 32 + r % 16 + o))]
   return p + [ins("SFPENCC", mod1=10, imm2=2)]
+MASK = {1: mask_rows, 2: mask_columns}  # the padding past the last tile along an axis
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
@@ -240,16 +259,17 @@ def elementwise(op, slots, dst=0):
 
 def at(row): return ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=row)  # aim FPU and SFPU at row
 def reduce_step(kind, slots, acc, first, edge=0):
-  """One column tile of a row reduction, which has SrcA = the tile and SrcB = zeros: the first lands in the
-  accumulator once it is free; later ones land in scratch and the SFPU folds them in. edge: how many of the tile's
-  columns are the tensor's, if it is the row's last and cut short."""
+  """One tile of a reduction, which has SrcA = the tile and SrcB = zeros: the first lands in the accumulator once it is
+  free; later ones land in scratch and the SFPU folds them in. edge: how many of the tile's rows or columns along the
+  axis are the tensor's, if it is the line's last and cut short."""
   row, sem = ACCS[acc]
+  mask = lambda d: MASK[FOLDS[kind]](kind, edge, d) if edge else []
   if first: return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem), at(row)] +
-                    elementwise("add", slots) + (mask_columns(kind, edge, 0) if edge else []))
-  return ([at(row)] + elementwise("add", slots, dst=128) + (mask_columns(kind, edge, 128) if edge else []) +
+                    elementwise("add", slots) + mask(0))
+  return ([at(row)] + elementwise("add", slots, dst=128) + mask(128) +
           [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] + runs(slots, kind, 32))
-def reduce_finish(kind, slots, acc, posts):  # fold each row across and run the SFPU ops on the result (then MATH_END)
-  return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), at(ACCS[acc][0])] + across_rows(kind) + sfpu(posts, slots)
+def reduce_finish(kind, slots, acc, posts):  # fold across the tile and run the SFPU ops on the result (then MATH_END)
+  return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), at(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, slots)
 
 def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU just wrote
   return [w for u in posts for w in [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
@@ -387,24 +407,25 @@ void kmain(volatile unsigned *a) {{
 }}"""
 
 def fused_kernel(expr, shapes):
-  """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt,
-  rowsum and rowmax, ("matmul", a, b) where a is an input and b an input or ("T", input), read transposed, and plain
-  numbers for inputs. shapes: each input's
-  (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting).
+  """A kernel for an expression: nested tuples, (op, x, y) for add, sub and mul, (op, x) for relu, exp, recip, rsqrt and
+  the reductions (FOLDS: sum0, max2, ...), ("matmul", a, b) where a is an input and b an input or ("T", input), read
+  transposed, and plain numbers for inputs. shapes: each input's (batch, rows, columns), laid out as Tensor says; a
+  dimension of 1 repeats across the others (broadcasting).
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
   offset (Tensor's)]. A unit is a tile of the result, or a block of up to 4 x 4 of them (one matmul and nothing that
-  reduces rows), or, if the expression reduces rows, a whole row of tiles, so the reduction can stay on chip; units run
-  through the batch, matrix after matrix.
+  reduces), or, if the expression reduces along an axis, a whole line of tiles along it (a row, a column, or one tile
+  position through the batch), so the reduction can stay on chip.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
   its K pairs of tiles, B's streamed through slots 1-2 and A's row kept in L1 while the result tiles stay in its row
   (if it fits below slot 256, else streamed through slots 3-4). A unary op runs on the SFPU over Dst: in place, on the
-  result of the op below it if nothing else reads that, or else on its operand plus the zero tile (slot 0). A row reduction folds each column
-  tile of its operand into an accumulator in Dst, then across the row (see across_rows), and packs one tile.
-  A row is done in passes: a pass is a sweep over its column tiles, and a reduction's result can only be read in the
-  pass after the one that swept it. Each pass recomputes what it needs (softmax computes exp twice) rather than keep
-  whole rows in L1. Values one tile wide (reductions, ops on them, narrow inputs) are worked out once per row, in the
-  first tile of the pass that needs them, into slots of their own.
+  result of the op below it if nothing else reads that, or else on its operand plus the zero tile (slot 0). A reduction
+  folds each tile of its operand along the axis into an accumulator in Dst, then across the tile (across_rows,
+  across_cols), and packs one tile.
+  A line is done in passes: a pass is a sweep over its tiles, and a reduction's result can only be read in the pass
+  after the one that swept it. Each pass recomputes what it needs (softmax computes exp twice) rather than keep whole
+  lines in L1. Values one tile long along the axis (reductions, ops on them, inputs of 1 there) are worked out once per
+  line, in the first tile of the pass that needs them, into slots of their own.
   Two frames of slots alternate between tiles: inputs, then one slot per op. Every intermediate is rounded to bf16 on
   its way to L1, exactly as if each op ran on its own; in-place SFPU ops see the fp32 result.
   The four programs run the same loops over units, passes and tiles, each doing its own part of every tile."""
@@ -416,43 +437,48 @@ def fused_kernel(expr, shapes):
       uses[c] = uses.get(c, 0) + 1
       count(c)
   count(expr)
-  batch, shapes = [b for b, _, _ in shapes], [(r, c) for _, r, c in shapes]
-  tiles = [(-(-r // 32), -(-c // 32)) for r, c in shapes]
-  ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, shape, width; refs: expr -> input number or ("op", j)
-  size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (rows, columns)
-  width = lambda r: tiles[r][1] if isinstance(r, int) else ops[r[1]]["width"]  # in tiles
+  ext = lambda s, ax: s[ax] if ax == 0 else -(-s[ax] // 32)  # a shape's extent along an axis: matrices, or tiles
+  ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, shape; refs: expr -> input number or ("op", j)
+  size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (batch, rows, columns)
   def visit(e):
     if isinstance(e, int): return e
     if e in refs: return refs[e]
     if e[0] == "matmul":  # B is an input, or ("T", input): that input transposed
       bt, y = (True, e[2][1]) if isinstance(e[2], tuple) else (False, e[2])
-      op = dict(kind="matmul", x=e[1], y=y, bt=bt, kt=tiles[e[1]][1], shape=(shapes[e[1]][0], shapes[y][0 if bt else 1]), width=tiles[y][0 if bt else 1])
+      a = shapes[e[1]]
+      op = dict(kind="matmul", x=e[1], y=y, bt=bt, kt=ext(a, 2), shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if bt else 2]))
     elif e[0] in COMBINE:
       x = visit(e[1])
-      op = dict(kind=e[0], x=x, shape=(size(x)[0], 1), width=1)
+      op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
     elif e[0] in SFPU:
       x = visit(e[1])
       if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below
         ops[x[1]]["posts"].append(e[0])
         refs[e] = x
         return x
-      op = dict(kind="add", x=x, y="zero", shape=size(x), width=width(x), posts=[e[0]])  # operand + 0 into Dst, then the SFPU
+      op = dict(kind="add", x=x, y="zero", shape=size(x), posts=[e[0]])  # operand + 0 into Dst, then the SFPU
     else:
       x, y = visit(e[1]), visit(e[2])
-      op = dict(kind=e[0], x=x, y=y, shape=tuple(map(max, size(x), size(y))), width=max(width(x), width(y)))
+      op = dict(kind=e[0], x=x, y=y, shape=tuple(map(max, size(x), size(y))))
     ops.append({"posts": [], **op})
     refs[e] = ("op", len(ops) - 1)
     return refs[e]
   root = visit(expr)[1]
   operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
-  # w: the row's width in tiles, what ops sweep (a matmul's A can be wider: its columns are K, streamed, not swept)
-  inputs, w = len(shapes), max([op["width"] for op in ops] + [width(r) for op in ops for r in operands(op)])
-  assert all(width(r) in (1, w) for op in ops for r in operands(op)), "a kernel sweeps its rows at one width"
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
-  wide = lambda r: r != "zero" and width(r) == w and not reduced(r)  # varies along the row; otherwise one tile a row
-  rowwise = any(op["kind"] in COMBINE for op in ops)
+  axes = {FOLDS[op["kind"]] for op in ops if op["kind"] in COMBINE}
+  assert len(axes) <= 1, "a kernel reduces along one axis"
+  reducing, axis = bool(axes), next(iter(axes), 2)  # the axis swept, in passes; otherwise units are tiles, j along a row
+  # n: the result's extent along each axis, what ops sweep along the one they reduce (a matmul's A can be wider: its
+  # columns are K, streamed, not swept)
+  inputs = len(shapes)
+  n = [max([ext(op["shape"], ax) for op in ops] + [ext(size(r), ax) for op in ops for r in operands(op)]) for ax in range(3)]
+  nb, rt, w = n
+  L = n[axis]  # the sweep's length
+  assert all(ext(size(r), axis) in (1, L) for op in ops for r in operands(op)), "a kernel sweeps its lines at one length"
+  swept = lambda r: r != "zero" and ext(size(r), axis) == L and not reduced(r)  # varies along the sweep; otherwise one tile a line
   assert len(ops) <= 15, "SEM_L1 counts at most 15 intermediates"
-  # passes: a wide op runs in the pass after every reduction it depends on has finished; a narrow one is ready then
+  # passes: a swept op runs in the pass after every reduction it depends on has finished; a narrow one is ready then
   ready, sweep = {}, {}  # ready: first pass a value can be read in; sweep: pass a reduction sweeps its operand in
   for j, op in enumerate(ops):
     deps = [ready[r[1]] if isinstance(r, tuple) else 0 for r in operands(op)]
@@ -468,62 +494,63 @@ def fused_kernel(expr, shapes):
     fits = top + ops[j]["kt"] <= UNPACKABLE
     rows_at.append(top if fits else None)
     top += ops[j]["kt"] if fits else 0
-  rows, cols = size(("op", root))
-  rt = -(-rows // 32)  # the result's tile rows (in each matrix of the batch)
-  # With one matmul and no row passes, a unit is a block of bp x bq result tiles, column by column: the block's bp rows of
+  me = ("op", root)
+  rows, cols = size(me)[1:]  # the result's
+  # With one matmul and no passes, a unit is a block of bp x bq result tiles, column by column: the block's bp rows of
   # A and its current column of B stay in L1, so each is read from DRAM once a block, not once a tile
-  bp = min(4, rt) if len(matmuls) == 1 and not rowwise else 1
+  bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
   while bp > 1 and FRAMES + 2 * frame + len(ops) + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE: bp -= 1
   bq = min(4, w) if bp > 1 else 1
   if bp > 1: rows_at = [FRAMES + 2 * frame + len(ops)]  # A's bp rows, then B's column
   kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 else None
-  def slot(f, r):  # an input or wide op lives in the frame, a narrow op in its own slot after both frames
+  def slot(f, r):  # an input or swept op lives in the frame, a narrow op in its own slot after both frames
     if r == "zero": return ZERO_SLOT
     if isinstance(r, int): return FRAMES + f * frame + r
-    return FRAMES + (f * frame + inputs + r[1] if wide(r) else 2 * frame + r[1])
+    return FRAMES + (f * frame + inputs + r[1] if swept(r) else 2 * frame + r[1])
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
-  in_batch = lambda i: f"b * a[{arg(i) + 1}] + " if batch[i] > 1 else ""  # one matrix repeats across the batch
-  def tile(i):  # which tile of input i goes with this unit's matrix b, row i_ and column j
-    rows, cols = tiles[i]
-    return f"{in_batch(i)}{'i_' if rows > 1 else 0} * a[{arg(i) + 2}] + {'j' if cols > 1 else 0} + a[{arg(i) + 3}]"
+  def where(r, base):  # which tile of r (an input, or the result: its [address, batch stride, row stride, offset] are at a[base]) is matrix b, row i_, column j's
+    s = size(r)
+    return f"{f'b * a[{base + 1}] + ' if s[0] > 1 else ''}{'i_' if ext(s, 1) > 1 else 0} * a[{base + 2}] + {'j' if ext(s, 2) > 1 else 0} + a[{base + 3}]"
+  tile = lambda i: where(i, arg(i))
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
   def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
     if j != root: return tt(MATH_END)
-    edge = [f"if ({f'j == {w - 1}' if wide(('op', root)) else 1}) {{ {tt(mask_columns('rowsum', cols % 32, 0))} }}"] * (cols > 1 and cols % 32 > 0)
-    edge += [f"if (i_ == {rt - 1}) {{ {tt(mask_rows(rows % 32))} }}"] * (rows > 1 and rows % 32 > 0)
+    at_end = lambda ax: f"{('i_', 'j')[ax - 1]} == {ext(size(me), ax) - 1}"
+    edge = [f"if ({at_end(2)}) {{ {tt(mask_columns('sum', cols % 32))} }}"] * (cols > 1 and cols % 32 > 0)
+    edge += [f"if ({at_end(1)}) {{ {tt(mask_rows('sum', rows % 32))} }}"] * (rows > 1 and rows % 32 > 0)
     return " ".join(edge + [tt(MATH_END)])
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
-    me = ("op", j)
-    return f"output({f if wide(me) else 0}, {slot(f, me)}, b * a[3] + i_ * a[4] + {'j' if wide(me) else 0} + a[5]); " if j == root else ""
+    return f"output({f if swept(me) else 0}, {slot(f, me)}, {where(me, 2)}); " if j == root else ""
   passes = []
   for p in range(last + 1):
     reductions = [j for j in sweep if sweep[j] == p]
-    sinks = [ops[j]["x"] for j in reductions] + ([("op", root)] if p == last and wide(("op", root)) else [])
-    swept = []  # the wide ops this pass computes, operands first
+    sinks = [ops[j]["x"] for j in reductions] + ([me] if p == last and swept(me) else [])
+    swept_ops = []  # the swept ops this pass computes, operands first
     def need(r):
-      if isinstance(r, tuple) and wide(r) and r[1] not in swept:
+      if isinstance(r, tuple) and swept(r) and r[1] not in swept_ops:
         for o in operands(ops[r[1]]): need(o)
-        swept.append(r[1])
+        swept_ops.append(r[1])
     for r in sinks: need(r)
-    once = [j for j, op in enumerate(ops) if not wide(("op", j)) and op["kind"] not in COMBINE and ready[j] == p]
+    once = [j for j, op in enumerate(ops) if not swept(("op", j)) and op["kind"] not in COMBINE and ready[j] == p]
     bodies = []
     for f in (0, 1):
       c = [[], [], [], []]  # each program's C for this tile
-      fetch = sorted({r for j in once + swept + reductions for r in operands(ops[j]) if isinstance(r, int)})
+      fetch = sorted({r for j in once + swept_ops + reductions for r in operands(ops[j]) if isinstance(r, int)})
       c[B] += [f"reached(frame_done[{f}]);"] + [f"get(a[{arg(r)}], {tile(r)}, {slot(f, r)});" for r in fetch] + ["ready();"]
       c[U].append("fetched();")
-      for j in once + swept:
-        op, me = ops[j], ("op", j)
+      for j in once + swept_ops:
+        op, me_j = ops[j], ("op", j)
         cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
-        pk = halves([pack(DST_HALF * h, slot(f, me), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])
+        pk = halves([pack(DST_HALF * h, slot(f, me_j), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])
         c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= 1; }}")
         if op["kind"] == "matmul":
-          kt, bw, q, bt = op["kt"], op["width"], matmuls.index(j), int(op["bt"])  # B's width in tiles; which matmul
+          kt, bw, q, bt = op["kt"], ext(op["shape"], 2), matmuls.index(j), int(op["bt"])  # B's width in tiles; which matmul
           x, y = arg(op["x"]), arg(op["y"])
           bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
-          b_tile = f"{in_batch(op['y'])}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch(op['y'])}m * a[{y + 2}] + {bj} + a[{y + 3}]"
+          in_batch = f"b * a[{y + 1}] + " if shapes[op["y"]][0] > 1 else ""
+          b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
           on, off = (tt(haloize(1)), tt(haloize(0))) if bt else ("", "")
-          a_tile = f"{in_batch(op['x'])}i_ * a[{x + 2}] + m + a[{x + 3}]"
+          a_tile = f"{f'b * a[{x + 1}] + ' if shapes[op['x']][0] > 1 else ''}i_ * a[{x + 2}] + m + a[{x + 3}]"
           if kept_b is not None:  # A's bp rows and B's column in L1: unpacker 0 walks the column, 1 the row of A
             c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); for (unsigned m = 0; m < {kt}; m++) "
                         f"step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
@@ -549,16 +576,16 @@ def fused_kernel(expr, shapes):
         c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= 1; }}")
       for acc, j in enumerate(reductions):
         assert acc < len(ACCS), "two reductions a pass"
-        op, me, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
+        op, me_j, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
         drain = "drain(); " if isinstance(x, tuple) else ""
-        edge = size(x)[1] % 32 if size(x)[1] > 1 else 0  # the operand's columns in its last tile, if that is cut short
-        end = "j == j1 - 1" if wide(x) else "k == 0"  # the row's last tile (a narrow operand is one tile a row)
+        edge = size(x)[axis] % 32 if axis and size(x)[axis] > 1 else 0  # the operand's rows or columns in its last tile, if cut short
+        end = f"k == {L - 1}" if swept(x) else "k == 0"  # the line's last tile (a narrow operand is one tile a line)
         def step(first):  # the last tile's padding must not count
           plain, cut = tt(reduce_step(kind, slots, acc, first)), tt(reduce_step(kind, slots, acc, first, edge))
           return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
         finish, posted = f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}', "" if j == root else " posted++;"
-        pk = tt(pack(ACCS[acc][0], slot(f, me), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
-        if wide(x):  # swept over the row
+        pk = tt(pack(ACCS[acc][0], slot(f, me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
+        if swept(x):  # swept along the line
           c[U].append(f"{drain}{tt(unpack(slot(f, x), ZERO_SLOT))} if ({end}) {{{posted} }}")
           c[M].append(f"if (k == 0) {{ {step(True)} }} else {{ {step(False)} }} if ({end}) {{ {finish} }}")
         else:  # reduced in the pass's first tile
@@ -568,11 +595,11 @@ def fused_kernel(expr, shapes):
       c[U].append(tt(REPORT))
       c[B].append(f"frame_done[{f}] = ++events;")
       bodies.append(c)
-    passes.append((bool(swept or reductions), bodies))
+    passes.append((bool(swept_ops or reductions), bodies))
   br, bc = -(-rt // bp), -(-w // bq)  # blocks down and across a matrix
   def program(c):  # the loops all four programs share, around each one's part of a tile
     tile_c = lambda b: f"if (tiles++ & 1) {{ {' '.join(b[1][c])} }} else {{ {' '.join(b[0][c])} }}"
-    if not rowwise:  # a unit is a block: its tiles column by column, those past the matrix's edge left out
+    if not reducing:  # a unit is a block: its tiles column by column, those past the matrix's edge left out
       return f"""  for (unsigned u = 0; u < a[1]; u++) {{
     unsigned unit = a[0] + u, b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = unit % {bc} * {bq};
     for (unsigned jj = 0; jj < {bq}; jj++) for (unsigned ii = 0; ii < {bp}; ii++) {{
@@ -581,17 +608,18 @@ def fused_kernel(expr, shapes):
       {tile_c(passes[0][1])}
     }}
   }}"""
-    sweeps = "\n".join(f"""    for (unsigned j = 0, k = 0; j < {w if full else 1}; j++, k++) {{
+    index = ("b", "i_", "j")  # a tile's place: matrix, row, column. A unit fixes the two the sweep does not walk
+    (outer, _), (inner, m) = [(index[ax], n[ax]) for ax in range(3) if ax != axis]
+    sweeps = "\n".join(f"""    for (unsigned {index[axis]} = 0, k = 0; k < {L if full else 1}; {index[axis]}++, k++) {{
       {tile_c(b)}
     }}""" for full, b in passes)
     return f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, b = unit / {rt}, i_ = unit % {rt}, j1 = {w};
+    unsigned unit = a[0] + u, {outer} = unit / {m}, {inner} = unit % {m};
 {sweeps}
   }}"""
-  total = f"a[1] * {w if wide(('op', root)) else 1}" if rowwise else "tiles"  # results this worker sends home
+  total = f"a[1] * {L if swept(me) else 1}" if reducing else "tiles"  # results this worker sends home
   image = compile_kernel(_brisc(total, program(B)), _unpacker(program(U)), _math(slots, program(M)), _packer(program(P)))
-  return image, (rt if rowwise else br * bc)  # and how many units a matrix of the result is
-
+  return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 
 def gather_kernel():
   """Rows of a tensor into a new one, args [first unit, units, out, the tensor's address, tile stride, tile offset, the
@@ -785,14 +813,14 @@ class Tensor:
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
       t.realize()
     inputs = []
-    e = _expr(self, (self.batch, self.rows), inputs, [-(-self.cols // 32) if self.cols > 1 else None, set()])
-    key = (e, tuple((u.batch, u.rows, u.cols) for u in inputs))
+    e = _tree(self, inputs)
+    key = (e, tuple(u.shape for u in inputs))
     kernel, units = _cached(key, lambda: fused_kernel(*key))
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
     self.op, self.srcs = None, ()
     args = [v for t in [self] + inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
-    return self._run(kernel, *args, units=self.batch * units)
+    return self._run(kernel, *args, units=units)
 
   def _run(self, kernel, *args, units=None):
     """Queue kernel over units of this tensor (tiles unless told), split evenly over as many workers as have any. Nothing waits for
@@ -810,7 +838,7 @@ class Tensor:
     return Tensor(self.rt, shape[1], shape[2], op, (self, other), shape[0])
   @property
   def shape(self): return (self.batch, self.rows, self.cols)
-  def _unary(self, op, cols=None): return Tensor(self.rt, self.rows, cols or self.cols, op, (self,), self.batch)
+  def _unary(self, op): return Tensor(self.rt, self.rows, self.cols, op, (self,), self.batch)
   def relu(self): return self._unary("relu")
   def exp(self): return self._unary("exp")
   def reciprocal(self): return self._unary("recip")
@@ -819,13 +847,19 @@ class Tensor:
     k = 2 * math.sqrt(2 / math.pi)
     return self * (1 + (self * (self * self * (-0.044715 * k) - k)).exp()).reciprocal()
   def softmax(self):  # along each row, max first so exp stays in range
-    e = (self - self.rowmax()).exp()
-    return e / e.rowsum()
+    e = (self - self.max(2)).exp()
+    return e / e.sum(2)
   def layernorm(self, eps=1e-5):  # each row to mean 0 and variance 1
-    c = self - self.rowsum() * (1 / self.cols)
-    return c * ((c * c).rowsum() * (1 / self.cols) + eps).rsqrt()
-  def rowsum(self): return self if self.cols == 1 else self._unary("rowsum", 1)
-  def rowmax(self): return self if self.cols == 1 else self._unary("rowmax", 1)
+    c = self - self.sum(2) * (1 / self.cols)
+    return c * ((c * c).sum(2) * (1 / self.cols) + eps).rsqrt()
+  def sum(self, axis=None): return self._reduce("sum", axis)
+  def max(self, axis=None): return self._reduce("max", axis)
+  def _reduce(self, f, axis):
+    """numpy's, keeping the axis as 1: over the batch (0, one matrix), down the rows (1, one row) or along each row
+    (2, one column); over all three if None. Each axis is a kernel of its own, sweeping lines of tiles along it."""
+    if axis is None: return self._reduce(f, 0)._reduce(f, 1)._reduce(f, 2)
+    shape = [1 if ax == axis % 3 else s for ax, s in enumerate(self.shape)]
+    return self if shape == list(self.shape) else Tensor(self.rt, shape[1], shape[2], f"{f}{axis % 3}", (self,), shape[0])
   def __add__(self, other): return self._elementwise("add", other)
   def __sub__(self, other): return self._elementwise("sub", other)
   def __mul__(self, other): return self._elementwise("mul", other)
@@ -856,20 +890,30 @@ def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU o
   seen.add(id(t))
   return 1 + (0 if t.op in ("matmul", "T") else sum(_ops(s, seen) for s in t.srcs))
 
+def _tree(t, inputs):
+  """The expression a kernel for t computes (fused_kernel's), realized tensors as numbers into inputs. The kernel
+  sweeps along the axis of t's reductions (the first found; any along another axis compute first, on their own)."""
+  axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
+  return _expr(t, t.shape, inputs, [axis, None, set()])
+
+def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)  # t's extent along an axis: matrices, or tiles
+
 def _expr(t, shape, inputs, kernel):
-  """The tree of unrealized ops under t, realized tensors as numbers into inputs. A kernel sweeps its rows at one width
-  (in tiles; kernel[0], the first one seen if t is one column), and has two accumulators for row reductions (kernel[1]
-  holds those it has): a reduction of anything wider than a tile but not that wide, or past the second, is computed
-  first, on its own."""
+  """The tree of unrealized ops under t, for a kernel of shape (t's). kernel: [the axis it sweeps, the sweep's length
+  (in tiles; the first seen, if t is one tile along it), the reductions it holds (two accumulators)]. Computed first, on
+  their own: an op of 1 along an axis the kernel keeps (repeated there: compute it once), and a reduction along another
+  axis, of another length, or past the second."""
   if t.op is None:
     if all(t is not u for u in inputs): inputs.append(t)
     return next(i for i, u in enumerate(inputs) if u is t)
-  if (t.batch, t.rows) != shape: return _expr(t.realize(), shape, inputs, kernel)  # repeated down or through the batch: compute it once
+  axis = kernel[0]
+  if any(t.shape[ax] != shape[ax] for ax in range(3) if ax != axis): return _expr(t.realize(), shape, inputs, kernel)
   if t.op in COMBINE:
-    w = -(-t.srcs[0].cols // 32)
-    if w > 1 and kernel[0] is None: kernel[0] = w
-    if (w > 1 and w != kernel[0]) or (id(t) not in kernel[1] and len(kernel[1]) == len(ACCS)): return _expr(t.realize(), shape, inputs, kernel)
-    kernel[1].add(id(t))
+    if FOLDS[t.op] != axis: return _expr(t.realize(), shape, inputs, kernel)
+    n = _ext(t.srcs[0], axis)
+    if n > 1 and kernel[1] is None: kernel[1] = n
+    if (n > 1 and n != kernel[1]) or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)): return _expr(t.realize(), shape, inputs, kernel)
+    kernel[2].add(id(t))
   if t.op == "T": return _expr(t.realize(), shape, inputs, kernel)  # a kernel of its own, unless a matmul's B (below)
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = t.srcs

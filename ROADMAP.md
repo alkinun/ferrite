@@ -21,7 +21,7 @@ Done: a real model generates text on ttsim with nothing from Tenstorrent but the
 Any model and training, from a small set of primitives: every model is built from these, and training is each run
 backwards.
 
-- [ ] Reductions along any axis (sum, max), not only rows
+- [x] Reductions along any axis (sum, max), not only rows (`test_reduce_axes`)
 - [ ] Movement at any granularity: reshape, permute, expand, pad, slice, not only on tile boundaries
 - [ ] More elementwise ops: log, sqrt, sin, cos, compare, where
 - [ ] More dtypes: fp32 tensors (accuracy, gradients), integers (indices)
