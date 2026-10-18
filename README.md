@@ -29,6 +29,9 @@ would schedule its own kernels and runs it on the chip. tinygrad's own scripts r
 
     TTSIM=/path/to/libttsim.so PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
 
+And PyTorch: a `FerriteTensor` is a torch.Tensor whose ops run on the chip, so eager PyTorch, its autograd and its
+optimizers do (`from adapters.torch_ferrite import ferrite; model, x = ferrite(model), ferrite(x)`).
+
 ## What is there
 
 - `ferrite/pci.py`, `ferrite/chip.py`: the card over PCIe (TLB windows onto the NoC, the ARC management core, DMA into
@@ -43,7 +46,8 @@ would schedule its own kernels and runs it on the chip. tinygrad's own scripts r
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: every Blackhole fact the code uses, as data. `NOTES.md` says where each comes from.
-- `adapters/tinygrad_ferrite.py`: tinygrad's frontend (Tensor, nn, autograd, optimizers) on ferrite, outside it.
+- `adapters/tinygrad_ferrite.py`, `adapters/torch_ferrite.py`: tinygrad and PyTorch on ferrite, outside it (with
+  `adapters/views.py`, tensors of any rank as views of ferrite's).
 
 ## Running
 

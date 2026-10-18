@@ -851,6 +851,46 @@ def test_tinygrad(tinygrad):
   want, got = train("CPU"), train("FERRITE")
   assert np.allclose(got, want, atol=1e-3) and got[-1] < got[0] - 0.3, (got, want)
 
+def test_torch(chip, monkeypatch):
+  # stage 4's second step: PyTorch on ferrite. A FerriteTensor is a torch.Tensor whose aten ops run on the chip, so eager
+  # PyTorch, its autograd and torch.optim.Adam do: elementwise ops, reductions, a matmul, softmax, layer norm, gelu (erf),
+  # slices, cat and cross entropy; an MLP for three Adam steps, and PyTorch's own TransformerEncoderLayer (attention, its
+  # backward written in PyTorch's ops) for two. All against PyTorch on the CPU, and none of it falling back to the CPU
+  torch = pytest.importorskip("torch")
+  from adapters import torch_ferrite as tf
+  import views
+  views.RT = views.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  fell_back, on_cpu = [], tf.on_cpu
+  monkeypatch.setattr(tf, "on_cpu", lambda func, args, kwargs: (fell_back.append(str(func)), on_cpu(func, args, kwargs))[1])
+  torch.manual_seed(16)
+  a, b, w = torch.randn(2, 3, 40), torch.randn(2, 3, 40), torch.randn(40, 5)
+  F = torch.nn.functional
+  cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.amax(-1), lambda x, y, w: x.exp().log(),
+           lambda x, y, w: torch.where(x > 0, x, y), lambda x, y, w: x @ w, lambda x, y, w: x.softmax(-1), lambda x, y, w: x[:, 1:3, ::2].relu(),
+           lambda x, y, w: F.layer_norm(x, (40,)), lambda x, y, w: F.gelu(x), lambda x, y, w: torch.cat([x, y], 1) * 1,
+           lambda x, y, w: F.cross_entropy(x.reshape(6, 40), torch.tensor([1, 2, 3, 4, 5, 6]))]
+  for n, f in enumerate(cases):
+    want, got = f(a, b, w), f(tf.ferrite(a), tf.ferrite(b), tf.ferrite(w)).cpu()
+    assert (got - want).abs().max() <= 1e-3 * (want.abs().max() + 1), (n, (got - want).abs().max())
+  def train(model, x, y, loss, steps, on_chip):
+    torch.manual_seed(17)
+    model, x, y = model(), x(), y()
+    if on_chip: model, x, y = tf.ferrite(model), tf.ferrite(x), tf.ferrite(y)
+    opt, losses = torch.optim.Adam(model.parameters(), lr=1e-2), []
+    for _ in range(steps):
+      opt.zero_grad()
+      l = loss(model(x), y)
+      l.backward(); opt.step(); losses.append(l.item())
+    return losses
+  mlp = (lambda: torch.nn.Sequential(torch.nn.Linear(16, 32), torch.nn.ReLU(), torch.nn.Linear(32, 10)), lambda: torch.randn(8, 16),
+         lambda: torch.randint(0, 10, (8,)), F.cross_entropy, 3)
+  block = (lambda: torch.nn.TransformerEncoderLayer(64, 4, 128, dropout=0.0, batch_first=True), lambda: torch.randn(4, 6, 64),
+           lambda: torch.zeros(1), lambda out, _: out.pow(2).mean(), 2)
+  for setup in (mlp, block):
+    want, got = train(*setup, on_chip=False), train(*setup, on_chip=True)
+    assert np.allclose(got, want, atol=1e-3), (got, want)
+  assert not fell_back, fell_back
+
 @pytest.mark.parametrize("n", [16, 40])
 def test_gpt2_layer(chip, n):
   # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so

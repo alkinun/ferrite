@@ -143,6 +143,10 @@ append a correction.
     through the host, short axes padded every tile, flat weights and transposes were moved where they could be read in
     place, and a product was made whole before its sum. 52 s a step went to 25 by layout alone. (NOTES: "tinygrad on
     ferrite")
+24. **Let the framework lower itself.** PyTorch has two thousand aten ops; its own decompositions bring them down to the
+    sixty the adapter writes out, and a training run of its transformer layer reached the CPU for one op, attention's
+    backward. A decomposition is code with its own purpose, though: the one for attention was written for export and
+    returns the attention weights where the kernel returns their logsumexp. (NOTES: "PyTorch on ferrite")
 
 ## Working method
 
