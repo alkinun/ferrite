@@ -38,7 +38,11 @@ append a correction.
    mantissas at 11 bits with round half up, the packer rounds half up, uploads round to nearest even. Bit-exact tests
    (small integers, a diagonal of full mantissas, A @ I) pin the layout and the phases where a tolerance would pass a
    bug. (NOTES: "Precision")
-10. **Moving data across SFPU lanes is scarce.** `SFPSHFT2` rotates within groups of 8 lanes and `SFPTRANSP` moves
+10. **A full-precision datum has one way in.** SrcA and SrcB hold 19 bits, so fp32 cannot go through the FPU at all:
+    the unpacker must write Dst directly and the SFPU must do the math. And the FPU's own sums are not fp32 either: it
+    adds each group of 8 products at 12 bits, so a matmul is good to 2^-12 whatever Dst holds. (NOTES: "fp32 tensors",
+    "Matmul precision")
+11. **Moving data across SFPU lanes is scarce.** `SFPSHFT2` rotates within groups of 8 lanes and `SFPTRANSP` moves
     groups between four registers; nothing else crosses lanes. Folding a tile's rows or columns costs 120 to 168
     instructions because of it. (NOTES: "Reductions")
 
@@ -84,9 +88,9 @@ append a correction.
 8. **Python's lifetimes are part of the memory manager.** A tensor frees its DRAM in `__del__`, which CPython runs at
    once unless a reference cycle holds the tensor; a closure in `realize` once did. (NOTES: "DRAM")
 9. **Cache what the compiler makes.** Compiled device images kept on disk took the test suite from 24 s to 5 s.
-10. **Numbers are tensors, so constants are bf16.** `x * (1/768)` multiplies by 1/768 rounded to 8 bits, 0.2% off,
-    and exp(10) as tinygrad writes it, `exp2(10 * log2(e))`, would be 2% off. exp, log and cos keep their constants in
-    fp32 inside their SFPU programs; a mean still pays. (NOTES: "The SFPU")
+10. **Numbers are tensors, so a constant has its tensor's dtype.** In bf16, `x * (1/768)` multiplies by 1/768 rounded to
+    8 bits, 0.2% off, and exp(10) as tinygrad writes it, `exp2(10 * log2(e))`, would be 2% off; so exp, log and cos keep
+    their constants in fp32 inside their SFPU programs. In fp32 tensors the constants are exact. (NOTES: "The SFPU")
 11. **A generalization must carry every special case along.** Making reductions work along any axis dropped one line
     that seeded the sweep's length from the kernel's own result, and a reduction of another length then crashed the
     compiler. No test reached it until the fuzzer learned `where`, one step later. Read the old code's guards before
@@ -94,7 +98,9 @@ append a correction.
 12. **A fuzzer is as good as its generator, and as its oracle.** Growing the generator to new ops found that
     regression. Its oracle, numpy without bf16 rounding, cannot judge a comparison of two computed values (a rounding
     step flips it), so comparisons in random trees only see exact inputs.
-13. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
+13. **Test at the precision you claim.** Every result went home as bf16, so tests compared at 2^-8 and two coarser
+    things hid under it: the FPU's 12-bit sums and exp's 4e-4. fp32 results showed both on the first run.
+14. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
     saved 10%. Skipping the datums outside the bounds and keeping the arguments in registers saved most of the rest.
     The profile of the test said the time was all ttsim running kernels, not Python. (NOTES: "Movement")
 
@@ -117,6 +123,8 @@ What Blackhole made hard to program, so that a design for simple software can de
   thread config (in-band `SETC16` only) and address counters, each written its own way.
 - **Counters wide enough never to be the limit.** An 8-bit Z, 4-bit semaphores and a 32-entry replay buffer each
   shaped the compiler.
+- **Full precision through the main datapath.** fp32 here cannot touch the matrix unit's inputs, and its dot products
+  align at 12 bits; a second, slower path (unpack into Dst, the SFPU) is the only way to fp32.
 - **Collectives in the NoC.** Multicast with a single completion, and atomic counters, are what made launches cheap.
 - **A simulator that models time as well as rules,** built alongside the chip, so that performance work does not wait
   for silicon.

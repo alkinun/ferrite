@@ -102,7 +102,7 @@ UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC 
 # unpackers, packer, FPU or SFPU, or the config unit, are idle (ISA STALLWAIT.md: B and C bits)
 STALL_SYNC, STALL_PACK, STALL_UNPACK, STALL_CFG, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 3, 1 << 7, 1 << 8, 0x1FF
 WAIT_UNPACK0, WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU, WAIT_CFG = 1 << 1, 0b110, 1 << 3, 1 << 4, 1 << 11, 1 << 12
-BF16 = 5  # data format code (ISA Unpackers/FormatConversion.md)
+FP32, TF32, BF16, INT32 = 0, 4, 5, 8  # data format codes (ISA Unpackers/FormatConversion.md)
 
 # Backend config: field -> (32-bit word index at TENSIX_CFG, first bit, width). The ISA docs defer these numbers to
 # tt-metal's cfg_defines.h; these are from ttsim's data/bh/tensix_regs.json and still need checking against silicon.
@@ -116,6 +116,9 @@ TENSIX_CFG_FIELDS = {
   "SEC0_out_format": (72, 0, 4), "SEC0_Haloize_mode": (72, 8, 1),
   "SEC0_uncompressed": (73, 0, 1), "SEC0_base": (76, 0, 32), "SEC0_dest_addr": (84, 0, 16),
   "SEC0_tile_x_dim": (86, 0, 16), "SEC0_offset": (92, 0, 16),
+  # unpacker 0's second context, which a thread picks with UNPACK_MISC (thread config): unpacking into Dst
+  "SEC0_uncompressed_1": (73, 1, 1), "SEC0_to_dst_1": (73, 5, 1), "SEC0_base_1": (77, 0, 32), "SEC0_dest_addr_1": (84, 16, 16),
+  "SEC0_tile_x_dim_1": (86, 16, 16), "SEC0_offset_1": (93, 0, 16),
   "SEC1_format": (112, 0, 4), "SEC1_x_dim": (112, 16, 16), "SEC1_y_dim": (113, 0, 8), "SEC1_z_dim": (113, 16, 8),
   "SEC1_out_format": (120, 0, 4), "SEC1_uncompressed": (121, 0, 1), "SEC1_base": (124, 0, 32), "PCK_dest_offset": (180, 0, 12),
 }

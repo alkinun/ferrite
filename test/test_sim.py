@@ -539,6 +539,38 @@ def test_movement(chip):
       t, a = move(t, a)
       assert value(t).tolist() == a.reshape(t.shape).tolist(), a.shape
 
+def test_fp32(chip):
+  # fp32 tensors, 4 KiB tiles: the math thread unpacks them straight into Dst and the SFPU does the math, so add, sub, mul,
+  # comparisons, where, movement and maxes are numpy's float32 exactly and sums are within its rounding; exp and the other
+  # SFPU programs are as accurate as for bf16. Casts both ways (to bf16 rounds as the packer does), bf16 with fp32 is
+  # fp32, and a number takes its tensor's dtype, so a mean of 768 values is exact. A matmul sums in fp32, but the FPU
+  # adds each group of 8 products at 12 bits (ttsim's model of it): fp32 results are good to about 2^-11, and fp32
+  # operands (bf16x3) reach that too rather than bf16's 2^-8. On one worker (the pipeline cycles) and on many
+  rng = np.random.default_rng(9)
+  value = lambda t: np.array(t.tolist()).reshape(t.shape)
+  f32 = lambda *shape: rng.uniform(-2, 2, shape).astype(np.float32)
+  for workers in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, chip.tensix[0], workers)
+    x, y = f32(2, 45, 70), f32(2, 45, 70)
+    tx, ty = Tensor.of(rt, x.tolist(), "fp32"), Tensor.of(rt, y.tolist(), "fp32")
+    launches, got = rt.launches, value((tx + ty) * tx - ty * 1.5)
+    assert rt.launches == launches + 1 and got.tolist() == ((x + y) * x - y * np.float32(1.5)).tolist(), "one kernel, fp32's rounding"
+    for got, want in [(tx, x), ((tx < ty).where(tx, ty * 0.5), np.where(x < y, x, y * np.float32(0.5))), (tx.max(1), x.max(1, keepdims=True)),
+                      (tx.T, x.transpose(0, 2, 1)), (tx[1][3:40:2, 5:66], x[1, 3:40:2, 5:66]), (tx[0].gather([44, 0, 7]), x[0, [44, 0, 7]])]:
+      assert value(got).tolist() == np.asarray(want, np.float32).reshape(got.shape).tolist()
+    assert np.allclose(value(tx.sum(2)), x.sum(2, keepdims=True), rtol=1e-6, atol=1e-5)
+    assert np.allclose(value((tx * 0.5).exp()), np.exp(x * np.float32(0.5)), rtol=5e-4)  # 12 squarings: fp32 rounding times 4096
+    b = bf16(x)
+    assert value(tx.bfloat16()).tolist() == bf16(x, True).tolist() and value(Tensor.of(rt, b.tolist()).float()).tolist() == b.tolist()
+    assert value(Tensor.of(rt, b.tolist()) + tx).tolist() == (b.astype(np.float32) + x).tolist(), "bf16 with fp32 is fp32"
+    assert value(Tensor.of(rt, np.full((1, 768), 3.0).tolist(), "fp32").mean()).tolist() == [[[3.0]]]
+    a, w = f32(64, 96), f32(96, 70)
+    ta, tw = Tensor.of(rt, a.tolist(), "fp32"), Tensor.of(rt, w.tolist(), "fp32")
+    want = bf16(a) @ bf16(w)
+    assert np.abs(value(Tensor.of(rt, bf16(a).tolist()).matmul(Tensor.of(rt, bf16(w).tolist()), "fp32")) - want).max() <= 2**-11 * np.abs(want).max()
+    want = a.astype(np.float64) @ w
+    assert np.abs(value(ta @ tw) - want).max() <= 2**-11 * np.abs(want).max()
+
 def test_fuzz(chip, monkeypatch):
   # random expressions (elementwise ops with broadcasting, unary ops, reductions along any axis, matmuls; odd shapes,
   # batches), and
@@ -552,18 +584,19 @@ def test_fuzz(chip, monkeypatch):
     f = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "T": lambda a: a.swapaxes(-1, -2),
          "relu": lambda a: np.maximum(a, 0), "exp": np.exp, "exp2": np.exp2, "log": np.log, "log2": np.log2, "sin": np.sin,
          "cos": np.cos, "sqrt": np.sqrt, "recip": lambda a: 1 / a, "max": np.maximum, "cmplt": lambda a, b: (a < b) * 1.0,
-         "cmpne": lambda a, b: (a != b) * 1.0, "keep": lambda c, x: np.where(c != 0, x, 0), "drop": lambda c, y: np.where(c != 0, 0, y)}
+         "cmpne": lambda a, b: (a != b) * 1.0, "keep": lambda c, x: np.where(c != 0, x, 0), "drop": lambda c, y: np.where(c != 0, 0, y),
+         "cast": lambda a: a}
     f |= {k: lambda a, k=k: getattr(a, k[:3])(int(k[3]), keepdims=True) for k in compiler.FOLDS}  # sum0, max2, ...
     return f[e[0]](*v)
   realize = Tensor.realize
   def checked_realize(t):
-    if t.op is None: return t
+    if t.op in (None, "T", "move"): return realize(t)  # data movement is test_movement's
     while compiler._ops(t, set()) > 15:  # too big for one kernel: its parts first, as realize does, each checked too
       u = t
       while compiler._ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: compiler._ops(s, set()))
       u.realize()
     inputs = []
-    e = compiler._tree(t, inputs)
+    e, _ = compiler._tree(t, inputs)
     xs = [value(u) for u in inputs]
     realize(t)
     want, got = numpy(e, xs), value(t)
@@ -572,10 +605,12 @@ def test_fuzz(chip, monkeypatch):
     return t
   monkeypatch.setattr(Tensor, "realize", checked_realize)
   rng = np.random.default_rng(5)
+  dtype = "bf16"
   def leaf(shape):  # some all negative, so an unmasked 0 in the padding would win a max
     lo = rng.choice([-2.0, -4.0])
-    a = bf16(rng.uniform(lo, lo + 4 if lo == -2 else lo + 3, shape))
-    return Tensor.of(rt, a.tolist() if shape[0] > 1 else a[0].tolist())
+    a = rng.uniform(lo, lo + 4 if lo == -2 else lo + 3, shape)
+    a = bf16(a) if dtype == "bf16" else a.astype(np.float32)
+    return Tensor.of(rt, a.tolist() if shape[0] > 1 else a[0].tolist(), dtype)
   def gen(shape, depth):
     b, r, c = shape
     kind = "leaf" if depth == 0 or rng.random() < 0.2 else rng.choice(["bin", "bin", "unary", "red", "mm", "where"])
@@ -599,8 +634,9 @@ def test_fuzz(chip, monkeypatch):
       bb = b if rng.random() < 0.5 else 1
       return (leaf((b, r, k)) @ (leaf((bb, c, k)).T if rng.random() < 0.3 else leaf((bb, k, c)))) * (1 / k)  # B read transposed, or not
     return leaf(shape)
-  for _ in range(30):  # sizes past 4 tiles make part-blocks of matmul results
+  for n in range(30):  # sizes past 4 tiles make part-blocks of matmul results; every other tree is fp32
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
+    dtype = ("bf16", "fp32")[n % 2]
     gen(shape, 4).realize()
   assert len(checked) >= 20 and any(e[0] == "matmul" or "sum" in str(e) for e in checked)
 

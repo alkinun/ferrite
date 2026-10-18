@@ -7,12 +7,12 @@ from ferrite import bh
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
 # (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for
 # the kernel's cores to talk through), two buffers of kernel arguments (launches alternate between them, so the next
-# launch's arguments go in while this one runs), the kernels it holds, a tile of zeros (2 KiB, for kernels to read and
-# never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the
+# launch's arguments go in while this one runs), the kernels it holds, a tile of zeros (4 KiB, an fp32 tile, for kernels
+# to read and never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the
 # workers' rectangle, how many], an outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the
 # workers' reports, and staging for one command, both above the kernels (loading a kernel writes the dispatcher's
 # tile too).
-MAILBOX, TRISCS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x7F800, 0x80000
+MAILBOX, TRISCS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
