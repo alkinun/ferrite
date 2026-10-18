@@ -119,9 +119,9 @@ def reconfigure(**fields):  # unpacker 0's config fields rewritten from thread 0
   return ([ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_UNPACK0)] + writes +
           [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)])
 def haloize(on): return reconfigure(SEC0_Haloize_mode=on)  # unpacker 0 transposes each 16x16 face into SrcA (or stops)
-def bfp8_b(slots):  # unpacker 0 reads bfp8 from B8's `slots` slots (a matmul's B: every slot's exponents, then their
-  # values), each value into SrcA as the bf16 it is; with 0, bf16 from the slots again
-  fmt, base = (bh.BFP8, B8) if slots else (bh.BF16, slot_base("bf16"))
+def bfp8_b(slots, region=0):  # unpacker 0 reads bfp8 from a region of `slots` slots at B8 (a matmul's B: every slot's
+  # exponents, then their values), each value into SrcA as the bf16 it is; with 0, bf16 from the slots again
+  fmt, base = (bh.BFP8, B8 + region * slots * tile_bytes("bfp8")) if slots else (bh.BF16, slot_base("bf16"))
   return reconfigure(SEC0_format=fmt, SEC0_out_format=fmt, SEC0_z_dim=max(slots, 1), SEC0_base=base // 16 - 1)
 def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and A's next tile in its row into SrcB
   return [setadc(bh.UNPACK0, s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
@@ -424,8 +424,10 @@ DEPTH = 4  # matmul steps whose reads may be in flight at once, each through a s
 ZERO_SLOT, FRAMES = 0, 1 + 2 * DEPTH  # slot 0 is a zero tile, then B's stream slots and A's, two frames, the narrow ops, and
                                       # what stays in L1: A's rows, B's column or buffers, kept inputs
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
-B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")  # a matmul's bfp8 B, past the slots: the exponents of each of
-                                                           # its slots, then their values (the unpacker's layout)
+B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")  # a matmul's bfp8 B, past the slots: regions (one, or mc's three
+# buffers), each the exponents of its slots, then their values (the unpacker's layout), at most B8_SLOTS slots: the
+# unpacker finds a slot's exponents by its first datum, which must stay below 65536
+B8_SLOTS = 64
 
 # SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
 # one of them: FETCHED, how many frames BRISC has fetched into L1; ISSUED, how many matmul steps it has issued the reads
@@ -474,11 +476,12 @@ static void send(void) {{  // the results packed so far go home, in the order th
 // A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, B's slot two steps
 // back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
-// bfp8 tile t into slot z at B8: its 64 exponents among the slots' exponents, its values among theirs
-static void get8(unsigned base, unsigned t, unsigned z) {{
-  unsigned at = base + t / 8 * {tile_bytes("bfp8")};
-  noc_get(BANK(t), at, {B8:#x} + 64 * z, 64);
-  noc_get(BANK(t), at + 64, {B8 + 64 * b8:#x} + 1024 * z, 1024);
+// bfp8 tile t into slot s at B8, slot s % b8 of region s / b8: its 64 exponents among the region's exponents, its values
+// among theirs
+static void get8(unsigned base, unsigned t, unsigned s) {{
+  unsigned at = base + t / 8 * {tile_bytes("bfp8")}, r = {B8:#x} + s / {max(b8, 1)} * {b8 * tile_bytes("bfp8")}, z = s % {max(b8, 1)};
+  noc_get(BANK(t), at, r + 64 * z, 64);
+  noc_get(BANK(t), at + 64, r + {64 * b8} + 1024 * z, 1024);
 }}
 // A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot or its place in the row or column
 // kept in L1, unless it is there already (KEPT). how: B as it is (0), transposed (1), bfp8 (2). Step k's reads carry
@@ -529,10 +532,10 @@ static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles) {{
   while (NIU(WR_ACKS) != acks) {{}}
   NIU(CLEAR_OUTSTANDING) = 0xFFFF;
 }}
-// This worker's part of a run of slots shared by a row or column of the grid, slots slot + from to slot + to - 1 (read in
-// already): to the same place in the `tiles` other tiles of rect, then flag, set to v, the same way. Alone, it waits for the reads
-static void share(unsigned slot, unsigned from, unsigned to, unsigned rect, unsigned tiles, unsigned flag, unsigned v) {{
-  if (tiles && to > from) mcast(SLOT(slot + from), (to - from) * {tb}, rect, tiles);
+// This worker's part of what a row or column of the grid shares, n bytes at l1 (read in already): to the same place in
+// the `tiles` other tiles of rect, then flag, set to v, the same way. Alone, it waits for the reads
+static void share(unsigned l1, unsigned n, unsigned rect, unsigned tiles, unsigned flag, unsigned v) {{
+  if (tiles && n) mcast(l1, n, rect, tiles);
   else noc_wait();
   FLAGS[flag] = v;
   if (tiles) mcast((unsigned)&FLAGS[flag], 4, rect, tiles);
@@ -721,8 +724,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     kt = ops[matmuls[0]]["kt"]
     bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
     n_grid = (-(-w // bq), -(-rt // bp))
-    if (base + (bp + 3) * kt <= UNPACKABLE and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B and
-        ops[matmuls[0]]["how"] != 2): mc = n_grid  # a bfp8 B is not shared yet
+    room = kt <= B8_SLOTS if ops[matmuls[0]]["how"] == 2 else base + (bp + 3) * kt <= UNPACKABLE  # B's three buffers
+    if base + bp * kt <= UNPACKABLE and room and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B: mc = n_grid
   # With one row of tiles (a token's matmul), the grid's workers each take a block of the result's columns and the first
   # grid row reads A's tiles in shares and multicasts them to all (bcast), so each comes from DRAM once, not once a
   # worker; B, which no two workers share, streams as it would. Each matrix of a batch (K split in parts) gets whole grid
@@ -737,11 +740,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     if nb * blocks > 1: bcast = (gx_n, -(-blocks // gx_n))
   if not mc and not bcast:
     bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
-    while bp > 1 and base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE: bp -= 1
+    while bp > 1 and (base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE or ops[matmuls[0]]["how"] == 2 and ops[matmuls[0]]["kt"] > B8_SLOTS):
+      bp -= 1
     bq = min(4, w) if bp > 1 else 1
   if bp > 1 or mc: rows_at = [base]  # A's bp rows, then B's column (or its three buffers)
   kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 or mc else None
-  # a bfp8 B goes to slots of its own at B8 (B's column, or DEPTH to stream through), unpacker 0 switched to them for its steps
+  # a bfp8 B goes to slots of its own at B8 (a region for each of mc's three buffers, or one for a block's column, or for
+  # DEPTH to stream through), unpacker 0 switched to them for its steps
   b8 = (ops[matmuls[0]]["kt"] if kept_b is not None else DEPTH) if any(ops[j]["how"] == 2 for j in matmuls) else 0
   # blocks down and across a matrix (the grid's)
   br, bc = (mc[1], len(grid[0])) if mc else (1, bcast[0] * bcast[1]) if bcast else (-(-rt // bp), -(-w // bq))
@@ -817,17 +822,24 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           in_batch = f"b * a[{y + 1}] + " if shapes[op["y"]][0] > 1 else ""
           b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
           on, off = (tt(haloize(1)), tt(haloize(0))) if bt else (tt(bfp8_b(b8)), tt(bfp8_b(0))) if how == 2 else ("", "")
+          if mc and how == 2: on = f"if (jj % 3 == 0) {{ {on} }} else if (jj % 3 == 1) {{ {tt(bfp8_b(b8, 1))} }} else {{ {tt(bfp8_b(b8, 2))} }}"
           a_tile = f"{f'b * a[{x + 1}] + ' if shapes[op['x']][0] > 1 else ''}i_ * a[{x + 2}] + m + a[{x + 3}]"
+          buf = mc and f"{0 if how == 2 else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a bfp8 B's in B8)
           if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
             gx_n, gy_n = mc
-            gx, gy, buf, a_n = f"unit % {bc}", f"unit / {bc}", f"{kept_b} + jj % 3 * {kt}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {kt}"
+            gx, gy, a_n = f"unit % {bc}", f"unit / {bc}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {kt}"
             part = lambda n, k, parts: (f"{k} * {n} / {parts}", f"({k} + 1) * {n} / {parts}")  # worker k's share of n tiles
             (a0, a1), (b0, b1) = part(a_n, gx, gx_n), part(kt, gy, gy_n)
             get_a = (f"for (unsigned e = {a0}; e < {a1}; e++) "
                      f"{{ unsigned i_ = i0 + e / {kt}, m = e % {kt}; get(a[{x}], {a_tile}, {rows_at[q]} + e); }} "
-                     f"share({rows_at[q]}, {a0}, {a1}, row_rect[{gy}], {gx_n - 1}, {gx}, 1);")
-            get_b = (f"for (unsigned m = {b0}; m < {b1}; m++) {'flipped' if bt else 'get'}(a[{y}], {b_tile}, {buf} + m); "
-                     f"share({buf}, {b0}, {b1}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, jj + 1);")
+                     f"share(SLOT({rows_at[q]} + {a0}), ({a1} - {a0}) * {tile_bytes(dtype)}, row_rect[{gy}], {gx_n - 1}, {gx}, 1);")
+            get_b = f"for (unsigned m = {b0}; m < {b1}; m++) {('get', 'flipped', 'get8')[how]}(a[{y}], {b_tile}, {buf} + m); "
+            share_b = lambda l1, n: f"share({l1}, ({b1} - {b0}) * {n}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, jj + 1);"
+            if how == 2:  # in region jj % 3 of B8: the share's exponents, then its values
+              region = f"{B8} + jj % 3 * {kt * tile_bytes('bfp8')}"
+              get_b += (f"if ({gy_n - 1} && {b1} > {b0}) mcast({region} + 64 * ({b0}), ({b1} - {b0}) * 64, col_rect[{gx}], {gy_n - 1}); " +
+                        share_b(f"{region} + {64 * kt} + 1024 * ({b0})", 1024))
+            else: get_b += share_b(f"SLOT({buf} + {b0})", tile_bytes(dtype))
             c[B].append(f"{{ if (ii == 0) {{ "  # a column's first tile: its column of B, and in the first column A's rows
                         f"if (jj == 0) {{ {get_a} }} "
                         # done with column jj - 2 here: this column's flag lets the others fill its buffer with jj + 1
@@ -841,7 +853,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
             walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
                     ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
-            column = f"{kept_b} + jj % 3 * {kt}" if mc else 0 if how == 2 else kept_b
+            column = 0 if how == 2 else buf if mc else kept_b  # a bfp8 B's from the start of its region
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
                         f"{on} for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(walk)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
@@ -928,7 +940,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     in_batch = f"b * a[{x + 1}] + " if shapes[ops[matmuls[0]]["x"]][0] > 1 else ""
     first = (f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, end = (gx + 1) * {kt} / {gx_n};\n"
              f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
-             f"      share({rows_at[0]}, e, end, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
+             f"      share(SLOT({rows_at[0]} + e), (end - e) * {tile_bytes(dtype)}, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
   brisc = _brisc(total, (first if bcast else "") + program(B), dtype, out, decls, tail, b8)
   image = compile_kernel(brisc, _unpacker(program(U), kernel_config(dtype, out)), _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
