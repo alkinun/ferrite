@@ -126,6 +126,8 @@ def bfp8_b(slots, region=0):  # unpacker 0 reads bfp8 from a region of `slots` s
 def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and A's next tile in its row into SrcB
   return [setadc(bh.UNPACK0, s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
+WALK = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),  # a step along B's column and A's row, both
+        ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # kept in L1
 def aim(row): return ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=row)  # the FPU and SFPU at Dst row on
 def math_begin(half, zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
   return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), aim(DST_HALF * half)] +
@@ -777,6 +779,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     if narrow(r) and passes_of(r) and top < UNPACKABLE: kept[r], top = top, top + 1
     elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= UNPACKABLE: kept[r], top = top, top + L
   last_read = lambda keep: max([passes_of(r)[-1] for r in kept if narrow(r) == keep], default=None)  # the last pass reading such
+  # In passes, a matmul computed in more than one (scores under a softmax) keeps the line's tiles of its B in L1 from the
+  # first, as a kept input does, rather than read them again each pass (one such matmul, A's row kept, while they fit)
+  line_b, computed = None, [None]
+  for j in matmuls:
+    mine = [p for p, pl in enumerate(plans) if j in pl[1]]
+    if (reducing and line_b is None and len(mine) > 1 and ops[j]["how"] != 2 and rows_at[matmuls.index(j)] is not None and
+        top + L * ops[j]["kt"] <= UNPACKABLE): line_b, computed, lines_at, top = j, mine, top, top + L * ops[j]["kt"]
+  if line_b is not None: decls += f"static unsigned line_done[{L}];\n"
   single = {}  # without passes, an input of one tile in all (a number) gets a slot of its own too, fetched once a worker
   if kept_b is not None: top = max(top, kept_b + (3 if mc else 1) * ops[matmuls[0]]["kt"])  # past A's rows and B's buffers
   for r in range(inputs) if not reducing else ():
@@ -861,16 +871,22 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
                         f"for (unsigned m = 0; m < {kt}; m++) step({how}, a[{y}], {b_tile}, nb ? {0 if how == 2 else kept_b} + m : KEPT, "
                         f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); tagged(0); }}")
           if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
-            walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
-                    ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
             column = 0 if how == 2 else buf if mc else kept_b  # a bfp8 B's from the start of its region
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
-                        f"{on} for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(walk)} }} {off}{posted} }}")
+                        f"{on} for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
             c[B].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) "
                         f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, {1 + DEPTH} + steps % {DEPTH}); tagged(0); }}")
             c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
                         f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
+          elif j == line_b:  # B's line in L1 across passes: fetched in the first pass that computes it, once the line before
+            at = f"{lines_at} + k * {kt}"  # has been done with it; A's row kept as below
+            if p == computed[0]:
+              c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
+                          f"step({how}, a[{y}], {b_tile}, {at} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
+            else: c[B].append(f"for (unsigned m = 0; m < {kt}; m++) kept_step();")
+            c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, at)])} {on} "
+                        f"for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
           else:
             new = "0" if bcast else f"fresh({q}, b * {rt} + i_)"  # bcast: A's row is in already
             c[B].append(f"{cond}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
@@ -918,7 +934,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
         c[P].append(f"if ({end}) {{ {output(j, f)}{pk} }}")
       c[M if dst else U].append(tt(REPORT))
       c[B].append(f"frame_done[{f}] = ++events;" + " narrow_done = events;" * (p == last_read(True)) +
-                  " kept_done[k] = events;" * (p == last_read(False)))
+                  " kept_done[k] = events;" * (p == last_read(False)) + " line_done[k] = events;" * (p == computed[-1]))
       bodies.append(c)
     passes.append((bool(swept_ops or reductions), bodies))
   def program(c):  # the loops all four programs share, around each one's part of a tile
