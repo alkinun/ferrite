@@ -26,7 +26,7 @@ backwards.
 - [x] More elementwise ops: log, sqrt, sin, cos, compare, where (`test_elementwise`)
 - [x] More dtypes: fp32 tensors (accuracy, gradients), integers (indices) (`test_fp32`, `test_int32`)
 - [x] Autograd: a backward for every primitive, checked against numpy's gradients (`test_autograd`)
-- [ ] A Llama-family model: RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache
+- [x] A Llama-family model: RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache (SmolLM-135M, `test/llama.py`)
 - [ ] A small CNN: convolution as an unfolded matmul
 - [ ] Training: a small GPT for a few hundred steps, its loss falling as numpy's does
 

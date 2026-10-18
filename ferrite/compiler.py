@@ -838,10 +838,13 @@ def move_kernel(dtype):
   BRISC alone, a datum at a time: a NoC read cannot put 2 bytes just anywhere, so x's tiles come whole into a cache in
   L1 as they are needed. A result tile starts as a copy of the zero tile, gets the datums inside the bounds, and goes
   home. Where a datum is in x takes two divisions, unless it is the element after the last one read (as in a reshape
-  or a slice of whole rows), which is a step."""
+  or a slice of whole rows), which is a step. A result of one row fills its tile with copies of it: the row is made
+  once and doubled down the tile by NoC copies inside L1."""
+  face, run = tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a face, and in a face's row
   return compile_kernel(f"""
 #define OUT {DATA:#x}
 #define CACHE {DATA + tile_bytes(dtype):#x}
+static void copy(unsigned from, unsigned to, unsigned n) {{ noc_read(noc_me() & 63, noc_me() >> 6, from, to, n); }}
 typedef {"unsigned short" if ITEMSIZE[dtype] == 2 else "unsigned"} datum;
 {_array("bank", [x | y << 6 for x, y in bh.DRAM])}
 static unsigned held[{MOVE_SLOTS}];  // tile number + 1 of what each cache slot holds (0: nothing yet)
@@ -873,6 +876,7 @@ void kmain(volatile unsigned *a) {{
     noc_read(noc_me() & 63, noc_me() >> 6, {ZEROS:#x}, OUT, {tile_bytes(dtype)});  // padding and what lies outside the bounds stay 0
     noc_wait();
     int r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c), c1 = to(j, cols, lo_c, hi_c);
+    if (rows == 1 && r1) r1 = 1;  // a single row: made once, doubled below
     for (int r = from(i, rows, lo_r); r < r1; r++) {{
       int y = rows == 1 ? 0 : i * 32 + r, e_row = e0 + b * sb + y * sr;
       for (int c = c0; c < c1; c++) {{
@@ -883,6 +887,12 @@ void kmain(volatile unsigned *a) {{
         if ((t = xb * bstride + xi / 32 * stride + xj / 32 + offset) != held_t) {{ tile = fetch(base, t); held_t = t; }}
         out[at(r, c)] = tile[at(xi % 32, xj % 32)];
       }}
+    }}
+    if (rows == 1 && r1) {{  // row 0 of faces 0 and 1 down their 16 rows, then faces 0-1 onto 2-3
+      l1_settle(OUT);
+      for (unsigned n = {run}; n < {face}; n *= 2) {{ copy(OUT, OUT + n, n); copy(OUT + {face}, OUT + {face} + n, n); noc_wait(); }}
+      copy(OUT, OUT + {2 * face}, {2 * face});
+      noc_wait();
     }}
     noc_write(OUT, bank[t % 8] & 63, bank[t % 8] >> 6, a[2] + t / 8 * {tile_bytes(dtype)}, {tile_bytes(dtype)});
     noc_wait();

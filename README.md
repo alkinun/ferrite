@@ -12,7 +12,10 @@ numpy (which matches Hugging Face's GPT-2):
     The meaning of life is not the same as the meaning of death
 
 Each word's scores stay within about 1 of numpy's (they span about 100); where numpy's top two are closer than that,
-bf16 can pick the other one.
+bf16 can pick the other one. A Llama-family model too, SmolLM-135M (grouped-query attention, RoPE, SwiGLU, a KV cache):
+
+    TTSIM=/path/to/libttsim.so python3 test/llama.py SmolLM-135M "The meaning of life is" 6
+    The meaning of life is a question that has been asked
 
 ## What is there
 

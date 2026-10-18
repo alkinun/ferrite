@@ -155,6 +155,15 @@ class Tensor:
     hi = tuple(w + n for w, n in zip(lo, self.shape))
     return self._move(shape, -sum(w * s for w, s in zip(lo, self._strides())), self._strides(), lo, hi)._track("pad", (self,), widths)
 
+  def cat(self, *xs, axis=0):  # along axis, the rest the same: each padded with zeros into its place, and summed (tinygrad's way)
+    ts, axis = (self, *xs), axis % 3
+    n, out, at = sum(t.shape[axis] for t in ts), None, 0
+    for t in ts:
+      widths = [(0, 0)] * 3
+      widths[axis] = (at, n - at - t.shape[axis])
+      out, at = t.pad(widths) if out is None else out + t.pad(widths), at + t.shape[axis]
+    return out
+
   def split(self, n, axis=1):
     """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads.
     The parts are whole tiles."""
@@ -268,6 +277,8 @@ class Tensor:
   def eq(self, x): return 1 - self.ne(x)
   __ne__, __eq__ = ne, eq
   def __hash__(self): return id(self)  # == is elementwise, so a tensor hashes by identity, as in tinygrad
+  def sigmoid(self): return (1 + (-self).exp()).reciprocal()
+  def silu(self): return self * self.sigmoid()
   def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
     k = 2 * math.sqrt(2 / math.pi)
     return self * (1 + (self * (self * self * (-0.044715 * k) - k)).exp()).reciprocal()

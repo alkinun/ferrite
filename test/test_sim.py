@@ -9,7 +9,8 @@ from ferrite.compiler import from_bf16, to_bf16
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, Runtime, compile_kernel
-import gpt2
+import gpt2, llama
+from types import SimpleNamespace
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
   b = np.asarray(a, np.float32).view(np.uint32)
@@ -634,7 +635,10 @@ def test_autograd(chip):
     (lambda a: a[:, 3:17, ::-1], lambda a: a[:, 3:17, ::-1], [ew]), (lambda a: a[1], lambda a: a[1:2], [ew]),
     (lambda a: a.split(2), lambda a: a.reshape(1, 20, 2, 32).transpose(2, 1, 3, 0).reshape(2, 20, 32), [((1, 20, 64), (-1, 1))]),
     (lambda a: a.merge(), lambda a: a.transpose(1, 0, 2).reshape(1, 20, 128), [((2, 20, 64), (-1, 1))]),
-    (lambda a: a.gather([3, 0, 7, 3]), lambda a: a[:, [3, 0, 7, 3]], [((1, 9, 40), (-1, 1))])]
+    (lambda a: a.gather([3, 0, 7, 3]), lambda a: a[:, [3, 0, 7, 3]], [((1, 9, 40), (-1, 1))]),
+    (lambda a, b: a.cat(b, axis=2), lambda a, b: np.concatenate([a, b], 2), [ew, ((2, 20, 13), (-1, 1))]),
+    (lambda a, b: b.cat(a, a, axis=0), lambda a, b: np.concatenate([b, a, a], 0), [ew, ((1, 20, 40), (-1, 1))]),
+    (Tensor.silu, lambda a: a / (1 + np.exp(-a)), [ew])]
   for n, (f, g, specs, *tol) in enumerate(cases):
     xs = [rng.uniform(lo, hi, shape) for shape, (lo, hi) in specs]
     ts = [Tensor.of(rt, x.astype(np.float32).tolist() if x.shape[0] > 1 else x[0].astype(np.float32).tolist(), "fp32").requires_grad_() for x in xs]
@@ -779,6 +783,60 @@ def test_gpt2_model(chip):
   got, want = gpt2.logits(ids, gpt2.upload(rt, weights), rt), gpt2.logits(ids, gpt2.arrays(weights))
   err = np.abs(got - want).max()
   assert want.argmax() == 407 and err < 2 and want[got.argmax()] >= want.max() - 2 * err, (err, got.argmax())
+
+def smol(rng, layers, vocab=256):  # random weights in SmolLM-135M's shapes (as test/llama.py names them), its config
+  c = SimpleNamespace(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)
+  shapes = {"input_layernorm": (1, 576, 1), "post_attention_layernorm": (1, 576, 1), "q_proj": (576, 576, 0), "k_proj": (576, 192, 0),
+            "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
+  w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
+  w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
+  return c, w | {"embed.T": w["embed"].T.copy()}
+
+@pytest.mark.parametrize("n", [16, 40])
+def test_llama_layer(chip, n):
+  # a Llama block (RMSNorm, RoPE, grouped-query attention, a SwiGLU MLP) in SmolLM-135M's shapes (576 wide, 9 query heads
+  # sharing 3 key and value heads, MLP 1536) on n tokens, against the same code (test/llama.py) in numpy, float64, with
+  # the same bf16 weights and rotary tables. Every intermediate is bf16 here, so the block's change to x must match to
+  # within 3% of its size
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(12)
+  c, w = smol(rng, 1)
+  p = {k.removeprefix("layers.0."): v for k, v in w.items() if k.startswith("layers.0.")}
+  x, (cos, sin) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, 0, n)
+  mask = np.tile(np.triu(np.full((n, n), -1e9, np.float32), 1), (3, 1))
+  on = lambda a: Tensor.of(rt, a.tolist())
+  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, on(cos), on(sin), on(mask), [None, None])
+  want = llama.layer(x, p, c, np.float64(cos), np.float64(sin), np.float64(mask), [None, None])
+  change = np.abs(want - x).max()
+  assert change > 0.5 and np.abs(np.array(got.tolist()) - want).max() < 0.03 * change, (np.abs(np.array(got.tolist()) - want).max(), change)
+
+def test_kv_cache(chip):
+  # a two-block Llama decoding with a KV cache: 5 prompt tokens, then 3 more one at a time, each reading the keys and
+  # values cached so far (grown by cat), against numpy doing the same; and numpy's cached logits equal its full recompute
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(13)
+  c, w = smol(rng, 2)
+  t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
+  caches, np_caches, ids = [[None, None], [None, None]], [[None, None], [None, None]], [7, 200, 31, 64, 5]
+  for step in range(4):
+    new = ids if step == 0 else ids[-1:]
+    got, want = llama.logits(llama.forward(new, t, c, caches, rt)), llama.forward(new, w, c, np_caches)[0]
+    assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (step, np.abs(got - want).max(), np.abs(want).max())
+    ids.append(int(want.argmax()))
+  assert caches[0][0].shape == (1 * 3, 8, 64) and np.allclose(want, llama.forward(ids[:-1], w, c, [[None, None], [None, None]])[0], atol=1e-3)
+
+@pytest.mark.skipif("LLAMA" not in os.environ, reason="LLAMA=/path/to/SmolLM-135M (Hugging Face HuggingFaceTB/SmolLM-135M) runs it")
+def test_llama_model(chip):
+  # a Llama-family model's real weights (SmolLM-135M: 30 blocks, grouped-query attention, tied embeddings): after "The
+  # meaning of life is", the next token's 49152 logits against the same model in numpy (whose fp32 version matches Hugging
+  # Face's to 2e-5), then a token decoded with the KV cache. About a minute on ttsim; test/llama.py generates text
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  c, weights = llama.load(os.environ["LLAMA"])
+  w, t = llama.arrays(weights), llama.upload(rt, weights)
+  caches, np_caches, new = [[None, None] for _ in range(c.layers)], [[None, None] for _ in range(c.layers)], [504, 2455, 282, 1029, 314]
+  for _ in range(2):
+    got, want = llama.logits(llama.forward(new, t, c, caches, rt)), llama.forward(new, w, c, np_caches)[0]
+    assert np.abs(got - want).max() < 1 and got.argmax() == want.argmax(), (np.abs(got - want).max(), got.argmax(), want.argmax())
+    new = [int(want.argmax())]
+  assert new == [1962], "a [question]"
 
 def test_softmax_and_layernorm(chip):
   # built from the primitives, each one launch: every worker owns whole rows and sweeps each in passes, reductions

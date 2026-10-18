@@ -114,7 +114,11 @@ append a correction.
     its backward is two more fp32 matmuls. The same holds for any op built from cheaper parts.
 17. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
     saved 10%. Skipping the datums outside the bounds and keeping the arguments in registers saved most of the rest.
-    The profile of the test said the time was all ttsim running kernels, not Python. (NOTES: "Movement")
+    A Llama decode step at 3.6 times the prompt's cost was one kernel: single-row moves making 32 copies of the row
+    one by one. A profile by kernel finds such things in a minute. (NOTES: "Movement")
+18. **Check the reference against its source.** The numpy SmolLM was 0.012 off Hugging Face's until the comparison
+    used fp32 rotary tables, as Hugging Face's fp32 model does; with them, 2e-5. A reference is only as good as its own
+    check. (NOTES: "A Llama-family model")
 
 ## Working method
 
