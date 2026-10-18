@@ -1,6 +1,6 @@
 # Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
-import math, os, random, struct, pytest
+import math, os, random, struct, sys, pytest
 import numpy as np
 from ferrite import bh, pci
 from ferrite.chip import Chip
@@ -806,6 +806,48 @@ def test_train(chip):
   losses = train.train(Runtime(chip, chip.tensix[0], chip.tensix[-1]), 5)
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
+
+@pytest.fixture
+def tinygrad(chip):  # tinygrad with ferrite as its FERRITE device, on this process's chip (TINYGRAD=/path/to/tinygrad, or installed)
+  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
+  pytest.importorskip("tinygrad")
+  from adapters import tinygrad_ferrite
+  tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  return tinygrad_ferrite
+
+def test_tinygrad(tinygrad):
+  # stage 4's first step: tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
+  # ferrite runs it: elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad
+  # writes one (a broadcast multiply, summed), softmax; then an MLP trained with Adam for three steps. All against
+  # tinygrad on its own CPU device, and on the chip (launches), not the host
+  from tinygrad import Tensor, nn
+  from tinygrad.helpers import Context
+  rng, rt = np.random.default_rng(14), tinygrad.runtime()
+  a, b, w = (rng.standard_normal(shape).astype(np.float32) for shape in ((2, 3, 40), (2, 3, 40), (40, 5)))
+  cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.max(-1), lambda x, y, w: x.exp().log(),
+           lambda x, y, w: (x > 0).where(x, y), lambda x, y, w: x @ w, lambda x, y, w: x.softmax(-1), lambda x, y, w: x.permute(2, 0, 1) - y.mean(),
+           lambda x, y, w: x.pad(((0, 0), (1, 2), (0, 0))) * 1.5, lambda x, y, w: x[:, 1:3, ::2].relu()]
+  for n, f in enumerate(cases):
+    want = f(*(Tensor(v, device="CPU") for v in (a, b, w))).numpy()
+    launches, got = rt.launches, f(*(Tensor(v, device="FERRITE") for v in (a, b, w))).numpy()
+    assert rt.launches > launches and got.shape == want.shape, n
+    assert np.abs(got - want).max() <= 1e-3 * (np.abs(want).max() + 1), (n, np.abs(got - want).max())  # a matmul to the FPU's 2^-11
+  def train(device):
+    rng = np.random.default_rng(15)
+    l1, l2 = nn.Linear(16, 32), nn.Linear(32, 10)
+    for l in (l1, l2):
+      l.weight = Tensor(rng.standard_normal(l.weight.shape).astype(np.float32) * 0.2, device=device)
+      l.bias = Tensor.zeros(*l.bias.shape, device=device)
+    opt, losses = nn.optim.Adam([l1.weight, l1.bias, l2.weight, l2.bias], lr=1e-2), []
+    x, y = (Tensor(v, device=device) for v in (rng.standard_normal((8, 16)).astype(np.float32), rng.integers(0, 10, 8).astype(np.int32)))
+    with Context(TRAINING=1):
+      for _ in range(3):
+        opt.zero_grad()
+        losses.append(l2(l1(x).relu()).sparse_categorical_crossentropy(y).backward().item())
+        opt.step()
+    return losses
+  want, got = train("CPU"), train("FERRITE")
+  assert np.allclose(got, want, atol=1e-3) and got[-1] < got[0] - 0.3, (got, want)
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_gpt2_layer(chip, n):

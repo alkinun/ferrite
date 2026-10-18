@@ -133,6 +133,16 @@ append a correction.
     gradients smaller than the matmul's error, and they went on as two models. The reference has to be evaluated at
     the system's own state (PyTorch on ferrite's weights, each step); long runs can only be compared as curves.
     (NOTES: "Training")
+22. **A fallback hides what it replaces.** The tinygrad adapter's first version passed every comparison with tinygrad
+    and launched nothing: data copied onto FERRITE stayed on the host, so every op took the fallback to tinygrad's
+    CPU. Then a tinygrad script ran on tinygrad's own default device, because the device was chosen in the environment
+    after tinygrad had read it. Count launches in a test, and make a fallback show itself. (NOTES: "tinygrad on
+    ferrite")
+23. **The primitives map; the layouts are the work.** tinygrad's ops are ferrite's almost one for one, and matched on the
+    first try. A transformer step's time went into where data lies: views that did not fold into three axes went
+    through the host, short axes padded every tile, flat weights and transposes were moved where they could be read in
+    place, and a product was made whole before its sum. 52 s a step went to 25 by layout alone. (NOTES: "tinygrad on
+    ferrite")
 
 ## Working method
 

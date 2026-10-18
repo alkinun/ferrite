@@ -50,7 +50,7 @@ Done: competitive numbers, and for every gap, a known reason.
 
 ## Stage 4: other people's code
 
-- [ ] A tinygrad backend (tinygrad is built on almost the same primitives)
+- [x] A tinygrad backend (tinygrad is built on almost the same primitives): `adapters/tinygrad_ferrite.py`, `test_tinygrad`
 - [ ] A PyTorch adapter
 - [ ] Models and training scripts written for those frameworks run unchanged
 

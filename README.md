@@ -24,6 +24,11 @@ each step's loss and gradients PyTorch's for the same weights, its loss falling 
     every step: loss within 1e-04 of PyTorch's on the same weights, gradients within 1e-02
     mean loss over 50 steps: 3.40 -> 3.12, PyTorch on its own 3.41 -> 3.07
 
+tinygrad runs on it too: ferrite is a tinygrad device, FERRITE, that takes tinygrad's tensor graph where tinygrad
+would schedule its own kernels and runs it on the chip. tinygrad's own scripts run unchanged:
+
+    TTSIM=/path/to/libttsim.so PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
+
 ## What is there
 
 - `ferrite/pci.py`, `ferrite/chip.py`: the card over PCIe (TLB windows onto the NoC, the ARC management core, DMA into
@@ -38,6 +43,7 @@ each step's loss and gradients PyTorch's for the same weights, its loss falling 
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: every Blackhole fact the code uses, as data. `NOTES.md` says where each comes from.
+- `adapters/tinygrad_ferrite.py`: tinygrad's frontend (Tensor, nn, autograd, optimizers) on ferrite, outside it.
 
 ## Running
 

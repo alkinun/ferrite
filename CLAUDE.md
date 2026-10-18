@@ -34,6 +34,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `test/test_sim.py`: every step, on ttsim (or on a card when `TTSIM` is not set).
 - `test/llama.py`: a Llama-family model, SmolLM-135M (RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache), the same way: written once, generating from the real weights, checked against numpy step by step.
 - `test/gpt2.py`: GPT-2 small (written once for ferrite Tensors and numpy), and greedy generation from the real weights, checked against numpy step by step.
+- `adapters/tinygrad_ferrite.py`: ferrite as tinygrad's FERRITE device, outside ferrite: tinygrad's tensor graph, taken where tinygrad would schedule it, run op by op on ferrite (movement as views folded into three axes, a broadcast multiply summed as a matmul, what ferrite lacks on tinygrad's CPU), and a runner for tinygrad scripts unchanged.
 - `test/train.py`: a small GPT (GPT-2's blocks) trained on ferrite in fp32 with Adam: each step's loss and gradients checked against PyTorch's on the same weights, and the loss curve against PyTorch training by itself.
 - `NOTES.md`: what we learned about the chip, and what is still unknown.
 - `LESSONS.md`: what the work has taught us, about the chip, the simulator, the compiler and how we work, and what a chip of our own should do differently. Add to it as we go, and keep it short and true.
@@ -49,7 +50,8 @@ Needs clang and lld on PATH, and ttsim's `libttsim.so` built for Blackhole (outs
     TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "The meaning of life is" 8
     TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "The meaning of life is" 8
     TTSIM=/path/to/libttsim.so python3 test/train.py 300
+    TTSIM=/path/to/libttsim.so PYTHONPATH=path/to/tinygrad python3 adapters/tinygrad_ferrite.py path/to/tinygrad/examples/transformer.py
 
-The tests need numpy; `test/gpt2.py` also tiktoken and the weights (Hugging Face `openai-community/gpt2`, `model.safetensors`), and `GPT2=path/to/model.safetensors` adds the whole model to the tests; `test/llama.py` wants Hugging Face's `HuggingFaceTB/SmolLM-135M` folder (config.json, tokenizer.json, model.safetensors), and `LLAMA=path/to/folder` adds it to the tests; `test/train.py` and `test_train` want PyTorch, as the reference. Without `TTSIM`, `pci.open_device()` looks for a real Blackhole on the PCI bus.
+The tests need numpy; `test/gpt2.py` also tiktoken and the weights (Hugging Face `openai-community/gpt2`, `model.safetensors`), and `GPT2=path/to/model.safetensors` adds the whole model to the tests; `test/llama.py` wants Hugging Face's `HuggingFaceTB/SmolLM-135M` folder (config.json, tokenizer.json, model.safetensors), and `LLAMA=path/to/folder` adds it to the tests; `test/train.py` and `test_train` want PyTorch, as the reference; `test_tinygrad` wants tinygrad (`TINYGRAD=path/to/tinygrad`, or installed), and the adapter numpy. Without `TTSIM`, `pci.open_device()` looks for a real Blackhole on the PCI bus.
 
 The simulator is a process-wide singleton that kills the process on any contract violation (bad address, bad TLB config, a semaphore taken while empty): a test run that stops early means the code did something the hardware would not like. pytest hides ttsim's `ERROR:` line; run with `-s` to see it.
