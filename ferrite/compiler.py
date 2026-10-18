@@ -163,40 +163,66 @@ FLAGS_ON, FLAGS_RESET, FLAGS_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC
 NAN, INF = 0x7FC00000, 0x7F800000
 def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # flags on: keep the lanes where integer LReg e >= n
 def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n (LReg t is overwritten)
-def poly(d, x, cs, temp):  # LReg d = cs[0] + cs[1] x + ... by Horner, each coefficient loaded into temp as it is needed
-  return sfp_const(d, cs[-1]) + [w for c in cs[-2::-1] for w in sfp_const(temp, c) + [mad(d, d, x, temp)]]
+CONSTS = {0.0: ZERO, 1.0: ONE, -1.0: MINUS_ONE}
+def poly(d, x, cs, temp):  # LReg d = cs[0] + cs[1] x + ... by Horner, each coefficient into temp as it is needed (0, +-1 are LRegs)
+  words = sfp_const(d, cs[-1])
+  for c in cs[-2::-1]: words += ([] if c in CONSTS else sfp_const(temp, c)) + [mad(d, d, x, CONSTS.get(c, temp))]
+  return words
 
-def exp(scale, floor):
-  """e^(x scale): (e^(x scale / 4096))^4096, a degree-4 Taylor series at |x scale / 4096| < 0.026, then 12 squarings.
-  Every step is a multiply-add, so it needs no exponent tricks; accuracy is ~1e-4, plenty for bf16. x is first raised to
-  at least floor (where the result is below the smallest normal float, so still 0), or the series itself overflows for
-  very negative x; large positive x overflows to inf in the squarings as it should."""
-  return (sfp_const(1, scale / 4096) + sfp_const(2, 1 / 24) + sfp_const(3, 1 / 6) + sfp_const(4, 0.5),
-          [sfp_load(), sfp_bf16(7, floor), ins("SFPSWAP", vd=7, vc=0, mod1=1), mul(5, 0, 1), mad(6, 5, 2, 3), mad(6, 6, 5, 4),
-           mad(6, 6, 5, ONE), mad(6, 6, 5, ONE)] + [mul(6, 6, 6) for _ in range(12)] + [sfp_store(6)])
+# The transcendentals reach fp32's own accuracy (about 1e-7), so an fp32 tensor gets numpy's float32 within a step or two:
+# each reduces x to a small range by exact steps, and a polynomial (fit offline to minimax) does the rest.
+EXP_P = [1.0, 1.0, 0.49999991, 0.16666421, 0.041668355, 0.008374773, 0.001382954]  # e^r on [-ln2/2, ln2/2], 8e-8
+LOG2_Q = [1.442695, -0.72134733, 0.4809106, -0.36070517, 0.2879189, -0.23891294, 0.21565668, -0.20746617, 0.12623915]  # 1.3e-7
+SIN_P = [1.0, -0.16666658, 0.0083330506, -0.00019809045, 2.6051646e-06]  # sin(r) / r in r^2, r in [-pi/2, pi/2], 1.4e-7
+
+def exp(base2):
+  """2^x, or e^x: n = round(t), t = x log2(e) (adding and taking away 1.5 2^23 rounds to an integer, whose bits it
+  leaves in the sum's low ones), r = (x - n) ln 2, or for e^x x - n ln 2 in two parts (Cody-Waite: n times 0.693359375 is
+  exact), e^r by a polynomial, times 2^floor(n/2) and 2^ceil(n/2), each built from its exponent bits: the multiplies
+  overflow to inf, or flush to 0, exactly where the result does. x is first held to where |t| <= 150 (NaN to an end)."""
+  (lim, t), ln2 = (150.0, 0) if base2 else (104.0, 5), math.log(2)
+  return (sfp_const(1, ln2) if base2 else sfp_const(1, 1 / ln2) + sfp_const(2, 0.693359375) + sfp_const(3, ln2 - 0.693359375),
+          [sfp_load(), sfp_bf16(4, -lim), ins("SFPSWAP", vd=4, vc=0, mod1=1), sfp_bf16(4, lim), ins("SFPSWAP", vd=0, vc=4, mod1=1),  # x within +-lim
+           *([] if base2 else [mul(5, 0, 1)]), sfp_bf16(6, 1.5 * 2**23), mad(4, t, ONE, 6), mad(7, 4, ONE, 6, neg=2),  # LReg 7: n
+           ins("SFPIADD", vd=6, vc=4, mod1=6),  # LReg 6: n as an integer, bits(t + 1.5 2^23) - bits(1.5 2^23)
+           *([mad(5, 7, ONE, 0, neg=1), mul(5, 5, 1)] if base2 else [mad(5, 7, 2, 0, neg=1), mad(5, 7, 3, 5, neg=1)]),  # LReg 5: r
+           *poly(4, 5, EXP_P, 7), ins("SFPSHFT", vd=0, vc=6, mod1=7, imm12=-1 & 0xFFF), ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=1),
+           ins("SFPSHFT", vd=6, mod1=3, imm12=-1 & 0xFFF),  # LReg 0, 6: floor(n/2), ceil(n/2), then each 2^ that, by its bits
+           *[w for r in (0, 6) for w in (ins("SFPIADD", vd=r, vc=r, mod1=5, imm12=127), ins("SFPSHFT", vd=r, mod1=1, imm12=23), mul(4, 4, r))],
+           sfp_store(4)])
 
 def log(scale):
-  """log2(x) scale: x = 2^e m with m in [1, 2), so log2(x) = e + u q(u), u = m - 1, q a polynomial fit on [0, 1) to 7e-5
-  of log2(m). Then the edges: inf and NaN give themselves, a negative number NaN, zero (and a denormal, flushed) -inf."""
-  return ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0, mod1=1), ins("SFPCAST", vd=1, vc=1), sfp_bf16(6, -127.0), mad(1, 1, ONE, 6),
-               ins("SFPSETEXP", vd=2, vc=0, mod1=1, imm12=127), mad(2, 2, ONE, MINUS_ONE),
-               *poly(3, 2, [1.4426008, -0.71663076, 0.44020653, -0.22450043, 0.058372099], 6), mad(3, 3, 2, 1),
-               *(sfp_const(6, scale) + [mul(3, 3, 6)] if scale != 1 else []),
-               ins("SFPEXEXP", vd=1, vc=0, mod1=1), FLAGS_ON, at_least(1, 255, 4), ins("SFPMOV", vd=3, vc=0), FLAGS_RESET,
-               ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), FLAGS_RESET, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), FLAGS_OFF, sfp_store(3)])
+  """log2(x) scale: x = 2^e m with m in [sqrt(1/2), sqrt(2)) (from [1, 2), halved and e one more where above sqrt 2), so
+  log2(x) = e + u q(u), u = m - 1, q a polynomial; relative near 1, where u is small and exact. Then the edges: inf and
+  NaN give themselves, a negative number NaN, zero (and a denormal, flushed) -inf."""
+  return (sfp_const(5, math.sqrt(2)) + (sfp_const(7, scale) if scale != 1 else []),
+          [sfp_load(), ins("SFPEXEXP", vd=1, vc=0, mod1=1), ins("SFPSETEXP", vd=2, vc=0, mod1=1, imm12=127),  # LReg 1: e, biased; 2: m
+           FLAGS_ON, ins("SFPGT", vd=2, vc=5, mod1=1), ins("SFPSETEXP", vd=2, vc=2, mod1=1, imm12=126), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=1),
+           FLAGS_OFF, ins("SFPCAST", vd=1, vc=1), sfp_bf16(6, -127.0), mad(1, 1, ONE, 6), mad(2, 2, ONE, MINUS_ONE),
+           *poly(3, 2, LOG2_Q, 6), mad(3, 3, 2, 1), *([mul(3, 3, 7)] if scale != 1 else []),
+           ins("SFPEXEXP", vd=1, vc=0, mod1=1), FLAGS_ON, at_least(1, 255, 4), ins("SFPMOV", vd=3, vc=0), FLAGS_RESET,
+           ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), FLAGS_RESET, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), FLAGS_OFF, sfp_store(3)])
 
 def sin(phase):
-  """sin(2 pi t), t = x / (2 pi) + phase: f = t - round(t) is in [-0.5, 0.5] (adding and taking away 1.5 2^23 rounds to an
-  integer), and sin(2 pi f) = f p(f^2), p a polynomial fit on that range to 6e-6. phase 0.25 makes it cos."""
-  return (sfp_const(1, 1 / (2 * math.pi)),
-          [sfp_load(), sfp_bf16(6, phase), mad(2, 0, 1, 6), sfp_bf16(3, 1.5 * 2**23), mad(4, 2, ONE, 3), mad(4, 4, ONE, 3, neg=2),
-           mad(2, 4, ONE, 2, neg=1), mul(3, 2, 2), *poly(4, 3, [6.2830539, -41.331123, 81.365494, -74.47094, 32.768826], 6),
-           mul(4, 4, 2), sfp_store(4)])
+  """sin(x + pi phase): k = round(x / pi + phase), r = x - k pi in two parts (Cody-Waite: k times 3.140625 is exact, and
+  so is what is left of x, being within a factor of 2 of it) + pi phase, also in two, so r is in [-pi/2, pi/2] with no
+  cancellation near a zero; sin(r) = r p(r^2), p a polynomial, and k's low bit, moved to the sign, flips it. phase 0.5
+  makes it cos. From |x| = 2^24 on, where an fp32 x is a whole number of no particular turn and the rounding trick
+  fails, it gives 0; inf and NaN give NaN."""
+  hi = 1.5707964  # pi/2 in fp32, and what it leaves out
+  return (sfp_const(1, 1 / math.pi),
+          [sfp_load(), sfp_bf16(7, phase), mad(4, 0, 1, 7), sfp_bf16(5, 1.5 * 2**23), mad(6, 4, ONE, 5), mad(4, 6, ONE, 5, neg=2),  # LReg 4: k
+           ins("SFPIADD", vd=5, vc=6, mod1=6), sfp_bf16(2, 3.140625), mad(6, 4, 2, 0, neg=1),  # LReg 5: k as an integer; 6: x - 3.140625 k
+           *(sfp_const(3, hi) + [mad(6, 6, ONE, 3)] if phase else []), *sfp_const(3, math.pi - 3.140625), mad(6, 4, 3, 6, neg=1),
+           *(sfp_const(3, math.pi / 2 - hi) + [mad(6, 6, ONE, 3)] if phase else []),  # LReg 6: r
+           ins("SFPSHFT", vd=5, mod1=1, imm12=31), ins("SFPEXEXP", vd=0, vc=0, mod1=1), mul(7, 6, 6), *poly(4, 7, SIN_P, 3), mul(4, 4, 6),
+           ins("SFPXOR", vd=4, vc=5), FLAGS_ON, at_least(0, 127 + 24, 5), ins("SFPMOV", vd=4, vc=ZERO), FLAGS_RESET, at_least(0, 255, 5),
+           *sfp_bits(4, NAN), FLAGS_OFF, sfp_store(4)])
 
 SFPU = {
   # max(x, 0): SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc; a pick, stored raw for int32
   "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, RAW)]),
-  "exp": exp(1, -104.0), "exp2": exp(math.log(2), -150.0), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.25),
+  "exp": exp(False), "exp2": exp(True), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
   # 1/x: SFPARECIP's 7-bit estimate, then two Newton steps y += y * (1 - x * y). Only where x is a normal number:
   # 0 and denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate
   "recip": ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent

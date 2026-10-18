@@ -102,8 +102,14 @@ append a correction.
     regression. Its oracle, numpy without bf16 rounding, cannot judge a comparison of two computed values (a rounding
     step flips it), so comparisons in random trees only see exact inputs.
 13. **Test at the precision you claim.** Every result went home as bf16, so tests compared at 2^-8 and two coarser
-    things hid under it: the FPU's 12-bit sums and exp's 4e-4. fp32 results showed both on the first run.
-14. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
+    things hid under it: the FPU's 12-bit sums and exp's 4e-4 (exp is fp32-grade now). fp32 results showed both.
+14. **Model the device program to tell its bugs from its algorithm's.** sin was 3e-7 off where its polynomial was
+    1.7e-7. A numpy model of the same fp32 steps matched the device to 6e-8, so the code was right and the method was
+    not: folding near a half-turn carried 0.5's rounding into a small result. Reducing by half-turns, in x, fixed it.
+15. **Reduce exactly, then approximate.** Each fp32 transcendental is an exact reduction (Cody-Waite constants short
+    enough that k times them is exact, exponent bits, a fold) and a short polynomial. The earlier exp, a series raised
+    to the 4096th power, could never beat its 12 roundings. (NOTES: "The SFPU")
+16. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
     saved 10%. Skipping the datums outside the bounds and keeping the arguments in registers saved most of the rest.
     The profile of the test said the time was all ttsim running kernels, not Python. (NOTES: "Movement")
 

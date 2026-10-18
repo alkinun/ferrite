@@ -87,6 +87,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPAND": (0x7E, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # vd &= vc
   "SFPOR": (0x7F, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # vd |= vc
   "SFPNOT": (0x80, {"vd": (4, 4), "vc": (8, 4)}),  # vd = ~vc
+  "SFPXOR": (0x8D, {"vd": (4, 4), "vc": (8, 4)}),  # vd ^= vc
   "SFPSETEXP": (0x82, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 8)}),  # mod1 1: vc with exponent imm12
   "SFPMAD": (0x84, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4), "va": (16, 4)}),  # vd = va * vb + vc
   "SFPMUL": (0x86, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4), "va": (16, 4)}),  # vc must be LReg 9

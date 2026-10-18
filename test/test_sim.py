@@ -280,7 +280,7 @@ def test_replay_keeps_pushes_small():
   tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(0, op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
   assert tile("add") <= 26 and tile("mul") <= 27, "was 48 and 80 before replay"
   assert len(c.step_unpack(0) + c.matmul(slots)) <= 12, "a matmul step was 71"
-  assert len(c.sfpu(["exp"], c.allocate({"exp"}))) <= 45, "32 passes of 19 words, replayed"
+  assert len(c.sfpu(["recip"], c.allocate({"recip"}))) <= 34, "32 passes of 12 words, replayed"
   for names in ({"mm", "mul"}, {"exp", "recip", "relu", "mm", "mul"}):  # what is recorded fits the 32-entry buffer
     assert sum(len(c.MATH_RUNS[n]) for n in c.allocate(names)) <= 32
 
@@ -541,8 +541,8 @@ def test_movement(chip):
 
 def test_fp32(chip):
   # fp32 tensors, 4 KiB tiles: the math thread unpacks them straight into Dst and the SFPU does the math, so add, sub, mul,
-  # comparisons, where, movement and maxes are numpy's float32 exactly and sums are within its rounding; exp and the other
-  # SFPU programs are as accurate as for bf16. Casts both ways (to bf16 rounds as the packer does), bf16 with fp32 is
+  # comparisons, where, movement and maxes are numpy's float32 exactly and sums are within its rounding; exp, log, sin
+  # and the like are within a step or two of fp32. Casts both ways (to bf16 rounds as the packer does), bf16 with fp32 is
   # fp32, and a number takes its tensor's dtype, so a mean of 768 values is exact. A matmul sums in fp32, but the FPU
   # adds each group of 8 products at 12 bits (ttsim's model of it): fp32 results are good to about 2^-11, and fp32
   # operands (bf16x3) reach that too rather than bf16's 2^-8. On one worker (the pipeline cycles) and on many
@@ -559,7 +559,11 @@ def test_fp32(chip):
                       (tx.T, x.transpose(0, 2, 1)), (tx[1][3:40:2, 5:66], x[1, 3:40:2, 5:66]), (tx[0].gather([44, 0, 7]), x[0, [44, 0, 7]])]:
       assert value(got).tolist() == np.asarray(want, np.float32).reshape(got.shape).tolist()
     assert np.allclose(value(tx.sum(2)), x.sum(2, keepdims=True), rtol=1e-6, atol=1e-5)
-    assert np.allclose(value((tx * 0.5).exp()), np.exp(x * np.float32(0.5)), rtol=5e-4)  # 12 squarings: fp32 rounding times 4096
+    w, v = np.float64(x * np.float32(4)), np.float64(x * x + np.float32(0.5))  # the transcendentals to a step or two of fp32 (2^-23 is
+    for got, want, scale in [((tx * 4.0).exp(), np.exp(w), np.exp(w)), ((tx * 4.0).exp2(), np.exp2(w), np.exp2(w)),  # 1.2e-7): relative,
+                             ((tx * tx + 0.5).log(), np.log(v), np.abs(np.log(v))), ((tx * tx + 0.5).log2(), np.log2(v), np.abs(np.log2(v))),
+                             ((tx * 32.0).sin(), np.sin(w * 8), 1), ((tx * 32.0).cos(), np.cos(w * 8), 1)]:  # sin and cos absolute
+      assert (np.abs(value(got) - want) / scale).max() <= 3e-7, (np.abs(value(got) - want) / scale).max()
     b = bf16(x)
     assert value(tx.bfloat16()).tolist() == bf16(x, True).tolist() and value(Tensor.of(rt, b.tolist()).float()).tolist() == b.tolist()
     assert value(Tensor.of(rt, b.tolist()) + tx).tolist() == (b.astype(np.float32) + x).tolist(), "bf16 with fp32 is fp32"
