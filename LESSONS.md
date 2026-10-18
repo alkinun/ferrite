@@ -14,7 +14,7 @@ append a correction.
    wrote is settled (`fence`, a load, `fence`) before it is sent. New code needs a write to `RISCV_IC_INVALIDATE`;
    `fence.i` does nothing. (NOTES: "What the cores run out of reset", "Device API")
 2. **Small fields set the real limits.** The unpackers see only 8 bits of their Z counter, so only L1 slots below 256
-   can be unpacked; a semaphore counts to 15, so a kernel holds 15 intermediates; a thread replays from 32 entries.
+   can be unpacked; a semaphore counts to 15, so a kernel holds 15 ops; a thread replays from 32 entries.
    Each showed up as a bug or a ceiling long after the design leaned on a wider assumption. Find the width of every
    counter before designing around it.
 3. **Reset values are undocumented, so write every register you rely on.** Thread config, address modes and
@@ -68,7 +68,7 @@ append a correction.
    Blackhole's. Silicon still has the last word. (NOTES: "Where the docs and ttsim disagree")
 6. **Know how a number was measured.** Every wait on ttsim ran it 1000 clocks at a time, so each was rounded up to the
    next 1000; a profile that waited after every launch put a training step at 766k cycles when it was 444k, and a
-   launch at 700 cycles when it was 390. Polling every 10 clocks costs a tenth more wall time. (NOTES: "How ttsim
+   one-tile add at 700 cycles when it was 390. Polling every 10 clocks costs a tenth more wall time. (NOTES: "How ttsim
    counts")
 7. **Read the simulator's clock before optimizing for it.** ttsim runs queued Tensix instructions at no cost and
    counts only the clocks where a tile's pipes all wait, one RISC-V instruction each. The MOP expander, planned as the
@@ -89,12 +89,13 @@ append a correction.
 4. **One padding rule beats special cases.** Padding is zero, except that a dimension of 1 fills its tile. That one
    rule gives broadcasting by tile reuse, lets a matmul sum over a padded K, and every kernel keeps it. Mask with
    stores, not multiplies: inf times 0 is NaN. (NOTES: "Any shape")
-5. **Launch cost dominates small work.** A GPT-2 token went from 2.07M simulated cycles to 140k mostly by launching
-   less and more cheaply: resident kernels, a ring the dispatcher reads by itself, multicast, split K, fewer kernels.
+5. **Launch cost dominates small work.** A GPT-2 token went from 2.07M simulated cycles to 117k mostly by launching
+   less and more cheaply: resident kernels, a ring the dispatcher reads by itself, multicast, split K, fewer kernels,
+   a go set up in advance.
    Faster math was a small part of it.
-6. **Generate straight-line code.** Kernel setup as stores of constants, overlapped across the threads, took a
-   one-tile kernel from 790 cycles to 490 against loops over tables in L1. The compiler is Python; the device code can
-   be as specialised as we like.
+6. **Generate straight-line code.** Kernel setup as straight-line pushes of constants, overlapped across the threads,
+   took a one-tile kernel from 790 cycles to 490 against loops over tables in L1. The compiler is Python; the device
+   code can be as specialised as we like.
 7. **Do layout work once.** Reading `wte` transposed every token cost 39k cycles, against 17.6k for a copy transposed
    once at load.
 8. **Python's lifetimes are part of the memory manager.** A tensor frees its DRAM in `__del__`, which CPython runs at

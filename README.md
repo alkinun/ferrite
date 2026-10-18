@@ -1,9 +1,9 @@
 # ferrite
 
 The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2300 lines of Python.
-No Tenstorrent software runs: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite talks to the card through its
-PCIe BARs from userspace, loads its own firmware onto every core, and compiles tensor expressions straight to Tensix
-instructions, written from the ISA documentation.
+Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
+talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
+tensor expressions straight to Tensix instructions, written from the ISA documentation.
 
 It runs GPT-2 small with the real weights, so far on the simulator, checking every word against the same model in
 numpy (which matches Hugging Face's GPT-2):
@@ -43,7 +43,7 @@ optimizers do (`from adapters.torch_ferrite import ferrite; model, x = ferrite(m
   each: elementwise ops (tinygrad's primitives and what it builds from them: exp, log, sin, cos, sqrt, comparisons,
   where), matmul, sums and maxes along any axis (so softmax and layer norm are one launch), transpose, views,
   reshape, permute, expand, pad and slicing at any offset (a chain of them one copy), convolution and max pooling, and
-  autograd (tinygrad's rules) for all of it but slices with a step.
+  autograd (tinygrad's rules) for all of it but slices with a step other than 1 or -1.
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: every Blackhole fact the code uses, as data. `NOTES.md` says where each comes from.
@@ -53,10 +53,10 @@ optimizers do (`from adapters.torch_ferrite import ferrite; model, x = ferrite(m
 ## Running
 
 Needs Python 3, clang and lld, and Tenstorrent's simulator, ttsim, built for Blackhole (`libttsim.so`). The tests also
-need numpy; the GPT-2 demo needs tiktoken and Hugging Face's `openai-community/gpt2` `model.safetensors`, and training
-PyTorch, as its reference.
+need numpy; the GPT-2 demo needs tiktoken and Hugging Face's `openai-community/gpt2` `model.safetensors`, the SmolLM
+demo its `HuggingFaceTB/SmolLM-135M` folder, and training PyTorch, as its reference.
 
-    TTSIM=/path/to/libttsim.so python3 -m ferrite.hello      # every core computes fib(30)
+    TTSIM=/path/to/libttsim.so python3 -m ferrite.hello      # every worker computes fib(30); one more dispatches
     TTSIM=/path/to/libttsim.so python3 -m pytest test        # every step, on the simulator
     TTSIM=/path/to/libttsim.so python3 -m ferrite.bench      # a matmul's speed and DRAM traffic
 
