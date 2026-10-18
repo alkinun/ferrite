@@ -206,7 +206,7 @@ ARC messages (kmd `msgqueue.c`, umd `blackhole_arc_message_queue.cpp`): `*0x8003
 
 ## The Tensix coprocessor, and the first compiler
 
-`ferrite/compiler.py`, encodings and register numbers in `ferrite/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_fusion`, `test_threads_wait`, `test_matmul_fusion`, `test_sfpu`, `test_elementwise`, `test_reductions`, `test_reduce_axes`, `test_softmax_and_layernorm`, `test_fp32`, `test_int32`.
+`ferrite/compiler.py` (the kernels; `ferrite/tensor.py` builds the trees of ops they compute), encodings and register numbers in `ferrite/bh.py`. Tested on ttsim: `test_tile_math`, `test_tensor_math`, `test_matmul_exact`, `test_matmul_random`, `test_stream_on_one_worker`, `test_fusion`, `test_threads_wait`, `test_matmul_fusion`, `test_sfpu`, `test_elementwise`, `test_reductions`, `test_reduce_axes`, `test_softmax_and_layernorm`, `test_fp32`, `test_int32`.
 
 **Who drives it.** Three Tensix threads, each an in-order instruction FIFO; any thread can issue to any unit (unpackers, FPU, packer, ...), the threads only differ in their per-thread state (ADCs, RWCs, GPRs, ThreadConfig). TRISC t pushes to thread t, through that thread's MOP expander; BRISC can push to all three (`0xFFE4_0000 + 0x10000 t`, skipping the MOP expander), but a BRISC push and a TRISC push in the same cycle drop the TRISC's, so only one of them may feed a thread. ferrite: each TRISC feeds its own thread and BRISC only moves data (ISA `BabyRISCV/PushTensixInstruction.md`).
 

@@ -6,7 +6,7 @@
 import sys
 from ferrite import bh, pci
 from ferrite.chip import Chip
-from ferrite.compiler import Tensor
+from ferrite.tensor import Tensor
 from ferrite.runtime import Runtime
 
 def bench(chip, m, k, n, repeat=3):

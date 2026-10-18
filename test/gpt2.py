@@ -6,7 +6,7 @@ import json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ferrite.compiler import Tensor
+from ferrite.tensor import Tensor
 
 HEADS = 12
 

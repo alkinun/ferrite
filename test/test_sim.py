@@ -4,8 +4,9 @@ import math, os, random, struct, pytest
 import numpy as np
 from ferrite import bh, pci
 from ferrite.chip import Chip
-from ferrite import compiler
-from ferrite.compiler import Tensor, from_bf16, to_bf16
+from ferrite import compiler, tensor
+from ferrite.compiler import from_bf16, to_bf16
+from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, Runtime, compile_kernel
 import gpt2
@@ -620,12 +621,12 @@ def test_fuzz(chip, monkeypatch):
   realize = Tensor.realize
   def checked_realize(t):
     if t.op in (None, "T", "move"): return realize(t)  # data movement is test_movement's
-    while compiler._ops(t, set()) > 15:  # too big for one kernel: its parts first, as realize does, each checked too
+    while tensor._ops(t, set()) > 15:  # too big for one kernel: its parts first, as realize does, each checked too
       u = t
-      while compiler._ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: compiler._ops(s, set()))
+      while tensor._ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: tensor._ops(s, set()))
       u.realize()
     inputs = []
-    e, _ = compiler._tree(t, inputs)
+    e, _ = tensor._tree(t, inputs)
     xs = [value(u) for u in inputs]
     realize(t)
     want, got = numpy(e, xs), value(t)
