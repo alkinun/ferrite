@@ -77,17 +77,24 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPLOAD": (0x70, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPLOADI": (0x71, {"imm16": (0, 16), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPSTORE": (0x72, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
-  "SFPEXEXP": (0x77, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
+  "SFPEXEXP": (0x77, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 1: the biased exponent, as an integer
   "SFPIADD": (0x79, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
   "SFPSHFT": (0x7A, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
+  "SFPSETCC": (0x7B, {"mod1": (0, 4), "vc": (8, 4)}),  # lane flags from vc: mod1 0, where its sign is set
   "SFPMOV": (0x7C, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
+  "SFPABS": (0x7D, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 1: of a float
   "SFPAND": (0x7E, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # vd &= vc
+  "SFPOR": (0x7F, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # vd |= vc
+  "SFPNOT": (0x80, {"vd": (4, 4), "vc": (8, 4)}),  # vd = ~vc
+  "SFPSETEXP": (0x82, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 8)}),  # mod1 1: vc with exponent imm12
   "SFPMAD": (0x84, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4), "va": (16, 4)}),  # vd = va * vb + vc
   "SFPMUL": (0x86, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4), "va": (16, 4)}),  # vc must be LReg 9
   "SFPENCC": (0x8A, {"mod1": (0, 4), "vd": (4, 4), "imm2": (12, 2)}),
   "SFPSWAP": (0x92, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
   "SFPSHFT2": (0x94, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 3: rotate each 8-lane group (a Dst row) by one
   "SFPTRANSP": (0x8C, {}),  # LRegs 0-3 (and 4-7) as a 4 x 4 of 8-lane groups, transposed: group j of LReg i swaps with group i of LReg j
+  "SFPCAST": (0x90, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 0: a sign-magnitude integer to float
+  "SFPGT": (0x97, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 8: vd = all ones if vd > vc (as ordered floats), else 0
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }
 UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets

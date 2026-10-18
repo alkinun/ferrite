@@ -320,6 +320,44 @@ def test_sfpu(chip):
       e, r = exp(uv), recip(wv)
       assert abs(gv - (e + r)) <= 2**-6 * max(abs(e), abs(r)), (uv, wv, gv, e + r)
 
+def test_elementwise(chip):
+  # tinygrad's primitives on the SFPU (exp2, log2, sin, sqrt; max, cmplt, cmpne; where, two exact picks and an add) and
+  # what is built from them, against numpy: to a bf16 step where they compute, exactly where they compare or pick. The
+  # edges too: 0, -0, a denormal (the Tensix flushes it to 0), inf, -inf, and negatives where only positives make sense
+  # (NaN, which the packer turns into inf)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(8)
+  edges = [0.0, -0.0, 1.0, -1.0, 3e-39, np.inf, -np.inf, 0.5, 2.0, 100.0, -100.0]
+  def make(lo, hi, extra=()):
+    a = bf16(np.concatenate([edges, extra, rng.uniform(lo, hi, 40 * 64 - len(edges) - len(extra))]).reshape(40, 64))
+    return a, np.where(np.abs(a) < 2.0**-126, 0.0, a), Tensor.of(rt, a.tolist())
+  def check(t, want, rel, atol=0.0):  # want rounded as the packer rounds (past bf16's range is inf), NaN as inf
+    want, got = np.nan_to_num(bf16(want, True), nan=np.inf, posinf=np.inf, neginf=-np.inf), np.array(t.tolist())
+    assert ((got == want) | (np.abs(got - want) <= rel * np.abs(want) + atol)).all(), np.argwhere(got != want)[:5]
+  with np.errstate(all="ignore"):
+    _, fx, tx = make(-8, 8, [1e30, -1e30])
+    for f, ref in [(tx.exp2, np.exp2), (tx.exp, np.exp), (tx.log2, np.log2), (tx.log, np.log), (tx.sqrt, np.sqrt)]: check(f(), ref(fx), 2**-7)
+    _, fa, ta = make(-20, 20, [np.pi / 2, np.pi])  # within 2^-7 of 1: near its zeros a sine is small, so absolutely
+    check(ta.sin(), np.sin(fa), 0, 2**-7)
+    check(ta.cos(), np.cos(fa), 0, 2**-7)
+  pos = bf16(rng.uniform(0.1, 50, (40, 64)))
+  check(Tensor.of(rt, pos.tolist()).rsqrt(), 1 / np.sqrt(pos), 2**-7)
+  # comparisons, max and min, where: small integers so that ties happen, signed zeros and infinities
+  ints = lambda: bf16(np.concatenate([[0.0, -0.0, np.inf, -np.inf, 3.0], rng.integers(-3, 4, 40 * 64 - 5)]).reshape(40, 64))
+  a, b = ints(), ints()
+  ta, tb = Tensor.of(rt, a.tolist()), Tensor.of(rt, b.tolist())
+  for got, want in [(ta < tb, a < b), (ta > tb, a > b), (ta == tb, a == b), (ta != tb, a != b), (ta <= tb, a <= b), (ta >= tb, a >= b),
+                    (ta.maximum(tb), np.maximum(a, b)), (ta.minimum(tb), np.minimum(a, b)), (ta < 1.0, a < 1), (2.0 > ta, 2 > a),
+                    ((ta < tb).where(tx, -np.inf), np.where(a < b, fx, -np.inf)), (ta.where(tb, 7.0), np.where(a != 0, b, 7))]:
+    assert np.array(got.tolist()).tolist() == np.asarray(want, float).tolist()
+  # fused: a comparison, where and two unary ops are one kernel; a masked softmax, where the mask is -inf, not -1e9
+  launches, got = rt.launches, (tx > 0).where(tx.log2(), tx.exp2())
+  with np.errstate(all="ignore"): check(got, np.where(fx > 0, np.log2(fx), np.exp2(fx)), 2**-7)
+  assert rt.launches == launches + 1
+  s, m = bf16(rng.uniform(-4, 4, (40, 64))), np.tril(np.ones((40, 64)))
+  masked = np.where(m > 0, s, -np.inf)
+  e = np.exp(masked - masked.max(1, keepdims=True))
+  close((Tensor.of(rt, m.tolist()) > 0).where(Tensor.of(rt, s.tolist()), -math.inf).softmax(), e / e.sum(1, keepdims=True), 0.02)
+
 def test_reductions(chip):
   # row max exactly, row sum to a bf16 step of the sum of magnitudes, each a column; then broadcast back:
   # x - max(x) along rows, and a column times a number, all against Python
@@ -360,6 +398,11 @@ def test_reduce_axes(chip):
     launches, got = rt.launches, tx.sum() * (1 / x.size)
     assert abs(got.tolist()[0][0] - x.mean()) <= 2**-7 * abs(x.mean()) and rt.launches == launches + 3, "an axis a launch"
     close(tx.sum(0) * tx[1] - 1.0, x.sum(0) * x[1] - 1, 2**-6)  # the batch sum, a view and a number in one kernel
+    y = bf16(rng.uniform(-2, 2, (2, 45, 200)))  # reductions of another length than the result along the axis: first, alone
+    ty = Tensor.of(rt, y.tolist())
+    close(tx[0:1, :, :].max(1) * ty[:, :, :70] + 1.0, x[0:1].max(1, keepdims=True) * y[:, :, :70] + 1, 2**-6)
+    close(tx.max(0) * ty[:, :, :70], x.max(0, keepdims=True) * y[:, :, :70], 2**-7)
+    close(tx[0].sum(2) + ty[1], x[0].sum(1, keepdims=True) + y[1], 2**-6)
     narrow = bf16(rng.uniform(-3, -1, (20, 70)))  # one tile tall: reduced on its own, and inside a taller kernel
     tnarrow = Tensor.of(rt, narrow.tolist())
     assert tnarrow.max(1).tolist() == narrow.max(0, keepdims=True).tolist()
@@ -506,9 +549,11 @@ def test_fuzz(chip, monkeypatch):
   def numpy(e, xs):
     if isinstance(e, int): return xs[e]
     v = [numpy(s, xs) for s in e[1:]]
-    f = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "T": lambda a: a.swapaxes(-1, -2), "relu": lambda a: np.maximum(a, 0),
-            "exp": np.exp, "recip": lambda a: 1 / a, "rsqrt": lambda a: 1 / np.sqrt(a)} | {
-            k: lambda a, k=k: getattr(a, k[:3])(int(k[3]), keepdims=True) for k in compiler.FOLDS}  # sum0, max2, ...
+    f = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "matmul": np.matmul, "T": lambda a: a.swapaxes(-1, -2),
+         "relu": lambda a: np.maximum(a, 0), "exp": np.exp, "exp2": np.exp2, "log": np.log, "log2": np.log2, "sin": np.sin,
+         "cos": np.cos, "sqrt": np.sqrt, "recip": lambda a: 1 / a, "max": np.maximum, "cmplt": lambda a, b: (a < b) * 1.0,
+         "cmpne": lambda a, b: (a != b) * 1.0, "keep": lambda c, x: np.where(c != 0, x, 0), "drop": lambda c, y: np.where(c != 0, 0, y)}
+    f |= {k: lambda a, k=k: getattr(a, k[:3])(int(k[3]), keepdims=True) for k in compiler.FOLDS}  # sum0, max2, ...
     return f[e[0]](*v)
   realize = Tensor.realize
   def checked_realize(t):
@@ -533,14 +578,17 @@ def test_fuzz(chip, monkeypatch):
     return Tensor.of(rt, a.tolist() if shape[0] > 1 else a[0].tolist())
   def gen(shape, depth):
     b, r, c = shape
-    kind = "leaf" if depth == 0 or rng.random() < 0.2 else rng.choice(["bin", "bin", "unary", "red", "mm"])
-    if kind == "bin":  # each operand keeps a dimension, or has 1 there (not both)
+    kind = "leaf" if depth == 0 or rng.random() < 0.2 else rng.choice(["bin", "bin", "unary", "red", "mm", "where"])
+    if kind in ("bin", "where"):  # each operand keeps a dimension, or has 1 there (not both)
       s1 = tuple(1 if rng.random() < 0.2 else d for d in shape)
       s2 = tuple(d if s1[i] == 1 else (1 if rng.random() < 0.2 else d) for i, d in enumerate(shape))
-      return getattr(gen(s1, depth - 1), rng.choice(["__add__", "__sub__", "__mul__"]))(gen(s2, depth - 1))
+      # comparisons only of inputs: between computed values a rounding step flips them, so numpy cannot check them
+      if kind == "where": return (leaf(shape) > 0).where(gen(s1, depth - 1), gen(s2, depth - 1))
+      return getattr(gen(s1, depth - 1), rng.choice(["__add__", "__sub__", "__mul__", "maximum", "minimum"]))(gen(s2, depth - 1))
     if kind == "unary":
       x = gen(shape, depth - 1)
-      return rng.choice([x.relu, (x * 0.5).exp, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt])()
+      return rng.choice([x.relu, (x * 0.5).exp, (x * 0.5).exp2, x.sin, x.cos, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt,
+                         (x * x + 1.0).log2, (x * x + 1.0).sqrt])()
     if kind == "red" and 1 in shape:  # along an axis that is 1 here (the batch, rows or columns). Values stay near 1
       axis = int(rng.choice([ax for ax, d in enumerate(shape) if d == 1]))  # (means, not sums), or exp would turn
       n = int(rng.choice([2, 3] if axis == 0 else [20, 32, 70, 96, 192]))   # rounding into large errors

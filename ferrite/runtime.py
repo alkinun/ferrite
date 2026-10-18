@@ -73,7 +73,7 @@ def compile_rv32(src, base=0):
   image runs wherever it is put; base only matters to firmware, which is put at 0. Images are kept in CACHE, named by
   a hash of the compiler's version, its flags, the link script and the source."""
   link = (f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
-          ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one output section, so .bss is zeros inside the image
+          ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one section: .bss is zeros in the image
   cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
   if cached.exists(): return cached.read_bytes()
   if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")

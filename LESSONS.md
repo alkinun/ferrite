@@ -84,7 +84,17 @@ append a correction.
 8. **Python's lifetimes are part of the memory manager.** A tensor frees its DRAM in `__del__`, which CPython runs at
    once unless a reference cycle holds the tensor; a closure in `realize` once did. (NOTES: "DRAM")
 9. **Cache what the compiler makes.** Compiled device images kept on disk took the test suite from 24 s to 5 s.
-10. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
+10. **Numbers are tensors, so constants are bf16.** `x * (1/768)` multiplies by 1/768 rounded to 8 bits, 0.2% off,
+    and exp(10) as tinygrad writes it, `exp2(10 * log2(e))`, would be 2% off. exp, log and cos keep their constants in
+    fp32 inside their SFPU programs; a mean still pays. (NOTES: "The SFPU")
+11. **A generalization must carry every special case along.** Making reductions work along any axis dropped one line
+    that seeded the sweep's length from the kernel's own result, and a reduction of another length then crashed the
+    compiler. No test reached it until the fuzzer learned `where`, one step later. Read the old code's guards before
+    deleting them, and give each one a test (`test_reduce_axes` now has it).
+12. **A fuzzer is as good as its generator, and as its oracle.** Growing the generator to new ops found that
+    regression. Its oracle, numpy without bf16 rounding, cannot judge a comparison of two computed values (a rounding
+    step flips it), so comparisons in random trees only see exact inputs.
+13. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
     saved 10%. Skipping the datums outside the bounds and keeping the arguments in registers saved most of the rest.
     The profile of the test said the time was all ttsim running kernels, not Python. (NOTES: "Movement")
 

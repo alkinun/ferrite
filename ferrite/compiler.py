@@ -98,7 +98,8 @@ REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), in
 def haloize(on):  # unpacker 0 transposes each 16x16 face into SrcA from its next unpack on (or stops): the config write
   word, bit, _ = bh.TENSIX_CFG_FIELDS["SEC0_Haloize_mode"]  # waits for unpacker 0's unpacks, the next unpack for the write
   return [ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_UNPACK0),
-          ins(f"RMWCIB{bit // 8}", cfg_reg_addr=word, data=on << bit % 8, mask=1 << bit % 8), ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)]
+          ins(f"RMWCIB{bit // 8}", cfg_reg_addr=word, data=on << bit % 8, mask=1 << bit % 8),
+          ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)]
 def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and A's next tile in its row into SrcB
   return [setadc(bh.UNPACK0, s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
@@ -136,37 +137,82 @@ def from_bf16(b): return struct.unpack("<f", struct.pack("<I", b << 16))[0]
 
 # SFPU programs: a setup, then a body run 32 times; each pass loads 32 datums of the Dst half (4 rows x 8 even or odd
 # columns) into LReg 0 and stores the result back, the store stepping Dst by 2 (address modes 2 and 3; fp32 Dst, mod0 3).
-def sfp_load(): return ins("SFPLOAD", vd=0, mod0=3, addr_mode=2)
+def sfp_load(r=0, at=0): return ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=at)
 def sfp_store(r): return ins("SFPSTORE", vd=r, mod0=3, addr_mode=3)
 def sfp_bits(r, bits): return [ins("SFPLOADI", vd=r, mod0=8, imm16=bits >> 16), ins("SFPLOADI", vd=r, mod0=10, imm16=bits & 0xFFFF)]
 def sfp_const(r, x): return sfp_bits(r, struct.unpack("<I", struct.pack("<f", x))[0])  # a full fp32 constant into LReg r
-def mad(d, a, b, c, negate_a=0): return ins("SFPMAD", vd=d, va=a, vb=b, vc=c, mod1=negate_a)  # d = (-)a * b + c
+def sfp_bf16(r, x):  # one word, for a constant bf16 holds exactly
+  assert from_bf16(to_bf16(x)) == x, f"{x} is not a bf16"
+  return ins("SFPLOADI", vd=r, mod0=0, imm16=to_bf16(x))
+def mad(d, a, b, c, neg=0): return ins("SFPMAD", vd=d, va=a, vb=b, vc=c, mod1=neg)  # d = a * b + c; neg 1: -a, 2: -c
 def mul(d, a, b): return ins("SFPMUL", vd=d, va=a, vb=b, vc=9)
-ZERO, ONE = 9, 10  # constant LRegs
+ZERO, ONE, MINUS_ONE = 9, 10, 11  # constant LRegs
+FLAGS_ON, FLAGS_RESET, FLAGS_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags
+NAN, INF = 0x7FC00000, 0x7F800000
+def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # flags on: keep the lanes where integer LReg e >= n
+def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n (LReg t is overwritten)
+def poly(d, x, cs, temp):  # LReg d = cs[0] + cs[1] x + ... by Horner, each coefficient loaded into temp as it is needed
+  return sfp_const(d, cs[-1]) + [w for c in cs[-2::-1] for w in sfp_const(temp, c) + [mad(d, d, x, temp)]]
+
+def exp(scale, floor):
+  """e^(x scale): (e^(x scale / 4096))^4096, a degree-4 Taylor series at |x scale / 4096| < 0.026, then 12 squarings.
+  Every step is a multiply-add, so it needs no exponent tricks; accuracy is ~1e-4, plenty for bf16. x is first raised to
+  at least floor (where the result is below the smallest normal float, so still 0), or the series itself overflows for
+  very negative x; large positive x overflows to inf in the squarings as it should."""
+  return (sfp_const(1, scale / 4096) + sfp_const(2, 1 / 24) + sfp_const(3, 1 / 6) + sfp_const(4, 0.5),
+          [sfp_load(), sfp_bf16(7, floor), ins("SFPSWAP", vd=7, vc=0, mod1=1), mul(5, 0, 1), mad(6, 5, 2, 3), mad(6, 6, 5, 4),
+           mad(6, 6, 5, ONE), mad(6, 6, 5, ONE)] + [mul(6, 6, 6) for _ in range(12)] + [sfp_store(6)])
+
+def log(scale):
+  """log2(x) scale: x = 2^e m with m in [1, 2), so log2(x) = e + u q(u), u = m - 1, q a polynomial fit on [0, 1) to 7e-5
+  of log2(m). Then the edges: inf and NaN give themselves, a negative number NaN, zero (and a denormal, flushed) -inf."""
+  return ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0, mod1=1), ins("SFPCAST", vd=1, vc=1), sfp_bf16(6, -127.0), mad(1, 1, ONE, 6),
+               ins("SFPSETEXP", vd=2, vc=0, mod1=1, imm12=127), mad(2, 2, ONE, MINUS_ONE),
+               *poly(3, 2, [1.4426008, -0.71663076, 0.44020653, -0.22450043, 0.058372099], 6), mad(3, 3, 2, 1),
+               *(sfp_const(6, scale) + [mul(3, 3, 6)] if scale != 1 else []),
+               ins("SFPEXEXP", vd=1, vc=0, mod1=1), FLAGS_ON, at_least(1, 255, 4), ins("SFPMOV", vd=3, vc=0), FLAGS_RESET,
+               ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), FLAGS_RESET, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), FLAGS_OFF, sfp_store(3)])
+
+def sin(phase):
+  """sin(2 pi t), t = x / (2 pi) + phase: f = t - round(t) is in [-0.5, 0.5] (adding and taking away 1.5 2^23 rounds to an
+  integer), and sin(2 pi f) = f p(f^2), p a polynomial fit on that range to 6e-6. phase 0.25 makes it cos."""
+  return (sfp_const(1, 1 / (2 * math.pi)),
+          [sfp_load(), sfp_bf16(6, phase), mad(2, 0, 1, 6), sfp_bf16(3, 1.5 * 2**23), mad(4, 2, ONE, 3), mad(4, 4, ONE, 3, neg=2),
+           mad(2, 4, ONE, 2, neg=1), mul(3, 2, 2), *poly(4, 3, [6.2830539, -41.331123, 81.365494, -74.47094, 32.768826], 6),
+           mul(4, 4, 2), sfp_store(4)])
+
 SFPU = {
   # max(x, 0): SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc
   "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0)]),
-  # e^x = (e^(x/4096))^4096: a degree-4 Taylor series at |x/4096| < 0.026, then 12 squarings. Every step is a
-  # multiply-add, so it needs no exponent tricks; accuracy is ~1e-4, plenty for bf16. x is first raised to at least
-  # -104 (e^-104 is below the smallest normal float, so still 0), or the series itself overflows for very negative x;
-  # large positive x overflows to inf in the squarings as it should
-  "exp": (sfp_const(1, 2**-12) + sfp_const(2, 1 / 24) + sfp_const(3, 1 / 6) + sfp_const(4, 0.5),
-          [sfp_load(), ins("SFPLOADI", vd=7, mod0=0, imm16=to_bf16(-104.0)), ins("SFPSWAP", vd=7, vc=0, mod1=1),
-           mul(5, 0, 1), mad(6, 5, 2, 3), mad(6, 6, 5, 4), mad(6, 6, 5, ONE), mad(6, 6, 5, ONE)] +
-          [mul(6, 6, 6) for _ in range(12)] + [sfp_store(6)]),
+  "exp": exp(1, -104.0), "exp2": exp(math.log(2), -150.0), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.25),
   # 1/x: SFPARECIP's 7-bit estimate, then two Newton steps y += y * (1 - x * y). Only where x is a normal number:
   # 0 and denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate
   "recip": ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent
-                 ins("SFPENCC", mod1=10, imm2=3),  # lanes enabled by flags, all set
-                 ins("SFPIADD", vd=4, vc=3, mod1=1, imm12=-128 & 0xFFF),  # keep lanes with exponent < 128 ...
-                 ins("SFPIADD", vd=4, vc=3, mod1=9, imm12=126),  # ... and >= -126
-                 mad(2, 0, 1, ONE, negate_a=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, negate_a=1), mad(1, 1, 2, 1),
-                 ins("SFPENCC", mod1=10, imm2=2), sfp_store(1)]),  # every lane again
-  # 1/sqrt(x) for x > 0: the bit trick (0x5F3759DF - bits / 2, within 3.5%), then two Newton steps y *= 1.5 - x/2 y^2
-  "rsqrt": (sfp_const(2, struct.unpack("<f", struct.pack("<I", 0x5F3759DF))[0]) + sfp_const(3, 1.5) + sfp_const(4, 0.5),
-            [sfp_load(), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF),  # LReg 1 = bits of x >> 1
-             ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +  # LReg 1 = magic - LReg 1 as integers; LReg 5 = x/2
-            [w for _ in range(2) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, negate_a=1), mul(1, 1, 6))] + [sfp_store(1)]),
+                 FLAGS_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
+                 mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), FLAGS_OFF, sfp_store(1)]),
+  # sqrt(x) = x / sqrt(x): 1/sqrt(x) by the bit trick (0x5F3759DF - bits / 2, within 3.5%) and two Newton steps
+  # y *= 1.5 - x/2 y^2, then times x (x + 0 first, so -0 is 0). 0, inf and NaN give themselves, a negative number NaN
+  "sqrt": (sfp_const(2, struct.unpack("<f", struct.pack("<I", 0x5F3759DF))[0]) + sfp_const(3, 1.5) + sfp_const(4, 0.5),
+           [sfp_load(), mad(0, 0, ONE, ZERO), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF),  # LReg 1 = bits of x >> 1
+            ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +  # LReg 1 = magic - LReg 1 as integers; LReg 5 = x/2
+           [w for _ in range(2) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, neg=1), mul(1, 1, 6))] +
+           [mul(1, 1, 0), ins("SFPEXEXP", vd=6, vc=0, mod1=1), FLAGS_ON, at_least(6, 255, 5), ins("SFPMOV", vd=1, vc=0), FLAGS_RESET,
+            below(6, 1, 5), ins("SFPMOV", vd=1, vc=0), FLAGS_RESET, ins("SFPSETCC", vc=0), *sfp_bits(1, NAN), FLAGS_OFF, sfp_store(1)]),
+}
+# Binary ops on the SFPU: x and y each added to zero into Dst (x at the op's Dst half, y 128 rows on), loaded into LRegs
+# 0 and 1, the result stored over x. Comparisons give 1.0 or 0 (all ones or 0 from SFPGT, and 1.0's bits), after x + 0
+# makes -0 into 0. keep and drop are the halves of where: x if c else 0, and y if not c else 0 (c: not 0), as bits, so
+# that an inf in the one not picked does not make a NaN, as c * x would.
+def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
+BINARY = {"max", "cmplt", "cmpne", "keep", "drop"}
+SFPU |= {
+  "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
+  "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
+                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1))),
+  "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
+                      ins("SFPAND", vd=1, vc=2), sfp_store(1))),
 }
 # Reductions along an axis (0: the batch, to one matrix; 1: rows, to one row; 2: columns, to one column): each tile
 # along it is x + 0 into Dst (the first in the result's half, the rest 128 rows further on, where the SFPU folds them
@@ -175,8 +221,7 @@ SFPU = {
 FOLDS = {f"{f}{ax}": ax for f in ("sum", "max") for ax in range(3)}  # kind -> the axis it folds
 def fold(kind, d, t):  # LReg d = d op t (for max, t is left with the min)
   return ins("SFPSWAP", vd=t, vc=d, mod1=1) if kind[:3] == "max" else mad(d, t, ONE, d)
-COMBINE = {k: [ins("SFPLOAD", vd=0, mod0=3, addr_mode=2), ins("SFPLOAD", vd=1, mod0=3, addr_mode=2, imm10=128), fold(k, 0, 1), sfp_store(0)]
-           for k in FOLDS}
+COMBINE = {k: binary(fold(k, 0, 1), sfp_store(0)) for k in FOLDS}
 def across_rows(kind):
   """Fold every tile row across its 32 columns. Row r of a tile is Dst row (r // 16) * 32 + r % 16 (columns 0-15)
   and 16 rows on (16-31); an SFPLOAD takes 4 such rows' even or odd columns, one row per 8-lane group. Folding the
@@ -186,7 +231,7 @@ def across_rows(kind):
   p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
   for base in (0, 4, 8, 12, 32, 36, 40, 44):
     at = [base, base + 2, base + 16, base + 18]  # even and odd columns, left and right face
-    p += [ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=a) for r, a in enumerate(at)]
+    p += [sfp_load(r, a) for r, a in enumerate(at)]
     p += [fold(kind, 0, 1), fold(kind, 2, 3), fold(kind, 0, 2)]
     p += [rot(1, 0), fold(kind, 0, 1), rot(1, 0), rot(1, 1), fold(kind, 0, 1), rot(1, 0), rot(1, 1), rot(1, 1), rot(1, 1), fold(kind, 0, 1)]
     p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
@@ -199,8 +244,8 @@ def across_cols(kind):
   p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
   for half, odd in [(h, o) for h in (0, 16) for o in (0, 2)]:
     at = [half + odd + base for base in (0, 4, 8, 12, 32, 36, 40, 44)]  # top face rows 0-15, bottom face
-    p += [ins("SFPLOAD", vd=0, mod0=3, addr_mode=2, imm10=at[0])]
-    p += [w for a in at[1:] for w in (ins("SFPLOAD", vd=1, mod0=3, addr_mode=2, imm10=a), fold(kind, 0, 1))]
+    p += [sfp_load(0, at[0])]
+    p += [w for a in at[1:] for w in (sfp_load(1, a), fold(kind, 0, 1))]
     p += [ins("SFPMOV", vd=r, vc=0) for r in (1, 2, 3)] + [ins("SFPTRANSP")] + [fold(kind, 0, r) for r in (1, 2, 3)]
     p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
   return p
@@ -217,18 +262,18 @@ def mask_columns(kind, n, d=0):
   p += sfp_bits(7, 14) + [ins("SFPAND", vd=7, vc=15)]
   for base, right, odd in [(b, r, o) for b in (0, 4, 8, 12, 32, 36, 40, 44) for r in (0, 1) for o in (0, 1)]:
     t = max(0, min(8, -(-(n - 16 * right - odd) // 2)))  # the first lane (of 8) at column n or more
-    if t < 8: p += [ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=7, mod1=9, imm12=-2 * t & 0xFFF),  # lanes t+
+    if t < 8: p += [FLAGS_ON, at_least(7, 2 * t, 6),  # lanes t+
                     ins("SFPSTORE", vd=fill, mod0=3, addr_mode=2, imm10=d + base + 16 * right + 2 * odd)]  # right faces: 16 rows on
-  return p + [ins("SFPENCC", mod1=10, imm2=2)]
+  return p + [FLAGS_OFF]
 def mask_rows(kind, m, d=0):
   """Rows m and on of the tile at Dst row d to the identity, past a tensor's last row. A store covers 4 rows, lane l in
   row l // 8 of them, and LReg 15 holds 2l, so LReg 15 - 16k >= 0 picks the rows from k on."""
   p, fill = masking(kind)
   for r in range(0, 32, 4):  # tile rows r..r+3: Dst rows (r // 16) * 32 + r % 16 on, left face, and 16 more, right face
     k = max(0, m - r)
-    if k < 4: p += [w for o in (0, 2, 16, 18) for w in (ins("SFPENCC", mod1=10, imm2=3), ins("SFPIADD", vd=6, vc=15, mod1=9, imm12=-16 * k & 0xFFF),
+    if k < 4: p += [w for o in (0, 2, 16, 18) for w in (FLAGS_ON, at_least(15, 16 * k, 6),
                                                      ins("SFPSTORE", vd=fill, mod0=3, addr_mode=2, imm10=d + r // 16 * 32 + r % 16 + o))]
-  return p + [ins("SFPENCC", mod1=10, imm2=2)]
+  return p + [FLAGS_OFF]
 MASK = {1: mask_rows, 2: mask_columns}  # the padding past the last tile along an axis
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
@@ -244,7 +289,7 @@ def run(slots, name, count=None):  # the first count words of a run: one REPLAY 
   words = MATH_RUNS[name][:count]
   return [replay(slots[name], len(words))] if name in slots else words
 def runs(slots, name, times): return run(slots, name) * times if name in slots else [Loop(times, MATH_RUNS[name])]
-def setup_math(slots): return [ins("SFPENCC", mod1=10, imm2=2)] + [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]
+def setup_math(slots): return [FLAGS_OFF] + [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]
 
 def last(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
 def matmul(slots):  # one matmul step: four phases (SrcA gives 5 mantissa bits a phase, SrcB 7: four make the whole product)
@@ -450,7 +495,7 @@ def fused_kernel(expr, shapes):
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
-    elif e[0] in SFPU:
+    elif e[0] in SFPU and e[0] not in BINARY:
       x = visit(e[1])
       if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below
         ops[x[1]]["posts"].append(e[0])
@@ -486,7 +531,7 @@ def fused_kernel(expr, shapes):
     else: ready[j] = max(deps, default=0)
   last = sweep[root] if root in sweep else ready[root]
   slots = allocate({"mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul"} |
-                   {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE})
+                   {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE or op["kind"] in BINARY})
   frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
   rows_at, top = [], FRAMES + 2 * frame + len(ops)  # each matmul's row of A in L1, while they fit; else A streams too
   assert top <= UNPACKABLE and len(matmuls) <= 16, "too many tiles in a kernel"
@@ -508,9 +553,10 @@ def fused_kernel(expr, shapes):
     if isinstance(r, int): return FRAMES + f * frame + r
     return FRAMES + (f * frame + inputs + r[1] if swept(r) else 2 * frame + r[1])
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
-  def where(r, base):  # which tile of r (an input, or the result: its [address, batch stride, row stride, offset] are at a[base]) is matrix b, row i_, column j's
+  def where(r, base):  # which tile of r (an input or the result, its [address, strides, offset] at a[base]) goes with b, i_, j
     s = size(r)
-    return f"{f'b * a[{base + 1}] + ' if s[0] > 1 else ''}{'i_' if ext(s, 1) > 1 else 0} * a[{base + 2}] + {'j' if ext(s, 2) > 1 else 0} + a[{base + 3}]"
+    b, i, j = f"b * a[{base + 1}] + " if s[0] > 1 else "", "i_" if ext(s, 1) > 1 else 0, "j" if ext(s, 2) > 1 else 0
+    return f"{b}{i} * a[{base + 2}] + {j} + a[{base + 3}]"
   tile = lambda i: where(i, arg(i))
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
   def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
@@ -552,14 +598,16 @@ def fused_kernel(expr, shapes):
           on, off = (tt(haloize(1)), tt(haloize(0))) if bt else ("", "")
           a_tile = f"{f'b * a[{x + 1}] + ' if shapes[op['x']][0] > 1 else ''}i_ * a[{x + 2}] + m + a[{x + 3}]"
           if kept_b is not None:  # A's bp rows and B's column in L1: unpacker 0 walks the column, 1 the row of A
-            c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
+            c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
+                        f"for (unsigned m = 0; m < {kt}; m++) step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, "
+                        f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); }}")
             walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
                     ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
             c[U].append(f"{cond}{{ push_word({setadc(bh.UNPACK1, 0):#x} + {rows_at[q]} + i_ % {bp} * {kt}); {tt([setadc(bh.UNPACK0, kept_b)])} "
                         f"{on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
-            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) step({bt}, a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
+            c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) "
+                        f"step({bt}, a[{y}], {b_tile}, 1 + (steps & 1), a[{x}], {a_tile}, 3 + (steps & 1));")
             c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); "
                         f"if (steps++ & 1) {{ {tt(unpack(2, 4) + REPORT)} }} else {{ {tt(unpack(1, 3) + REPORT)} }} }} {off}{posted} }}")
           else:
@@ -571,8 +619,13 @@ def fused_kernel(expr, shapes):
                       f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
           continue
         drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
-        c[U].append(f"{cond}{{ {drain}{tt(unpack(slot(f, op['x']), slot(f, op['y'])))}{posted} }}")
-        math = halves([math_begin(h, op['kind'] == 'mul') + elementwise(op['kind'], slots) + sfpu(op['posts'], slots) for h in (0, 1)])
+        x, y = slot(f, op["x"]), slot(f, op["y"])
+        if op["kind"] in BINARY:  # x and y each into Dst for the SFPU: x in the op's half, y 128 rows on
+          unpacks = unpack(x, ZERO_SLOT) + unpack(y, ZERO_SLOT)
+          fpu = elementwise("add", slots) + elementwise("add", slots, dst=128) + sfpu([op["kind"]], slots)
+        else: unpacks, fpu = unpack(x, y), elementwise(op["kind"], slots)
+        c[U].append(f"{cond}{{ {drain}{tt(unpacks)}{posted} }}")
+        math = halves([math_begin(h, op['kind'] == 'mul') + fpu + sfpu(op['posts'], slots) for h in (0, 1)])
         c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= 1; }}")
       for acc, j in enumerate(reductions):
         assert acc < len(ACCS), "two reductions a pass"
@@ -673,8 +726,8 @@ def transpose_kernel(rows, cols):
     if (u & 1) {{ {per_frame[1]} }} else {{ {per_frame[0]} }}
   }}"""
   return compile_kernel(
-    _brisc("a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} * a[5] + t % {per} / {ct} + a[6], {frame(f)[0]}); ready(); "
-                                f"frame_done[{f}] = ++events;" for f in (0, 1)])),
+    _brisc("a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} * a[5] + t % {per} / {ct} + a[6], "
+                          f"{frame(f)[0]}); ready(); frame_done[{f}] = ++events;" for f in (0, 1)])),
     _unpacker(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]), TRANSPOSING),
     _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)]) + " h ^= 1;"] * 2)),  # padding stays 0
     _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + halves([pack(DST_HALF * h, frame(f)[1], SEM_PACKED) for h in (0, 1)]) + " h ^= 1;"
@@ -698,7 +751,10 @@ def move_kernel():
 static unsigned held[{MOVE_SLOTS}];  // tile number + 1 of what each cache slot holds (0: nothing yet)
 static volatile unsigned short *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
   unsigned s = t % {MOVE_SLOTS};
-  if (held[s] != t + 1) {{ noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, CACHE + s * {TILE}, {TILE}); noc_wait(); held[s] = t + 1; }}
+  if (held[s] == t + 1) return (volatile unsigned short *)(CACHE + s * {TILE});
+  noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, CACHE + s * {TILE}, {TILE});
+  noc_wait();
+  held[s] = t + 1;
   return (volatile unsigned short *)(CACHE + s * {TILE});
 }}
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
@@ -825,7 +881,7 @@ class Tensor:
     slice of whole tiles (starting on tile boundaries, ending on one or at the end, step 1) is a view, read in place;
     any other is a copy (_move)."""
     if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)
-    assert len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
+    assert isinstance(key, tuple) and len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
     ranges = [range(*k.indices(n)) for k, n in zip((slice(None),) * (3 - len(key)) + tuple(key), self.shape)]
     shape = tuple(map(len, ranges))
     assert all(shape), f"an empty slice of {self.shape}"
@@ -918,30 +974,53 @@ class Tensor:
     self.rt.launch(kernel, args, units or self.tiles)
     return self
 
-  def _elementwise(self, op, other):
-    """numpy's broadcasting: shapes match, or one side has 1 where the other does not. A number is a 1 x 1 tensor."""
-    if not isinstance(other, Tensor): other = Tensor.full(self.rt, 1, 1, other)
-    shape = []
-    for a, b in ((self.batch, other.batch), (self.rows, other.rows), (self.cols, other.cols)):
-      assert a == b or 1 in (a, b), f"cannot broadcast {self.shape} with {other.shape}"
-      shape.append(max(a, b))
-    return Tensor(self.rt, shape[1], shape[2], op, (self, other), shape[0])
   @property
   def shape(self): return (self.batch, self.rows, self.cols)
+
+  # Elementwise: tinygrad's primitives (exp2, log2, sin, sqrt, reciprocal; add, mul, max, cmplt, cmpne; where), and the
+  # rest built from them. exp, log and cos are SFPU programs too, with log2(e), ln 2 and the quarter turn kept in fp32
+  # inside: as numbers they would be bf16 tensors, and exp(10) as exp2(10 * log2(e)) would be 2% off.
   def _unary(self, op): return Tensor(self.rt, self.rows, self.cols, op, (self,), self.batch)
-  def relu(self): return self._unary("relu")
-  def exp(self): return self._unary("exp")
+  def _binop(self, op, x, reverse=False):
+    """numpy's broadcasting: shapes match, or one side has 1 where the other does not. A number is a 1 x 1 tensor."""
+    if not isinstance(x, Tensor): x = Tensor.full(self.rt, 1, 1, x)
+    a, b = (x, self) if reverse else (self, x)
+    assert all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)), f"cannot broadcast {a.shape} with {b.shape}"
+    batch, rows, cols = map(max, a.shape, b.shape)
+    return Tensor(self.rt, rows, cols, op, (a, b), batch)
+  def exp2(self): return self._unary("exp2")
+  def log2(self): return self._unary("log2")
+  def sin(self): return self._unary("sin")
+  def sqrt(self): return self._unary("sqrt")
   def reciprocal(self): return self._unary("recip")
-  def rsqrt(self): return self._unary("rsqrt")
+  def exp(self): return self._unary("exp")
+  def log(self): return self._unary("log")
+  def cos(self): return self._unary("cos")
+  def relu(self): return self._unary("relu")
+  def rsqrt(self): return self.sqrt().reciprocal()
+  def maximum(self, x): return self._binop("max", x)
+  def minimum(self, x): return -((-self).maximum(-x))
+  def where(self, x, y): return self._binop("keep", x) + self._binop("drop", y)  # x where self is not 0, else y
+  def __add__(self, x): return self._binop("add", x)
+  def __sub__(self, x): return self._binop("sub", x)
+  def __mul__(self, x): return self._binop("mul", x)
+  def __rsub__(self, x): return self._binop("sub", x, True)
+  __radd__, __rmul__ = __add__, __mul__
+  def __truediv__(self, x): return self * (1 / x if isinstance(x, (int, float)) else x.reciprocal())
+  def __neg__(self): return self * -1.0
+  def __lt__(self, x): return self._binop("cmplt", x)
+  def __gt__(self, x): return self._binop("cmplt", x, True)
+  def __ge__(self, x): return 1.0 - (self < x)
+  def __le__(self, x): return 1.0 - (self > x)
+  def ne(self, x): return self._binop("cmpne", x)
+  def eq(self, x): return 1.0 - self.ne(x)
+  __ne__, __eq__ = ne, eq
+  def __hash__(self): return id(self)  # == is elementwise, so a tensor hashes by identity, as in tinygrad
   def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
     k = 2 * math.sqrt(2 / math.pi)
     return self * (1 + (self * (self * self * (-0.044715 * k) - k)).exp()).reciprocal()
-  def softmax(self):  # along each row, max first so exp stays in range
-    e = (self - self.max(2)).exp()
-    return e / e.sum(2)
-  def layernorm(self, eps=1e-5):  # each row to mean 0 and variance 1
-    c = self - self.sum(2) * (1 / self.cols)
-    return c * ((c * c).sum(2) * (1 / self.cols) + eps).rsqrt()
+
+  # Reductions, and what is built from them
   def sum(self, axis=None): return self._reduce("sum", axis)
   def max(self, axis=None): return self._reduce("max", axis)
   def _reduce(self, f, axis):
@@ -950,13 +1029,15 @@ class Tensor:
     if axis is None: return self._reduce(f, 0)._reduce(f, 1)._reduce(f, 2)
     shape = [1 if ax == axis % 3 else s for ax, s in enumerate(self.shape)]
     return self if shape == list(self.shape) else Tensor(self.rt, shape[1], shape[2], f"{f}{axis % 3}", (self,), shape[0])
-  def __add__(self, other): return self._elementwise("add", other)
-  def __sub__(self, other): return self._elementwise("sub", other)
-  def __mul__(self, other): return self._elementwise("mul", other)
-  def __truediv__(self, other): return self * (1 / other if isinstance(other, (int, float)) else other.reciprocal())
-  __radd__, __rmul__ = __add__, __mul__
-  def __rsub__(self, other): return Tensor.full(self.rt, 1, 1, other) - self
-  def __neg__(self): return self * -1.0
+  def mean(self, axis=None):
+    s = self.sum(axis)
+    return s * (math.prod(s.shape) / math.prod(self.shape))
+  def softmax(self, axis=-1):  # max first, so exp stays in range
+    e = (self - self.max(axis)).exp()
+    return e / e.sum(axis)
+  def layernorm(self, axis=-1, eps=1e-5):  # to mean 0 and variance 1 along axis
+    c = self - self.mean(axis)
+    return c * ((c * c).mean(axis) + eps).rsqrt()
 
   def __matmul__(self, other):  # matrix by matrix through a batch; a batch of 1 repeats
     assert self.cols == other.rows and (self.batch == other.batch or 1 in (self.batch, other.batch)), f"{self.shape} @ {other.shape}"
@@ -984,7 +1065,8 @@ def _tree(t, inputs):
   """The expression a kernel for t computes (fused_kernel's), realized tensors as numbers into inputs. The kernel
   sweeps along the axis of t's reductions (the first found; any along another axis compute first, on their own)."""
   axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
-  return _expr(t, t.shape, inputs, [axis, None, set()])
+  n = _ext(t, axis)  # the sweep is as long as t along the axis, unless t is one tile there: then its first reduction says
+  return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set()])
 
 def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)  # t's extent along an axis: matrices, or tiles
 
