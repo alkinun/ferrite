@@ -119,6 +119,10 @@ append a correction.
 18. **Check the reference against its source.** The numpy SmolLM was 0.012 off Hugging Face's until the comparison
     used fp32 rotary tables, as Hugging Face's fp32 model does; with them, 2e-5. A reference is only as good as its own
     check. (NOTES: "A Llama-family model")
+19. **Copies do not compose; maps do.** Every move was a launch of its own, which was fine while moves came one at a
+    time. The first convolution chained three a tap and took 34 launches for one layer. Composing the maps before
+    anything runs, as tinygrad composes views, took it to 16 launches and from 505k cycles to 118k. Keep movement a
+    description until something has to read it. (NOTES: "Movement at any granularity", "A small CNN")
 
 ## Working method
 

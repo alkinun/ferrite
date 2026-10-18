@@ -20,6 +20,12 @@ def close(t, want, tol):  # a tensor's values within tol (relative, and absolute
   got = np.array(t.tolist())
   assert got.shape == want.shape and np.allclose(got, want, rtol=tol, atol=tol), f"off by up to {np.abs(got - want).max()}"
 
+def conv(x, w, padding=0):  # numpy's convolution of x (channels, height, width) by w (out, in, k * k), tap by tap
+  k = math.isqrt(w.shape[2])
+  x = np.pad(x, ((0, 0), (padding, padding), (padding, padding)))
+  ho, wo = x.shape[1] - k + 1, x.shape[2] - k + 1
+  return sum(np.einsum("oc,chw->ohw", w[:, :, ky * k + kx], x[:, ky:ky + ho, kx:kx + wo]) for ky in range(k) for kx in range(k))
+
 @pytest.fixture(scope="session")
 def chip(): return Chip(pci.open_device())  # one per process: libttsim can only be initialized once
 
@@ -489,8 +495,9 @@ def test_batch(chip):
 
 def test_movement(chip):
   # reshape, permute, expand, pad and slices at any offset and step, against numpy bit for bit (a move only copies).
-  # Slices of whole tiles stay views; the rest is one launch each. A moved tensor goes home with tidy padding, so a
-  # matmul and a reduction can read it. Then random chains of moves, on one worker, whose cache of tiles cycles
+  # Slices of whole tiles stay views; the rest is one launch each, and so is a chain of them. A moved tensor goes home
+  # with tidy padding, so a matmul and a reduction can read it. Then random chains of moves, on one worker, whose cache
+  # of tiles cycles
   rng = np.random.default_rng(7)
   value = lambda t: np.array(t.tolist()).reshape(t.shape)
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
@@ -502,6 +509,9 @@ def test_movement(chip):
            (tx[0:1, 7:8, :].expand(3, 45, 70), np.broadcast_to(x[0:1, 7:8, :], (3, 45, 70))),
            (tx.pad(((3, 1), (40, 2))), np.pad(x, ((0, 0), (3, 1), (40, 2))))]
   for t, want in cases: assert value(t).tolist() == want.reshape(t.shape).tolist(), (t.shape, want.shape)
+  launches, t = rt.launches, tx.reshape(135, 70)[:, 7:100:2, ::-1].pad(((1, 0), (3, 1), (2, 5))).permute(2, 1, 0)[:, 1:4, 1:2].expand(77, 3, 40)
+  want = np.broadcast_to(np.pad(x.reshape(1, 135, 70)[:, 7:100:2, ::-1], ((1, 0), (3, 1), (2, 5))).transpose(2, 1, 0)[:, 1:4, 1:2], (77, 3, 40))
+  assert value(t).tolist() == want.tolist() and rt.launches == launches + 1, "a chain of moves is one move"
   launches, v = rt.launches, tx[1:3, 32:45, 32:64]
   assert rt.launches == launches and v.addr == tx.addr and value(v).tolist() == x[1:3, 32:45, 32:64].tolist(), "a view, no copy"
   w = bf16(rng.uniform(-1, 1, (50, 20)))
@@ -638,7 +648,9 @@ def test_autograd(chip):
     (lambda a: a.gather([3, 0, 7, 3]), lambda a: a[:, [3, 0, 7, 3]], [((1, 9, 40), (-1, 1))]),
     (lambda a, b: a.cat(b, axis=2), lambda a, b: np.concatenate([a, b], 2), [ew, ((2, 20, 13), (-1, 1))]),
     (lambda a, b: b.cat(a, a, axis=0), lambda a, b: np.concatenate([b, a, a], 0), [ew, ((1, 20, 40), (-1, 1))]),
-    (Tensor.silu, lambda a: a / (1 + np.exp(-a)), [ew])]
+    (Tensor.silu, lambda a: a / (1 + np.exp(-a)), [ew]),
+    (lambda a, b: a.conv2d(b, 1), lambda a, b: conv(a, b, 1), [((3, 9, 10), (-1, 1)), ((4, 3, 9), (-1, 1))], 2**-11),
+    (Tensor.max_pool2d, lambda a: a.reshape(2, 10, 2, 20, 2).max((2, 4)), [ew])]
   for n, (f, g, specs, *tol) in enumerate(cases):
     xs = [rng.uniform(lo, hi, shape) for shape, (lo, hi) in specs]
     ts = [Tensor.of(rt, x.astype(np.float32).tolist() if x.shape[0] > 1 else x[0].astype(np.float32).tolist(), "fp32").requires_grad_() for x in xs]
@@ -751,6 +763,26 @@ def test_mnist_mlp(chip):
   top2 = np.sort(want, 1)[:, -2:]
   clear = top2[:, 1] - top2[:, 0] > 0.05
   assert clear.sum() >= 8 and (logits.argmax(1) == want.argmax(1))[clear].all()
+
+def test_mnist_cnn(chip):
+  # stage 1's CNN: MNIST-shaped images through a 3x3 convolution (1 -> 8 channels, padded) and relu, a 2x2 max pool, a
+  # 3x3 convolution (8 -> 16) and relu, a pool, and 784 -> 10, against numpy in float64; random weights, as above. Each
+  # convolution is one matmul by the stacked patches, each of whose 9 taps is one move
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3)
+  w1, b1 = bf16(rng.normal(0, 1 / 3, (8, 1, 9))), bf16(rng.normal(0, 0.1, (8, 1, 1)))
+  w2, b2 = bf16(rng.normal(0, 72**-0.5, (16, 8, 9))), bf16(rng.normal(0, 0.1, (16, 1, 1)))
+  w3, b3 = bf16(rng.normal(0, 784**-0.5, (784, 10))), bf16(rng.normal(0, 0.1, (1, 10)))
+  tw1, tb1, tw2, tb2, tw3, tb3 = (Tensor.of(rt, a.tolist()) for a in (w1, b1, w2, b2, w3, b3))
+  pool = lambda a: a.reshape(a.shape[0], a.shape[1] // 2, 2, a.shape[2] // 2, 2).max((2, 4))
+  for _ in range(2):
+    x = bf16(rng.uniform(0, 1, (1, 28, 28)))
+    launches = rt.launches
+    h = ((Tensor.of(rt, x[0].tolist()).conv2d(tw1, 1) + tb1).relu().max_pool2d().conv2d(tw2, 1) + tb2).relu().max_pool2d()
+    logits = np.array((h.reshape(1, 784) @ tw3 + tb3).tolist())
+    assert rt.launches - launches <= 50, rt.launches - launches
+    h = pool(np.maximum(conv(pool(np.maximum(conv(x, w1, 1) + b1, 0)), w2, 1) + b2, 0))
+    want = h.reshape(1, 784) @ w3 + b3
+    assert np.allclose(logits, want, rtol=0.02, atol=0.02), np.abs(logits - want).max()
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_gpt2_layer(chip, n):

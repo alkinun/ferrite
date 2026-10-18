@@ -27,7 +27,7 @@ backwards.
 - [x] More dtypes: fp32 tensors (accuracy, gradients), integers (indices) (`test_fp32`, `test_int32`)
 - [x] Autograd: a backward for every primitive, checked against numpy's gradients (`test_autograd`)
 - [x] A Llama-family model: RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache (SmolLM-135M, `test/llama.py`)
-- [ ] A small CNN: convolution as an unfolded matmul
+- [x] A small CNN: convolution as an unfolded matmul, max pooling (`test_mnist_cnn`)
 - [ ] Training: a small GPT for a few hundred steps, its loss falling as numpy's does
 
 Done: Llama and CNN inference and GPT training run correctly on ttsim.

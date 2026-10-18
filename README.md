@@ -26,7 +26,8 @@ bf16 can pick the other one. A Llama-family model too, SmolLM-135M (grouped-quer
 - `ferrite/tensor.py`: lazy tensors (any shape, batched, bf16, fp32 or int32) whose expressions become one fused kernel
   each: elementwise ops (tinygrad's primitives and what it builds from them: exp, log, sin, cos, sqrt, comparisons,
   where), matmul, sums and maxes along any axis (so softmax and layer norm are one launch), transpose, views,
-  reshape, permute, expand, pad and slicing at any offset, and autograd (tinygrad's rules) for all of it.
+  reshape, permute, expand, pad and slicing at any offset (a chain of them one copy), convolution and max pooling, and
+  autograd (tinygrad's rules) for all of it.
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: every Blackhole fact the code uses, as data. `NOTES.md` says where each comes from.

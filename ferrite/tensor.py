@@ -15,7 +15,7 @@ class Tensor:
   its result that way too, so a matmul can sum over a padded K.
   A view (x[b], slices on tile boundaries, x.split(n)) shares its owner's DRAM: its tile (b, i, j) is tile
   b * bstride + i * stride + j + offset. Any other movement (reshape, permute, expand, pad, other slices) is a copy,
-  made by move_kernel from a map over the source's elements.
+  made by move_kernel from a map over the source's elements; a chain of them is one copy.
   A tensor made from one that requires_grad remembers how (_ctx: op, operands, arguments), past realizing, for
   backward (see gradient)."""
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1, dtype="bf16"):
@@ -123,18 +123,24 @@ class Tensor:
       b, r, c = (g.start for g in ranges)
       t = self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32, self.bstride)
     else:
-      st = self._strides()
-      t = self._move(shape, sum(g.start * s for g, s in zip(ranges, st)), tuple(g.step * s for g, s in zip(ranges, st)))
+      t = self._map(shape, (0, 1, 2), [g.start for g in ranges], [g.step for g in ranges])
     return t._track("slice", (self,), ranges)
 
   # Movement: each is one map from the result's elements to this tensor's (_move), copied by one launch of move_kernel
-  def _strides(self): return (self.rows * self.cols, self.cols, 1)  # of its elements, counted in row-major order
   def _move(self, shape, offset, strides, lo=(0, 0, 0), hi=None):
     """The tensor of shape (batch, rows, cols) whose element (b, r, c) is this one's offset + b strides[0] + r
     strides[1] + c strides[2] (counted in row-major order) inside lo..hi on each axis, and 0 outside."""
     t = Tensor(self.rt, shape[1], shape[2], "move", (self,), shape[0], self.dtype)
     t.map = (offset, *strides, *lo, *(hi or shape))
     return t
+  def _map(self, shape, axes, starts, steps):
+    """The tensor of shape (batch, rows, cols) whose element e along each axis a is this one's element starts[a] +
+    steps[a] e along its axis axes[a], and 0 where that is outside it (permute, expand, pad, slices). Of a move not yet
+    made, it is one move: the two maps composed, as tinygrad composes views, so a chain of these is one launch."""
+    if self.op == "move": x, offset, strides, lo, hi = self.srcs[0], self.map[0], self.map[1:4], self.map[4:7], self.map[7:]
+    else: x, offset, strides, lo, hi = self, 0, (self.rows * self.cols, self.cols, 1), (0, 0, 0), self.shape
+    inside = [_inside(o, s, lo[k], hi[k], n) for k, o, s, n in zip(axes, starts, steps, shape)]
+    return x._move(shape, offset + sum(strides[k] * o for k, o in zip(axes, starts)), [strides[k] * s for k, s in zip(axes, steps)], *zip(*inside))
   def reshape(self, *shape):  # up to three sizes, missing ones in front being 1
     shape = (1,) * (3 - len(shape)) + shape
     assert math.prod(shape) == math.prod(self.shape), f"cannot reshape {self.shape} to {shape}"
@@ -143,17 +149,16 @@ class Tensor:
     assert sorted(order) == [0, 1, 2]
     if order == (0, 2, 1): return self.T
     if order == (0, 1, 2): return self
-    return self._move(tuple(self.shape[k] for k in order), 0, tuple(self._strides()[k] for k in order))._track("permute", (self,), order)
+    return self._map(tuple(self.shape[k] for k in order), order, (0, 0, 0), (1, 1, 1))._track("permute", (self,), order)
   def expand(self, *shape):  # dimensions of 1 repeated, missing ones in front being 1
     shape = (1,) * (3 - len(shape)) + shape
     assert all(n in (m, 1) for n, m in zip(self.shape, shape)), f"cannot expand {self.shape} to {shape}"
     if shape == self.shape: return self
-    return self._move(shape, 0, tuple(s if n == m else 0 for s, n, m in zip(self._strides(), self.shape, shape)))._track("expand", (self,))
+    return self._map(shape, (0, 1, 2), (0, 0, 0), [int(n == m) for n, m in zip(self.shape, shape)])._track("expand", (self,))
   def pad(self, widths):  # zeros: (before, after) for each of the last len(widths) axes, as numpy's
     widths = ((0, 0),) * (3 - len(widths)) + tuple(widths)
-    lo, shape = tuple(w[0] for w in widths), tuple(n + w[0] + w[1] for n, w in zip(self.shape, widths))
-    hi = tuple(w + n for w, n in zip(lo, self.shape))
-    return self._move(shape, -sum(w * s for w, s in zip(lo, self._strides())), self._strides(), lo, hi)._track("pad", (self,), widths)
+    shape = tuple(n + w[0] + w[1] for n, w in zip(self.shape, widths))
+    return self._map(shape, (0, 1, 2), [-w[0] for w in widths], (1, 1, 1))._track("pad", (self,), widths)
 
   def cat(self, *xs, axis=0):  # along axis, the rest the same: each padded with zeros into its place, and summed (tinygrad's way)
     ts, axis = (self, *xs), axis % 3
@@ -184,7 +189,7 @@ class Tensor:
     """The transpose (of each matrix of a batch). A matmul reads it as its B straight from this tensor, transposing
     tiles as they come in; anything else realizes it in a kernel of its own (transpose_kernel). The unpacker transposes
     only on its way into SrcA, so fp32 and int32 move instead."""
-    if self.dtype != "bf16": return self._move((self.batch, self.cols, self.rows), 0, (self.rows * self.cols, 1, self.cols))._track("T", (self,))
+    if self.dtype != "bf16": return self._map((self.batch, self.cols, self.rows), (0, 2, 1), (0, 0, 0), (1, 1, 1))._track("T", (self,))
     return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch)
 
   def realize(self, into=None):
@@ -277,6 +282,24 @@ class Tensor:
   def eq(self, x): return 1 - self.ne(x)
   __ne__, __eq__ = ne, eq
   def __hash__(self): return id(self)  # == is elementwise, so a tensor hashes by identity, as in tinygrad
+  # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
+  def conv2d(self, w, padding=0):
+    """By w (out channels, in channels, k * k): a k x k kernel, im2col's way, as one matmul. With each channel flattened
+    into a row, tap (ky, kx) of the kernel reads those rows from ky W + kx on; the k * k taps stacked are the patches,
+    column y W + x the patch at (y, x) (those with x past the last wrap around, and are dropped from the result). Each
+    tap is one move: the flattening, its slice and its place in the stack composed."""
+    k = math.isqrt(w.cols)
+    assert k * k == w.cols and w.rows == self.batch, f"{self.shape} by {w.shape}: (out, in, k * k)"
+    x = self.pad(((padding, padding), (padding, padding))) if padding else self
+    (c, h, wd), ho, wo = x.shape, x.rows - k + 1, x.cols - k + 1
+    rows = x.reshape(1, c, h * wd).pad(((0, 0), (0, k - 1)))  # k - 1 zeros on the end, for the last tap's wrapped columns
+    taps = [rows[:, :, ky * wd + kx:ky * wd + kx + ho * wd] for ky in range(k) for kx in range(k)]
+    out = w.permute(0, 2, 1).reshape(1, w.batch, k * k * c) @ taps[0].cat(*taps[1:], axis=1)
+    return out.reshape(w.batch, ho, wd)[:, :, :wo]
+  def max_pool2d(self, k=2):  # the largest of each k x k block: of each k rows, then of each k columns
+    c, h, w = self.shape
+    assert h % k == 0 and w % k == 0, f"{self.shape} in {k} x {k} blocks"
+    return self.reshape(c * h // k, k, w).max(1).reshape(1, c * h * w // (k * k), k).max(2).reshape(c, h // k, w // k)
   def sigmoid(self): return (1 + (-self).exp()).reciprocal()
   def silu(self): return self * self.sigmoid()
   def gelu(self):  # GPT-2's: 0.5 x (1 + tanh(z)), z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
@@ -403,6 +426,12 @@ def _backward(t, g):
     onehot = args[0].T == Tensor.of(t.rt, [list(range(x.rows))], "int32")
     return (onehot.cast(g.dtype).T.matmul(g, x.dtype),)
   raise NotImplementedError(f"no backward for {op}")
+
+def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (first, end)
+  if s == 0: return (0, n) if lo <= o < hi else (0, 0)
+  if s < 0: o, s, lo, hi = -o, -s, 1 - hi, 1 - lo
+  first, end = max(-((o - lo) // s), 0), min(-((o - hi) // s), n)
+  return (first, end) if first < end else (0, 0)
 
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are whole tensors, realized first, not tiles in the same kernel
 def _lazy(t, seen):  # the unrealized ops under t, t first
