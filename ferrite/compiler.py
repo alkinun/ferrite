@@ -96,7 +96,9 @@ SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem
                 ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SEMINIT", sem_sel=SEM_UNPACKED, max_value=15),
                 *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS], *counters(UNPACKERS, 1024)]
 SETUP_PACK = counters(bh.PACK, 16) + record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
-def setadc(unpacker, slot): return ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=slot)  # its Z: the slot
+def setadc(unpacker, slot):  # its Z: the slot, a number or a C expression (then (word, expression): pushed with it added)
+  word = ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0)
+  return word + slot if isinstance(slot, int) else (word, slot)
 def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then handed to the FPU
   return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
@@ -385,7 +387,8 @@ def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(progra
 
 def tt(words):
   """C for a TRISC to push words to its thread as .ttinsn instructions: each word rotated left by 2 and written into
-  the code, so the TRISC stalls while the thread's FIFO is full. A Loop becomes a C loop."""
+  the code, so the TRISC stalls while the thread's FIFO is full. A Loop becomes a C loop, and a (word, expression) a
+  store of the word plus the expression's value, worked out at run time."""
   c, pending = [], []
   for w in list(words) + [None]:
     if isinstance(w, int):
@@ -394,7 +397,8 @@ def tt(words):
       continue
     if pending: c.append(f'asm volatile(".word {", ".join(pending)}" ::: "memory");')
     pending = []
-    if w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
+    if isinstance(w, tuple): c.append(f"push_word({w[0]:#x} + ({w[1]}));")
+    elif w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
   return " ".join(c)
 
 ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, row values, A's rows
@@ -566,8 +570,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   then across the tile (across_rows, across_cols), and packs one tile.
   A line is done in passes: a pass is a sweep over its tiles, and a reduction's result can only be read in the pass
   after the one that swept it. Each pass recomputes what it needs (softmax computes exp twice) rather than keep whole
-  lines in L1. Values one tile long along the axis (reductions, ops on them, inputs of 1 there) are worked out once per
-  line, in the first tile of the pass that needs them, into slots of their own.
+  lines of it in L1, but reads inputs from DRAM once: one read in more than one pass keeps its line of tiles in L1 from
+  the first, while they fit. Values one tile long along the axis (reductions, ops on them, inputs of 1 there) are
+  worked out once per line, in the first tile of the pass that needs them, into slots of their own.
   Two frames of slots alternate between tiles: inputs, then one slot per op. Every intermediate is rounded to bf16 on
   its way to L1, exactly as if each op ran on its own; in-place SFPU ops see the fp32 result.
   The four programs run the same loops over units, passes and tiles, each doing its own part of every tile."""
@@ -664,10 +669,27 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   if bp > 1 or mc: rows_at = [base]  # A's bp rows, then B's column (or columns)
   kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 or mc else None
   br, bc = (mc[1], len(grid[0])) if mc else (-(-rt // bp), -(-w // bq))  # blocks down and across a matrix (the grid's)
-  decls = ""  # BRISC's tables for a multicast matmul
-  def slot(f, r):  # an input or swept op lives in the frame, a narrow op in its own slot after both frames
+  decls = ""  # BRISC's tables and statics for a multicast matmul or kept inputs
+  def plan(p):  # pass p's reductions, the swept ops it computes (operands first), and the narrow ops it works out once
+    reductions, swept_ops = [j for j in sweep if sweep[j] == p], []
+    def need(r):
+      if isinstance(r, tuple) and swept(r) and r[1] not in swept_ops:
+        for o in operands(ops[r[1]]): need(o)
+        swept_ops.append(r[1])
+    for r in [ops[j]["x"] for j in reductions] + ([me] if p == last and swept(me) else []): need(r)
+    return reductions, swept_ops, [j for j, op in enumerate(ops) if not swept(("op", j)) and op["kind"] not in COMBINE and ready[j] == p]
+  plans = [plan(p) for p in range(last + 1)]
+  reads = [{r for j in sum(pl, []) for r in operands(ops[j]) if isinstance(r, int)} for pl in plans]  # the inputs each pass reads
+  # In passes, an input one tile along the sweep gets a slot of its own, fetched once a line, and one read in more than one
+  # pass keeps its line of tiles in L1 (while they fit below slot 256), fetched in the first: neither comes again from DRAM
+  kept, passes_of, narrow = {}, lambda r: [p for p in range(last + 1) if r in reads[p]], lambda r: ext(shapes[r], axis) == 1
+  for r in range(inputs) if reducing else ():
+    if narrow(r) and passes_of(r): kept[r], top = top, top + 1
+    elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= UNPACKABLE: kept[r], top = top, top + L
+  last_read = lambda keep: max([passes_of(r)[-1] for r in kept if narrow(r) == keep], default=None)  # the last pass reading such
+  def slot(f, r):  # an input or swept op lives in the frame (or where it is kept), a narrow op in its own slot after both frames
     if r == "zero": return ZERO_SLOT
-    if isinstance(r, int): return FRAMES + f * frame + r
+    if isinstance(r, int): return FRAMES + f * frame + r if r not in kept else kept[r] if narrow(r) else f"{kept[r]} + k"
     return FRAMES + (f * frame + inputs + r[1] if swept(r) else 2 * frame + r[1])
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
   def where(r, base):  # which tile of r (an input or the result, its [address, strides, offset] at a[base]) goes with b, i_, j
@@ -686,22 +708,18 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     return (f if swept(me) else 0) if out != dtype and r == me else slot(f, r)
   def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
     return f"output({f if swept(me) else 0}, {pslot(f, me)}, {where(me, 2)}); " if j == root else ""
+  def fetch(f, p, r):  # BRISC's fetch of input r in pass p: into the frame, or into its kept slot in the first pass reading it,
+    if r not in kept: return f"get(a[{arg(r)}], {tile(r)}, {slot(f, r)});"  # once the line before has been read there
+    if p != passes_of(r)[0]: return ""
+    return (f"if (k == 0) {{ reached(narrow_done); get(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
+            f"reached(kept_done[k]); get(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
+  if kept: decls += f"static unsigned kept_done[{L}], narrow_done;  // events once the line before's last read of a kept slot is done"
   passes = []
-  for p in range(last + 1):
-    reductions = [j for j in sweep if sweep[j] == p]
-    sinks = [ops[j]["x"] for j in reductions] + ([me] if p == last and swept(me) else [])
-    swept_ops = []  # the swept ops this pass computes, operands first
-    def need(r):
-      if isinstance(r, tuple) and swept(r) and r[1] not in swept_ops:
-        for o in operands(ops[r[1]]): need(o)
-        swept_ops.append(r[1])
-    for r in sinks: need(r)
-    once = [j for j, op in enumerate(ops) if not swept(("op", j)) and op["kind"] not in COMBINE and ready[j] == p]
+  for p, (reductions, swept_ops, once) in enumerate(plans):
     bodies = []
     for f in (0, 1):
       c = [[], [], [], []]  # each program's C for this tile
-      fetch = sorted({r for j in once + swept_ops + reductions for r in operands(ops[j]) if isinstance(r, int)})
-      c[B] += [f"reached(frame_done[{f}]);"] + [f"get(a[{arg(r)}], {tile(r)}, {slot(f, r)});" for r in fetch] + ["ready();"]
+      c[B] += [f"reached(frame_done[{f}]);"] + [fetch(f, p, r) for r in sorted(reads[p])] + ["ready();"]
       c[U].append("fetched();")
       if dst: c[M].append("arrived();")
       for j in once + swept_ops:
@@ -747,8 +765,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
             walk = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
                     ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT
             column = f"{kept_b} + jj % {mc[2]} * {kt}" if mc else kept_b
-            c[U].append(f"{cond}{{ push_word({setadc(bh.UNPACK1, 0):#x} + {rows_at[q]} + i_ % {bp} * {kt}); "
-                        f"push_word({setadc(bh.UNPACK0, 0):#x} + {column}); "
+            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
                         f"{on} for (unsigned m = 0; m < {kt}; m++) {{ fetched(); {tt(walk)} }} {off}{posted} }}")
           elif rows_at[q] is None:  # A's tile streams in beside B's, each step
             c[B].append(f"{cond}for (unsigned m = 0; m < {kt}; m++) "
@@ -799,7 +816,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           c[M].append(f"if ({end}) {{ {step(True)} {finish} }}")
         c[P].append(f"if ({end}) {{ {output(j, f)}{pk} }}")
       c[M if dst else U].append(tt(REPORT))
-      c[B].append(f"frame_done[{f}] = ++events;")
+      c[B].append(f"frame_done[{f}] = ++events;" + " narrow_done = events;" * (p == last_read(True)) +
+                  " kept_done[k] = events;" * (p == last_read(False)))
       bodies.append(c)
     passes.append((bool(swept_ops or reductions), bodies))
   def program(c):  # the loops all four programs share, around each one's part of a tile

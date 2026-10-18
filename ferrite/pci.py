@@ -40,9 +40,10 @@ class Sim:
       if base <= bus and bus + n <= base + size: return addr + bus - base
     raise RuntimeError(f"device DMA to {bus:#x}+{n}, which is not host memory we allocated")
 
+  TICK = 10  # chip clocks each poll runs: the finest any measurement is (at 1000, every wait was rounded up to 1000)
   def tick(self):  # the simulator only runs when we let it
-    self.lib.libttsim_clock(1000)
-    self.clocks += 1000
+    self.lib.libttsim_clock(self.TICK)
+    self.clocks += self.TICK
   def now(self): return self.clocks / bh.AICLK  # seconds of chip time, by ttsim's clock, which is not silicon's timing
 
 class Card:

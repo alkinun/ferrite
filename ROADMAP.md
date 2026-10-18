@@ -42,7 +42,7 @@ Done: everything from stage 1 runs correctly on the card.
 ## Stage 3: fast on silicon
 
 - [ ] Matmul near the chip's peak, decode near its DRAM bandwidth
-- [x] Tiles multicast between cores: each input tile of a matmul read from DRAM once (`test_matmul_multicast`)
+- [x] Tiles multicast between cores: a matmul reads each input tile from DRAM once (`test_matmul_multicast`)
 - [ ] What the simulator could not measure: several reads in flight, BFP8 weights, fewer fidelity phases where accuracy
       allows
 - [ ] Benchmarks against Tenstorrent's own stack, published

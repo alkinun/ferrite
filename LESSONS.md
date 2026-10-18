@@ -66,6 +66,15 @@ append a correction.
 5. **When the docs and ttsim disagree, ask which chip each describes.** Some Blackhole ISA pages are Wormhole's copied
    over (address modes of 2 bits, not Blackhole's 3). ttsim's `tensix_isa.json` and `tensix_regs.json` are
    Blackhole's. Silicon still has the last word. (NOTES: "Where the docs and ttsim disagree")
+6. **Know how a number was measured.** Every wait on ttsim ran it 1000 clocks at a time, so each was rounded up to the
+   next 1000; a profile that waited after every launch put a training step at 766k cycles when it was 444k, and a
+   launch at 700 cycles when it was 390. Polling every 10 clocks costs a tenth more wall time. (NOTES: "How ttsim
+   counts")
+7. **Read the simulator's clock before optimizing for it.** ttsim runs queued Tensix instructions at no cost and
+   counts only the clocks where a tile's pipes all wait, one RISC-V instruction each. The MOP expander, planned as the
+   next step, only saves pushes, which it does not count; a PC profile of the idle clocks showed the cores waiting on
+   each other instead, and fetches on BRISC's critical path: fetching a layer norm's inputs once took it from 2.6k
+   cycles to 0.6k. (NOTES: "How ttsim counts")
 
 ## The compiler and runtime
 
