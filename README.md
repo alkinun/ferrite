@@ -37,3 +37,8 @@ need numpy; the GPT-2 demo needs tiktoken and Hugging Face's `openai-community/g
 
 Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (as root). It has not met one yet: `NOTES.md` has the
 bring-up plan for the first day on a p150.
+
+## Where it is going
+
+`ROADMAP.md`: from here to a general compiler, silicon, frameworks, many cards, and a chip of our own.
+

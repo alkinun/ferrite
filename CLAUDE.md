@@ -33,6 +33,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `test/test_sim.py`: every step, on ttsim (or on a card when `TTSIM` is not set).
 - `test/gpt2.py`: GPT-2 small (written once for ferrite Tensors and numpy), and greedy generation from the real weights, checked against numpy step by step.
 - `NOTES.md`: what we learned about the chip, and what is still unknown.
+- `ROADMAP.md`: the stages from here, each with its steps and what done means.
 
 ## Running
 
