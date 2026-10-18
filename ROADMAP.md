@@ -22,7 +22,7 @@ Any model and training, from a small set of primitives: every model is built fro
 backwards.
 
 - [x] Reductions along any axis (sum, max), not only rows (`test_reduce_axes`)
-- [ ] Movement at any granularity: reshape, permute, expand, pad, slice, not only on tile boundaries
+- [x] Movement at any granularity: reshape, permute, expand, pad, slice, not only on tile boundaries (`test_movement`)
 - [ ] More elementwise ops: log, sqrt, sin, cos, compare, where
 - [ ] More dtypes: fp32 tensors (accuracy, gradients), integers (indices)
 - [ ] Autograd: a backward for every primitive, checked against numpy's gradients

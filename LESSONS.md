@@ -84,6 +84,9 @@ append a correction.
 8. **Python's lifetimes are part of the memory manager.** A tensor frees its DRAM in `__del__`, which CPython runs at
    once unless a reference cycle holds the tensor; a closure in `realize` once did. (NOTES: "DRAM")
 9. **Cache what the compiler makes.** Compiled device images kept on disk took the test suite from 24 s to 5 s.
+10. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
+    saved 10%. Skipping the datums outside the bounds and keeping the arguments in registers saved most of the rest.
+    The profile of the test said the time was all ttsim running kernels, not Python. (NOTES: "Movement")
 
 ## Working method
 

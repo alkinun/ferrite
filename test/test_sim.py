@@ -442,6 +442,60 @@ def test_batch(chip):
   one, a = Runtime(chip, chip.tensix[0], chip.tensix[1]), a[:, :20]  # last: it takes two of rt's cores. One worker, and one
   close(Tensor.of(one, a.tolist()) @ Tensor.of(one, b.tolist()), a @ b, 2**-6)  # tile row a matrix: A's row in L1 changes with the matrix
 
+def test_movement(chip):
+  # reshape, permute, expand, pad and slices at any offset and step, against numpy bit for bit (a move only copies).
+  # Slices of whole tiles stay views; the rest is one launch each. A moved tensor goes home with tidy padding, so a
+  # matmul and a reduction can read it. Then random chains of moves, on one worker, whose cache of tiles cycles
+  rng = np.random.default_rng(7)
+  value = lambda t: np.array(t.tolist()).reshape(t.shape)
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  x = bf16(rng.uniform(-2, 2, (3, 45, 70)))
+  tx = Tensor.of(rt, x.tolist())
+  cases = [(tx.reshape(5, 27, 70), x.reshape(5, 27, 70)), (tx.reshape(63, 150), x.reshape(63, 150)),
+           *[(tx.permute(*o), x.transpose(o)) for o in [(1, 0, 2), (2, 1, 0), (1, 2, 0), (2, 0, 1), (0, 2, 1)]],
+           (tx[1:3, 5:40:3, ::-1], x[1:3, 5:40:3, ::-1]), (tx[:, 3:4], x[:, :, 3:4]), (tx[2:3, 44:45, :], x[2:3, 44:45, :]),
+           (tx[0:1, 7:8, :].expand(3, 45, 70), np.broadcast_to(x[0:1, 7:8, :], (3, 45, 70))),
+           (tx.pad(((3, 1), (40, 2))), np.pad(x, ((0, 0), (3, 1), (40, 2))))]
+  for t, want in cases: assert value(t).tolist() == want.reshape(t.shape).tolist(), (t.shape, want.shape)
+  launches, v = rt.launches, tx[1:3, 32:45, 32:64]
+  assert rt.launches == launches and v.addr == tx.addr and value(v).tolist() == x[1:3, 32:45, 32:64].tolist(), "a view, no copy"
+  w = bf16(rng.uniform(-1, 1, (50, 20)))
+  close(tx[0][5:40, 10:60] @ Tensor.of(rt, w.tolist()), x[0, 5:40, 10:60] @ w, 2**-6)
+  close(tx[:, 3:50, 5:69].sum(1) * (1 / 47), x[:, 3:50, 5:69].sum(1, keepdims=True) / 47, 2**-7)
+  one = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  def move(t, a):  # a random move of t and the same of numpy's a; batches stay small
+    b, r, c = a.shape
+    kind = rng.choice(["reshape", "permute", "slice", "pad", "expand" if 1 in a.shape else "slice"])
+    if kind == "reshape":
+      n = int(rng.choice([d for d in range(1, min(b * r * c, 200) + 1) if b * r * c % d == 0]))
+      nb = int(rng.choice([d for d in range(1, 4) if b * r * c // n % d == 0]))
+      shape = (nb, b * r * c // n // nb, n)
+      return t.reshape(*shape), a.reshape(shape)
+    if kind == "permute":
+      o = tuple(int(k) for k in rng.permutation(3))
+      while a.shape[o[0]] > 4: o = tuple(int(k) for k in rng.permutation(3))
+      return t.permute(*o), a.transpose(o)
+    if kind == "pad":
+      p = [(int(rng.integers(0, 2)), int(rng.integers(0, 2)))] + [(int(rng.integers(0, 20)), int(rng.integers(0, 20))) for _ in range(2)]
+      return t.pad(p), np.pad(a, p)
+    if kind == "expand":
+      shape = tuple(n if n > 1 else int(rng.integers(2, 4)) if ax == 0 else int(rng.choice([2, 33])) for ax, n in enumerate(a.shape))
+      return t.expand(*shape), np.broadcast_to(a, shape)
+    key = []
+    for n in a.shape:
+      lo = int(rng.integers(0, n))
+      hi = int(rng.integers(lo + 1, n + 1))
+      step = int(rng.choice([1, 1, 2, 3, -1]))
+      key.append(slice(hi - 1, lo - 1 if lo else None, step) if step < 0 else slice(lo, hi, step))
+    return t[tuple(key)], a[tuple(key)]
+  for _ in range(8):
+    shape = (int(rng.choice([1, 2, 3])), int(rng.choice([1, 20, 45])), int(rng.choice([1, 20, 70])))
+    a = bf16(rng.uniform(-2, 2, shape))
+    t = Tensor.of(one, a.tolist() if shape[0] > 1 else a[0].tolist())
+    for _ in range(3):
+      t, a = move(t, a)
+      assert value(t).tolist() == a.reshape(t.shape).tolist(), a.shape
+
 def test_fuzz(chip, monkeypatch):
   # random expressions (elementwise ops with broadcasting, unary ops, reductions along any axis, matmuls; odd shapes,
   # batches), and

@@ -680,6 +680,63 @@ def transpose_kernel(rows, cols):
     _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + halves([pack(DST_HALF * h, frame(f)[1], SEM_PACKED) for h in (0, 1)]) + " h ^= 1;"
                    for f in (0, 1)])))
 
+MOVE_SLOTS = 127  # x's tiles cached in L1 by a move, by tile number mod a prime, so power-of-two strides spread out
+
+def move_kernel():
+  """A tensor moved around: reshape, permute, expand, pad, slice. args [first unit, units, out, x's address, tile
+  strides for batch and row, tile offset, x's rows and columns, the result's rows and columns, then the map: an offset
+  and strides for batch, row and column, and each axis's bounds lo and hi]. Element (b, r, c) of the result, inside
+  the bounds, is element offset + b sb + r sr + c sc of x, counted in row-major order; outside them, 0.
+  BRISC alone, a datum at a time: a NoC read cannot put 2 bytes just anywhere, so x's tiles come whole into a cache in
+  L1 as they are needed. A result tile starts as a copy of the zero tile, gets the datums inside the bounds, and goes
+  home. Where a datum is in x takes two divisions, unless it is the element after the last one read (as in a reshape
+  or a slice of whole rows), which is a step."""
+  return compile_kernel(f"""
+#define OUT {DATA:#x}
+#define CACHE {DATA + TILE:#x}
+{_array("bank", [x | y << 6 for x, y in bh.DRAM])}
+static unsigned held[{MOVE_SLOTS}];  // tile number + 1 of what each cache slot holds (0: nothing yet)
+static volatile unsigned short *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
+  unsigned s = t % {MOVE_SLOTS};
+  if (held[s] != t + 1) {{ noc_read(bank[t % 8] & 63, bank[t % 8] >> 6, base + t / 8 * {TILE}, CACHE + s * {TILE}, {TILE}); noc_wait(); held[s] = t + 1; }}
+  return (volatile unsigned short *)(CACHE + s * {TILE});
+}}
+static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
+// The places [from, to) of tile k along an axis n long whose element is inside [lo, hi); a dimension of 1 fills its tile
+static int from(int k, int n, int lo) {{ return n == 1 || lo <= 32 * k ? 0 : lo - 32 * k; }}
+static int to(int k, int n, int lo, int hi) {{
+  if (n == 1) return lo <= 0 && 0 < hi ? 32 : 0;
+  int end = (hi < n ? hi : n) - 32 * k;
+  return end < 32 ? end : 32;
+}}
+void kmain(volatile unsigned *a) {{
+  unsigned base = a[3], bstride = a[4], stride = a[5], offset = a[6], xr = a[7], xc = a[8], rows = a[9], cols = a[10];
+  unsigned tr = (rows + 31) / 32, tc = (cols + 31) / 32;
+  int e0 = a[11], sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18], hi_r = a[19], hi_c = a[20];
+  volatile unsigned short *out = (volatile unsigned short *)OUT, *tile = 0;
+  unsigned next = ~0u, row = 0, xj = 0, seen = ~0u, xb = 0, xi = 0, held_t = ~0u;  // the element after the last one read, and where it is
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned t = a[0] + u;
+    int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;
+    noc_read(noc_me() & 63, noc_me() >> 6, {ZEROS:#x}, OUT, {TILE});  // padding and what lies outside the bounds stay 0
+    noc_wait();
+    int r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c), c1 = to(j, cols, lo_c, hi_c);
+    for (int r = from(i, rows, lo_r); r < r1; r++) {{
+      int y = rows == 1 ? 0 : i * 32 + r, e_row = e0 + b * sb + y * sr;
+      for (int c = c0; c < c1; c++) {{
+        unsigned e = e_row + (cols == 1 ? 0 : j * 32 + c) * sc, t = 0;
+        if (e != next) {{ row = e / xc; xj = e % xc; }} else if (++xj == xc) {{ xj = 0; row++; }}
+        if (row != seen) {{ seen = row; xb = row / xr; xi = row % xr; }}
+        next = e + 1;
+        if ((t = xb * bstride + xi / 32 * stride + xj / 32 + offset) != held_t) {{ tile = fetch(base, t); held_t = t; }}
+        out[at(r, c)] = tile[at(xi % 32, xj % 32)];
+      }}
+    }}
+    noc_write(OUT, bank[t % 8] & 63, bank[t % 8] >> 6, a[2] + t / 8 * {TILE}, {TILE});
+    noc_wait();
+  }}
+}}""")
+
 class Tensor:
   """batch x rows x cols of bf16 (batch 1 unless said): in DRAM as 32x32 tiles, matrix after matrix, each in row-major
   tile order, tile i in bank i % 8; or, until realized, an op on other tensors. Realizing compiles the whole tree of
@@ -688,8 +745,9 @@ class Tensor:
   Any shape: the last tile row and column are padded, with zeros, except that a dimension of 1 fills its tile with
   copies (a row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. Every kernel leaves
   its result that way too, so a matmul can sum over a padded K.
-  A view (x[r0:r1, c0:c1] on tile boundaries, x[b], x.split(n)) shares its owner's DRAM: its tile (b, i, j) is tile
-  b * bstride + i * stride + j + offset."""
+  A view (x[b], slices on tile boundaries, x.split(n)) shares its owner's DRAM: its tile (b, i, j) is tile
+  b * bstride + i * stride + j + offset. Any other movement (reshape, permute, expand, pad, other slices) is a copy,
+  made by move_kernel from a map over the source's elements."""
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1):
     self.rt, self.rows, self.cols, self.batch, self.op, self.srcs = rt, rows, cols, batch, op, srcs
     tr, tc = -(-rows // 32), -(-cols // 32)  # tile rows and columns
@@ -763,14 +821,45 @@ class Tensor:
     return v
 
   def __getitem__(self, key):
-    """x[b], one matrix of a batch; or x[r0:r1, c0:c1] of a matrix, a view of whole tiles: starts on tile boundaries,
-    and ends too unless at the tensor's end. No copy; kernels read it in place."""
+    """x[b], one matrix of a batch; x[rows, cols] of every matrix, or x[batch, rows, cols], with slices (any step). A
+    slice of whole tiles (starting on tile boundaries, ending on one or at the end, step 1) is a view, read in place;
+    any other is a copy (_move)."""
     if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)
-    assert self.batch == 1
-    (r0, r1, _), (c0, c1, _) = (k.indices(n) for k, n in zip(key, (self.rows, self.cols)))
-    assert r0 % 32 == c0 % 32 == 0 and (r1 % 32 == 0 or r1 == self.rows) and (c1 % 32 == 0 or c1 == self.cols), "views are whole tiles"
-    assert (r1 - r0 > 1 or self.rows == 1) and (c1 - c0 > 1 or self.cols == 1), "a dimension of 1 must fill its tile"
-    return self._view(r1 - r0, c1 - c0, 1, r0 // 32 * self.stride + c0 // 32)
+    assert len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
+    ranges = [range(*k.indices(n)) for k, n in zip((slice(None),) * (3 - len(key)) + tuple(key), self.shape)]
+    shape = tuple(map(len, ranges))
+    assert all(shape), f"an empty slice of {self.shape}"
+    if all(g.step == 1 and (ax == 0 or g.start % 32 == 0 and (g.stop % 32 == 0 or g.stop == n) and (len(g) > 1 or n == 1))
+           for ax, (g, n) in enumerate(zip(ranges, self.shape))):  # whole tiles; a dimension of 1 must fill its tile
+      b, r, c = (g.start for g in ranges)
+      return self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32, self.bstride)
+    st = self._strides()
+    return self._move(shape, sum(g.start * s for g, s in zip(ranges, st)), tuple(g.step * s for g, s in zip(ranges, st)))
+
+  # Movement: each is one map from the result's elements to this tensor's (_move), copied by one launch of move_kernel
+  def _strides(self): return (self.rows * self.cols, self.cols, 1)  # of its elements, counted in row-major order
+  def _move(self, shape, offset, strides, lo=(0, 0, 0), hi=None):
+    """The tensor of shape (batch, rows, cols) whose element (b, r, c) is this one's offset + b strides[0] + r
+    strides[1] + c strides[2] (counted in row-major order) inside lo..hi on each axis, and 0 outside."""
+    t = Tensor(self.rt, shape[1], shape[2], "move", (self,), shape[0])
+    t.map = (offset, *strides, *lo, *(hi or shape))
+    return t
+  def reshape(self, *shape):  # up to three sizes, missing ones in front being 1
+    shape = (1,) * (3 - len(shape)) + shape
+    assert math.prod(shape) == math.prod(self.shape), f"cannot reshape {self.shape} to {shape}"
+    return self if shape == self.shape else self._move(shape, 0, (shape[1] * shape[2], shape[2], 1))
+  def permute(self, *order):  # the axes in a new order; swapping rows and columns is the transpose
+    assert sorted(order) == [0, 1, 2]
+    if order == (0, 2, 1): return self.T
+    return self if order == (0, 1, 2) else self._move(tuple(self.shape[k] for k in order), 0, tuple(self._strides()[k] for k in order))
+  def expand(self, *shape):  # dimensions of 1 repeated, missing ones in front being 1
+    shape = (1,) * (3 - len(shape)) + shape
+    assert all(n in (m, 1) for n, m in zip(self.shape, shape)), f"cannot expand {self.shape} to {shape}"
+    return self if shape == self.shape else self._move(shape, 0, tuple(s if n == m else 0 for s, n, m in zip(self._strides(), self.shape, shape)))
+  def pad(self, widths):  # zeros: (before, after) for each of the last len(widths) axes, as numpy's
+    widths = ((0, 0),) * (3 - len(widths)) + tuple(widths)
+    lo, shape = tuple(w[0] for w in widths), tuple(n + w[0] + w[1] for n, w in zip(self.shape, widths))
+    return self._move(shape, -sum(w * s for w, s in zip(lo, self._strides())), self._strides(), lo, tuple(w + n for w, n in zip(lo, self.shape)))
 
   def split(self, n, axis=1):
     """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads.
@@ -784,7 +873,7 @@ class Tensor:
     """The batch side by side as one matrix, the inverse of split: x.split(n).merge() is x. The kernel computing it
     writes each matrix into its columns (realize into a view); one already computed is copied there."""
     out = Tensor(self.rt, self.rows, self.batch * self.cols)
-    (self if self.op not in (None, "T") else self + 0.0).realize(out.split(self.batch))  # a transpose cannot write a view
+    (self if self.op not in (None, "T", "move") else self + 0.0).realize(out.split(self.batch))  # nor can these write a view
     return out
 
   @property
@@ -796,12 +885,13 @@ class Tensor:
   def realize(self, into=None):
     """Compute it now, into DRAM of its own, or into the view `into` (see merge). Returns it, now realized."""
     if self.op is None: return self
-    if self.op == "T":
-      assert into is None, "a transpose writes a tensor of its own"
-      x, self.op, self.srcs = self.srcs[0].realize(), None, ()
+    if self.op in ("T", "move"):  # data movement, into a tensor of its own
+      assert into is None, "a transpose or a move writes a tensor of its own"
+      x, op, self.op, self.srcs = self.srcs[0].realize(), self.op, None, ()
       self.addr = self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * TILE)
-      kernel = _cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols))
-      return self._run(kernel, self.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset)
+      where = (self.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset)
+      if op == "T": return self._run(_cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols)), *where)
+      return self._run(_cached("move", move_kernel), *where, x.rows, x.cols, self.rows, self.cols, *(v & 0xFFFFFFFF for v in self.map))
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
       for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
       # and an elementwise value that a reduction and something else both read: once, on as many workers as it has tiles
@@ -879,16 +969,16 @@ class Tensor:
       return sum((parts[i] for i in range(1, s)), parts[0])
     return Tensor(self.rt, self.rows, other.cols, "matmul", (self, other), max(self.batch, other.batch))
 
-def _lazy(t, seen):  # the unrealized ops under t, t first (a matmul's operands and a transpose's are whole tensors)
+def _lazy(t, seen):  # the unrealized ops under t, t first (a matmul's, a transpose's and a move's operands are whole tensors)
   if t.op is None or id(t) in seen: return
   seen.add(id(t))
   yield t
-  for s in () if t.op in ("matmul", "T") else t.srcs: yield from _lazy(s, seen)
+  for s in () if t.op in ("matmul", "T", "move") else t.srcs: yield from _lazy(s, seen)
 
 def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
   if t.op is None or id(t) in seen: return 0
   seen.add(id(t))
-  return 1 + (0 if t.op in ("matmul", "T") else sum(_ops(s, seen) for s in t.srcs))
+  return 1 + (0 if t.op in ("matmul", "T", "move") else sum(_ops(s, seen) for s in t.srcs))
 
 def _tree(t, inputs):
   """The expression a kernel for t computes (fused_kernel's), realized tensors as numbers into inputs. The kernel
@@ -914,7 +1004,7 @@ def _expr(t, shape, inputs, kernel):
     if n > 1 and kernel[1] is None: kernel[1] = n
     if (n > 1 and n != kernel[1]) or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)): return _expr(t.realize(), shape, inputs, kernel)
     kernel[2].add(id(t))
-  if t.op == "T": return _expr(t.realize(), shape, inputs, kernel)  # a kernel of its own, unless a matmul's B (below)
+  if t.op in ("T", "move"): return _expr(t.realize(), shape, inputs, kernel)  # kernels of their own (a matmul's B may be read transposed, below)
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = t.srcs
     b = ("T", _expr(b.srcs[0].realize(), shape, inputs, kernel)) if b.op == "T" else _expr(b.realize(), shape, inputs, kernel)
