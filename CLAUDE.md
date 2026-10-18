@@ -34,6 +34,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `test/test_sim.py`: every step, on ttsim (or on a card when `TTSIM` is not set).
 - `test/llama.py`: a Llama-family model, SmolLM-135M (RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache), the same way: written once, generating from the real weights, checked against numpy step by step.
 - `test/gpt2.py`: GPT-2 small (written once for ferrite Tensors and numpy), and greedy generation from the real weights, checked against numpy step by step.
+- `adapters/views.py`: ferrite tensors of any rank for the framework adapters: views (shape, strides, offset, a mask) of a ferrite tensor, folded into its three axes when an op needs the data (as it is, a transpose, one move, or block swaps), elementwise operands, reductions over any axes.
 - `adapters/tinygrad_ferrite.py`: ferrite as tinygrad's FERRITE device, outside ferrite: tinygrad's tensor graph, taken where tinygrad would schedule it, run op by op on ferrite (movement as views folded into three axes, a broadcast multiply summed as a matmul, what ferrite lacks on tinygrad's CPU), and a runner for tinygrad scripts unchanged.
 - `test/train.py`: a small GPT (GPT-2's blocks) trained on ferrite in fp32 with Adam: each step's loss and gradients checked against PyTorch's on the same weights, and the loss curve against PyTorch training by itself.
 - `NOTES.md`: what we learned about the chip, and what is still unknown.

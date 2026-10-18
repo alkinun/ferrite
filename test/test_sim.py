@@ -812,7 +812,8 @@ def tinygrad(chip):  # tinygrad with ferrite as its FERRITE device, on this proc
   if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
   pytest.importorskip("tinygrad")
   from adapters import tinygrad_ferrite
-  tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  import views  # the adapters' shared layer, on the path the adapter put it on
+  views.RT = views.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
   return tinygrad_ferrite
 
 def test_tinygrad(tinygrad):
@@ -822,7 +823,8 @@ def test_tinygrad(tinygrad):
   # tinygrad on its own CPU device, and on the chip (launches), not the host
   from tinygrad import Tensor, nn
   from tinygrad.helpers import Context
-  rng, rt = np.random.default_rng(14), tinygrad.runtime()
+  import views
+  rng, rt = np.random.default_rng(14), views.runtime()
   a, b, w = (rng.standard_normal(shape).astype(np.float32) for shape in ((2, 3, 40), (2, 3, 40), (40, 5)))
   cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.max(-1), lambda x, y, w: x.exp().log(),
            lambda x, y, w: (x > 0).where(x, y), lambda x, y, w: x @ w, lambda x, y, w: x.softmax(-1), lambda x, y, w: x.permute(2, 0, 1) - y.mean(),
