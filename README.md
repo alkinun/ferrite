@@ -40,5 +40,6 @@ bring-up plan for the first day on a p150.
 
 ## Where it is going
 
-`ROADMAP.md`: from here to a general compiler, silicon, frameworks, many cards, and a chip of our own.
+`ROADMAP.md`: from here to a general compiler, silicon, frameworks, many cards, and a chip of our own. `LESSONS.md`: what we
+have learned on the way.
 
