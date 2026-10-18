@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2300 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2500 lines of Python.
 Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
