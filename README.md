@@ -25,7 +25,8 @@ each step's loss and gradients PyTorch's for the same weights, its loss falling 
     mean loss over 50 steps: 3.40 -> 3.12, PyTorch on its own 3.41 -> 3.07
 
 tinygrad runs on it too: ferrite is a tinygrad device, FERRITE, that takes tinygrad's tensor graph where tinygrad
-would schedule its own kernels and runs it on the chip. tinygrad's own scripts run unchanged:
+would schedule its own kernels and runs it on the chip. tinygrad's own scripts run unchanged: its transformer example
+learns two-digit addition on ttsim to 99.99% on its test set (10 rounds of 50 steps, about 7 hours):
 
     TTSIM=/path/to/libttsim.so PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
 
