@@ -151,6 +151,11 @@ append a correction.
     pad on tile boundaries), tiles transposed (an fp32 `.T`) or runs along a row or down a column. Copying those as they
     are took a training step's moves from 450k cycles to 28k, and tinygrad's transformer step from 6.1M to 2.9M. Which
     way to sweep mattered as much: attention's heads run 6 datums along a row and 32 down a column. (NOTES: "Movement")
+26. **Work out a cost's floor before trying to lower it.** The benchmark's matmul read its inputs 6.9 times over, and
+    bigger blocks looked like the fix; but 96 workers making 16 result tiles each from 4 rows and 4 columns is already
+    the fewest reads a worker can make alone, so only sharing between workers could go lower. Multicast took it to 1.0,
+    and the grid it needed put idle workers to use as well (a 4-row matmul went from 6 workers to 48). (NOTES: "Tiles
+    shared between workers")
 
 ## Working method
 

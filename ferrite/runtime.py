@@ -5,14 +5,15 @@ from ferrite import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
-# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for
-# the kernel's cores to talk through), two buffers of kernel arguments (launches alternate between them, so the next
-# launch's arguments go in while this one runs), the kernels it holds, a tile of zeros (4 KiB, an fp32 tile, for
-# kernels to read and never write), then free space. The dispatcher: its config [doorbell, ring lo, hi, ring size,
-# status lo, hi, the workers' rectangle, how many], an outbox [go, kernel, arguments, workers] [rptr, launches done],
-# the count of the workers' reports, and staging for one command, both above the kernels (loading a kernel writes the
-# dispatcher's tile too).
-MAILBOX, TRISCS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1100, 0x2000, 0x7F000, 0x80000
+# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], FLAGS (for a kernel's workers to tell
+# each other things over the NoC: a count other workers add to, two flags they write, scratch; never zeroed, so flags
+# carry the launch's number), SYNC (zeroed before each launch, for the kernel's cores to talk through), two buffers of
+# kernel arguments (launches alternate between them, so the next launch's arguments go in while this one runs), the
+# kernels it holds, a tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The
+# dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an
+# outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for
+# one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
+MAILBOX, TRISCS, FLAGS, SYNC, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1030, 0x1040, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_SIZE = 64
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
@@ -242,6 +243,12 @@ class Runtime:
     # address -> size, and (launches queued, address) of what was freed while launches queued before might still use it
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS  # kernels in L1: image -> address; where the next goes
     *self.cores, self.dispatcher = cores  # the dispatcher is end, the rectangle's last
+    # The workers as a grid of whole rows (all but the dispatcher's), for kernels that multicast along rows and columns:
+    # (x of each column, y of each row), worker gy * columns + gx at (x[gx], y[gy]). None for less than a row
+    xs = sorted({x for x, _ in self.cores})
+    ys = [y for y in sorted({y for _, y in self.cores}) if all((x, y) in self.cores for x in xs)]
+    assert self.cores[:len(xs) * len(ys)] == [(x, y) for y in ys for x in xs], "whole rows first"
+    self.grid = (tuple(xs), tuple(ys)) if ys else None
     buf, bus = chip.pci.alloc(64 + ring)
     self.status, self.ring = buf[:64], buf[64:]
     worker, dispatcher = compile_rv32(FIRMWARE), compile_rv32(DISPATCHER)

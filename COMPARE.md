@@ -40,6 +40,9 @@ compiles nothing.
 Size: ferrite is about 2,200 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python not counting
 tests: tt-metal 540k, LLK 111k (44k of it Blackhole's), TT-NN 935k, UMD 56k, tt-kmd 10k.
 
+Since then: ferrite's matmuls share their tiles between workers by multicast (NOTES, "Tiles shared between workers"):
+the matmul above reads 2,688 tiles, 1.00x its inputs, as TT-NN's does, in 9.0k cycles.
+
 ## What carries over to silicon
 
 - **DRAM traffic does.** A byte read from DRAM is a byte on the card too. TT-NN's matmul reads every input tile once:

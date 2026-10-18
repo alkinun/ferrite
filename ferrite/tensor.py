@@ -215,7 +215,7 @@ class Tensor:
       t.realize()
     inputs = []
     e, dtype = _tree(self, inputs)
-    key = (e, tuple(u.shape for u in inputs), dtype, self.dtype)
+    key = (e, tuple(u.shape for u in inputs), dtype, self.dtype, self.rt.grid)
     kernel, units = _cached(key, lambda: fused_kernel(*key))
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
@@ -502,7 +502,7 @@ def _expr(t, shape, inputs, kernel):
     return ("matmul", _expr(a.realize(), shape, inputs, kernel), b)
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
-kernels = {}  # (expression, input shapes, dtype, result dtype) -> (image, units), or a data movement kernel's name and shape -> image
+kernels = {}  # (expression, input shapes, dtype, result dtype, workers' grid) -> (image, units), or a data movement kernel's name and shape -> image
 def _cached(key, compile):
   if key not in kernels: kernels[key] = compile()
   return kernels[key]
