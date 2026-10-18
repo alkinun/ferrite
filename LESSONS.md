@@ -123,6 +123,16 @@ append a correction.
     time. The first convolution chained three a tap and took 34 launches for one layer. Composing the maps before
     anything runs, as tinygrad composes views, took it to 16 launches and from 505k cycles to 118k. Keep movement a
     description until something has to read it. (NOTES: "Movement at any granularity", "A small CNN")
+20. **The backward pass is a different program.** It transposes what the forward never did (every matmul's gradient
+    takes A^T and B^T), pads what the forward sliced and broadcasts what it summed. The fast path built for inference,
+    a matmul reading a bf16 B transposed, had no fp32 twin, so fp32 transposes moved a datum at a time were 2M of a
+    training step's 3M cycles, until the matmul split its operands into bf16 before transposing them. Profile training
+    as a workload of its own. (NOTES: "Training")
+21. **Check a run step by step on its own state.** Training beside PyTorch looked broken: gradients 4% apart by the
+    second step, and once a loss of 7.3 against 2.9. Every step was right. Adam's first step had split the runs on
+    gradients smaller than the matmul's error, and they went on as two models. The reference has to be evaluated at
+    the system's own state (PyTorch on ferrite's weights, each step); long runs can only be compared as curves.
+    (NOTES: "Training")
 
 ## Working method
 

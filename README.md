@@ -17,6 +17,13 @@ bf16 can pick the other one. A Llama-family model too, SmolLM-135M (grouped-quer
     TTSIM=/path/to/libttsim.so python3 test/llama.py SmolLM-135M "The meaning of life is" 6
     The meaning of life is a question that has been asked
 
+And it trains: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSONS.md a character at a time,
+each step's loss and gradients PyTorch's for the same weights, its loss falling as PyTorch's does:
+
+    TTSIM=/path/to/libttsim.so python3 test/train.py 300
+    every step: loss within 1e-04 of PyTorch's on the same weights, gradients within 1e-02
+    mean loss over 50 steps: 3.40 -> 3.12, PyTorch on its own 3.41 -> 3.07
+
 ## What is there
 
 - `ferrite/pci.py`, `ferrite/chip.py`: the card over PCIe (TLB windows onto the NoC, the ARC management core, DMA into
@@ -35,7 +42,8 @@ bf16 can pick the other one. A Llama-family model too, SmolLM-135M (grouped-quer
 ## Running
 
 Needs Python 3, clang and lld, and Tenstorrent's simulator, ttsim, built for Blackhole (`libttsim.so`). The tests also
-need numpy; the GPT-2 demo needs tiktoken and Hugging Face's `openai-community/gpt2` `model.safetensors`.
+need numpy; the GPT-2 demo needs tiktoken and Hugging Face's `openai-community/gpt2` `model.safetensors`, and training
+PyTorch, as its reference.
 
     TTSIM=/path/to/libttsim.so python3 -m ferrite.hello      # every core computes fib(30)
     TTSIM=/path/to/libttsim.so python3 -m pytest test        # every step, on the simulator

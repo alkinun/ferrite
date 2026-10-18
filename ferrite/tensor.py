@@ -188,9 +188,8 @@ class Tensor:
   def T(self):
     """The transpose (of each matrix of a batch). A matmul reads it as its B straight from this tensor, transposing
     tiles as they come in; anything else realizes it in a kernel of its own (transpose_kernel). The unpacker transposes
-    only on its way into SrcA, so fp32 and int32 move instead."""
-    if self.dtype != "bf16": return self._map((self.batch, self.cols, self.rows), (0, 2, 1), (0, 0, 0), (1, 1, 1))._track("T", (self,))
-    return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch)
+    only on its way into SrcA, so fp32 and int32 move instead (an fp32 matmul transposes its bf16 parts)."""
+    return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch, self.dtype)
 
   def realize(self, into=None):
     """Compute it now, into DRAM of its own, or into the view `into` (see merge). Returns it, now realized."""
@@ -200,7 +199,8 @@ class Tensor:
       x, op, self.op, self.srcs, d = self.srcs[0].realize(), self.op, None, (), self.dtype
       self.addr = self._alloc()
       where = (self.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset)
-      if op == "T": return self._run(_cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols)), *where)
+      if op == "T" and d == "bf16": return self._run(_cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols)), *where)
+      if op == "T": self.map = (0, x.rows * x.cols, 1, x.cols, 0, 0, 0, *self.shape)
       return self._run(_cached(("move", d), lambda: move_kernel(d)), *where, x.rows, x.cols, self.rows, self.cols,
                        *(v & 0xFFFFFFFF for v in self.map))
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
@@ -222,6 +222,14 @@ class Tensor:
     self.op, self.srcs = None, ()
     args = [v for t in [self] + inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
     return self._run(kernel, *args, units=units)
+  def assign(self, x):
+    """x's value in this tensor, which stays the same object, as an optimizer updates a weight: x is computed into DRAM
+    of its own, which this tensor takes (its old DRAM going back), and x becomes a view of it."""
+    assert self.op is None and self.owner is None and (x.shape, x.dtype) == (self.shape, self.dtype), "a whole tensor, its own shape and dtype"
+    x = (x if x.op else x + 0).realize()  # a copy of a tensor already computed, which keeps its own DRAM
+    self.rt.dram_free(self.addr)
+    self.addr, x.owner = x.addr, self
+    return self
 
   def _run(self, kernel, *args, units=None):
     """Queue kernel over units of this tensor (tiles unless told), split evenly over as many workers as have any. Nothing waits for
@@ -322,6 +330,9 @@ class Tensor:
   def softmax(self, axis=-1):  # max first, so exp stays in range
     e = (self - self.max(axis)).exp()
     return e / e.sum(axis)
+  def log_softmax(self, axis=-1):
+    m = self - self.max(axis)
+    return m - m.exp().sum(axis).log()
   def layernorm(self, axis=-1, eps=1e-5):  # to mean 0 and variance 1 along axis
     c = self - self.mean(axis)
     return c * ((c * c).mean(axis) + eps).rsqrt()
@@ -334,8 +345,9 @@ class Tensor:
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
     if "fp32" in (self.dtype, x.dtype):  # one op to backward, which is two more fp32 matmuls, not through its bf16 parts
-      (ah, al), (bh, bl) = ((t.bfloat16(), (t.float() - t.bfloat16()).bfloat16()) for t in (self, x))
-      return (ah.matmul(bh, "fp32") + (ah.matmul(bl, "fp32") + al.matmul(bh, "fp32")))._track("matmul", (self, x)).cast(dtype)
+      (ah, al), (bh, bl) = _parts(self), _parts(x)
+      out, lo = ah.matmul(bh, "fp32"), [a.matmul(b, "fp32") for a, b in ((ah, bl), (al, bh)) if a is not None and b is not None]
+      return (out + sum(lo[1:], lo[0]) if lo else out)._track("matmul", (self, x)).cast(dtype)
     assert self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch)), f"{self.shape} @ {x.shape}"
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
     kt, tiles = self.cols // 32, -(-self.rows // 32) * -(-x.cols // 32)
@@ -422,10 +434,15 @@ def _backward(t, g):
     g = g[tuple(slice(None, None, r.step) for r in args[0])] if any(r.step < 0 for r in args[0]) else g
     lo = [min(r) for r in args[0]]
     return (g.pad([(a, n - a - len(r)) for a, n, r in zip(lo, x.shape, args[0])]),)
-  if op == "gather":  # the rows' gradients summed into the rows they came from: one-hot(ids)^T @ g
-    onehot = args[0].T == Tensor.of(t.rt, [list(range(x.rows))], "int32")
-    return (onehot.cast(g.dtype).T.matmul(g, x.dtype),)
+  if op == "gather":  # the rows' gradients summed into the rows they came from: one-hot(ids)^T @ g, its row i where ids are i
+    return ((Tensor.of(t.rt, [[i] for i in range(x.rows)], "int32") == args[0]).bfloat16().matmul(g, x.dtype),)
   raise NotImplementedError(f"no backward for {op}")
+
+def _parts(t):  # an fp32 matmul's operand as bf16 hi + lo (no lo for a bf16 one); a transpose split first, its parts transposed as bf16
+  if t.op == "T": return tuple(p if p is None else p.T for p in _parts(t.srcs[0]))
+  if t.dtype == "bf16": return t, None
+  hi = t.bfloat16()
+  return hi, (t - hi).bfloat16()
 
 def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (first, end)
   if s == 0: return (0, n) if lo <= o < hi else (0, 0)

@@ -9,7 +9,7 @@ from ferrite.compiler import from_bf16, to_bf16
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, Runtime, compile_kernel
-import gpt2, llama
+import gpt2, llama, train
 from types import SimpleNamespace
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
@@ -783,6 +783,15 @@ def test_mnist_cnn(chip):
     h = pool(np.maximum(conv(pool(np.maximum(conv(x, w1, 1) + b1, 0)), w2, 1) + b2, 0))
     want = h.reshape(1, 784) @ w3 + b3
     assert np.allclose(logits, want, rtol=0.02, atol=0.02), np.abs(logits - want).max()
+
+def test_train(chip):
+  # stage 1's training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning README
+  # and LESSONS in fp32 with Adam (test/train.py runs it for 300 steps). Every step's loss and gradients against
+  # PyTorch's on the same weights, to the matmul's 2^-11; the loss falling; and the first step the same as PyTorch's own
+  pytest.importorskip("torch")
+  losses = train.train(Runtime(chip, chip.tensix[0], chip.tensix[-1]), 5)
+  assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
+  assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_gpt2_layer(chip, n):

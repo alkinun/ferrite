@@ -18,6 +18,13 @@ def fns(x):  # what numpy and ferrite spell differently
     return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split, softmax=softmax, layernorm=layernorm,
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))))
+  if type(x).__module__ == "torch":  # test/train.py's reference
+    import torch
+    F = torch.nn.functional
+    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], softmax=lambda a: a.softmax(-1),
+                           split=lambda a, n: a.reshape(a.shape[0], n, -1).transpose(0, 1), merge=lambda a: a.transpose(0, 1).reshape(a.shape[1], -1),
+                           layernorm=lambda a: F.layer_norm(a, a.shape[-1:]), t=lambda a: a.transpose(-1, -2),
+                           gelu=lambda a: F.gelu(a, approximate="tanh"))
   return SimpleNamespace(rows=Tensor.gather, width=lambda a: a.cols, split=Tensor.split, softmax=Tensor.softmax,
                          layernorm=Tensor.layernorm, merge=Tensor.merge, t=lambda a: a.T, gelu=Tensor.gelu)
 
