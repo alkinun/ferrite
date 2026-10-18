@@ -31,7 +31,11 @@ learns two-digit addition on ttsim to 99.99% on its test set (10 rounds of 50 st
     TTSIM=/path/to/libttsim.so PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
 
 And PyTorch: a `FerriteTensor` is a torch.Tensor whose ops run on the chip, so eager PyTorch, its autograd and its
-optimizers do (`from adapters.torch_ferrite import ferrite; model, x = ferrite(model), ferrite(x)`).
+optimizers do. Hugging Face transformers' own SmolLM-135M runs unchanged, and writes what PyTorch on the CPU writes:
+
+    from adapters.torch_ferrite import ferrite
+    model = ferrite(AutoModelForCausalLM.from_pretrained("SmolLM-135M"))
+    model.generate(ferrite(ids), max_new_tokens=6)    # The meaning of life is a question that has been asked
 
 ## What is there
 

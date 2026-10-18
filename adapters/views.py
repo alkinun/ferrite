@@ -152,7 +152,8 @@ def common_groups(shape, values):  # how an elementwise op folds shape: as an op
 def operand(v, shape, groups):
   """v as ferrite takes it in an elementwise op of shape folded in groups: a dimension of 1 broadcast as it is where the
   groups keep it one, everything else folded."""
-  small = [1 if s == 0 and n > 1 else n for n, s in zip(v.view.shape, v.view.strides)]
+  whole = [not v.view.mask or v.view.mask[k] == (0, n) for k, n in enumerate(v.view.shape)]  # nothing padded along it
+  small = [1 if s == 0 and n > 1 and whole[k] else n for k, (n, s) in enumerate(zip(v.view.shape, v.view.strides))]
   view = View(small, [0 if n == 1 else s for n, s in zip(small, v.view.strides)], v.view.offset, v.view.mask and
               [(0, 1) if n == 1 else w for w, n in zip(v.view.mask, small)])
   sizes = lambda shp: [math.prod(shp[k] for k in g) for g in groups]

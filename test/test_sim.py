@@ -976,6 +976,47 @@ def test_torch(chip, monkeypatch):
     assert np.allclose(got, want, atol=1e-3), (got, want)
   assert not fell_back, fell_back
 
+def test_transformers(chip, monkeypatch):
+  # stage 4: someone else's model, unchanged. Hugging Face transformers' own Llama (SmolLM's architecture: RMSNorm, RoPE,
+  # grouped-query attention, SwiGLU, tied embeddings), small and with random weights, through the PyTorch adapter: its
+  # logits, greedy generate with its KV cache, and three Adam steps, against PyTorch on the CPU from the same weights
+  # (at a learning rate of 1e-2, Adam makes gradients that nearly cancel full steps of either sign, and fp32 matmuls as
+  # bf16x3 drift 0.01 apart in two steps), with nothing on the CPU but generate's integer bitwise and. With LLAMA set,
+  # SmolLM-135M's real weights too, all 30 blocks (85 s on ttsim)
+  transformers = pytest.importorskip("transformers")
+  import torch
+  from adapters import torch_ferrite as tf
+  import views
+  views.RT = views.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  fell_back, on_cpu = [], tf.on_cpu
+  monkeypatch.setattr(tf, "on_cpu", lambda func, args, kwargs: (fell_back.append(str(func)), on_cpu(func, args, kwargs))[1])
+  config = transformers.LlamaConfig(vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
+                                    num_key_value_heads=2, tie_word_embeddings=True, pad_token_id=0)
+  def model(): torch.manual_seed(18); return transformers.LlamaForCausalLM(config)
+  ids = torch.tensor([[1, 5, 9, 200, 31, 7]])
+  with torch.no_grad():
+    want, got = model()(ids).logits, tf.ferrite(model())(tf.ferrite(ids)).logits.cpu()
+    assert (got - want).abs().max() < 1e-3, (got - want).abs().max()
+    assert torch.equal(tf.ferrite(model()).generate(tf.ferrite(ids), max_new_tokens=4, do_sample=False).cpu(),
+                       model().generate(ids, max_new_tokens=4, do_sample=False))
+  def train(on_chip):
+    m, x = (tf.ferrite(model()), tf.ferrite(ids)) if on_chip else (model(), ids)
+    opt, losses = torch.optim.Adam(m.parameters(), lr=1e-3), []
+    for _ in range(3):
+      opt.zero_grad()
+      loss = m(x, labels=x).loss
+      loss.backward(); opt.step(); losses.append(loss.item())
+    return losses
+  want, got = train(False), train(True)
+  assert np.allclose(got, want, atol=1e-3), (got, want)
+  if "LLAMA" in os.environ:
+    with torch.no_grad():
+      smol = lambda: transformers.AutoModelForCausalLM.from_pretrained(os.environ["LLAMA"], torch_dtype=torch.float32)
+      ids = torch.tensor([[504, 3172, 282, 1029, 314]])  # "The meaning of life is"
+      want, got = smol()(ids).logits, tf.ferrite(smol())(tf.ferrite(ids)).logits.cpu()
+      assert (got - want).abs().max() < 0.1 and got[0, -1].argmax() == want[0, -1].argmax(), (got - want).abs().max()
+  assert set(fell_back) <= {"aten.bitwise_and.Tensor"}, fell_back
+
 @pytest.mark.parametrize("n, dtype", [(16, "bf16"), (40, "bf16"), (40, "bfp8")])
 def test_gpt2_layer(chip, n, dtype):
   # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so attention spans tiles),

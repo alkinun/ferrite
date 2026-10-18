@@ -177,6 +177,10 @@ append a correction.
 28. **Wait where waiting is free.** Several reads in flight need someone to see each step's reads land. BRISC, which
     everyone waits on, took 30 more instructions a step to watch them (a GPT-2 token 111k cycles to 147k); thread 0's
     TRISC, which waits for those tiles anyway, watches them for 3k. (NOTES: "Reads in flight")
+29. **In place is part of what an op means.** PyTorch's decomposition of padding fills a tensor, then copies the input
+    into a view of it in place (`prims.copy_to`). That went to the CPU, which copied into a CPU tensor of its own and
+    left ours alone, so a loss's padded labels were all -100 and the loss NaN, with no error anywhere. Write such ops
+    out, and know what a fallback does with the tensor it was meant to write. (NOTES: "PyTorch on ferrite")
 
 ## Working method
 
