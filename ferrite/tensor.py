@@ -4,7 +4,7 @@
 # another shape) realized first.
 import array, math
 from ferrite import bh
-from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, fused_kernel, gather_kernel, move_kernel, tile_bytes, transpose_kernel
+from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, fused_kernel, gather_kernel, move_kernel, shared_k, tile_bytes, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -349,6 +349,14 @@ class Tensor:
     if s > 1:  # too few result tiles to keep the workers busy (a token's MLP): K cut in s, a batch, and the parts summed
       parts = self.split(s).matmul(x.split(s, 0), dtype, fidelity)
       return sum((parts[i] for i in range(1, s)), parts[0])
+    k, rt = -(-self.cols // 32), -(-self.rows // 32)
+    if self.batch == x.batch == 1 and rt > 1 and k > shared_k(rt, self.rt.grid):  # K too long for the workers to share the
+      most = shared_k(rt, self.rt.grid, 1)                                         # tiles: in parts that fit, each added onto
+      per, out = 32 * -(-k // -(-k // most)), None                                 # the parts before as it is made
+      for c in range(0, self.cols, per):
+        part = self[:, c:c + per].matmul(x[c:c + per, :], dtype, fidelity)
+        out = (part if out is None else part + out).realize()
+      return out
     out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x), max(self.batch, x.batch), dtype)
     out.fidelity = fidelity
     return out

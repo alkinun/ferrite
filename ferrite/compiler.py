@@ -429,6 +429,10 @@ B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")  # a matmul's bfp8 B, p
 # unpacker finds a slot's exponents by its first datum, which must stay below 65536
 B8_SLOTS = 64
 
+def shared_k(rt, grid, added=0):  # the longest K, in tiles, of a matmul of rt tile rows, with `added` inputs added to it,
+  inputs, ops = 2 + added, 1 + added  # whose tiles the grid's workers share by multicast (mc): A's rows and B's three
+  return (UNPACKABLE - FRAMES - 2 * (inputs + ops) - ops) // (-(-rt // min(len(grid[1]), rt)) + 3)  # buffers past the frames
+
 # SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
 # one of them: FETCHED, how many frames BRISC has fetched into L1; ISSUED, how many matmul steps it has issued the reads
 # of; UNPACKED, how many frames and steps thread 0 has unpacked, from TRISC0; READY, set by TRISC0 once the backend
