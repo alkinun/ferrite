@@ -95,7 +95,7 @@ def counters(mask, n):  # a thread's address counters for these units to 0, each
 SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem_sel=SEM_PACKED, max_value=15),
                 ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SEMINIT", sem_sel=SEM_UNPACKED, max_value=15),
                 *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS], *counters(UNPACKERS, 1024)]
-SETUP_PACK = counters(bh.PACK, 16) + record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
+SETUP_PACK, PACK_RUNS = counters(bh.PACK, 16), record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
 def setadc(unpacker, slot):  # its Z: the slot, a number or a C expression (then (word, expression): pushed with it added)
   word = ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0)
   return word + slot if isinstance(slot, int) else (word, slot)
@@ -349,7 +349,7 @@ def run(slots, name, count=None):  # the first count words of a run: one REPLAY 
   words = MATH_RUNS[name][:count]
   return [replay(slots[name], len(words))] if name in slots else words
 def runs(slots, name, times): return run(slots, name) * times if name in slots else [Loop(times, MATH_RUNS[name])]
-def setup_math(slots): return [FLAGS_OFF] + [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]
+def math_runs(slots): return [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]  # recorded at setup
 
 def release(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
 def matmul(slots):  # one matmul step: four phases (SrcA gives 5 mantissa bits a phase, SrcB 7: four make the whole product)
@@ -405,7 +405,7 @@ FLAGS_B = 16  # FLAGS: a grid row's workers' flags, then from here a grid column
 ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, row values, A's rows
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
 
-# SYNC (zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
+# SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
 # one of them: FETCHED, how many times BRISC has fetched tiles into L1 (a frame, or a matmul step's pair); UNPACKED, how
 # many of those thread 0 has unpacked, from TRISC0; READY, set by TRISC0 once the backend config and semaphores are
 # set up; PACKED, how many results the pack thread has packed, from TRISC2, with where each goes in RING (four
@@ -417,7 +417,7 @@ static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return S
 """
 TRISC = SYNC_WORDS + f"""
 #define SEM(s) (((volatile unsigned *){bh.TENSIX_SEM:#x})[__builtin_ctz(s)])  // read: its value; write 0: post, 1: take one
-// Setup goes through stores, not .ttinsn: fused .ttinsn instructions can corrupt what REPLAY records
+// What REPLAY records goes through stores, not .ttinsn: fused .ttinsn instructions can corrupt the recording
 static inline void push_word(unsigned w) {{ *(volatile unsigned *){bh.TENSIX_PUSH:#x} = w; }}
 static unsigned posted, drained;  // intermediates owed to L1, and those waited for
 static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} }} }}  // until everything packed so far has landed
@@ -515,7 +515,7 @@ static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed
   asm volatile("fence" ::: "memory");  // the config writes are out; a read from the same block is processed after them
   (void)CFG[{next(iter(cfg))}];
   asm volatile("fence" ::: "memory");  // and has answered, so no instruction pushed below can see them stale
-  {_pushes(thread() + SETUP_UNPACK)}
+  {tt(thread() + SETUP_UNPACK)}
   tensix_idle();  // the semaphores are set before the other threads can touch them
   SYNC[READY] = 1;
   unsigned tiles = 0;
@@ -528,7 +528,7 @@ def _math(slots, body, dst=False):  # TRISC1; dst: it unpacks into Dst itself, s
 static unsigned arrived_;
 static void arrived(void) {{ arrived_++; while (peek(FETCHED) < arrived_) {{}} }}  // until BRISC has fetched the next tiles
 {KMAIN}
-  {_pushes(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + setup_math(slots))}
+  {tt(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + [FLAGS_OFF])} {_pushes(math_runs(slots))}
   while (!peek(READY)) {{}}  // the backend config and the semaphores
   unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
 {body}
@@ -546,7 +546,7 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
   used[s] = ++outputs;
 }}
 {KMAIN}
-  {_pushes(thread() + SETUP_PACK)}
+  {tt(thread() + SETUP_PACK)} {_pushes(PACK_RUNS)}
   while (!peek(READY)) {{}}
   unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
 {body}

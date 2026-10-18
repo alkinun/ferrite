@@ -5,17 +5,17 @@ from ferrite import bh
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
-# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (zeroed before each launch, for
-# the kernel's cores to talk through), FLAGS (32 words for a kernel's workers to signal each other over the NoC, each
-# written by one of them; never zeroed, so a flag carries the launch's number), two buffers of kernel arguments
-# (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds, a
-# tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The dispatcher: its
-# config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an outbox [go, kernel,
-# arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for one command, both
-# above the kernels (loading a kernel writes the dispatcher's tile too).
+# (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (for the kernel's cores to talk
+# through; its counters zeroed before each launch), FLAGS (32 words for a kernel's workers to signal each other over
+# the NoC, each written by one of them; never zeroed, so a flag carries the launch's number), two buffers of kernel
+# arguments (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels
+# it holds, a tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The
+# dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an
+# outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for
+# one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
-SYNC_SIZE = 64
+SYNC_SIZE, SYNC_COUNTS = 64, 8  # bytes, and the words that start each launch at 0 (a kernel writes the rest before reading)
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
 STAGING_ROOM = bh.L1_SIZE - STAGING
 
@@ -160,7 +160,7 @@ void brisc_loop(void) {{
     volatile unsigned *a = (volatile unsigned *)MAILBOX[2];
     unsigned units = a[0];
     a[0] = me * units / n; a[1] = (me + 1) * units / n - a[0];
-    for (unsigned i = 0; i < {SYNC_SIZE // 4}; i++) ((volatile unsigned *){SYNC:#x})[i] = 0;
+    for (unsigned i = 0; i < {SYNC_COUNTS}; i++) ((volatile unsigned *){SYNC:#x})[i] = 0;
     CFG[{bh.CFG_IC_INVALIDATE}] = 0xF;  // BRISC and the TRISCs
     asm volatile("fence" ::: "memory");  // the write is out, a read from the same block is processed after it,
     (void)CFG[0];
@@ -201,19 +201,27 @@ DISPATCHER = f"""
 {start("brisc", "park", "park", "park")}  // its TRISCs have nothing to do
 __attribute__((naked)) void park(void) {{ asm("1: j 1b"); }}
 __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\n j loop"); }}
+static void acknowledged(unsigned acks) {{  // until a multicast has an acknowledgement from every worker
+  while (NIU(WR_ACKS) != acks) {{}}
+  NIU(CLEAR_OUTSTANDING) = 0xFFFF;  // nothing else is in flight
+}}
 static void multicast(unsigned l1, unsigned addr, unsigned n) {{  // n bytes from l1 to addr in every worker; until all have them
   unsigned acks = NIU(WR_ACKS) + CONFIG[7];
   l1_settle(l1);
   noc_issue(l1, noc_me(), addr, CONFIG[6], MCAST, n);  // the rectangle less this tile, which is in it
-  while (NIU(WR_ACKS) != acks) {{}}
-  NIU(CLEAR_OUTSTANDING) = 0xFFFF;  // nothing else is in flight
+  acknowledged(acks);
 }}
+// The go, the outbox's first 16 bytes to every worker's mailbox, is always the same multicast: request initiator 1 holds
+// it, so a launch starts with one store
+static void go(void) {{ unsigned acks = NIU(WR_ACKS) + CONFIG[7]; NIU1(CMD) = 1; acknowledged(acks); }}
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0;
-  unsigned ready = 0, ready_n = 0, ready_kernel = 0, ready_end = 0;  // a launch whose arguments are in place (0: none)
+  unsigned ready = 0, ready_n = 0, ready_end = 0;  // a launch whose arguments and go are in place (0: none)
   unsigned running = 0, running_end = 0, reports = 0;  // the launch the workers are on; the count once it is done
   volatile unsigned *cmd = (volatile unsigned *){STAGING:#x};
+  NIU1(TARG_LO) = {OUTBOX:#x}; NIU1(TARG_MID) = 0; NIU1(TARG_HI) = noc_me(); NIU1(RET_LO) = {MAILBOX:#x}; NIU1(RET_MID) = 0;
+  NIU1(RET_HI) = CONFIG[6]; NIU1(PACKET_TAG) = 0; NIU1(CTRL) = MCAST; NIU1(LEN) = 16;
   for (;;) {{
     asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
     if (!ready && CONFIG[0] != rptr) {{  // the next command, while the last launch runs
@@ -225,14 +233,17 @@ void loop(void) {{
       noc_wait();
       ready = ++launches;  // its arguments go into the buffer the running launch is not using
       multicast({STAGING + 16:#x}, {ARGS:#x} + ready % 2 * {ARGS_SIZE}, cmd[2]);
-      ready_n = cmd[3]; ready_kernel = cmd[1]; ready_end = rptr += cmd[0];
+      ready_n = cmd[3]; ready_end = rptr += cmd[0];
+      OUT[0] = ready; OUT[1] = cmd[1]; OUT[2] = {ARGS:#x} + ready % 2 * {ARGS_SIZE}; OUT[3] = ready_n;  // its go, written now:
+      l1_settle({OUTBOX:#x});  // the running launch's go has gone already
     }}
+    if (ready && running)  // nothing to do but start the next launch: watch for the last report, and nothing else
+      while (*(volatile unsigned *){DONE:#x} != reports) asm volatile("fence" ::: "memory");
     asm volatile("fence" ::: "memory");
     unsigned done = running && *(volatile unsigned *){DONE:#x} == reports ? running : 0, end = running_end;
     if (done) running = 0;
     if (ready && !running) {{  // a worker is idle here: it finished its last launch
-      OUT[0] = ready; OUT[1] = ready_kernel; OUT[2] = {ARGS:#x} + ready % 2 * {ARGS_SIZE}; OUT[3] = ready_n;
-      multicast({OUTBOX:#x}, {MAILBOX:#x}, 16);
+      go();
       running = ready; running_end = ready_end; reports += ready_n; ready = 0;
     }}
     if (done) {{  // only now, so the host hears late rather than the next launch going late

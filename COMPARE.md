@@ -44,8 +44,8 @@ tests: tt-metal 540k, LLK 111k (44k of it Blackhole's), TT-NN 935k, UMD 56k, tt-
 Since then: ferrite's matmuls share their tiles between workers by multicast (NOTES, "Tiles shared between workers"):
 the matmul above reads 2,688 tiles, 1.00x its inputs, as TT-NN's does, each worker reading an equal share, in 1.85k
 cycles (NOTES, "Cutting the critical path"). A line's inputs stay in L1 between passes (NOTES, "Lines in passes"): the
-softmax reads 48 tiles, 1.00x, in 1.4k cycles, the layer norm 54, 1.12x (its constants, once a line), in 0.46k. A
-one-tile launch is 0.36k. On ttsim these are RISC-V instructions on the critical path, not silicon time.
+softmax reads 48 tiles, 1.00x, in 1.4k cycles, the layer norm 54, 1.12x (its constants, once a line), in 0.42k. A
+one-tile launch is 0.27k (NOTES, "Launch cost"). On ttsim these are RISC-V instructions on the critical path, not silicon time.
 
 ## What carries over to silicon
 
