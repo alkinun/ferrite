@@ -109,7 +109,10 @@ append a correction.
 15. **Reduce exactly, then approximate.** Each fp32 transcendental is an exact reduction (Cody-Waite constants short
     enough that k times them is exact, exponent bits, a fold) and a short polynomial. The earlier exp, a series raised
     to the 4096th power, could never beat its 12 roundings. (NOTES: "The SFPU")
-16. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
+16. **Differentiate the operation, not its implementation.** An fp32 matmul is three bf16 matmuls, and autograd
+    through those parts rounded every gradient to bf16, 3e-3 off where the forward was 2e-4. Recorded as one matmul,
+    its backward is two more fp32 matmuls. The same holds for any op built from cheaper parts.
+17. **Find where the time goes before cutting.** In the move kernel the divisions looked expensive and removing them
     saved 10%. Skipping the datums outside the bounds and keeping the arguments in registers saved most of the rest.
     The profile of the test said the time was all ttsim running kernels, not Python. (NOTES: "Movement")
 

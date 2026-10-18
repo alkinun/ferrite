@@ -601,6 +601,65 @@ def test_int32(chip):
       assert value(got).tolist() == np.asarray(want, np.float64).reshape(got.shape).tolist(), (got.shape, got.dtype)
     assert (ts * 0.5).dtype == "fp32" and (ts > 0).dtype == "int32" and value(ts * 0.5).tolist() == (s * 0.5).reshape(1, 45, 70).tolist()
 
+def test_autograd(chip):
+  # every op's backward against numpy: the loss sum(f(inputs) * w), w random so every element of the gradient differs,
+  # and its gradient by central differences in float64. fp32 tensors, odd shapes, broadcasting; matmuls to the FPU's
+  # 2^-12, the rest to fp32's rounding. Then a bf16 leaf (its gradient comes back through the cast), a tensor read twice
+  # (gradients add), and .grad adding up over two backward passes
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(11)
+  value = lambda t: np.array(t.tolist()).reshape(t.shape)
+  gelu = lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))
+  softmax = lambda a, ax: np.exp(a - a.max(ax, keepdims=True)) / np.exp(a - a.max(ax, keepdims=True)).sum(ax, keepdims=True)
+  norm = lambda a: (a - a.mean(2, keepdims=True)) / np.sqrt(a.var(2, keepdims=True) + 1e-5)
+  ew, row, col, pos = ((2, 20, 40), (-1, 1)), ((1, 1, 40), (-1, 1)), ((1, 20, 1), (-1, 1)), ((2, 20, 40), (0.5, 2))
+  cases = [  # (ferrite, numpy, each input's shape and range[, tolerance: 2e-4 unless said])
+    (lambda a, b: a + b, lambda a, b: a + b, [ew, col]), (lambda a, b: a - b, lambda a, b: a - b, [row, ew]),
+    (lambda a, b: a * b, lambda a, b: a * b, [ew, row]), (lambda a, b: a / b, lambda a, b: a / b, [ew, pos]),
+    (lambda a, b: a.maximum(b), np.maximum, [ew, ew]), (lambda a, b: a.minimum(b * 0.5), lambda a, b: np.minimum(a, b * 0.5), [ew, col]),
+    (lambda a, b: (a > b).where(a * 2.0, b), lambda a, b: np.where(a > b, a * 2, b), [ew, row]),
+    *[(getattr(Tensor, f), g, [r]) for f, g, r in [
+      ("exp", np.exp, ew), ("exp2", np.exp2, ew), ("log", np.log, pos), ("log2", np.log2, pos), ("sin", np.sin, ew), ("cos", np.cos, ew),
+      ("sqrt", np.sqrt, pos), ("rsqrt", lambda a: 1 / np.sqrt(a), pos), ("reciprocal", lambda a: 1 / a, pos),
+      ("relu", lambda a: np.maximum(a, 0), ew), ("gelu", gelu, ew)]],
+    *[(lambda a, ax=ax: a.sum(ax), lambda a, ax=ax: a.sum(ax, keepdims=True), [ew]) for ax in (0, 1, 2)],
+    *[(lambda a, ax=ax: a.max(ax), lambda a, ax=ax: a.max(ax, keepdims=True), [ew]) for ax in (0, 1, 2)],
+    (lambda a: a.mean(), lambda a: a.mean(keepdims=True), [ew]), (lambda a: a.softmax(), lambda a: softmax(a, 2), [ew]),
+    (lambda a: a.softmax(1), lambda a: softmax(a, 1), [ew]), (lambda a: a.layernorm(), norm, [ew]),
+    (lambda a, b: a @ b, lambda a, b: a @ b, [((2, 20, 40), (-1, 1)), ((1, 40, 30), (-1, 1))], 2**-11),
+    (lambda a, b: a @ b.T, lambda a, b: a @ b.swapaxes(1, 2), [((2, 20, 40), (-1, 1)), ((2, 30, 40), (-1, 1))], 2**-11),
+    (lambda a: a.T, lambda a: a.swapaxes(1, 2), [ew]), (lambda a: a.reshape(4, 25, 16), lambda a: a.reshape(4, 25, 16), [ew]),
+    (lambda a: a.permute(2, 0, 1), lambda a: a.transpose(2, 0, 1), [ew]),
+    (lambda a: a.expand(3, 20, 40), lambda a: np.broadcast_to(a, (3, 20, 40)), [col]),
+    (lambda a: a.pad(((1, 2), (3, 0), (0, 5))), lambda a: np.pad(a, ((1, 2), (3, 0), (0, 5))), [ew]),
+    (lambda a: a[:, 3:17, ::-1], lambda a: a[:, 3:17, ::-1], [ew]), (lambda a: a[1], lambda a: a[1:2], [ew]),
+    (lambda a: a.split(2), lambda a: a.reshape(1, 20, 2, 32).transpose(2, 1, 3, 0).reshape(2, 20, 32), [((1, 20, 64), (-1, 1))]),
+    (lambda a: a.merge(), lambda a: a.transpose(1, 0, 2).reshape(1, 20, 128), [((2, 20, 64), (-1, 1))]),
+    (lambda a: a.gather([3, 0, 7, 3]), lambda a: a[:, [3, 0, 7, 3]], [((1, 9, 40), (-1, 1))])]
+  for n, (f, g, specs, *tol) in enumerate(cases):
+    xs = [rng.uniform(lo, hi, shape) for shape, (lo, hi) in specs]
+    ts = [Tensor.of(rt, x.astype(np.float32).tolist() if x.shape[0] > 1 else x[0].astype(np.float32).tolist(), "fp32").requires_grad_() for x in xs]
+    xs = [np.float64(np.float32(x)) for x in xs]
+    out = g(*xs)
+    w = rng.uniform(-1, 1, out.shape)
+    loss = (f(*ts) * Tensor.of(rt, w.tolist() if w.shape[0] > 1 else w[0].tolist(), "fp32")).sum()
+    loss.backward()
+    for i, (x, t) in enumerate(zip(xs, ts)):
+      want = np.zeros_like(x)
+      for at in np.ndindex(x.shape):  # d loss / d x[at], centrally
+        hi_, lo_ = [v.copy() for v in xs], [v.copy() for v in xs]
+        hi_[i][at] += 1e-6; lo_[i][at] -= 1e-6
+        want[at] = ((g(*hi_) * w).sum() - (g(*lo_) * w).sum()) / 2e-6
+      got = value(t.grad)
+      assert np.abs(got - want).max() <= (tol or [2e-4])[0] * (np.abs(want).max() + 1), (n, i, np.abs(got - want).max())
+  a, b, w = rng.uniform(-1, 1, (20, 40)), bf16(rng.uniform(-1, 1, (20, 40))), rng.uniform(-1, 1, (20, 40))
+  ta, tb, tw = Tensor.of(rt, a.tolist(), "fp32").requires_grad_(), Tensor.of(rt, b.tolist()).requires_grad_(), Tensor.of(rt, w.tolist(), "fp32")
+  ((ta * tb + ta * ta) * tw).sum().backward()
+  assert tb.grad.dtype == "bf16" and np.allclose(value(tb.grad)[0], a * w, rtol=2**-8, atol=2**-8), "a bf16 leaf, through the cast"
+  assert np.allclose(value(ta.grad)[0], (b + 2 * a) * w, rtol=1e-6, atol=1e-6), "ta read twice: the gradients add"
+  (ta * tw).sum().backward()
+  assert np.allclose(value(ta.grad)[0], (b + 2 * a) * w + w, rtol=1e-6, atol=1e-6), ".grad adds up"
+  assert np.allclose(value((ta * ta).sum().gradient(ta)[0])[0], 2 * a, rtol=1e-6), "gradient() gives it without touching .grad"
+
 def test_fuzz(chip, monkeypatch):
   # random expressions (elementwise ops with broadcasting, unary ops, reductions along any axis, matmuls; odd shapes,
   # batches), and

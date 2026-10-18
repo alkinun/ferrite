@@ -15,12 +15,22 @@ class Tensor:
   its result that way too, so a matmul can sum over a padded K.
   A view (x[b], slices on tile boundaries, x.split(n)) shares its owner's DRAM: its tile (b, i, j) is tile
   b * bstride + i * stride + j + offset. Any other movement (reshape, permute, expand, pad, other slices) is a copy,
-  made by move_kernel from a map over the source's elements."""
+  made by move_kernel from a map over the source's elements.
+  A tensor made from one that requires_grad remembers how (_ctx: op, operands, arguments), past realizing, for
+  backward (see gradient)."""
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1, dtype="bf16"):
     self.rt, self.rows, self.cols, self.batch, self.op, self.srcs, self.dtype = rt, rows, cols, batch, op, srcs, dtype
     tr, tc = -(-rows // 32), -(-cols // 32)  # tile rows and columns
     self.tiles, self.bstride, self.stride, self.offset, self.owner = batch * tr * tc, tr * tc, tc, 0, None
     self.addr = None if op else self._alloc()
+    self.requires_grad, self.grad, self._ctx = False, None, None
+    if op not in (None, "move", "view"): self._track(op, srcs)  # moves and views say what they are themselves
+  def _track(self, op, srcs, *args):  # remember how this was made, if anything it came from needs a gradient
+    if any(s.requires_grad for s in srcs): self.requires_grad, self._ctx = True, (op, srcs, args)
+    return self
+  def requires_grad_(self, on=True):
+    self.requires_grad = on
+    return self
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
 
   def __del__(self):  # its DRAM goes back once nothing refers to it (and no queued launch can still use it)
@@ -91,7 +101,7 @@ class Tensor:
     assert self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1), "rows of a matrix, by a row of int32"
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     return out._run(_cached(("gather", d), lambda: gather_kernel(d)), out.addr, self.realize().addr, self.stride, self.offset,
-                    -(-self.cols // 32), ids.cols, ids.addr, ids.offset)
+                    -(-self.cols // 32), ids.cols, ids.addr, ids.offset)._track("gather", (self,), ids)
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
@@ -103,7 +113,7 @@ class Tensor:
     """x[b], one matrix of a batch; x[rows, cols] of every matrix, or x[batch, rows, cols], with slices (any step). A
     slice of whole tiles (starting on tile boundaries, ending on one or at the end, step 1) is a view, read in place;
     any other is a copy (_move)."""
-    if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)
+    if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)._track("index", (self,), key)
     assert isinstance(key, tuple) and len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
     ranges = [range(*k.indices(n)) for k, n in zip((slice(None),) * (3 - len(key)) + tuple(key), self.shape)]
     shape = tuple(map(len, ranges))
@@ -111,9 +121,11 @@ class Tensor:
     if all(g.step == 1 and (ax == 0 or g.start % 32 == 0 and (g.stop % 32 == 0 or g.stop == n) and (len(g) > 1 or n == 1))
            for ax, (g, n) in enumerate(zip(ranges, self.shape))):  # whole tiles; a dimension of 1 must fill its tile
       b, r, c = (g.start for g in ranges)
-      return self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32, self.bstride)
-    st = self._strides()
-    return self._move(shape, sum(g.start * s for g, s in zip(ranges, st)), tuple(g.step * s for g, s in zip(ranges, st)))
+      t = self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32, self.bstride)
+    else:
+      st = self._strides()
+      t = self._move(shape, sum(g.start * s for g, s in zip(ranges, st)), tuple(g.step * s for g, s in zip(ranges, st)))
+    return t._track("slice", (self,), ranges)
 
   # Movement: each is one map from the result's elements to this tensor's (_move), copied by one launch of move_kernel
   def _strides(self): return (self.rows * self.cols, self.cols, 1)  # of its elements, counted in row-major order
@@ -126,41 +138,44 @@ class Tensor:
   def reshape(self, *shape):  # up to three sizes, missing ones in front being 1
     shape = (1,) * (3 - len(shape)) + shape
     assert math.prod(shape) == math.prod(self.shape), f"cannot reshape {self.shape} to {shape}"
-    return self if shape == self.shape else self._move(shape, 0, (shape[1] * shape[2], shape[2], 1))
+    return self if shape == self.shape else self._move(shape, 0, (shape[1] * shape[2], shape[2], 1))._track("reshape", (self,))
   def permute(self, *order):  # the axes in a new order; swapping rows and columns is the transpose
     assert sorted(order) == [0, 1, 2]
     if order == (0, 2, 1): return self.T
-    return self if order == (0, 1, 2) else self._move(tuple(self.shape[k] for k in order), 0, tuple(self._strides()[k] for k in order))
+    if order == (0, 1, 2): return self
+    return self._move(tuple(self.shape[k] for k in order), 0, tuple(self._strides()[k] for k in order))._track("permute", (self,), order)
   def expand(self, *shape):  # dimensions of 1 repeated, missing ones in front being 1
     shape = (1,) * (3 - len(shape)) + shape
     assert all(n in (m, 1) for n, m in zip(self.shape, shape)), f"cannot expand {self.shape} to {shape}"
-    return self if shape == self.shape else self._move(shape, 0, tuple(s if n == m else 0 for s, n, m in zip(self._strides(), self.shape, shape)))
+    if shape == self.shape: return self
+    return self._move(shape, 0, tuple(s if n == m else 0 for s, n, m in zip(self._strides(), self.shape, shape)))._track("expand", (self,))
   def pad(self, widths):  # zeros: (before, after) for each of the last len(widths) axes, as numpy's
     widths = ((0, 0),) * (3 - len(widths)) + tuple(widths)
     lo, shape = tuple(w[0] for w in widths), tuple(n + w[0] + w[1] for n, w in zip(self.shape, widths))
-    return self._move(shape, -sum(w * s for w, s in zip(lo, self._strides())), self._strides(), lo, tuple(w + n for w, n in zip(lo, self.shape)))
+    hi = tuple(w + n for w, n in zip(lo, self.shape))
+    return self._move(shape, -sum(w * s for w, s in zip(lo, self._strides())), self._strides(), lo, hi)._track("pad", (self,), widths)
 
   def split(self, n, axis=1):
     """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads.
     The parts are whole tiles."""
     assert self.batch == 1
-    if axis: assert self.cols % (32 * n) == 0; return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)
+    if axis: assert self.cols % (32 * n) == 0; return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
     assert self.rows % (32 * n) == 0
-    return self._view(self.rows // n, self.cols, n, 0, self.rows // n // 32 * self.stride)
+    return self._view(self.rows // n, self.cols, n, 0, self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
   def merge(self):
     """The batch side by side as one matrix, the inverse of split: x.split(n).merge() is x. The kernel computing it
     writes each matrix into its columns (realize into a view); one already computed is copied there."""
     out = Tensor(self.rt, self.rows, self.batch * self.cols, dtype=self.dtype)
     (self if self.op not in (None, "T", "move") else self + 0.0).realize(out.split(self.batch))  # nor can these write a view
-    return out
+    return out._track("merge", (self,))
 
   @property
   def T(self):
     """The transpose (of each matrix of a batch). A matmul reads it as its B straight from this tensor, transposing
     tiles as they come in; anything else realizes it in a kernel of its own (transpose_kernel). The unpacker transposes
-    only on its way into SrcA, so fp32 moves instead."""
-    if self.dtype == "fp32": return self._move((self.batch, self.cols, self.rows), 0, (self.rows * self.cols, 1, self.cols))
+    only on its way into SrcA, so fp32 and int32 move instead."""
+    if self.dtype != "bf16": return self._move((self.batch, self.cols, self.rows), 0, (self.rows * self.cols, 1, self.cols))._track("T", (self,))
     return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch)
 
   def realize(self, into=None):
@@ -284,9 +299,9 @@ class Tensor:
     sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24."""
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
-    if "fp32" in (self.dtype, x.dtype):
+    if "fp32" in (self.dtype, x.dtype):  # one op to backward, which is two more fp32 matmuls, not through its bf16 parts
       (ah, al), (bh, bl) = ((t.bfloat16(), (t.float() - t.bfloat16()).bfloat16()) for t in (self, x))
-      return (ah.matmul(bh, "fp32") + (ah.matmul(bl, "fp32") + al.matmul(bh, "fp32"))).cast(dtype)
+      return (ah.matmul(bh, "fp32") + (ah.matmul(bl, "fp32") + al.matmul(bh, "fp32")))._track("matmul", (self, x)).cast(dtype)
     assert self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch)), f"{self.shape} @ {x.shape}"
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
     kt, tiles = self.cols // 32, -(-self.rows // 32) * -(-x.cols // 32)
@@ -296,6 +311,87 @@ class Tensor:
       parts = self.split(s).matmul(x.split(s, 0), dtype)
       return sum((parts[i] for i in range(1, s)), parts[0])
     return Tensor(self.rt, self.rows, x.cols, "matmul", (self, x), max(self.batch, x.batch), dtype)
+
+  # Autograd: tinygrad's, a rule per op (_backward) applied from the result back, each made of the same lazy ops, so
+  # the backward fuses into kernels as the forward does (and recomputes what the forward fused, rather than store it)
+  def gradient(self, *targets, gradient=None):
+    """d self / d each target (None where self does not depend on it), lazy. self is a single value, unless gradient,
+    d (something) / d self, is given."""
+    assert gradient is not None or self.shape == (1, 1, 1), "the gradient of a single value, or given one"
+    order, seen = [], set()
+    def visit(t):  # what self was made of, operands first
+      if id(t) in seen or t._ctx is None: return
+      seen.add(id(t))
+      for s in t._ctx[1]:
+        if s.requires_grad: visit(s)
+      order.append(t)
+    visit(self)
+    grads = {id(self): gradient if gradient is not None else Tensor.full(self.rt, 1, 1, 1.0, self.dtype)}
+    for t in reversed(order):
+      if (g := grads.pop(id(t), None)) is None: continue
+      for s, gs in zip(t._ctx[1], _backward(t, g)):
+        if gs is not None and s.requires_grad: grads[id(s)] = grads[id(s)] + gs if id(s) in grads else gs
+    return [_full(grads[id(t)], t.shape) if id(t) in grads else None for t in targets]
+  def backward(self, gradient=None):
+    """The gradient of self into .grad of every tensor it came from that requires_grad and is not made of others (the
+    leaves), added to what is there, as PyTorch and tinygrad do. Returns self."""
+    leaves, seen = [], set()
+    def visit(t):
+      if id(t) in seen: return
+      seen.add(id(t))
+      if t._ctx is None: leaves.append(t)
+      for s in t._ctx[1] if t._ctx else ():
+        if s.requires_grad: visit(s)
+    visit(self)
+    for t, g in zip(leaves, self.gradient(*leaves, gradient=gradient)): t.grad = g if t.grad is None else t.grad + g
+    return self
+
+def _unbroadcast(g, shape):  # g summed over the axes where shape is 1 and g is not: the gradient of what was broadcast
+  for ax in range(3):
+    if shape[ax] == 1 and g.shape[ax] > 1: g = g.sum(ax)
+  return g
+def _full(g, shape): return g if g.shape == shape else g.expand(*shape)  # for what needs every element, not broadcasting
+
+def _backward(t, g):
+  """The gradients of t's operands, given g, t's: None for one with none (a condition, a comparison)."""
+  op, srcs, args = t._ctx
+  x, y = (srcs + (None,))[:2]
+  if op in ("add", "sub", "mul", "max", "keep", "drop", "cmplt", "cmpne"):
+    if op in ("cmplt", "cmpne"): return (None, None)
+    if op in ("keep", "drop"): return (None, _unbroadcast(x._binop(op, g), y.shape))  # where's halves: the condition has none
+    if op == "add": gx, gy = g, g
+    elif op == "sub": gx, gy = g, -g
+    elif op == "mul": gx, gy = g * y, g * x
+    else: m = (x > y) + x.eq(y) * 0.5; gx, gy = g * m, g * (1 - m)  # max: ties share it, as in tinygrad
+    return (_unbroadcast(gx, x.shape), _unbroadcast(gy, y.shape))
+  if op in FOLDS:  # a sum broadcasts back; a max goes to its maxima, shared
+    if op[:3] == "sum": return (g,)
+    m = x.eq(t)
+    return (g * m / m.sum(FOLDS[op]),)
+  unary = {"exp": lambda: g * t, "exp2": lambda: g * t * math.log(2), "log": lambda: g * x.reciprocal(),
+           "log2": lambda: g * (x * math.log(2)).reciprocal(), "sin": lambda: g * x.cos(), "cos": lambda: -(g * x.sin()),
+           "sqrt": lambda: g * (t * 2).reciprocal(), "recip": lambda: -(g * t * t), "relu": lambda: g * (x > 0),
+           "cast": lambda: g.cast(x.dtype)}
+  if op in unary: return (unary[op](),)
+  g = _full(g, t.shape)  # movement and matmul need every element of it
+  if op == "matmul": return (_unbroadcast(g.matmul(y.T, x.dtype), x.shape), _unbroadcast(x.T.matmul(g, y.dtype), y.shape))
+  if op == "T": return (g.T,)
+  if op == "reshape": return (g.reshape(*x.shape),)
+  if op == "permute": return (g.permute(*sorted(range(3), key=args[0].__getitem__)),)
+  if op == "expand": return (_unbroadcast(g, x.shape),)
+  if op == "pad": return (g[tuple(slice(w[0], w[0] + n) for w, n in zip(args[0], x.shape))],)
+  if op == "index": return (g.pad(((args[0], x.batch - args[0] - 1), (0, 0), (0, 0))),)
+  if op == "split": return (g.merge() if args[0] else g.reshape(*x.shape),)
+  if op == "merge": return (g.split(x.batch),)
+  if op == "slice":  # back into place, zeros around it; a reversed axis reversed again
+    assert all(abs(r.step) == 1 for r in args[0]), "a slice with a step has no backward yet"
+    g = g[tuple(slice(None, None, r.step) for r in args[0])] if any(r.step < 0 for r in args[0]) else g
+    lo = [min(r) for r in args[0]]
+    return (g.pad([(a, n - a - len(r)) for a, n, r in zip(lo, x.shape, args[0])]),)
+  if op == "gather":  # the rows' gradients summed into the rows they came from: one-hot(ids)^T @ g
+    onehot = args[0].T == Tensor.of(t.rt, [list(range(x.rows))], "int32")
+    return (onehot.cast(g.dtype).T.matmul(g, x.dtype),)
+  raise NotImplementedError(f"no backward for {op}")
 
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are whole tensors, realized first, not tiles in the same kernel
 def _lazy(t, seen):  # the unrealized ops under t, t first

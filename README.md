@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 1950 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2100 lines of Python.
 No Tenstorrent software runs: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite talks to the card through its
 PCIe BARs from userspace, loads its own firmware onto every core, and compiles tensor expressions straight to Tensix
 instructions, written from the ISA documentation.
@@ -22,8 +22,8 @@ bf16 can pick the other one.
   reads by itself, so a launch costs the host one PCIe write.
 - `ferrite/tensor.py`: lazy tensors (any shape, batched, bf16, fp32 or int32) whose expressions become one fused kernel
   each: elementwise ops (tinygrad's primitives and what it builds from them: exp, log, sin, cos, sqrt, comparisons,
-  where), matmul, sums and maxes along any axis (so softmax and layer norm are one launch), transpose, views, and
-  reshape, permute, expand, pad and slicing at any offset.
+  where), matmul, sums and maxes along any axis (so softmax and layer norm are one launch), transpose, views,
+  reshape, permute, expand, pad and slicing at any offset, and autograd (tinygrad's rules) for all of it.
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: every Blackhole fact the code uses, as data. `NOTES.md` says where each comes from.
