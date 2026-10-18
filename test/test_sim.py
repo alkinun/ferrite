@@ -133,6 +133,20 @@ def test_queue(chip):
   rt.wait()
   for x, y in rt.cores: assert chip.read32(x, y, DATA) == sum(range(100))
 
+def test_profile(chip):
+  # each launch's [go, last report] on the dispatcher's wall clock lands in host memory, and Runtime.profile adds them
+  # up by name: three kernels, queued back to back four times, take about the time the host saw (the rest is between
+  # launches)
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  x, y = (Tensor.of(rt, [[float((r + c * k) % 7) for c in range(256)] for r in range(256)]) for k in (1, 2))
+  run = lambda: ((x + y).realize(), (x @ y).realize(), x.softmax().realize())
+  run(), rt.wait()  # compiled
+  since, start = rt.launches, chip.pci.now()
+  for _ in range(4): run()
+  rows, elapsed = rt.profile(since), (chip.pci.now() - start) * bh.AICLK
+  assert sorted((name, n) for name, n, _ in rows) == [("add", 4), ("matmul", 4), ("max2 sub exp sum2 recip mul", 4)], rows
+  assert all(cycles > 0 for *_, cycles in rows) and 0.5 * elapsed < sum(cycles for *_, cycles in rows) <= elapsed
+
 def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))

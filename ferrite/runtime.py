@@ -11,8 +11,8 @@ from ferrite import bh
 # (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds, a
 # tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The dispatcher: its
 # config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an outbox [go, kernel,
-# arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for one command, both
-# above the kernels (loading a kernel writes the dispatcher's tile too).
+# arguments, workers] [rptr, launches done] (and at +32 a launch's [go, last report] times), the count of the workers'
+# reports, and staging for one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_COUNTS = 8  # SYNC's words that start each launch at 0 (a kernel writes the rest before reading them)
@@ -195,7 +195,10 @@ void trisc_loop(unsigned i) {{
 # them or for the first `workers`, and the workers count themselves done in one word. A multicast's acknowledgements
 # come one per worker, so they are counted on the acknowledgement counter, and the request counter (up once, down once
 # per worker) is cleared after. One launch runs at a time, but the next one's command is read and its arguments
-# written while it runs (into the other argument buffer), so it goes the moment the last worker reports.
+# written while it runs (into the other argument buffer), so it goes the moment the last worker reports. When it is
+# done, its [go, last report] times on the dispatcher's wall clock go into a ring of TIMES entries in host memory after
+# the commands, then [read pointer, launches done] into the status: a profile of every launch, on the chip's own clock.
+TIMES = 1024
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
 #define OUT ((volatile unsigned *){OUTBOX:#x})
@@ -215,11 +218,14 @@ static void multicast(unsigned l1, unsigned addr, unsigned n) {{  // n bytes fro
 // The go, the outbox's first 16 bytes to every worker's mailbox, is always the same multicast: request initiator 1 holds
 // it, so a launch starts with one store
 static void go(void) {{ unsigned acks = NIU(WR_ACKS) + CONFIG[7]; NIU1(CMD) = 1; acknowledged(acks); }}
+static unsigned clock(void) {{ return *(volatile unsigned *){bh.WALL_CLOCK:#x}; }}
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0;
   unsigned ready = 0, ready_n = 0, ready_end = 0;  // a launch whose arguments and go are in place (0: none)
-  unsigned running = 0, running_end = 0, reports = 0;  // the launch the workers are on; the count once it is done
+  unsigned running = 0, running_end = 0, reports = 0, began = 0;  // the launch the workers are on; the count once it
+                                                                  // is done; when its go went
+  unsigned long long times = ring + size;  // launch n's [go, last report] at times + n % TIMES * 16
   volatile unsigned *cmd = (volatile unsigned *){STAGING:#x};
   NIU1(TARG_LO) = {OUTBOX:#x}; NIU1(TARG_MID) = 0; NIU1(TARG_HI) = noc_me(); NIU1(RET_LO) = {MAILBOX:#x}; NIU1(RET_MID) = 0;
   NIU1(RET_HI) = CONFIG[6]; NIU1(PACKET_TAG) = 0; NIU1(CTRL) = MCAST; NIU1(LEN) = 16;
@@ -243,14 +249,17 @@ void loop(void) {{
       while (*(volatile unsigned *){DONE:#x} != reports) asm volatile("fence" ::: "memory");
     asm volatile("fence" ::: "memory");
     unsigned done = running && *(volatile unsigned *){DONE:#x} == reports ? running : 0, end = running_end;
+    unsigned took = began, finished = done ? clock() : 0;
     if (done) running = 0;
     if (ready && !running) {{  // a worker is idle here: it finished its last launch
+      began = clock();
       go();
       running = ready; running_end = ready_end; reports += ready_n; ready = 0;
     }}
     if (done) {{  // only now, so the host hears late rather than the next launch going late
-      OUT[4] = end;
-      OUT[5] = done;
+      OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished;
+      noc_write({OUTBOX + 32:#x}, {bh.PCIE[0]}, {bh.PCIE[1]}, times + done % {TIMES} * 16, 8);
+      noc_wait();  // its times are there before the host hears it is done
       noc_write({OUTBOX + 16:#x}, {bh.PCIE[0]}, {bh.PCIE[1]}, status, 8);
       noc_wait();
     }}
@@ -280,8 +289,9 @@ class Runtime:
     ys = [y for y in sorted({y for _, y in self.cores}) if all((x, y) in self.cores for x in xs)]
     assert self.cores[:len(xs) * len(ys)] == [(x, y) for y in ys for x in xs], "whole rows first"
     self.grid = tuple(xs), tuple(ys)
-    buf, bus = chip.pci.alloc(64 + ring)
-    self.status, self.ring = buf[:64], buf[64:]
+    buf, bus = chip.pci.alloc(64 + ring + 16 * TIMES)
+    self.status, self.ring, self.times = buf[:64], buf[64:64 + ring], buf[64 + ring:]
+    self.names = [""] * TIMES  # each of the last TIMES launches' name, for profile
     worker, dispatcher = compile_rv32(FIRMWARE), compile_rv32(DISPATCHER)
     assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
     (dx, dy), n = self.dispatcher, len(self.cores)
@@ -316,10 +326,10 @@ class Runtime:
     self.wait()
     self.loaded, self.room = {}, KERNELS
 
-  def launch(self, kernel, args=(), units=None):
+  def launch(self, kernel, args=(), units=None, name=""):
     """Queue kernel, an image from compile_kernel, with the same arguments on every worker: [first unit, units, *args].
     Its work is `units` units (one per worker by default), shared evenly and in order among as many workers as there are
-    units, and the first two arguments say which are this worker's. Loads it first if need be."""
+    units, and the first two arguments say which are this worker's. Loads it first if need be. name: its name in profile."""
     kernel, n = self.load(kernel), min(units or len(self.cores), len(self.cores))
     body = struct.pack(f"<{2 + len(args)}I", units or n, 0, *args)
     assert len(body) <= ARGS_SIZE, f"{len(body)} bytes of arguments, room for {ARGS_SIZE}"
@@ -335,8 +345,22 @@ class Runtime:
     self.ring[at:at + length] = cmd
     self.wptr += length
     self.launches += 1
+    self.names[self.launches % TIMES] = name
     self.workers.append((self.launches, n))
     self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))  # the launch's one PCIe write
+
+  def profile(self, since):
+    """The launches after launch number `since` by name, once they are done: [(name, launches, cycles)], most cycles
+    first. A launch's cycles run from its go to its last worker's report, on the dispatcher's wall clock: the chip's
+    cycles on a card, ttsim's on the simulator. Only the last TIMES launches are kept."""
+    self.wait()
+    assert self.launches - since <= TIMES, f"{self.launches - since} launches to profile, the last {TIMES} kept"
+    totals = collections.defaultdict(lambda: [0, 0])
+    for n in range(since + 1, self.launches + 1):
+      go, done = struct.unpack_from("<2I", self.times, n % TIMES * 16)
+      totals[self.names[n % TIMES]][0] += 1
+      totals[self.names[n % TIMES]][1] += (done - go) % 2**32
+    return sorted(((name, n, cycles) for name, (n, cycles) in totals.items()), key=lambda r: -r[2])
 
   def args(self):  # where the last launch's arguments are, on each worker it went to (its results, for some kernels)
     return ARGS + self.launches % 2 * ARGS_SIZE

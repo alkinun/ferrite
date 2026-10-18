@@ -103,7 +103,7 @@ class Tensor:
     assert self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1), "rows of a matrix, by a row of int32"
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     return out._run(_cached(("gather", d), lambda: gather_kernel(d)), out.addr, self.realize().addr, self.stride, self.offset,
-                    -(-self.cols // 32), ids.cols, ids.addr, ids.offset)._track("gather", (self,), ids)
+                    -(-self.cols // 32), ids.cols, ids.addr, ids.offset, name="gather")._track("gather", (self,), ids)
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
@@ -201,10 +201,11 @@ class Tensor:
       x, op, self.op, self.srcs, d = self.srcs[0].realize(), self.op, None, (), self.dtype
       self.addr = self._alloc()
       where = (self.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset)
-      if op == "T" and d == "bf16": return self._run(_cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols)), *where)
+      if op == "T" and d == "bf16":
+        return self._run(_cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols)), *where, name="transpose")
       if op == "T": self.map = (0, x.rows * x.cols, 1, x.cols, 0, 0, 0, *self.shape)
       return self._run(_cached(("move", d), lambda: move_kernel(d)), *where, x.rows, x.cols, self.rows, self.cols,
-                       *(v & 0xFFFFFFFF for v in self.map))
+                       *(v & 0xFFFFFFFF for v in self.map), name="move")
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
       for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
       # and an elementwise value that a reduction and something else both read: once, on as many workers as it has tiles
@@ -223,7 +224,7 @@ class Tensor:
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
     args = [v for t in [self] + inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
-    return self._run(kernel, *args, units=units)
+    return self._run(kernel, *args, units=units, name=_name(e))
   def assign(self, x):
     """x's value in this tensor, which stays the same object, as an optimizer updates a weight: x is computed into DRAM
     of its own, which this tensor takes (its old DRAM going back), and x becomes a view of it."""
@@ -233,10 +234,10 @@ class Tensor:
     self.addr, x.owner = x.addr, self
     return self
 
-  def _run(self, kernel, *args, units=None):
+  def _run(self, kernel, *args, units=None, name=""):
     """Queue kernel over units of this tensor (tiles unless told), split evenly over as many workers as have any. Nothing waits for
     it: launches run in order, so the next kernel reads this result, and reading it back (tobytes) waits."""
-    self.rt.launch(kernel, args, units or self.tiles)
+    self.rt.launch(kernel, args, units or self.tiles, name)
     return self
 
   @property
@@ -478,7 +479,16 @@ def _tree(t, inputs):
   n = _ext(t, axis)  # the sweep is as long as t along the axis, unless t is one tile there: then its first reduction says
   return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
 
-def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)  # t's extent along an axis: matrices, or tiles
+def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)
+
+def _name(e):  # a kernel's name in profiles: its ops, operands first, each once
+  ops = []
+  def walk(e):
+    if not isinstance(e, tuple): return
+    for c in e[1:]: walk(c)
+    if e[0] not in ops: ops.append(e[0])
+  walk(e)
+  return " ".join(ops)  # t's extent along an axis: matrices, or tiles
 
 def _expr(t, shape, inputs, kernel):
   """The tree of unrealized ops under t, for a kernel of shape (t's). kernel: [the axis it sweeps, the sweep's length

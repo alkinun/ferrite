@@ -35,7 +35,7 @@ Done: Llama and CNN inference and GPT training run correctly on ttsim.
 ## Stage 2: silicon
 
 - [ ] The bring-up checklist on a p150 (NOTES.md, "Bring-up on a p150"): hello, the tests, the models
-- [ ] Real timing: per-kernel profiles from the card, not the simulator's cycles
+- [ ] Real timing: per-kernel profiles from the card, not the simulator's cycles (`Runtime.profile`, on ttsim so far)
 
 Done: everything from stage 1 runs correctly on the card.
 

@@ -29,5 +29,6 @@ if __name__ == "__main__":
   seconds, tflops, reread = bench(chip, m, k, n)
   peak = len(chip.tensix) * bh.MVMUL_FLOPS * bh.AICLK / tensor.FIDELITY / 1e12  # a product takes FIDELITY phases
   speed = (f"{seconds * bh.AICLK / 1e3:.1f}k ttsim cycles (the RISC-V work on its critical path, not silicon time)"
-           if isinstance(chip.pci, pci.Sim) else f"{seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at {tensor.FIDELITY} fidelity phases")
+           if isinstance(chip.pci, pci.Sim) else
+           f"{seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at {tensor.FIDELITY} fidelity phases")
   print(f"{m}x{k} @ {k}x{n}: {speed}; DRAM reads {reread:.1f}x the inputs")

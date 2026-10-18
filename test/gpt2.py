@@ -98,12 +98,14 @@ def main():
   ids, agree = enc.encode(prompt), 0
   print(prompt, end="", flush=True)
   for _ in range(steps):
-    start = time.time()
+    start, since = time.time(), rt.launches
     got, want = logits(ids, t, rt), logits(ids, w)
     agree += int(got.argmax()) == int(want.argmax())
     ids.append(int(want.argmax()))  # numpy's pick, so that one near tie does not send the two down different paths
     print(enc.decode([ids[-1]]) + ("" if got.argmax() == want.argmax() else f"[ferrite: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
     print(f" ({time.time() - start:.0f}s, logits within {np.abs(got - want).max():.2f})", end="", file=sys.stderr, flush=True)
   print(f"\nferrite picked the same token as numpy {agree} times out of {steps}")
+  print("the last token's kernels, by cycles on the chip's clock (Runtime.profile):")
+  for name, n, cycles in rt.profile(since)[:8]: print(f"{cycles:9d} {n:4d}  {name[:90]}")
 
 if __name__ == "__main__": main()
