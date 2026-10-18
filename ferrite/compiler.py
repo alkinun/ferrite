@@ -723,7 +723,19 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     n_grid = (-(-w // bq), -(-rt // bp))
     if (base + (bp + 3) * kt <= UNPACKABLE and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B and
         ops[matmuls[0]]["how"] != 2): mc = n_grid  # a bfp8 B is not shared yet
-  if not mc:
+  # With one row of tiles (a token's matmul), the grid's workers each take a block of the result's columns and the first
+  # grid row reads A's tiles in shares and multicasts them to all (bcast), so each comes from DRAM once, not once a
+  # worker; B, which no two workers share, streams as it would. Each matrix of a batch (K split in parts) gets whole grid
+  # rows of its own, its blocks padded out to them
+  bcast = None
+  if (grid and not mc and len(matmuls) == 1 and not reducing and rt == 1 and ext(ops[matmuls[0]]["shape"], 2) == w and
+      rows_at[0] is not None and nb <= len(grid[1])):
+    per = len(grid[1]) // nb * len(grid[0])  # workers for each matrix
+    bp, bq = 1, -(-w // min(per, w))
+    blocks = -(-w // bq)
+    gx_n = len(grid[0]) if nb > 1 else min(len(grid[0]), blocks)
+    if nb * blocks > 1: bcast = (gx_n, -(-blocks // gx_n))
+  if not mc and not bcast:
     bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
     while bp > 1 and base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE: bp -= 1
     bq = min(4, w) if bp > 1 else 1
@@ -731,7 +743,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 or mc else None
   # a bfp8 B goes to slots of its own at B8 (B's column, or DEPTH to stream through), unpacker 0 switched to them for its steps
   b8 = (ops[matmuls[0]]["kt"] if kept_b is not None else DEPTH) if any(ops[j]["how"] == 2 for j in matmuls) else 0
-  br, bc = (mc[1], len(grid[0])) if mc else (-(-rt // bp), -(-w // bq))  # blocks down and across a matrix (the grid's)
+  # blocks down and across a matrix (the grid's)
+  br, bc = (mc[1], len(grid[0])) if mc else (1, bcast[0] * bcast[1]) if bcast else (-(-rt // bp), -(-w // bq))
   decls, tail = "", ""  # BRISC's tables and statics for a multicast matmul or kept inputs, and its last words
   if mc:
     (gx_n, gy_n), (xs, ys) = mc, grid
@@ -837,7 +850,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
             c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
                         f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
           else:
-            c[B].append(f"{cond}{{ unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
+            new = "0" if bcast else f"fresh({q}, b * {rt} + i_)"  # bcast: A's row is in already
+            c[B].append(f"{cond}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
                         f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ "
                         f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
@@ -907,8 +921,16 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
 {sweeps}
   }}"""
   total = f"a[1] * {L if swept(me) else 1}" if reducing else "tiles"  # results this worker sends home
-  image = compile_kernel(_brisc(total, program(B), dtype, out, decls, tail, b8), _unpacker(program(U), kernel_config(dtype, out)),
-                         _math(slots, program(M), dst), _packer(program(P)))
+  if bcast:  # before its first tile, each worker waits for A's row, which the first grid row of its matrix's reads and multicasts
+    (gx_n, gy_n), (xs, ys), kt, x = bcast, grid, ops[matmuls[0]]["kt"], arg(ops[matmuls[0]]["x"])
+    rects = [xs[gx_n - 1] | ys[g + gy_n - 1] << 6 | (xs[0] | ys[g] << 6) << 12 for g in range(0, nb * gy_n, gy_n)]  # each matrix's rows
+    decls, tail = _array("rect", rects) + "\n", f"unflag({gx_n}, 0);"
+    in_batch = f"b * a[{x + 1}] + " if shapes[ops[matmuls[0]]["x"]][0] > 1 else ""
+    first = (f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, end = (gx + 1) * {kt} / {gx_n};\n"
+             f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
+             f"      share({rows_at[0]}, e, end, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
+  brisc = _brisc(total, (first if bcast else "") + program(B), dtype, out, decls, tail, b8)
+  image = compile_kernel(brisc, _unpacker(program(U), kernel_config(dtype, out)), _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 
 def _rows(dtype):  # C shared by gather and move: the banks, copies inside this L1, and a row filling its tile

@@ -286,15 +286,16 @@ def test_bfp8(chip):
   assert (x @ w + x @ v + bias).relu().tolist() == (x @ Tensor.of(rt, w.tolist()) + x @ v + bias).relu().tolist()
 
 def test_matmul_multicast(chip):
-  # with a grid of workers (Runtime.grid), a matmul of more than one row of tiles reads each input tile from DRAM
-  # once: worker (gy, gx) computes one block, each worker of a grid row reads its share of the block row's rows of A
-  # and multicasts it along the row, each of a grid column its share of each column of B down it. Odd edges; a K so
-  # long that B's three buffers nearly fill the slots below 256; B read transposed (four quarter-tile reads a tile);
-  # and an epilogue fused after, bit for bit the same as unfused
+  # with a grid of workers (Runtime.grid), a matmul reads each input tile from DRAM once. Of more than one row of tiles:
+  # worker (gy, gx) computes one block, each worker of a grid row reads its share of the block row's rows of A and
+  # multicasts it along the row, each of a grid column its share of each column of B down it. Of one row (a token's):
+  # each worker a block of columns, A's row read by the first grid row and multicast to all, from 2 workers to 96. Odd
+  # edges; a K so long that B's three buffers nearly fill the slots below 256; B read transposed (four quarter-tile
+  # reads a tile); and an epilogue fused after, bit for bit the same as unfused
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   rng = np.random.default_rng(3)
-  for m, k, n, bt in ((320, 96, 416, False), (288, 1920, 224, False), (352, 64, 200, True)):
+  for m, k, n, bt in ((320, 96, 416, False), (288, 1920, 224, False), (352, 64, 200, True), (1, 768, 3072, False), (5, 96, 40, True)):
     a, b = bf16(rng.uniform(-1, 1, (m, k))), bf16(rng.uniform(-1, 1, (k, n)))
     tb = Tensor.of(rt, b.T.tolist()).T if bt else Tensor.of(rt, b.tolist())
     y, before = Tensor.of(rt, a.tolist()) @ tb, reads()
