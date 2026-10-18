@@ -832,7 +832,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           in_batch = f"b * a[{y + 1}] + " if shapes[op["y"]][0] > 1 else ""
           b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
           on, off = (tt(haloize(1)), tt(haloize(0))) if bt else (tt(bfp8_b(b8)), tt(bfp8_b(0))) if how == 2 else ("", "")
-          if mc and how == 2: on = f"if (jj % 3 == 0) {{ {on} }} else if (jj % 3 == 1) {{ {tt(bfp8_b(b8, 1))} }} else {{ {tt(bfp8_b(b8, 2))} }}"
+          if mc and how == 2: on = " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp8_b(b8, r))} }}" for r in range(3))  # the column's buffer
           a_tile = f"{f'b * a[{x + 1}] + ' if shapes[op['x']][0] > 1 else ''}i_ * a[{x + 2}] + m + a[{x + 3}]"
           buf = mc and f"{0 if how == 2 else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a bfp8 B's in B8)
           if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
