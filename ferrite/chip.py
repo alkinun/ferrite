@@ -1,4 +1,5 @@
-# A Blackhole over its PCIe device interface: NoC reads and writes through one 2 MiB TLB window, and core reset.
+# A Blackhole over its PCIe device interface: NoC reads and writes through a shared 2 MiB TLB window (or a TLB of its
+# own: map), waits with a timeout, ARC messages and telemetry, and core reset.
 import struct, time
 from ferrite import bh
 

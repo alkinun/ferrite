@@ -7,19 +7,20 @@ from ferrite import bh
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
 # (the first half multicast by the dispatcher), the TRISCs' [go, done 0, 1, 2], SYNC (for the kernel's cores to talk
 # through; its counters zeroed before each launch), FLAGS (32 words for a kernel's workers to signal each other over
-# the NoC, each written by one of them; never zeroed, so a flag carries the launch's number), two buffers of kernel
-# arguments (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels
-# it holds, a tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The
-# dispatcher: its config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an
-# outbox [go, kernel, arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for
-# one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
+# the NoC, each written by one of them, and zeroed by its own worker at the end), two buffers of kernel arguments
+# (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds, a
+# tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The dispatcher: its
+# config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an outbox [go, kernel,
+# arguments, workers] [rptr, launches done], the count of the workers' reports, and staging for one command, both
+# above the kernels (loading a kernel writes the dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
-SYNC_SIZE, SYNC_COUNTS = 64, 8  # bytes, and the words that start each launch at 0 (a kernel writes the rest before reading)
+SYNC_COUNTS = 8  # SYNC's words that start each launch at 0 (a kernel writes the rest before reading them)
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
 STAGING_ROOM = bh.L1_SIZE - STAGING
 
-# Prepended to every device program: NoC transfers through request initiator 0 of NIU 0 (bh.NIU_REGS, bh.NOC_CMD).
+# Prepended to every device program: NoC transfers through NIU 0 (bh.NIU_REGS, bh.NOC_CMD), noc_read and noc_write by
+# request initiator 0, noc_get and noc_put by 1 and 2, which the firmware presets at boot (noc_setup).
 DEVICE = f"""
 #define L1_DATA {DATA:#x}
 #define NIU(reg) (((volatile unsigned *){bh.NIU:#x})[(reg) / 4])
@@ -65,7 +66,7 @@ static inline void noc_write(unsigned l1, unsigned x, unsigned y, unsigned long 
   for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(l1, noc_me(), addr, x | y << 6, WRITE, k = n < MAX_PACKET ? n : MAX_PACKET);
 }}
 static inline void noc_wait(void) {{  // until every read has landed and every write is acknowledged
-  (void)NIU(CMD);  // reading the initiator first keeps the counter read behind the last request
+  (void)NIU(CMD); (void)NIU1(CMD); (void)NIU2(CMD);  // reading the initiators back keeps the counter read behind their last requests
   while (NIU(OUTSTANDING)) {{}}
   asm volatile("fence" ::: "memory");  // drop L0 data cache lines the NoC may have just overwritten
 }}
@@ -131,7 +132,7 @@ def start(brisc, trisc0, trisc1, trisc2):  # firmware's first words: BRISC start
 
 # A launch: BRISC sees go in its mailbox, with the addresses of the kernel to run and of its arguments, and how many
 # workers it is for (the first n: the rest sit it out). The arguments start with a number of units to share, which
-# BRISC turns into this worker's [first unit, how many]. It zeroes SYNC, drops the cached instructions of all four
+# BRISC turns into this worker's [first unit, how many]. It zeroes SYNC's counters, drops the cached instructions of all four
 # cores (the kernel may sit where another was), and tells the TRISCs to go; each core runs its program from the
 # kernel's header, and a TRISC then waits for its Tensix thread to finish everything it pushed. Once all four are done
 # BRISC reports: it notes the launch in its own mailbox (for the host, should one hang) and adds 1 to the dispatcher's
@@ -165,7 +166,7 @@ void brisc_loop(void) {{
     asm volatile("fence" ::: "memory");  // the write is out, a read from the same block is processed after it,
     (void)CFG[0];
     asm volatile("fence" ::: "memory");  // and we have that read's answer before going on
-    l1_settle({SYNC:#x});  // SYNC is zero before any core of the kernel looks at it
+    l1_settle({SYNC:#x});  // SYNC's counters are zero before any core of the kernel looks at them
     TRISCS[0] = seen;
     run(0);
     noc_wait();  // whatever the kernel sent is in place before we say it is done
@@ -232,9 +233,10 @@ void loop(void) {{
       noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at + 16, {STAGING + 16:#x}, cmd[0] - 16);
       noc_wait();
       ready = ++launches;  // its arguments go into the buffer the running launch is not using
-      multicast({STAGING + 16:#x}, {ARGS:#x} + ready % 2 * {ARGS_SIZE}, cmd[2]);
+      unsigned args = {ARGS:#x} + ready % 2 * {ARGS_SIZE};
+      multicast({STAGING + 16:#x}, args, cmd[2]);
       ready_n = cmd[3]; ready_end = rptr += cmd[0];
-      OUT[0] = ready; OUT[1] = cmd[1]; OUT[2] = {ARGS:#x} + ready % 2 * {ARGS_SIZE}; OUT[3] = ready_n;  // its go, written now:
+      OUT[0] = ready; OUT[1] = cmd[1]; OUT[2] = args; OUT[3] = ready_n;  // its go, written now:
       l1_settle({OUTBOX:#x});  // the running launch's go has gone already
     }}
     if (ready && running)  // nothing to do but start the next launch: watch for the last report, and nothing else
@@ -273,11 +275,11 @@ class Runtime:
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS  # kernels in L1: image -> address; where the next goes
     *self.cores, self.dispatcher = cores  # the dispatcher is end, the rectangle's last
     # The workers as a grid of whole rows (all but the dispatcher's), for kernels that multicast along rows and columns:
-    # (x of each column, y of each row), worker gy * columns + gx at (x[gx], y[gy]). None for less than a row
+    # (x of each column, y of each row), worker gy * columns + gx at (x[gx], y[gy])
     xs = sorted({x for x, _ in self.cores})
     ys = [y for y in sorted({y for _, y in self.cores}) if all((x, y) in self.cores for x in xs)]
     assert self.cores[:len(xs) * len(ys)] == [(x, y) for y in ys for x in xs], "whole rows first"
-    self.grid = (tuple(xs), tuple(ys)) if ys else None
+    self.grid = tuple(xs), tuple(ys)
     buf, bus = chip.pci.alloc(64 + ring)
     self.status, self.ring = buf[:64], buf[64:]
     worker, dispatcher = compile_rv32(FIRMWARE), compile_rv32(DISPATCHER)
@@ -286,8 +288,8 @@ class Runtime:
     chip.halt(*end, start)
     chip.write(*end, 0, worker, start)
     chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
-    for i, (x, y) in enumerate(self.cores):  # the mailbox and the TRISCs' go and done: zero, but for whom to report to and the index
-      chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, dx | dy << 6, 0, i).ljust(SYNC - MAILBOX, b"\0"))
+    for i, (x, y) in enumerate(self.cores):  # mailbox, TRISCs' go and done, SYNC, FLAGS: zero, but for whom to report to and the index
+      chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, dx | dy << 6, 0, i).ljust(ARGS - MAILBOX, b"\0"))
     chip.write(dx, dy, 0, dispatcher)
     rect = end[0] | end[1] << 6 | (start[0] | start[1] << 6) << 12  # a multicast's NOC_RET_ADDR_HI
     chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))

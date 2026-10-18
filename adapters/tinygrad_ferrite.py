@@ -1,8 +1,8 @@
 # ferrite as a tinygrad device: tinygrad is the frontend (Tensor, nn, autograd, optimizers), ferrite the compiler and the
 # runtime. Realizing a FERRITE tensor hands tinygrad's tensor graph (its primitives on shaped tensors, before tinygrad
 # would schedule them into kernels) to ferrite op by op, and ferrite fuses and launches them its own way.
-# tinygrad's tensors have any rank and ferrite's three axes, so movement stays a view of a ferrite tensor (shape,
-# strides, offset, and a mask for padding: a small ShapeTracker), folded into three axes when an op needs the data. A
+# tinygrad's tensors have any rank and ferrite's three axes, so movement stays a view of a ferrite tensor (views.py),
+# folded into three axes when an op needs the data. A
 # multiply summed over axes both operands span, broadcast against each other elsewhere, is a matmul. What ferrite does
 # not do (the integer arithmetic of random numbers, other dtypes) runs on tinygrad's own CPU device and comes over.
 #   import adapters.tinygrad_ferrite, then DEV=FERRITE or Tensor(..., device="FERRITE")
@@ -15,8 +15,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.dtype import _to_np_dtype
 from tinygrad.device import Allocator, BufferStorage, Compiled, Device
 from tinygrad.uop.ops import Ops, UOp
-from ferrite import tensor
 from views import View, Value, broadcast, common_groups, download, fold, grouping, materialize, merge, operand, reduce, spread, upload
+from ferrite import tensor  # after views, which puts ferrite on the path
 
 DTYPES = {dtypes.float32: "fp32", dtypes.bfloat16: "bf16", dtypes.int32: "int32", dtypes.bool: None}  # bool: 0 or 1, any dtype
 def npdtype(dt): return np.uint16 if dt is dtypes.bfloat16 else _to_np_dtype(dt)
@@ -109,7 +109,7 @@ class Evaluator:
     shape, summed = m.shape, list(order[:u.arg[1]])
     full = lambda v, k: shape[k] == 1 or v.view.strides[k] != 0
     if not all(full(a, k) and full(b, k) for k in summed): return None
-    free = [k for k in order[u.arg[1]:]]
+    free = list(order[u.arg[1]:])
     batch = [k for k in free if full(a, k) and full(b, k)]
     rows, cols = [k for k in free if full(a, k) and not full(b, k)], [k for k in free if full(b, k) and not full(a, k)]
     if len(batch) + len(rows) + len(cols) != len(free) or not (rows or cols): return None
@@ -250,6 +250,7 @@ tinygrad.tensor.create_linear_with_vars = schedule
 
 if __name__ == "__main__":  # a tinygrad script on ferrite, as it is (tinygrad's JIT replays schedules, which this does not make)
   from tinygrad.helpers import DEV, JIT
+  assert len(sys.argv) > 1, "usage: python3 adapters/tinygrad_ferrite.py script.py [its arguments]"
   DEV.value, JIT.value = "FERRITE", 0
   sys.argv = sys.argv[1:]
   runpy.run_path(sys.argv[0], run_name="__main__")

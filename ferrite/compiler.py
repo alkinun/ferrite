@@ -10,7 +10,7 @@
 # so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
 import math, struct
 from ferrite import bh
-from ferrite.runtime import DATA, FLAGS, MAILBOX, SYNC, ZEROS, compile_kernel
+from ferrite.runtime import DATA, FLAGS, SYNC, ZEROS, compile_kernel
 
 ITEMSIZE = {"bf16": 2, "fp32": 4, "int32": 4}  # the dtypes, by bytes a value; a tile is 1024 values
 def tile_bytes(dtype): return 1024 * ITEMSIZE[dtype]  # a bf16 tile is one SrcA/SrcB bank (64 rows of 16), 64 Dst rows
@@ -352,17 +352,20 @@ def runs(slots, name, times): return run(slots, name) * times if name in slots e
 def math_runs(slots): return [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]  # recorded at setup
 
 def release(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
+def phased(slots, name, phases):  # a run of MATH_RUNS, once each fidelity phase, the last word releasing both Src banks
+  words = MATH_RUNS[name]
+  return [ins("SETRWC", bit_mask=0b1111)] + run(slots, name) * (phases - 1) + run(slots, name, len(words) - 1) + [release(words[-1])]
 def matmul(slots, phases=4):
   """One matmul step: its first `phases` fidelity phases (SETRWC starts each step at phase 0). A phase multiplies 7 of
   A's 8 significand bits (SrcB) or its last one by 5 of B's (SrcA) or its last 3 (ISA SrcASrcB.md): phase 0 is A's top 7
   by B's top 5, 1 the same by B's last 3, 2 A's last bit by B's top 5, 3 the last by the last. So four make the whole
   product, three leave out under 2^-11 of it, two drop A's last bit (truncating, 2^-7 at most), one keeps 5 bits of B."""
-  return [ins("SETRWC", bit_mask=0b1111)] + run(slots, "mm") * (phases - 1) + run(slots, "mm", 15) + [release(matmul_phase()[-1])]
+  return phased(slots, "mm", phases)
 
 def elementwise(op, slots, dst=0):
   """Math for one tile of SrcA op SrcB at Dst row dst: 8 rows of 16 per instruction, address mode 0 steps 8 rows.
   ELWMUL always accumulates and multiplies a slice of the mantissas per fidelity phase: on a zeroed Dst, 4 phases."""
-  if op == "mul": return [ins("SETRWC", bit_mask=0b1111)] + run(slots, "mul") * 3 + run(slots, "mul", 8) + [release(MUL_PHASE[-1])]
+  if op == "mul": return phased(slots, "mul", 4)
   fpu = {"add": "ELWADD", "sub": "ELWSUB"}[op]
   return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [release(ins(fpu, dst=dst))]
 
@@ -405,8 +408,9 @@ def tt(words):
     elif w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
   return " ".join(c)
 
-FLAGS_B = 16  # FLAGS: a grid row's workers' flags, then from here a grid column's
-ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, row values, A's rows
+FLAGS_B = 16  # FLAGS: A's flags (a grid row's workers), then from here B's (a grid column's)
+ZERO_SLOT, FRAMES = 0, 5  # slot 0 is a zero tile, 1-4 stream a matmul's B and A, then two frames, the narrow ops, and what
+                          # stays in L1: A's rows, B's column or buffers, kept inputs
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
 
 # SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
@@ -421,17 +425,18 @@ static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return S
 """
 TRISC = SYNC_WORDS + f"""
 #define SEM(s) (((volatile unsigned *){bh.TENSIX_SEM:#x})[__builtin_ctz(s)])  // read: its value; write 0: post, 1: take one
-// What REPLAY records goes through stores, not .ttinsn: fused .ttinsn instructions can corrupt the recording
+// What REPLAY records (fused .ttinsn instructions can corrupt the recording) and words worked out at run time go through stores
 static inline void push_word(unsigned w) {{ *(volatile unsigned *){bh.TENSIX_PUSH:#x} = w; }}
 static unsigned posted, drained;  // intermediates owed to L1, and those waited for
 static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} }} }}  // until everything packed so far has landed
 """
-# A fused kernel's programs read their arguments through a plain pointer: they are fixed for the launch (and in this
+# A Tensix kernel's programs read their arguments through a plain pointer: they are fixed for the launch (and in this
 # core's view once the firmware has fenced), so the compiler may keep them in registers and out of loops
 KMAIN = "void kmain(volatile unsigned *args) {\n  const unsigned *a = (const unsigned *)args;"
 def _pushes(words): return " ".join(f"push_word({w:#x});" for w in words)  # straight-line, with no table to load from
 
-def _brisc(total, body, dtype="bf16", out="bf16", decls=""):  # moves tiles: inputs into L1 ahead of the unpackers, results home behind the packer
+def _brisc(total, body, dtype="bf16", out="bf16", decls="", tail=""):  # moves tiles: inputs into L1 ahead of the unpackers,
+  # results home behind the packer; decls: statics and tables the body needs; tail: its last words
   tb, to = tile_bytes(dtype), tile_bytes(out)
   return SYNC_WORDS + f"""
 #define SLOT(i) ({slot_base(dtype):#x} + (i) * {tb})  // where the unpackers read slot i
@@ -472,15 +477,20 @@ static unsigned fresh(unsigned q, unsigned i) {{
   reached(events);
   return rows[q] = i + 1;
 }}
-static void kept(void) {{ SYNC[FETCHED] = ++fetched; ++events; }}  // a matmul step whose tiles are in L1 already
-// Tiles shared between workers by multicast. FLAGS: a flag for each worker of a grid row (its part of A's rows is here),
-// then for each worker of a grid column (its part of B's column is)
+static void kept_step(void) {{ SYNC[FETCHED] = ++fetched; ++events; }}  // a matmul step whose tiles are in L1 already
+// Tiles shared between workers by multicast. FLAGS: how many shares each worker of this one's grid row (of A's rows),
+// then of its grid column (of B's columns) has sent it. Each worker zeroes its own at the end (unflag): by then it has
+// seen every flag of the launch, and none is written again before the next go
 #define FLAGS ((volatile unsigned *){FLAGS:#x})
-static unsigned stamp, col_end[3];  // this launch << 12, in every flag, so none from an earlier launch counts; events at
-                                    // the end of the last column in each B buffer
+static unsigned col_end[3];  // events at the end of the last column in each B buffer
 static void await(unsigned i, unsigned n, unsigned v) {{  // until flags i to i + n - 1 reach v; results go home meanwhile
   for (unsigned k = i; k < i + n; k++)
-    for (;;) {{ asm volatile("fence" ::: "memory"); if ((int)(FLAGS[k] - v) >= 0) break; send(); }}
+    for (;;) {{ asm volatile("fence" ::: "memory"); if (FLAGS[k] >= v) break; send(); }}
+}}
+static void unflag(unsigned a, unsigned b) {{
+  for (unsigned k = 0; k < a; k++) FLAGS[k] = 0;
+  for (unsigned k = 0; k < b; k++) FLAGS[{FLAGS_B} + k] = 0;
+  l1_settle({FLAGS:#x});
 }}
 // n bytes of this L1 to the same place in the `tiles` other tiles of rect (end | start << 12), until all have them. A
 // multicast leaves the outstanding count wrong (up once, down once a tile), so nothing else may be in flight: cleared after
@@ -505,6 +515,7 @@ static void share(unsigned slot, unsigned from, unsigned to, unsigned rect, unsi
   out = a[2];
   unsigned tiles = 0;
 {body}
+  {tail}
   while (sent < {total}) send();
 }}"""
 
@@ -529,8 +540,8 @@ static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed
 
 def _math(slots, body, dst=False):  # TRISC1; dst: it unpacks into Dst itself, so it waits for BRISC's fetches too
   return TRISC + f"""
-static unsigned arrived_;
-static void arrived(void) {{ arrived_++; while (peek(FETCHED) < arrived_) {{}} }}  // until BRISC has fetched the next tiles
+static unsigned needed;
+static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  // until BRISC has fetched the next tiles
 {KMAIN}
   {tt(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + [FLAGS_OFF])} {_pushes(math_runs(slots))}
   while (!peek(READY)) {{}}  // the backend config and the semaphores
@@ -568,19 +579,20 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
-  offset (Tensor's)]. A unit is a tile of the result, or a block of up to 4 x 4 of them (one matmul and nothing that
-  reduces), or, if the expression reduces along an axis, a whole line of tiles along it (a row, a column, or one tile
-  position through the batch), so the reduction can stay on chip.
+  offset (Tensor's)]. A unit is a tile of the result, or a block of them (one matmul and nothing that reduces: up to 4
+  x 4, or given a grid, a worker's block of it), or, if the expression reduces along an axis, a whole line of tiles
+  along it (a row, a column, or one tile position through the batch), so the reduction can stay on chip.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
   its K pairs of tiles, B's streamed through slots 1-2 and A's row kept in L1 while the result tiles stay in its row
   (if it fits below slot 256, else streamed through slots 3-4). A matmul with more than one row of tiles, given a
-  grid, reads each input tile from DRAM once: worker (gy, gx) of the grid computes one block, the first worker of a
-  grid row reads the block row's rows of A and multicasts them along it, and the first of a grid column reads each of
-  its columns of B in turn and multicasts it down, into one of two buffers while the other is in use. A unary op runs
-  on the SFPU over Dst: in place, on the result of the op below it if nothing else reads that, or else on its operand
-  plus the zero tile (slot 0). A reduction folds each tile of its operand along the axis into an accumulator in Dst,
-  then across the tile (across_rows, across_cols), and packs one tile.
+  grid, reads each input tile from DRAM once: worker (gy, gx) of the grid computes one block, each worker of a grid
+  row reads its share of the block row's rows of A and multicasts it along the row, and each of a grid column its
+  share of each of the column's columns of B, down the column into one of three buffers, flagging each share (FLAGS)
+  once every recipient has it. A unary op runs on the SFPU over Dst: in place, on the result of the op below it if
+  nothing else reads that, or else on its operand plus the zero tile (slot 0). A reduction folds each tile of its
+  operand along the axis into an accumulator in Dst, then across the tile (across_rows, across_cols), and packs one
+  tile.
   A line is done in passes: a pass is a sweep over its tiles, and a reduction's result can only be read in the pass
   after the one that swept it. Each pass recomputes what it needs (softmax computes exp twice) rather than keep whole
   lines of it in L1, but reads inputs from DRAM once: one read in more than one pass keeps its line of tiles in L1 from
@@ -599,7 +611,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   count(expr)
   out, dst = out or dtype, dtype != "bf16"  # dst: the math thread fills Dst itself and the SFPU does the math
   ext = lambda s, ax: s[ax] if ax == 0 else -(-s[ax] // 32)  # a shape's extent along an axis: matrices, or tiles
-  ops, refs = [], {}  # ops: dicts with kind, x, y, kt, posts, shape; refs: expr -> input number or ("op", j)
+  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also bt, kt, phases); refs: expr -> input number or ("op", j)
   size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (batch, rows, columns)
   def visit(e):
     if isinstance(e, int): return e
@@ -634,7 +646,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
   axes = {FOLDS[op["kind"]] for op in ops if op["kind"] in COMBINE}
   assert len(axes) <= 1, "a kernel reduces along one axis"
-  reducing, axis = bool(axes), next(iter(axes), 2)  # the axis swept, in passes; otherwise units are tiles, j along a row
+  reducing, axis = bool(axes), next(iter(axes), 2)  # the axis swept, in passes; otherwise 2, and units are blocks of tiles
   # n: the result's extent along each axis, what ops sweep along the one they reduce (a matmul's A can be wider: its
   # columns are K, streamed, not swept)
   inputs = len(shapes)
@@ -659,7 +671,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
                    {sfpu_name(op) for op in ops if sfpu_op(op)})
   frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
   assert not (dst and matmuls), "only bf16 kernels have matmuls"
-  rows_at, top = [], FRAMES + 2 * frame + len(ops)  # each matmul's row of A in L1, while they fit; else A streams too
+  base = FRAMES + 2 * frame + len(ops)  # the first slot past the frames and the narrow ops
+  rows_at, top = [], base  # each matmul's row of A in L1, while they fit; else A streams too
   assert top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS and len(matmuls) <= 16, "too many tiles in a kernel"
   for j in matmuls:
     fits = top + ops[j]["kt"] <= UNPACKABLE
@@ -669,8 +682,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   rows, cols = size(me)[1:]  # the result's
   # With one matmul and no passes, a unit is a block of bp x bq result tiles, column by column: the block's bp rows of
   # A and its current column of B stay in L1, so each is read from DRAM once a block, not once a tile. Given a grid,
-  # the blocks are the grid's (mc: its columns and rows in use, and B's buffers), and the tiles go round by multicast
-  base, mc = FRAMES + 2 * frame + len(ops), None  # base: the first slot past the frames and the narrow values
+  # the blocks are the grid's (mc: its columns and rows in use), and the tiles go round by multicast
+  mc = None
   if grid and len(matmuls) == 1 and not reducing and nb == 1 and rt > 1 and ext(ops[matmuls[0]]["shape"], 2) == w:
     kt = ops[matmuls[0]]["kt"]
     bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
@@ -680,10 +693,15 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
     while bp > 1 and base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE: bp -= 1
     bq = min(4, w) if bp > 1 else 1
-  if bp > 1 or mc: rows_at = [base]  # A's bp rows, then B's column (or columns)
+  if bp > 1 or mc: rows_at = [base]  # A's bp rows, then B's column (or its three buffers)
   kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 or mc else None
   br, bc = (mc[1], len(grid[0])) if mc else (-(-rt // bp), -(-w // bq))  # blocks down and across a matrix (the grid's)
-  decls = ""  # BRISC's tables and statics for a multicast matmul or kept inputs
+  decls, tail = "", ""  # BRISC's tables and statics for a multicast matmul or kept inputs, and its last words
+  if mc:
+    (gx_n, gy_n), (xs, ys) = mc, grid
+    decls = (_array("row_rect", [xs[gx_n - 1] | y << 6 | (xs[0] | y << 6) << 12 for y in ys[:gy_n]]) +
+             _array("col_rect", [x | ys[gy_n - 1] << 6 | (x | ys[0] << 6) << 12 for x in xs[:gx_n]]))
+    tail = f"unflag({gx_n}, {gy_n});"
   def plan(p):  # pass p's reductions, the swept ops it computes (operands first), and the narrow ops it works out once
     reductions, swept_ops = [j for j in sweep if sweep[j] == p], []
     def need(r):
@@ -698,7 +716,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
   # pass keeps its line of tiles in L1 (while they fit below slot 256), fetched in the first: neither comes again from DRAM
   kept, passes_of, narrow = {}, lambda r: [p for p in range(last + 1) if r in reads[p]], lambda r: ext(shapes[r], axis) == 1
   for r in range(inputs) if reducing else ():
-    if narrow(r) and passes_of(r): kept[r], top = top, top + 1
+    if narrow(r) and passes_of(r) and top < UNPACKABLE: kept[r], top = top, top + 1
     elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= UNPACKABLE: kept[r], top = top, top + L
   last_read = lambda keep: max([passes_of(r)[-1] for r in kept if narrow(r) == keep], default=None)  # the last pass reading such
   def slot(f, r):  # an input or swept op lives in the frame (or where it is kept), a narrow op in its own slot after both frames
@@ -727,7 +745,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     if p != passes_of(r)[0]: return ""
     return (f"if (k == 0) {{ reached(narrow_done); get(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
             f"reached(kept_done[k]); get(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
-  if kept: decls += f"static unsigned kept_done[{L}], narrow_done;  // events once the line before's last read of a kept slot is done"
+  if kept: decls += "static unsigned narrow_done;  // events once the line before's last read of a kept slot is done\n"
+  if any(not narrow(r) for r in kept): decls += f"static unsigned kept_done[{L}];\n"
   passes = []
   for p, (reductions, swept_ops, once) in enumerate(plans):
     bodies = []
@@ -735,7 +754,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
       c = [[], [], [], []]  # each program's C for this tile
       c[B] += [f"reached(frame_done[{f}]);"] + [fetch(f, p, r) for r in sorted(reads[p])] + ["ready();"]
       c[U].append("fetched();")
-      if dst: c[M].append("arrived();")
+      if dst: c[M].append("fetched();")
       for j in once + swept_ops:
         op, me_j = ops[j], ("op", j)
         cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
@@ -756,17 +775,15 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
             (a0, a1), (b0, b1) = part(a_n, gx, gx_n), part(kt, gy, gy_n)
             get_a = (f"for (unsigned e = {a0}; e < {a1}; e++) "
                      f"{{ unsigned i_ = i0 + e / {kt}, m = e % {kt}; get(a[{x}], {a_tile}, {rows_at[q]} + e); }} "
-                     f"share({rows_at[q]}, {a0}, {a1}, row_rect[{gy}], {gx_n - 1}, {gx}, stamp | 1);")
+                     f"share({rows_at[q]}, {a0}, {a1}, row_rect[{gy}], {gx_n - 1}, {gx}, 1);")
             get_b = (f"for (unsigned m = {b0}; m < {b1}; m++) {'flipped' if bt else 'get'}(a[{y}], {b_tile}, {buf} + m); "
-                     f"share({buf}, {b0}, {b1}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, stamp | (jj + 1));")
+                     f"share({buf}, {b0}, {b1}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, jj + 1);")
             c[B].append(f"{{ if (ii == 0) {{ "  # a column's first tile: its column of B, and in the first column A's rows
-                        f"if (jj == 0) {{ stamp = *(volatile unsigned *){MAILBOX:#x} << 12; {get_a} }} "
-                        f"if (jj >= 2) reached(col_end[(jj + 1) % 3]); "  # done with column jj - 2, so others may fill jj - 3's buffer
-                        f"{get_b} await({FLAGS_B}, {gy_n}, stamp | (jj + 1)); if (jj == 0) await(0, {gx_n}, stamp | 1); }} "
-                        f"for (unsigned m = 0; m < {kt}; m++) kept(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
-            xs, ys = grid
-            decls = (_array("row_rect", [xs[gx_n - 1] | y << 6 | (xs[0] | y << 6) << 12 for y in ys[:gy_n]]) +
-                     _array("col_rect", [x | ys[gy_n - 1] << 6 | (x | ys[0] << 6) << 12 for x in xs[:gx_n]]))
+                        f"if (jj == 0) {{ {get_a} }} "
+                        # done with column jj - 2 here: this column's flag lets the others fill its buffer with jj + 1
+                        f"if (jj >= 2) reached(col_end[(jj + 1) % 3]); "
+                        f"{get_b} await({FLAGS_B}, {gy_n}, jj + 1); if (jj == 0) await(0, {gx_n}, 1); }} "
+                        f"for (unsigned m = 0; m < {kt}; m++) kept_step(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
           elif kept_b is not None:  # A's bp rows and B's column in L1
             c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
                         f"for (unsigned m = 0; m < {kt}; m++) step({bt}, a[{y}], {b_tile}, nb ? {kept_b} + m : KEPT, "
@@ -853,7 +870,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
 {sweeps}
   }}"""
   total = f"a[1] * {L if swept(me) else 1}" if reducing else "tiles"  # results this worker sends home
-  image = compile_kernel(_brisc(total, program(B), dtype, out, decls), _unpacker(program(U), kernel_config(dtype, out)),
+  image = compile_kernel(_brisc(total, program(B), dtype, out, decls, tail), _unpacker(program(U), kernel_config(dtype, out)),
                          _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 

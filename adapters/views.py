@@ -7,6 +7,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ferrite import pci, tensor
 from ferrite.chip import Chip
+from ferrite.runtime import Runtime
 
 NP = {"fp32": np.float32, "bf16": np.uint16, "int32": np.int32}  # ferrite's dtypes in numpy (bf16 as its bits)
 
@@ -14,7 +15,6 @@ RT = None  # the Runtime the adapters run on: every worker of the chip, unless s
 def runtime():
   global RT
   if RT is None:
-    from ferrite.runtime import Runtime
     chip = Chip(pci.open_device())
     RT = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   return RT
@@ -89,9 +89,9 @@ def grouping(shape, shape3):  # shape's axes in three consecutive groups whose s
   return None
 
 def materialize(v, groups=None):
-  """v as a ferrite tensor of three axes, each a group of v's axes (fold's, by default): v's own tensor if the view is
-  the tensor as it is, a transpose for a swapped one (which a matmul reads in place), else one move; a view that does not
-  fold into three axes goes through the host."""
+  """v as a ferrite tensor of three axes, each a group of v's axes (fold's, by default): v's own tensor (reshaped if need
+  be) if the view is it as it lies, a transpose for a swapped one (which a matmul reads in place), one move, or moves that
+  swap blocks of axes (transposes); any other view goes through the host."""
   groups = groups or groups3(v.shape)
   shape3, t = tuple(math.prod(v.shape[k] for k in g) for g in groups), v.t
   if v.view.contiguous() and t.shape == shape3: return t
@@ -113,11 +113,10 @@ def transposes(v):
   axes = [k for k, n in enumerate(v.shape) if n > 1]
   order = sorted(axes, key=lambda k: -v.view.strides[k])  # the axes as the tensor holds them
   if v.view.offset or v.view.mask or [v.view.strides[k] for k in order] != list(View([v.shape[k] for k in order]).strides): return None
-  t = v.t
+  t, size = v.t, lambda ks: math.prod(v.shape[q] for q in ks)
   for i, k in enumerate(axes):
     j = order.index(k)
     if j == i: continue
-    size = lambda ks: math.prod(v.shape[q] for q in ks)
     p, y, z = size(order[:i]), size(order[i:j]), size(order[j:])
     t = t._move((p, z, y), 0, (y * z, 1, z))  # blocks y and z swapped
     order = order[:i] + order[j:] + order[i:j]

@@ -5,6 +5,8 @@ import array, math
 from ferrite import bh
 from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, fused_kernel, gather_kernel, move_kernel, tile_bytes, transpose_kernel
 
+FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
+
 class Tensor:
   """batch x rows x cols of bf16, fp32 or int32 (dtype; batch 1 unless said): in DRAM as 32x32 tiles, matrix after matrix, each in row-major
   tile order, tile i in bank i % 8; or, until realized, an op on other tensors. Realizing compiles the whole tree of
@@ -38,7 +40,7 @@ class Tensor:
 
   def _where(self, b, i, j):  # tile (i, j) of matrix b in DRAM: (x, y, address)
     t = b * self.bstride + i * self.stride + j + self.offset
-    return (*bh.DRAM[t % 8], self.addr + t // 8 * tile_bytes(self.dtype))
+    return (*bh.DRAM[t % len(bh.DRAM)], self.addr + t // len(bh.DRAM) * tile_bytes(self.dtype))
 
   @classmethod
   def full(cls, rt, rows, cols, value, dtype="bf16"): return cls.of(rt, [[value] * cols for _ in range(rows)], dtype)
@@ -181,7 +183,7 @@ class Tensor:
     """The batch side by side as one matrix, the inverse of split: x.split(n).merge() is x. The kernel computing it
     writes each matrix into its columns (realize into a view); one already computed is copied there."""
     out = Tensor(self.rt, self.rows, self.batch * self.cols, dtype=self.dtype)
-    (self if self.op not in (None, "T", "move") else self + 0.0).realize(out.split(self.batch))  # nor can these write a view
+    (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))  # computed already, or a move: copied in by + 0
     return out._track("merge", (self,))
 
   @property
@@ -455,7 +457,6 @@ def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (fi
   first, end = max(-((o - lo) // s), 0), min(-((o - hi) // s), n)
   return (first, end) if first < end else (0, 0)
 
-FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4, exact products (see compiler.matmul for fewer)
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are whole tensors, realized first, not tiles in the same kernel
 def _lazy(t, seen):  # the unrealized ops under t, t first
   if t.op is None or id(t) in seen: return
@@ -507,7 +508,9 @@ def _expr(t, shape, inputs, kernel):
     return ("matmul", _expr(a.realize(), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
-kernels = {}  # (expression, input shapes, dtype, result dtype, workers' grid) -> (image, units), or a data movement kernel's name and shape -> image
+# (expression, input shapes, dtype, result dtype, workers' grid) -> (image, units); a move or gather's name and dtype
+# (a transpose's: its shape) -> image
+kernels = {}
 def _cached(key, compile):
   if key not in kernels: kernels[key] = compile()
   return kernels[key]

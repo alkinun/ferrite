@@ -1,12 +1,12 @@
 # How fast a bf16 matmul runs on every worker (ROADMAP, stage 3). On a card the time is wall time; on ttsim it is
-# simulated cycles at the chip's clock, which tracks how much work the kernels do but not how fast silicon does it
-# (ttsim runs each instruction at once, and its DRAM answers at once). So it also counts what the workers read from
-# DRAM, against reading each input once: on silicon a big matmul waits on DRAM more than on its MVMULs.
+# simulated cycles, the RISC-V work on the critical path (queued Tensix instructions cost ttsim nothing, and its DRAM
+# answers at once), not silicon's speed. So it also counts what the workers read from DRAM, against reading each input
+# once: on silicon a big matmul waits on DRAM more than on its MVMULs.
 #   TTSIM=/path/to/libttsim.so python3 -m ferrite.bench [M K N]
 import sys
 from ferrite import bh, pci
 from ferrite.chip import Chip
-from ferrite.tensor import Tensor
+from ferrite.tensor import FIDELITY, Tensor
 from ferrite.runtime import Runtime
 
 def bench(chip, m, k, n, repeat=3):
@@ -26,7 +26,7 @@ if __name__ == "__main__":
   chip = Chip(pci.open_device())
   m, k, n = map(int, sys.argv[1:4]) if len(sys.argv) > 3 else (512, 768, 3072)
   seconds, tflops, reread = bench(chip, m, k, n)
-  peak = len(chip.tensix) * bh.MVMUL_FLOPS * bh.AICLK / 4 / 1e12  # four fidelity phases, as our matmuls do
-  speed = (f"{seconds * bh.AICLK / 1e3:.1f}k ttsim cycles (it does not time Tensix instructions: a count of work, not silicon time)"
-           if isinstance(chip.pci, pci.Sim) else f"{seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at full precision")
+  peak = len(chip.tensix) * bh.MVMUL_FLOPS * bh.AICLK / FIDELITY / 1e12  # a product takes FIDELITY phases
+  speed = (f"{seconds * bh.AICLK / 1e3:.1f}k ttsim cycles (the RISC-V work on its critical path, not silicon time)"
+           if isinstance(chip.pci, pci.Sim) else f"{seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at {FIDELITY} fidelity phases")
   print(f"{m}x{k} @ {k}x{n}: {speed}; DRAM reads {reread:.1f}x the inputs")

@@ -31,7 +31,7 @@ class FerriteTensor(torch.Tensor):
   def __torch_dispatch__(cls, func, types, args=(), kwargs=None): return dispatch(func, args, kwargs or {})
 
 def ferrite(x):
-  """x on the chip: a tensor (a FerriteTensor; a FerriteTensor itself), or a module, whose parameters and buffers move."""
+  """x on the chip as a FerriteTensor (one already is returned as it is), or a module with its parameters and buffers moved there."""
   if isinstance(x, torch.nn.Module):
     for m in x.modules():
       for name, p in m.named_parameters(recurse=False): setattr(m, name, torch.nn.Parameter(ferrite(p.detach()), p.requires_grad))

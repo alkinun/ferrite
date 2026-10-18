@@ -43,7 +43,7 @@ BRISC_STACK_TOP = 0xFFB00000 + 8 * 1024  # end of BRISC's private data RAM; BRIS
 TRISC_STACK_TOP = 0xFFB00000 + 4 * 1024  # each TRISC's is 4 KiB, at the same address
 TRISC_RESET_PC = 0xFFB12228  # RISCV_DEBUG_REG_TRISC0_RESET_PC, then TRISC1's and TRISC2's
 TRISC_RESET_PC_OVERRIDE = 0xFFB12234  # bit i: TRISC i starts at its RESET_PC rather than 0x6000 / 0xA000 / 0xE000
-NIU = 0xFFB20000  # NoC 0 interface (ISA NoC/MemoryMap.md): request initiator i's registers at +INITIATOR i, counters at +0x200
+NIU = 0xFFB20000  # NoC 0 interface (ISA NoC/MemoryMap.md): request initiator i's registers at + i * INITIATOR, counters at +0x200
 NIU_REGS = {  # offsets from NIU. A request: target and return addresses (64 bits each, then the tile's x | y << 6), a tag,
   # control bits (NOC_CMD), a length, and CMD = 1 to send it; AT_DATA is an atomic's operand
   "TARG_LO": 0x0, "TARG_MID": 0x4, "TARG_HI": 0x8, "RET_LO": 0xC, "RET_MID": 0x10, "RET_HI": 0x14, "PACKET_TAG": 0x18, "CTRL": 0x1C,
@@ -54,7 +54,7 @@ NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING cou
            "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,  # a write to a rectangle: broadcast, path reserve, static VC
            "ATOMIC": 1, "INCREMENT": 1 << 12 | 31 << 2,  # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of word 0
            "MAX_PACKET": 16384}
-NIU_READS = NIU + NIU_REGS["READS"]  # NIU_MST_RD_RESP_RECEIVED: read responses this tile has had (the one counter ttsim keeps)
+NIU_READS = NIU + NIU_REGS["READS"]  # NIU_MST_RD_RESP_RECEIVED: read requests answered, one a request (bench's DRAM reads)
 TENSIX_CFG = 0xFFEF0000  # Tensix backend config bank 0, one word per register; BRISC and TRISCs only, not the NoC
 CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: writing bit 0 (BRISC) .. bit 4 (NCRISC) drops that core's instruction cache
 
@@ -143,5 +143,6 @@ TENSIX_CFG_FIELDS = {
 THREAD_CFG = {"StateID": 0, "MATH_Offset": 1, "DISABLE_IMPLIED_SRCA": 2, "DISABLE_IMPLIED_SRCB": 3, "SRCA_SET": 5,
               "CLR_DVALID": 7, "FIDELITY_BASE": 11, "UNPACK_MISC": 41}
 SRCA_SET_BY_ADDR = 1 << 2  # SrcA/SrcB rows come from the unpacker's address, which our UNPACRs rely on
-ADDR_MOD_AB, ADDR_MOD_DST, ADDR_MOD_PACK, ADDR_MOD_BIAS = 12, 28, 37, 47  # AB: SrcAIncr | SrcBIncr << 8,
-FIDELITY_INCR = 13  # DST: DestIncr | FidelityIncr << 13, PACK: YsrcIncr. Row counters wrap at 64 (Src) and 1024 (Dst).
+# Address modes, 8 slots each: AB: SrcAIncr | SrcBIncr << 8, DST: DestIncr | FidelityIncr << FIDELITY_INCR, PACK:
+# YsrcIncr, BIAS: the packer's. Row counters wrap at 64 (Src) and 1024 (Dst)
+ADDR_MOD_AB, ADDR_MOD_DST, ADDR_MOD_PACK, ADDR_MOD_BIAS, FIDELITY_INCR = 12, 28, 37, 47, 13

@@ -40,7 +40,7 @@ class Sim:
       if base <= bus and bus + n <= base + size: return addr + bus - base
     raise RuntimeError(f"device DMA to {bus:#x}+{n}, which is not host memory we allocated")
 
-  TICK = 10  # chip clocks each poll runs: the finest any measurement is (at 1000, every wait was rounded up to 1000)
+  TICK = 10  # chip clocks a poll runs, so every wait (and so every cycle count) is rounded up to a multiple of it
   def tick(self):  # the simulator only runs when we let it
     self.lib.libttsim_clock(self.TICK)
     self.clocks += self.TICK

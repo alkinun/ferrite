@@ -2,9 +2,8 @@
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
 import math, os, random, struct, sys, pytest
 import numpy as np
-from ferrite import bh, pci
+from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
-from ferrite import compiler, tensor
 from ferrite.compiler import from_bf16, to_bf16
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
@@ -117,8 +116,8 @@ void kmain(volatile unsigned *a) {  // a: [index, 1, bank x, bank y, src, dst, n
     assert chip.read(*cores[(i + 1) % len(cores)], DATA + n, 64) == o[:64], f"L1 of the core after {i}"
 
 def test_queue(chip):
-  # 100 launches queued back to back through a ring that holds 16 of them: it fills, the host waits for space, the
-  # dispatcher wraps around it six times. Each launch adds its index to a word in every worker's L1.
+  # 100 launches queued back to back through a ring that holds 32 of them (64 bytes each): it fills, the host waits for
+  # space, the dispatcher wraps around it three times. Each launch adds its index to a word in every worker's L1.
   rt = Runtime(chip, chip.tensix[0], chip.tensix[2], ring=2048)
   for x, y in rt.cores: chip.write32(x, y, DATA, 0)
   add = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[2]; }")
@@ -214,17 +213,19 @@ def test_matmul_random(chip):
       assert abs(got[i][j] - sum(terms)) <= 2**-8 * sum(map(abs, terms)), (i, j, got[i][j], sum(terms))
 
 def test_matmul_blocks(chip):
-  # result tiles go in blocks of up to 4 x 4, with the block's rows of A and column of B kept in L1. 5 x 6 tiles cut
-  # into blocks leaves part-blocks at the edges, whose missing tiles must not be computed: they would land past the
-  # result in DRAM, on the tensor allocated after it (the canary, written before the queued kernel runs)
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  # on one worker, result tiles go in blocks of up to 4 x 4, with the block's rows of A and column of B kept in L1; on
+  # every worker, a block each of the grid. 5 x 6 tiles leaves part-blocks at the edges either way, whose missing tiles
+  # must not be computed: they would land past the result in DRAM, on the tensor allocated after it (the canary,
+  # written before the queued kernel runs)
   a = [[float((r * 7 + c * 3) % 5 - 2) for c in range(96)] for r in range(160)]
   b = [[float((r + 2 * c) % 3 - 1) for c in range(192)] for r in range(96)]
-  y = (Tensor.of(rt, a) @ Tensor.of(rt, b)).realize()  # queued
-  canary = Tensor.of(rt, [[1.0] * 192] * 160)
-  assert y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(96)) for j in range(192)] for i in range(160)]
-  assert canary.tolist() == [[1.0] * 192] * 160
-  # one row of result tiles and a long K, as a token's MLP: K is cut into 4 parts on 4 times the workers, and summed
+  for workers in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, chip.tensix[0], workers)
+    y = (Tensor.of(rt, a) @ Tensor.of(rt, b)).realize()  # queued
+    canary = Tensor.of(rt, [[1.0] * 192] * 160)
+    assert y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(96)) for j in range(192)] for i in range(160)]
+    assert canary.tolist() == [[1.0] * 192] * 160
+  # one row of result tiles and a long K, as a token's MLP: K is cut into 8 parts on 8 times the workers, and summed
   # (sums under 256, so every partial and total is exact in bf16)
   a, b = [[float((r + c) % 3 - 1) for c in range(1024)] for r in range(5)], [[float(r % 16 == c % 16) for c in range(64)] for r in range(1024)]
   y = Tensor.of(rt, a) @ Tensor.of(rt, b)
@@ -798,7 +799,7 @@ def test_fuzz(chip, monkeypatch):
       bb = b if rng.random() < 0.5 else 1
       return (leaf((b, r, k)) @ (leaf((bb, c, k)).T if rng.random() < 0.3 else leaf((bb, k, c)))) * (1 / k)  # B read transposed, or not
     return leaf(shape)
-  for n in range(30):  # sizes past 4 tiles make part-blocks of matmul results; every other tree is fp32
+  for n in range(30):  # sizes past 4 tiles make part-blocks of batched matmuls (unbatched ones share by multicast); every other tree is fp32
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
     dtype = ("bf16", "fp32")[n % 2]
     gen(shape, 4).realize()
@@ -1005,7 +1006,7 @@ def test_kv_cache(chip):
     got, want = llama.logits(llama.forward(new, t, c, caches, rt)), llama.forward(new, w, c, np_caches)[0]
     assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (step, np.abs(got - want).max(), np.abs(want).max())
     ids.append(int(want.argmax()))
-  assert caches[0][0].shape == (1 * 3, 8, 64) and np.allclose(want, llama.forward(ids[:-1], w, c, [[None, None], [None, None]])[0], atol=1e-3)
+  assert caches[0][0].shape == (c.kv, 8, 64) and np.allclose(want, llama.forward(ids[:-1], w, c, [[None, None], [None, None]])[0], atol=1e-3)
 
 @pytest.mark.skipif("LLAMA" not in os.environ, reason="LLAMA=/path/to/SmolLM-135M (Hugging Face HuggingFaceTB/SmolLM-135M) runs it")
 def test_llama_model(chip):
