@@ -355,10 +355,9 @@ class Tensor:
     fidelity = fidelity or FIDELITY
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
-    if "fp32" in (self.dtype, x.dtype):  # one op to backward, which is two more fp32 matmuls, not through its bf16 parts
-      (ah, al), (bh, bl) = _parts(self), _parts(x)
-      out, lo = ah.matmul(bh, "fp32", 4), [a.matmul(b, "fp32", 4) for a, b in ((ah, bl), (al, bh)) if a is not None and b is not None]
-      return (out + sum(lo[1:], lo[0]) if lo else out)._track("matmul", (self, x)).cast(dtype)
+    if "fp32" in (self.dtype, x.dtype):  # one op to backward, which keeps its bf16 parts for its own two fp32 matmuls
+      a, b = _parts(self), _parts(x)
+      return _bf16x3(a, b)._track("matmul", (self, x), a, b).cast(dtype)
     assert self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch)), f"{self.shape} @ {x.shape}"
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
     kt, tiles = self.cols // 32, -(-self.rows // 32) * -(-x.cols // 32)
@@ -460,6 +459,9 @@ def _backward(t, g):
            "cast": lambda: g.cast(x.dtype)}
   if op in unary: return (unary[op](),)
   g = _full(g, t.shape)  # movement and matmul need every element of it
+  if op == "matmul" and args:  # fp32: from the forward's parts, transposed, and g's, made once for both
+    gp, (xp, yp) = _parts(g), args
+    return (_unbroadcast(_bf16x3(gp, _pT(yp)).cast(x.dtype), x.shape), _unbroadcast(_bf16x3(_pT(xp), gp).cast(y.dtype), y.shape))
   if op == "matmul": return (_unbroadcast(g.matmul(y.T, x.dtype), x.shape), _unbroadcast(x.T.matmul(g, y.dtype), y.shape))
   if op == "T": return (g.T,)
   if op == "reshape": return (g.reshape(*x.shape),)
@@ -478,11 +480,16 @@ def _backward(t, g):
     return ((Tensor.of(t.rt, [[i] for i in range(x.rows)], "int32") == args[0]).bfloat16().matmul(g, x.dtype),)
   raise NotImplementedError(f"no backward for {op}")
 
-def _parts(t):  # an fp32 matmul's operand as bf16 hi + lo (no lo for a bf16 one); a transpose split first, its parts transposed as bf16
-  if t.op == "T": return tuple(p if p is None else p.T for p in _parts(t.srcs[0]))
+def _parts(t):  # an fp32 matmul's operand as bf16 (hi, lo), no lo for a bf16 one; a transpose split first, its parts transposed as bf16
+  if t.op == "T": return _pT(_parts(t.srcs[0]))
   if t.dtype == "bf16": return t, None
   hi = t.bfloat16()
   return hi, (t - hi).bfloat16()
+def _pT(parts): return tuple(p if p is None else p.T for p in parts)
+def _bf16x3(a, b):  # hi@hi + (hi@lo + lo@hi) in fp32, from two operands' parts
+  (ah, al), (bh, bl) = a, b
+  out, lo = ah.matmul(bh, "fp32", 4), [p.matmul(q, "fp32", 4) for p, q in ((ah, bl), (al, bh)) if p is not None and q is not None]
+  return out + sum(lo[1:], lo[0]) if lo else out
 
 def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (first, end)
   if s == 0: return (0, n) if lo <= o < hi else (0, 0)
