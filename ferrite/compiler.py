@@ -371,7 +371,7 @@ def allocate(names):
 def run(slots, name, count=None):  # the first count words of a run: one REPLAY if it was recorded, else the words
   words = MATH_RUNS[name][:count]
   return [replay(slots[name], len(words))] if name in slots else words
-def runs(slots, name, times): return run(slots, name) * times if name in slots else [Loop(times, MATH_RUNS[name])]
+def runs(slots, name, times): return [Loop(times, run(slots, name))]  # a C loop: the math thread runs ahead of its pushes anyway
 def math_runs(slots): return [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]  # recorded at setup
 
 def release(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
