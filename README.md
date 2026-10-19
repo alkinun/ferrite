@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2700 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2800 lines of Python.
 Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
@@ -72,8 +72,8 @@ one; `COMPARE.md` has the numbers and what carries over.
   host memory), or ttsim's simulated card behind the same interface.
 - `ferrite/runtime.py`: firmware for every core, kernels that stay loaded, and a command ring in host memory that one
   core reads by itself, so a launch costs the host one PCIe write, and a recorded block of launches one too.
-- `ferrite/tensor.py`: lazy tensors of any shape, bf16, fp32, int32 or bfp8, with numpy's broadcasting and tinygrad's
-  autograd. A tree of ops becomes one fused kernel; `jit` records a function's launches and replays them.
+- `ferrite/tensor.py`: lazy tensors of any shape, bf16, fp32, int32, bfp8 or bfp4, with numpy's broadcasting and
+  tinygrad's autograd. A tree of ops becomes one fused kernel; `jit` records a function's launches and replays them.
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: Blackhole's facts as data: addresses, limits, instruction and config encodings.

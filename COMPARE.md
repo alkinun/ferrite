@@ -129,7 +129,7 @@ lead is in the work around the math, so it is largest where that work is: small 
 Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.2 s; tt-metal builds its firmware when
 the device opens (0.9 s) and each op's kernels the first time (0.6 to 0.8 s). Both cache on disk.
 
-Size: ferrite is about 2,700 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python, not counting
+Size: ferrite is about 2,800 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python, not counting
 tests: tt-metal 540k, LLK 111k (44k of it Blackhole's), TT-NN 935k, UMD 56k, tt-kmd 10k.
 
 On 2026-10-18 (ferrite at bc715ac) it was the other way round for DRAM: ferrite's matmul read 6.9 times its inputs, its
@@ -165,5 +165,5 @@ on-device sampling, which uses an SFPU instruction ttsim does not model, `SFPCON
       TT_METAL_DISABLE_SFPLOADMACRO=1 LD_LIBRARY_PATH=$PWD/tt-metal/build_Release/lib \
       PYTHONPATH=$PWD/tt-metal:$PWD/tt-metal/ttnn:$PWD/tt-metal/tools python3 cmp/ttnn_smollm.py performance 4    # or accuracy
     ... cmp/ttnn_smollm.py performance 3 all 32    # 32 users: decode alone (TT prefills users one at a time)
-    START=1000 ... cmp/ttnn_smollm.py performance 3    # from place 1000 of an empty cache; so does ferrite_smollm.py
+    START=1000 ... cmp/ttnn_smollm.py performance 3    # from place 1000, the cache empty; ferrite_smollm.py too
     COUNT_OPS=1 ... cmp/ttnn_smollm.py performance 2 1    # TT-NN operations a token, untraced, one block (2 for two)
