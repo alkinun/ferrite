@@ -38,6 +38,18 @@ def flat(a, n, npd):  # a host value as n values' bytes
 def to_chip(v, dtype):  # a host value (a tinygrad CPU tensor) as a chip value, in its own shape
   return Value(upload(array(v), DTYPES[dtype]), View(v.shape), dtype)
 
+fixed = {}  # host operands that read no buffer (a constant's arithmetic, an arange), by UOp: the same every time
+def up(x, dtype, shape3):
+  """A host value as an operand on the chip, folded to shape3: a number if all its values are one, else a tensor. One
+  that reads no buffer is worked out and goes up once (the last 256 kept)."""
+  if (key := (x.uop, dtype, shape3)) in fixed: return fixed[key]
+  a = array(x)
+  v = (int(c) if isinstance(c := a.flat[0].item(), bool) else c) if a.size and (a == a.flat[0]).all() else upload(a, dtype, shape3)
+  if not any(u.op in (Ops.BUFFER, Ops.ALLOC, Ops.PARAM) for u in x.uop.toposort()):
+    if len(fixed) >= 256: del fixed[next(iter(fixed))]
+    fixed[key] = v
+  return v
+
 def on_ferrite(u): return isinstance(u.device, str) and u.device.startswith("FERRITE")
 
 # Elementwise ops: tinygrad's on ferrite's (ferrite's comparisons give 1 or 0 in their operands' dtype, which is how a bool lives here)
@@ -72,7 +84,7 @@ class Evaluator:
     if isinstance(x, (bool, int, float)): return int(x) if isinstance(x, bool) else x
     if isinstance(x, Tensor):  # from the host: a number if it is one spread over a shape
       if (c := constant(x)) is not None: return int(c) if isinstance(c, bool) else c
-      return upload(array(x), "fp32" if dtypes.is_float(x.dtype) else "int32", [math.prod(shape[k] for k in g) for g in groups])
+      return up(x, "fp32" if dtypes.is_float(x.dtype) else "int32", tuple(math.prod(shape[k] for k in g) for g in groups))
     return operand(x, shape, groups)
 
   def chip_op(self, u, srcs):
@@ -198,6 +210,9 @@ class Evaluator:
       h = buf.ensure_allocated()._buf
       if h.value is not None: return Value(h.value.t, h.value.view, h.value.dtype)
       if h.bytes is None: return Tensor.zeros(buf.nbytes // v.dtype.itemsize, dtype=v.dtype, device="CPU")  # nothing stored yet
+      if v.dtype in DTYPES and len(h.bytes) <= 32 * v.dtype.itemsize:  # a row of a tile at most (an optimizer's numbers): up as it is
+        h.value, h.bytes = Value(upload(np.frombuffer(h.bytes, npdtype(v.dtype)), DTYPES[v.dtype]), View(v.shape), v.dtype), None
+        return Value(h.value.t, h.value.view, h.value.dtype)
       return cpu(np.frombuffer(h.bytes, npdtype(v.dtype)))  # on the host until a use gives it a shape
     return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape))
 
