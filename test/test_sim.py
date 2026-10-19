@@ -1064,13 +1064,14 @@ def test_transformers(chip, monkeypatch):
       assert (got - want).abs().max() < 0.1 and got[0, -1].argmax() == want[0, -1].argmax(), (got - want).abs().max()
   assert set(fell_back) <= {"aten.bitwise_and.Tensor"}, fell_back
 
-@pytest.mark.parametrize("n, dtype", [(16, "bf16"), (40, "bf16"), (40, "bfp8")])
-def test_gpt2_layer(chip, n, dtype):
+@pytest.mark.parametrize("n, dtype, size", [(16, "bf16", 0), (40, "bf16", 0), (40, "bfp8", 0), (16, "bf16", 64)])
+def test_gpt2_layer(chip, n, dtype, size):
   # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so attention spans tiles),
   # against the same code (test/gpt2.py) in numpy, float64, with the same weights: bf16, or the matrices cast to bfp8 on
-  # the chip (numpy then has them as the chip does). Weights as GPT-2 initialises them; the attention is causal and not
-  # uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to ~2) must match to
-  # within 3% of its size
+  # the chip (numpy then has them as the chip does); with size, its keys and values put into a KV cache of that many
+  # places, attention reading all of them, the empty ones masked. Weights as GPT-2 initialises them; the attention is
+  # causal and not uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to
+  # ~2) must match to within 3% of its size
   rt, rng, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 768
   shapes = {"ln_1.weight": (1, d, 1), "ln_1.bias": (1, d, 0), "attn.c_attn.weight": (d, 3 * d, 0), "attn.c_attn.bias": (1, 3 * d, 0),
             "attn.c_proj.weight": (d, d, 0), "attn.c_proj.bias": (1, d, 0), "ln_2.weight": (1, d, 1), "ln_2.bias": (1, d, 0),
@@ -1080,25 +1081,36 @@ def test_gpt2_layer(chip, n, dtype):
   t = {k: Tensor.of(rt, v.tolist()) for k, v in p.items()}
   t |= {k: v.cast(dtype).realize() for k, v in t.items() if v.rows > 1}
   p |= {k: gpt2.values(v) for k, v in t.items() if v.dtype != "bf16"}
-  got = gpt2.layer(Tensor.of(rt, x.tolist()), t, Tensor.of(rt, gpt2.mask(n).tolist()))
+  cache = (lambda zeros: zeros((24, size, 64)) if size else None)  # a block's keys and values, or none
+  places = Tensor.of(rt, [list(range(n))], "int32") if size else None
+  got = gpt2.layer(Tensor.of(rt, x.tolist()), t, Tensor.of(rt, gpt2.mask(range(n), size or n).tolist()), 12,
+                   cache(lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), places)
   got = np.array(got.tolist())
-  want = gpt2.layer(x, p, gpt2.mask(n))
+  want = gpt2.layer(x, p, gpt2.mask(range(n), size or n), 12, cache(np.zeros), range(n))
   change = np.abs(want - x).max()
   assert change > 1 and np.abs(got - want).max() < 0.03 * change, (np.abs(got - want).max(), change)
 
 @pytest.mark.skipif("GPT2" not in os.environ, reason="GPT2=/path/to/model.safetensors (Hugging Face openai-community/gpt2) runs it")
 def test_gpt2_model(chip):
   # stage 0's finish line: GPT-2 small's real weights, all 12 blocks, the embeddings (gathered on the chip) and the output layer
-  # (the token embedding transposed on the chip). After "The meaning of life is", the next token's 50257 logits against
-  # the same model in numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and a pick numpy
-  # rates as good: " not" (407) by numpy, and " to" just 0.36 behind, closer than bf16's rounding through 12 blocks can
-  # tell apart (the residual reaches 3000, where bf16 steps by 16). About 30 s on ttsim; test/gpt2.py generates text
+  # (the token embedding transposed on the chip). After "The meaning of life is", then after each of three more tokens
+  # (a token at a time from the KV cache, the last a replay), the next token's 50257 logits against the same model in
+  # numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and a pick numpy rates as good: first
+  # " not" (407) by numpy, and " to" just 0.36 behind, closer than bf16's rounding through 12 blocks can tell apart (the
+  # residual reaches 3000, where bf16 steps by 16). About 90 s on ttsim; test/gpt2.py generates text
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   weights = gpt2.load(os.environ["GPT2"])
-  ids = [464, 3616, 286, 1204, 318]  # "The meaning of life is" (tiktoken's gpt2 encoding)
-  got, want = gpt2.logits(ids, gpt2.upload(rt, weights), rt), gpt2.logits(ids, gpt2.arrays(weights))
-  err = np.abs(got - want).max()
-  assert want.argmax() == 407 and err < 2 and want[got.argmax()] >= want.max() - 2 * err, (err, got.argmax())
+  t, w, ids = gpt2.upload(rt, weights), gpt2.arrays(weights), [464, 3616, 286, 1204, 318]  # (tiktoken's gpt2 encoding)
+  kv = gpt2.kv_cache(12, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist()))
+  run, on = lambda ids, places: gpt2.forward(ids, t, gpt2.mask(places, 32), places, kv), lambda row: Tensor.of(rt, [row], "int32")
+  step = tensor.jit(run)
+  for i in range(4):
+    new = ids if i == 0 else ids[-1:]
+    got = gpt2.values((run if i == 0 else step)(on(new), on(list(range(len(ids) - len(new), len(ids))))))[0]
+    want = gpt2.logits(ids, w)
+    err = np.abs(got - want).max()
+    assert (i or want.argmax() == 407) and err < 2 and want[got.argmax()] >= want.max() - 2 * err, (i, err, got.argmax())
+    ids.append(int(want.argmax()))
 
 def smol(rng, layers, vocab=256):  # random weights in SmolLM-135M's shapes (as test/llama.py names them), its config
   c = SimpleNamespace(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)

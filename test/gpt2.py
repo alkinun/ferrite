@@ -1,5 +1,7 @@
 # GPT-2 small on ferrite: the real weights, greedy generation, each step checked against the same model in numpy (the
-# same bf16 weights, float32 math). The model is written once, for ferrite Tensors and numpy arrays alike.
+# same bf16 weights, float32 math). The model is written once, for ferrite Tensors and numpy arrays alike. Its KV cache
+# has a fixed size and a token's place is data, not a shape, so every decode step launches the same kernels: after the
+# first two, each is a replay (tensor.jit).
 #   TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "prompt" [tokens] [bfp8]
 # The weights are Hugging Face's openai-community/gpt2 model.safetensors; the tokenizer is tiktoken's "gpt2". bfp8: the
 # weight matrices in bfp8 on the chip (numpy then has them as the chip does).
@@ -7,7 +9,7 @@ import json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ferrite.tensor import Tensor
+from ferrite.tensor import Tensor, jit
 
 HEADS = 12
 
@@ -18,7 +20,8 @@ def fns(x):  # what numpy and ferrite spell differently
     layernorm = lambda a: (a - a.mean(-1, keepdims=True)) / np.sqrt(a.var(-1, keepdims=True) + 1e-5)
     return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split, softmax=softmax, layernorm=layernorm,
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
-                           gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))))
+                           gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))),
+                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b))
   if type(x).__module__ == "torch":  # test/train.py's reference
     import torch
     F = torch.nn.functional
@@ -27,31 +30,45 @@ def fns(x):  # what numpy and ferrite spell differently
                            layernorm=lambda a: F.layer_norm(a, a.shape[-1:]), t=lambda a: a.transpose(-1, -2),
                            gelu=lambda a: F.gelu(a, approximate="tanh"))
   return SimpleNamespace(rows=Tensor.gather, width=lambda a: a.cols, split=Tensor.split, softmax=Tensor.softmax,
-                         layernorm=Tensor.layernorm, merge=Tensor.merge, t=lambda a: a.T, gelu=Tensor.gelu)
+                         layernorm=Tensor.layernorm, merge=Tensor.merge, t=lambda a: a.T, gelu=Tensor.gelu, put=Tensor.put)
 
 def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 
-def layer(x, p, mask, heads=HEADS):
+def layer(x, p, mask, heads=HEADS, cache=None, places=None):
   """One transformer block: attention then MLP, each after a layer norm and added back. p: the block's weights by their
-  names in the file, less "h.<layer>."; mask: 0 on and below the diagonal, -1e9 above."""
+  names in the file, less "h.<layer>."; mask: 0 where a token may look, -1e9 where it may not (see mask); cache: this
+  block's keys and values, its heads' then theirs (kv_cache), a row for every place: this call's are put at places,
+  both in one put, and attention reads all of them."""
   f = fns(x)
   d = f.width(x)
   hd = d // heads
   qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
   q, k, v = (f.split(qkv[:, i * d:(i + 1) * d], heads) for i in range(3))  # the heads as a batch
+  if cache is not None:
+    f.put(cache, places, f.split(qkv[:, d:], 2 * heads))
+    k, v = cache[:heads, :, :], cache[heads:, :, :]
   s = q @ f.t(k) * (1 / math.sqrt(hd)) + mask
   y = f.merge(f.softmax(s) @ v) @ p["attn.c_proj.weight"]  # the heads side by side, then c_proj
   x = x + (y + p["attn.c_proj.bias"])  # x last: it is the large one, so it is rounded once
   h = layernorm(x, p["ln_2.weight"], p["ln_2.bias"]) @ p["mlp.c_fc.weight"] + p["mlp.c_fc.bias"]
   return x + (f.gelu(h) @ p["mlp.c_proj.weight"] + p["mlp.c_proj.bias"])
 
-def forward(ids, w, mask):
+def forward(ids, w, mask, places=None, caches=None):
   """The logits for the token after ids: token and position embeddings, the blocks, a last layer norm, and the output
-  layer, which is the token embedding again (w["wte.T"], its transpose)."""
+  layer, which is the token embedding again (w["wte.T"], its transpose). places: where ids sit in the sequence (0 on
+  unless given), and caches each block's keys and values (kv_cache), for a token at a time: rows, lists for numpy and
+  int32 tensors for ferrite, so a step's places are data and every step launches the same kernels (jit)."""
   f, layers = fns(w["wte.weight"]), 1 + max(int(k.split(".")[1]) for k in w if k.startswith("h."))
-  x = f.rows(w["wte.weight"], ids) + f.rows(w["wpe.weight"], range(len(ids)))
-  for l in range(layers): x = layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask)
-  return f.rows(layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), [len(ids) - 1]) @ w["wte.T"]
+  x = f.rows(w["wte.weight"], ids) + f.rows(w["wpe.weight"], range(len(ids)) if places is None else places)
+  for l in range(layers):
+    x = layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask, HEADS, caches and caches[l], places)
+  return f.rows(layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), [x.shape[-2] - 1]) @ w["wte.T"]
+
+def mask(places, size):  # -1e9 where a token at places would look past its own among size places, else 0: in numpy, or
+  if not isinstance(places, Tensor): return np.where(np.arange(size) > np.array(places)[:, None], np.float32(-1e9), np.float32(0))
+  return ((Tensor.of(places.rt, [list(range(size))], "int32") > places.reshape(1, places.cols, 1)) * -1e9).cast("bf16")  # on the chip
+
+def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # each block's, by zeros(shape)
 
 def load(path):
   """{name: (bf16 bits, the same as float32)} from a safetensors file: 8 bytes of header size, a JSON header naming each
@@ -81,12 +98,10 @@ def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip
 def values(x):  # a ferrite matrix as numpy float32 (bf16 bits, or bfp8's as bf16)
   return (np.frombuffer(x.tobytes(), np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(x.rows, x.cols)
 
-def mask(n): return np.triu(np.full((n, n), -1e9, np.float32), 1)
-
 def logits(ids, w, rt=None):
   """The logits for the token after ids, as a numpy vector: on the chip if rt is given (w: from upload), else in numpy."""
-  if rt is None: return forward(ids, w, mask(len(ids)))[0]
-  return values(forward(ids, w, Tensor.of(rt, mask(len(ids)).tolist())))[0]
+  if rt is None: return forward(ids, w, mask(range(len(ids)), len(ids)))[0]
+  return values(forward(ids, w, Tensor.of(rt, mask(range(len(ids)), len(ids)).tolist())))[0]
 
 def main():
   import tiktoken
@@ -102,14 +117,21 @@ def main():
   t = upload(rt, weights, dtype)
   w = arrays(weights, t)
   print(f"{sum(bits.size for bits, _ in weights.values()) / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
-  ids, agree = enc.encode(prompt), 0
+  ids, agree, layers = enc.encode(prompt), 0, 1 + max(int(k.split(".")[1]) for k in w if k.startswith("h."))
+  size = -(-(len(ids) + steps) // 32) * 32  # a row for each place the generation reaches, in whole tiles
+  kv, np_kv = kv_cache(layers, size, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), kv_cache(layers, size, np.zeros)
+  on = lambda row: Tensor.of(rt, [row], "int32")  # a row of ids or places, on the chip
+  run = lambda ids, places, w, kv: forward(ids, w, mask(places, size), places, kv)
+  step, new = jit(lambda ids, places: run(ids, places, t, kv)), ids  # a token at a time, replayed from the third
   print(prompt, end="", flush=True)
-  for _ in range(steps):
-    start, since = time.time(), rt.launches
-    got, want = logits(ids, t, rt), logits(ids, w)
+  for i in range(steps):  # the prompt at once, then a token at a time, each seeing the keys and values cached so far
+    start, since, places = time.time(), rt.launches, list(range(len(ids) - len(new), len(ids)))
+    got = values(run(on(new), on(places), t, kv) if i == 0 else step(on(new), on(places)))[0]
+    want = run(new, places, w, np_kv)[0]
     agree += int(got.argmax()) == int(want.argmax())
-    ids.append(int(want.argmax()))  # numpy's pick, so that one near tie does not send the two down different paths
-    print(enc.decode([ids[-1]]) + ("" if got.argmax() == want.argmax() else f"[ferrite: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
+    new = [int(want.argmax())]  # numpy's pick, so that one near tie does not send the two down different paths
+    ids += new
+    print(enc.decode(new) + ("" if got.argmax() == want.argmax() else f"[ferrite: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
     print(f" ({time.time() - start:.0f}s, logits within {np.abs(got - want).max():.2f})", end="", file=sys.stderr, flush=True)
   print(f"\nferrite picked the same token as numpy {agree} times out of {steps}")
   print("the last token's kernels, by cycles on the chip's clock (Runtime.profile):")

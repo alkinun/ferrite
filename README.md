@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2600 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2700 lines of Python.
 Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
@@ -31,11 +31,12 @@ need numpy. Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (
 ## What runs
 
 GPT-2 small and SmolLM-135M with their real weights (Hugging Face's `model.safetensors`), each word checked against the
-same model in numpy. SmolLM decodes with a KV cache, each token replayed from a recording, so a token costs the host
-0.1 ms. Both can keep their weight matrices in bfp8 (add `bfp8`), at about half the bytes.
+same model in numpy; where ferrite picks another, its pick is in brackets (here a near tie, 0.36 apart in numpy's
+logits). SmolLM decodes with a KV cache, each token replayed from a recording, so a token costs the host 0.1 ms. Both
+can keep their weight matrices in bfp8 (add `bfp8`), at about half the bytes.
 
     TTSIM=... python3 test/gpt2.py model.safetensors "The meaning of life is" 8
-    The meaning of life is not the same as the meaning of death
+    The meaning of life is not[ferrite: ' to'] the same as the meaning of death
     TTSIM=... python3 test/llama.py SmolLM-135M "The meaning of life is" 6
     The meaning of life is a question that has been asked
 

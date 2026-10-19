@@ -19,14 +19,10 @@ def fns(x):  # what numpy and ferrite spell differently
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            softmax=lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True),
                            mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), silu=lambda a: a / (1 + np.exp(-a)),
-                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b), repeat=lambda a, n: np.repeat(a, n, 0),
-                           mask=lambda places, size: np.where(np.arange(size) > np.array(places)[:, None], -1e9, 0.0))
+                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b), repeat=lambda a, n: np.repeat(a, n, 0))
   return SimpleNamespace(rows=Tensor.gather, split=Tensor.split, merge=Tensor.merge, t=lambda a: a.T, softmax=Tensor.softmax,
                          mean=lambda a: a.mean(2),
-                         rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, repeat=Tensor.repeat_interleave, mask=mask)
-
-def mask(places, size):  # -1e9 where a token would look past its place
-  return ((Tensor.of(places.rt, [list(range(size))], "int32") > places.reshape(1, places.cols, 1)) * -1e9).cast("bf16")
+                         rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, repeat=Tensor.repeat_interleave)
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
@@ -73,7 +69,7 @@ def forward(ids, places, w, c, caches):
   rows: lists for numpy, int32 tensors for ferrite."""
   f = fns(w["embed"])
   x = f.rows(w["embed"], ids)
-  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), f.mask(places, caches[0][0].shape[-2])
+  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(places, caches[0][0].shape[-2])
   for l in range(c.layers):
     x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], places)
   return f.rows(rms(x, w["norm"], c.eps), [x.shape[-2] - 1]) @ w["embed.T"]
