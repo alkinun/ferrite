@@ -16,7 +16,7 @@ from tinygrad.dtype import _to_np_dtype
 from tinygrad.device import Allocator, BufferStorage, Compiled, Device
 from tinygrad.uop.ops import GroupOp, Ops, PatternMatcher, UOp, UPat, graph_rewrite, identity_element
 from tinygrad.schedule.prepare import resolve_function
-from views import View, Value, broadcast, common_groups, download, fold, grouping, materialize, merge, operand, reduce, spread, upload
+from views import View, Value, broadcast, common_groups, download, fold, grouping, indices, materialize, merge, operand, reduce, spread, upload
 from ferrite import tensor  # after views, which puts ferrite on the path
 
 DTYPES = {dtypes.float32: "fp32", dtypes.bfloat16: "bf16", dtypes.int32: "int32", dtypes.bool: None}  # bool: 0 or 1, any dtype
@@ -225,14 +225,27 @@ class Evaluator:
     return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape))
 
   def store(self, target, value):
-    """value into the buffer target (a whole one, perhaps reshaped)."""
-    while target.op in (Ops.RESHAPE, Ops.AFTER): target = target.src[0]
-    assert target.op in (Ops.BUFFER, Ops.ALLOC), f"a store into {target.op}"
+    """value into the buffer target: a whole one (perhaps reshaped), or a part of one (a view: the buffer's elements are
+    worked on on the host, those of the part replaced, so a value read from it before keeps what it had)."""
+    chain = []
+    while target.op not in (Ops.BUFFER, Ops.ALLOC):
+      assert target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE), f"a store into {target.op}"
+      chain, target = chain + [target], target.src[0]
     if target.buffer.nbytes == 0: return None
     buf = target.buffer.ensure_allocated()
-    if isinstance(buf._buf, Part): raise NotImplementedError("a store into part of a FERRITE buffer")
     n, npd = buf.nbytes // target.dtype.itemsize, npdtype(target.dtype)
-    data = lambda: download(value) if isinstance(value, Value) else array(value) if isinstance(value, Tensor) else value
+    if any(u.op in (Ops.SHRINK, Ops.PERMUTE) for u in chain):
+      view = View((n,))  # the part, as a view of the buffer's elements
+      for u in reversed(chain):
+        if view is None or u.op in (Ops.AFTER, Ops.DETACH): continue
+        view = view.reshape(tuple(u.shape)) if u.op is Ops.RESHAPE else view.permute(u.arg) if u.op is Ops.PERMUTE else view.shrink(self.marg(u))
+      assert view is not None and on_ferrite(target) and isinstance(buf._buf, Holder), "a store into part of a buffer: FERRITE's, a view"
+      a = np.frombuffer(contents(buf._buf) or bytes(buf.nbytes), npd).copy()
+      a[indices(view)] = np.broadcast_to(host(value, target.dtype), view.shape)
+      buf._buf.bytes, buf._buf.value = a.tobytes(), None
+      return None
+    if isinstance(buf._buf, Part): raise NotImplementedError("a store into part of a FERRITE buffer")
+    data = lambda: host(value, target.dtype)
     if not on_ferrite(target): buf.copyin(memoryview(flat(data(), n, npd)))
     elif isinstance(value, Value):  # kept in whatever three axes it has, if its view is all of it as it lies
       t = value.t if value.whole() else materialize(value)
@@ -244,10 +257,14 @@ class Evaluator:
 class Holder:  # a FERRITE buffer's contents: bytes from the host, or a chip value (its own view and dtype)
   def __init__(self): self.bytes, self.value = None, None
 
-def contents(h):  # a holder's bytes as tinygrad lays them out (a bool is a byte, whatever it was computed in), or None
-  if h.value is None: return h.bytes
-  a = download(h.value)
-  return np.ascontiguousarray(a != 0 if h.value.dtype is dtypes.bool else a).tobytes()
+def host(v, dtype):  # a chip value, host value or number as numpy, laid out as tinygrad has dtype (bf16 as its bits, a bool a byte)
+  if isinstance(v, Value):
+    a = download(v)
+    return a != 0 if v.dtype is dtypes.bool else a
+  return array(v if isinstance(v, Tensor) else Tensor(v, dtype=dtype, device="CPU"))
+
+def contents(h):  # a holder's bytes as tinygrad lays them out, or None
+  return h.bytes if h.value is None else np.ascontiguousarray(host(h.value, h.value.dtype)).tobytes()
 
 class Part:  # part of a FERRITE buffer, as tinygrad views one at an offset: read from the whole each time, never written
   value = None

@@ -124,12 +124,15 @@ def transposes(v):
     order = order[:i] + order[j:] + order[i:j]
   return t
 
+def indices(view):  # each element's place among the tensor's, in the view's shape (masked ones too)
+  if not view.shape: return np.array(view.offset)
+  return view.offset + sum(np.arange(n).reshape([-1 if j == k else 1 for j in range(len(view.shape))]) * s
+                           for k, (n, s) in enumerate(zip(view.shape, view.strides)))
+
 def download(v):  # a chip value as numpy, in its shape (bf16 as its bits)
   a = np.frombuffer(v.t.tobytes(), NP[v.t.dtype])
   view = v.view
-  idx = view.offset + sum(np.arange(n).reshape([-1 if j == k else 1 for j in range(len(view.shape))]) * s
-                          for k, (n, s) in enumerate(zip(view.shape, view.strides)))
-  out = a[np.clip(idx, 0, a.size - 1)] if view.shape else a[view.offset:view.offset + 1].reshape(())
+  out = np.asarray(a[np.clip(indices(view), 0, a.size - 1)])  # (a 0-d array for no shape, not a scalar)
   if view.mask is not None:
     for k, (lo, hi) in enumerate(view.mask):
       keep = (np.arange(view.shape[k]) >= lo) & (np.arange(view.shape[k]) < hi)

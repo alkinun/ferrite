@@ -1027,6 +1027,10 @@ def test_tinygrad(tinygrad):
   assert t[1, 1:3].numpy().tolist() == a[1, 1:3].tolist()  # a buffer read through tinygrad's view of part of it (_offset)
   assert t[:, :0].sum(1).numpy().tolist() == [[0] * 40] * 2 and t[:, :0].numpy().shape == (2, 0, 40)  # nothing to compute
   assert (t[0, 0, :1].pad(((1, 0),))[0:1] * t[0, 0]).numpy().tolist() == [0] * 40  # padding stays padding, broadcast too
+  t, want = Tensor.zeros(6, 6, device="FERRITE").contiguous().realize(), np.zeros((6, 6))  # stores into parts of a buffer
+  t[2:4, 3:5] = Tensor.ones(2, 2, device="FERRITE"); t[0] = 7.0; t[1:6:2, 0] = Tensor([1.0, 2.0, 3.0], device="FERRITE")
+  want[2:4, 3:5], want[0], want[1:6:2, 0] = 1, 7, [1, 2, 3]
+  assert t.numpy().tolist() == want.tolist()
   def train(device):
     rng = np.random.default_rng(15)
     l1, l2 = nn.Linear(16, 32), nn.Linear(32, 10)
