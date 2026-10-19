@@ -58,9 +58,9 @@ transformers' models run, generate and fine-tune unchanged.
 
 Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 4 to 18 times
 fewer cycles of control work, reading as little DRAM, and runs SmolLM-135M end to end, the same tokens, in 8 to 9 times
-fewer cycles a token than Tenstorrent's own LLM code (`tt_transformers`), with a third as many launches. The simulator
-times only that control work, not the math or the DRAM, so how fast either is on a real card waits for one; `COMPARE.md`
-has the numbers and what carries over.
+fewer cycles a token than Tenstorrent's own LLM code (`tt_transformers`), with a third as many launches (3 times fewer
+for 32 users decoding at once). The simulator times only that control work, not the math or the DRAM, so how fast either
+is on a real card waits for one; `COMPARE.md` has the numbers and what carries over.
 
 ## Code
 

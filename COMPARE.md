@@ -29,6 +29,7 @@ cache, and both write the same tokens, " a question that has been".
 |---|---|---|---|
 | a decode token, replayed | **180k cycles** | **199k** | 1,602k (performance or accuracy mode) |
 | the prompt's prefill, 5 tokens | **224k** | **243k** | 2,108k (performance; 3,064k the first time) |
+| a decode step for 32 users, a token each | **564k** | **582k** | 1,829k (performance) |
 | launches a decode token | **443** | **443** | about 1,360 TT-NN operations, each one or more programs |
 | weights read a decode token | 269 MB | 143 MB | 116 MB (performance), 168 MB (accuracy) |
 | ... that at a p150's 512 GB/s | 0.53 ms | 0.28 ms | 0.23 ms, 0.33 ms |
@@ -40,13 +41,21 @@ cache in bf16 at HiFi4 and the MLP in bfp8; the output layer is bfp8 in both. tt
 math, which those settings barely change (ferrite's bfp8 costs it 10%, two reads a tile). TT's operations a token are
 82 for one block and 126 for two (counted untraced), so 44 a block where ferrite has 14.
 
+32 users decoding together (all from the same prompt, each at its own places; `llama.forward`'s starts, TT's batch)
+take ferrite 3.2 times fewer cycles a step than TT, 17.6k a token against 57k. Batching gains TT more: it computes 32
+rows for one user anyway, so 32 users cost it 14% more than one. Its attention is per user, where ferrite's runs over
+every user's cache, masked: no more tile work, but one line of work a head, 9 lines for 119 workers (NOTES, "A
+Llama-family model").
+
 What it could mean on a card: if silicon's RISC-V control work is anything like ttsim's count (in-order cores, about
 an instruction a clock at 1.35 GHz), TT's 1.6M cycles are 1.2 ms of control a token, five times its 0.23 ms of DRAM
 in performance mode, while ferrite's 0.13 to 0.15 ms are under its DRAM time (0.28 ms in bfp8). Then ferrite decodes
 as fast as its weights can be read and TT does not. ttsim's NoC and DRAM answer at once, so a card adds latency to
 both, and only a card can say how far apart they are; SmolLM-135M is small, so control is a large share of its time,
 and in a bigger model DRAM is a larger share for both. Both replay a decode step, so the host's part is small: ferrite's
-is 0.1 to 0.2 ms of Python a token (measured), TT's trace was not measured.
+is 0.1 to 0.2 ms of Python a token (measured), TT's trace was not measured. At 32 users the same reckoning gives
+ferrite 0.42 to 0.43 ms of control a step against its weights' 0.28 (bfp8) or 0.53 ms (bf16), and TT 1.36 ms against
+0.23 ms: about 60 to 75 thousand tokens a second against 23 thousand, if control is what ttsim counts.
 
 ## How it was counted
 
@@ -108,8 +117,9 @@ SmolLM-135M through TT's Python API needs `tools` on the path (its `tracy` modul
 TT's tokenizer (which fails on this model: no `<unk>` in its vocabulary), and the prefill warmup off (it runs TT's
 on-device sampling, which uses an SFPU instruction ttsim does not model, `SFPCONFIG` mode 8):
 
-    TTSIM=/path/to/libttsim.so python3 cmp/ferrite_smollm.py bf16 4    # or bfp8
+    TTSIM=/path/to/libttsim.so python3 cmp/ferrite_smollm.py bf16 4    # or bfp8; a third argument, 32, for 32 users
     HF_MODEL=/path/to/SmolLM-135M TT_METAL_RUNTIME_ROOT=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so \
       TT_METAL_DISABLE_SFPLOADMACRO=1 LD_LIBRARY_PATH=$PWD/tt-metal/build_Release/lib \
       PYTHONPATH=$PWD/tt-metal:$PWD/tt-metal/ttnn:$PWD/tt-metal/tools python3 cmp/ttnn_smollm.py performance 4    # or accuracy
+    ... cmp/ttnn_smollm.py performance 3 all 32    # 32 users: decode alone (TT prefills users one at a time)
     COUNT_OPS=1 ... cmp/ttnn_smollm.py performance 2 1    # TT-NN operations a token, untraced, one block (2 for two)

@@ -1179,6 +1179,31 @@ def test_kv_cache(chip):
     ids.append(int(want.argmax()))
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
+def test_batched_decode(chip):
+  # four sequences decoding together, a token each a step, from prompts of different lengths: their KV caches side by
+  # side in one (sequence u's places from row 32 u), each token seeing only its own sequence's places up to its own.
+  # Each prompt is prefilled into its rows, then every step is one call for all four, replayed from the third
+  # (tensor.jit), against each sequence decoded alone in numpy
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(19)
+  c, w = smol(rng, 2)
+  t, size, prompts = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, 32, [[7, 200, 31], [5, 64], [9, 9, 9, 9, 9], [100]]
+  kv = llama.kv_cache(c, size * len(prompts), lambda shape: Tensor.of(rt, np.zeros(shape).tolist()))
+  np_kv = [llama.kv_cache(c, size, np.zeros) for _ in prompts]
+  on = lambda row: Tensor.of(rt, [row], "int32")
+  step, ids = tensor.jit(lambda ids, places, starts: llama.forward(ids, places, t, c, kv, starts)), [list(p) for p in prompts]
+  for u, p in enumerate(prompts):  # each prompt into its own rows; its last token's logits give its next token
+    got = gpt2.values(llama.forward(on(p), on(list(range(len(p)))), t, c, kv, on([size * u] * len(p))))[len(p) - 1]
+    want = llama.forward(p, range(len(p)), w, c, np_kv[u])[0]
+    assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (u, np.abs(got - want).max())
+    ids[u].append(int(want.argmax()))
+  for i in range(4):
+    places = [len(s) - 1 for s in ids]
+    got = gpt2.values(step(on([s[-1] for s in ids]), on(places), on([size * u for u in range(len(ids))])))
+    for u, s in enumerate(ids):
+      want = llama.forward(s[-1:], [places[u]], w, c, np_kv[u])[0]
+      assert np.abs(got[u] - want).max() < 0.03 * np.abs(want).max(), (i, u, np.abs(got[u] - want).max())
+      s.append(int(want.argmax()))
+
 @pytest.mark.skipif("LLAMA" not in os.environ, reason="LLAMA=/path/to/SmolLM-135M (Hugging Face HuggingFaceTB/SmolLM-135M) runs it")
 def test_llama_model(chip):
   # a Llama-family model's real weights (SmolLM-135M: 30 blocks, grouped-query attention, tied embeddings): after "The

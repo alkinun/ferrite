@@ -2,7 +2,8 @@
 # weights, greedy generation, each step checked against the same model in numpy (the same bf16 weights, float32 math).
 # The model is written once, for ferrite Tensors and numpy arrays alike, as test/gpt2.py is. Its KV cache has a fixed
 # size and a token's place is data, not a shape, so on ferrite every decode step launches the same kernels: after the
-# first two, each is a replay (tensor.jit).
+# first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
+# starts), a token each a step.
 #   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8]
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors. bfp8:
 # the weight matrices in bfp8 on the chip (numpy then has them as the chip does).
@@ -29,17 +30,17 @@ def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 a head's halves, (-x2, x1) as x @ turn
   return x * cos + (x @ turn) * sin
 
-def layer(x, p, c, rotary, mask, cache, places):
+def layer(x, p, c, rotary, mask, cache, rows):
   """One block: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as x @ w, so
   the Hugging Face ones transposed, q, k and v's side by side, and gate and up's), c: the config, rotary: (cos, sin,
-  turn), cache: this block's [keys, values], each with a row for every place, this call's written at its places; mask:
-  -1e9 where a token would see a place past its own."""
+  turn), cache: this block's [keys, values], each with a row for every place, this call's written at its rows; mask:
+  -1e9 where a token must not look (gpt2.mask)."""
   f, hd = fns(x), c.dim // c.heads
   h = rms(x, p["input_layernorm"], c.eps)
   qkv = h @ p["qkv_proj"]
   qk = rope(f.split(qkv[:, :c.dim + c.kv * hd], c.heads + c.kv), *rotary)  # q's heads and k's as one batch
   q, k, v = qk[:c.heads, :, :], qk[c.heads:, :, :], f.split(qkv[:, c.dim + c.kv * hd:], c.kv)
-  f.put(cache[0], places, k), f.put(cache[1], places, v)
+  f.put(cache[0], rows, k), f.put(cache[1], rows, v)
   k, v = (f.repeat(t, c.heads // c.kv) for t in cache)  # each key and value head for each query head of its group, in place
   s = q @ f.t(k) * (1 / math.sqrt(hd))
   x = x + f.merge(f.softmax(s + mask) @ v) @ p["o_proj"]
@@ -63,16 +64,19 @@ def fuse(w):  # each block's q, k and v projections as one matrix, and its gate 
     w[pre + "gate_up_proj"] = join(w.pop(pre + "gate_proj"), w.pop(pre + "up_proj"))
   return w
 
-def forward(ids, places, w, c, caches):
+def forward(ids, places, w, c, caches, starts=None):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (one
   [keys, values] a block, each with a row for every place), and each sees the places up to its own. ids and places are
-  rows: lists for numpy, int32 tensors for ferrite."""
+  rows: lists for numpy, int32 tensors for ferrite. starts: several sequences decoding together (a batch of users), their
+  caches side by side, each token's sequence starting at its start's row and each token seeing only its own sequence;
+  then the logits are every token's, the next token of each (rows: numpy arrays for numpy)."""
   f = fns(w["embed"])
-  x = f.rows(w["embed"], ids)
-  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(places, caches[0][0].shape[-2])
+  x, rows = f.rows(w["embed"], ids), places if starts is None else places + starts
+  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(rows, caches[0][0].shape[-2], starts)
   for l in range(c.layers):
-    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], places)
-  return f.rows(rms(x, w["norm"], c.eps), [x.shape[-2] - 1]) @ w["embed.T"]
+    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], rows)
+  h = rms(x, w["norm"], c.eps)
+  return (h if starts is not None else f.rows(h, [x.shape[-2] - 1])) @ w["embed.T"]
 
 def kv_cache(c, size, zeros):  # each block's [keys, values], a row for each of size places, made by zeros(shape)
   return [[zeros((c.kv, size, c.dim // c.heads)) for _ in range(2)] for _ in range(c.layers)]

@@ -64,9 +64,15 @@ def forward(ids, w, mask, places=None, caches=None):
     x = layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask, HEADS, caches and caches[l], places)
   return f.rows(layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), [x.shape[-2] - 1]) @ w["wte.T"]
 
-def mask(places, size):  # -1e9 where a token at places would look past its own among size places, else 0: in numpy, or
-  if not isinstance(places, Tensor): return np.where(np.arange(size) > np.array(places)[:, None], np.float32(-1e9), np.float32(0))
-  return ((Tensor.of(places.rt, [list(range(size))], "int32") > places.reshape(1, places.cols, 1)) * -1e9).cast("bf16")  # on the chip
+def mask(places, size, starts=None):
+  """-1e9 where a token at places, among size places, would look past its own (or, given its sequence's start, before
+  that), else 0: in numpy, or on the chip from int32 rows of places, so a decode step's mask is data, not a shape."""
+  if not isinstance(places, Tensor):
+    cols, places = np.arange(size), np.asarray(places)[:, None]
+    return np.where((cols > places) | (cols < (0 if starts is None else np.asarray(starts)[:, None])), np.float32(-1e9), np.float32(0))
+  cols, column = Tensor.of(places.rt, [list(range(size))], "int32"), lambda row: row.reshape(1, row.cols, 1)
+  out = cols > column(places)
+  return ((out if starts is None else out + (cols < column(starts))) * -1e9).cast("bf16")
 
 def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # each block's, by zeros(shape)
 

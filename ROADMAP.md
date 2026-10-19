@@ -45,6 +45,7 @@ Done: everything from stage 1 runs correctly on the card.
 - [x] Tiles multicast between cores: a matmul reads each input tile from DRAM once (`test_matmul_multicast`)
 - [x] A decode step replayed from a recording, the host's part of a GPT-2 or SmolLM token 0.1 ms (`jit`, `test_kv_cache`)
 - [x] A training step replayed too: `assign` writes in place, Adam's step numbers are inputs (`test/train.py`, `test_train`)
+- [x] Several users decoding together, their KV caches side by side: 32 SmolLM tokens a step (`test_batched_decode`)
 - [ ] What the simulator could not measure: several reads in flight (`DEPTH`), BFP8 weights (`cast("bfp8")`, exact on
       ttsim), and what fewer fidelity phases gain (`matmul(fidelity=)`, its accuracy measured on ttsim)
 - [ ] Benchmarks against Tenstorrent's own stack, published
