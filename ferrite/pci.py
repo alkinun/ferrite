@@ -50,7 +50,10 @@ class Card:
   """A real card from userspace: config space and BARs through sysfs, DMA memory from locked hugepages.
   Needs root, the kernel driver unbound, and the IOMMU off or in passthrough (bus address == physical address)."""
   def __init__(self, bdf):
+    if os.geteuid() != 0: raise PermissionError("a card wants root: its config space, its BARs, and physical addresses for DMA")
     self.sys = f"/sys/bus/pci/devices/{bdf}"
+    if os.path.exists(f"{self.sys}/iommu_group/type") and (kind := open(f"{self.sys}/iommu_group/type").read().strip()) != "identity":
+      raise RuntimeError(f"the IOMMU translates {bdf}'s DMA ({kind}), and Card gives it physical addresses: boot with iommu=pt")
     if os.path.exists(f"{self.sys}/driver"): _write(f"{self.sys}/driver/unbind", bdf)
     _write(f"{self.sys}/enable", "1")
     self.cfg = os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC)
@@ -78,7 +81,8 @@ class Card:
     it goes back to the kernel's pool once nothing refers to it (a Runtime's ring and status live as long as it does)."""
     assert size <= 1 << 21, "one hugepage at a time"
     MAP_HUGETLB, MAP_LOCKED = 0x40000, 0x2000
-    buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED)
+    try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED)
+    except OSError: raise MemoryError("no free 2 MiB hugepage for memory the card can reach: echo 4 > /proc/sys/vm/nr_hugepages") from None
     with open("/proc/self/pagemap", "rb") as f:
       f.seek(ctypes.addressof(ctypes.c_char.from_buffer(buf)) // mmap.PAGESIZE * 8)
       pfn = int.from_bytes(f.read(8), "little") & ((1 << 55) - 1)

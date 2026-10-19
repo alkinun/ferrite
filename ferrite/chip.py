@@ -89,3 +89,13 @@ class Chip:
     return {t & 0xFFFF: vals[t >> 16] for t in tags}
 
   def halt(self, x, y, start=None): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES, start)  # hold all five cores in reset
+
+if __name__ == "__main__":  # what a card says about itself: the first thing to run on one (or on ttsim, with TTSIM set)
+  from ferrite import pci
+  dev = pci.open_device()
+  chip = Chip(dev)
+  t = chip.telemetry()
+  banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]
+  print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware up, Tensix powered; AI clock {t.get(bh.TAG_AICLK, 0)} MHz; "
+        f"{len(chip.tensix)} Tensix in {len(chip.tensix) // len(bh.TENSIX_Y)} columns; DRAM banks {banks} trained")
+  print("telemetry:", " ".join(f"{tag}={value:#x}" for tag, value in sorted(t.items())))

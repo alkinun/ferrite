@@ -25,7 +25,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 
 - `ferrite/bh.py`: Blackhole's facts as data: addresses, sizes and limits, instruction and config encodings (an instruction's modifier values stay where the compiler uses them). NOTES.md says where each comes from.
 - `ferrite/pci.py`: the device interface (config space, BARs, DMA memory, `tick`), with two backends: `Sim` (libttsim.so) and `Card` (sysfs).
-- `ferrite/chip.py`: NoC reads and writes through TLB windows (unicast and multicast), waiting with a timeout, ARC messages and telemetry, core reset.
+- `ferrite/chip.py`: NoC reads and writes through TLB windows (unicast and multicast), waiting with a timeout, ARC messages and telemetry, core reset; `python3 -m ferrite.chip` prints what a card says about itself.
 - `ferrite/runtime.py`: device C compiled with clang and lld (cached in `~/.cache/ferrite`), firmware for the workers and the dispatcher, kernels loaded once and kept until their room is full, the command ring in host memory (a launch, or a recorded block of them, is one PCIe write), DRAM, waiting, and each launch's time on the chip's clock (`profile`).
 - `ferrite/compiler.py`: Tensix instructions from the ISA. A fused kernel is four programs (BRISC moves tiles; each TRISC feeds one Tensix thread: unpack, math or pack): elementwise ops and SFPU programs, matmuls (blocks, tiles shared between workers by multicast, reads in flight, bfp8 weights), reductions along any axis in passes, movement, `gather` and `put`.
 - `ferrite/tensor.py`: `Tensor`: lazy, any shape, bf16, fp32, int32 or bfp8, numpy's broadcasting, views, tinygrad's ops and autograd. Realizing turns a tree of ops into as few kernels as fit; `jit` records a function's launches and replays them.
@@ -38,6 +38,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 
 Needs clang and lld on PATH, and ttsim's `libttsim.so` built for Blackhole (outside this repo: `./make.py src/_out/release_bh/libttsim.so` in tenstorrent/ttsim).
 
+    TTSIM=/path/to/libttsim.so python3 -m ferrite.chip
     TTSIM=/path/to/libttsim.so python3 -m ferrite.hello
     TTSIM=/path/to/libttsim.so python3 -m pytest test
     TTSIM=/path/to/libttsim.so python3 -m ferrite.bench

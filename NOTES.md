@@ -223,8 +223,7 @@ A decode step meets that with a KV cache of a fixed size and each token's place 
 
 1. **Commands other than "launch":** host-to-DRAM copies, events, waiting on another queue.
 2. **NCRISC**, a second data mover, stays in reset. It could take the sends home off BRISC, or fetch for a second NoC.
-3. **Hang reports from silicon.** The host should also read each stuck core's PC snapshot (`0xFFB1_3138`...); ttsim does not model those registers.
-4. **Ordering of the host's ring writes before the doorbell** relies on x86 ordering cached stores before an uncached MMIO write. Fine on x86, and needs a barrier anywhere else.
+3. **Ordering of the host's ring writes before the doorbell** relies on x86 ordering cached stores before an uncached MMIO write. Fine on x86, and needs a barrier anywhere else.
 
 ## The Tensix coprocessor, and the compiler
 
@@ -580,10 +579,11 @@ A token's DRAM reads went from 222.8k tiles to 136.7k with a token's A shared an
 
 Everything so far ran on ttsim, which models the chip from Tenstorrent's own knowledge but runs each instruction at once, ignores most busy conditions, and completes NoC requests instantly. The day the card arrives, go in this order; each step only needs the ones before it. The tests open the card themselves when `TTSIM` is not set (`pci.open_device`), so the commands are the simulator's without it, as root.
 
-Before: `lspci -d 1e52:b140` shows the card; the IOMMU is off or in passthrough (`iommu=pt`), since `pci.Card` hands the device physical addresses; a few 2 MiB hugepages are free (`echo 4 > /proc/sys/vm/nr_hugepages`; each `Runtime` holds one). `pci.Card` unbinds tt-kmd itself.
+Before: `lspci -d 1e52:b140` shows the card; the IOMMU is off or in passthrough (`iommu=pt`), since `pci.Card` hands the device physical addresses; a few 2 MiB hugepages are free (`echo 4 > /proc/sys/vm/nr_hugepages`; each `Runtime` holds one). `pci.Card` unbinds tt-kmd itself, and stops with what to do when it is not root, when the IOMMU translates the card's DMA (its group's type is not `identity`), or when no hugepage is free.
 
 | step | command | what it confirms (and what to suspect if it fails) |
 |---|---|---|
+| 0 | `python3 -m ferrite.chip` | what the card says about itself: ARC's firmware up, Tensix powered (`bh.POWER_ON`), the AI clock, how many Tensix columns, which DRAM banks trained, and every telemetry tag (ttsim says 1000 MHz and 12 columns) |
 | 1 | `pytest test -k "config_space or arc"` | BARs, the TLB config registers (`bh.TLB_CONFIG`, `TLB_FIELDS`), the NoC coordinates of ARC, ARC's boot status, message queue and telemetry tags, and that `POWER_ON` wakes Tensix (else try AICLK go busy, `0x52`) |
 | 2 | `-k "dma or l1 or (dram and not freed)"` | the PCIe tile's loopback into host memory (`bh.PCIE`, bus addresses below 2^58), unicast L1 writes, DRAM bank coordinates and GDDR training |
 | 3 | `python3 -m ferrite.hello` | soft reset bits, reset PCs and their override (`bh.TRISC_RESET_PC`), the firmware's jump table, the NIU's request registers (and that request initiators 1 and 2 keep theirs between requests: `noc_setup` presets them once, then every kernel's `noc_get` and `noc_put` and the dispatcher's go write only what changes), device writes into host memory, and the dispatcher: its multicasts from a core (the rectangle in `NOC_RET_ADDR_HI` with translated coordinates, one acknowledgement per worker, the counter clear) and the workers' atomic increments. A hang here with every worker done (their mailboxes say so) points at the count; one before any worker starts, at the multicast's acknowledgements (the dispatcher waits for exactly one per worker: more, from tiles in the rectangle that are not workers, would hang it rather than let a go overtake the arguments) |
@@ -595,7 +595,7 @@ Before: `lspci -d 1e52:b140` shows the card; the IOMMU is off or in passthrough 
 | 9 | `GPT2=... pytest test -k gpt2`, then `test/gpt2.py` | everything at once, and the first real timings: the last token's kernels by cycles on the chip's wall clock (`Runtime.profile`; if they are all 0, look at `bh.WALL_CLOCK`) |
 | 10 | `python3 -m ferrite.bench`, `python3 -m ferrite.bench 512 768 3072 2`, then `python3 -m ferrite.bench 1 768 3072` and the same with `4 bfp8` | real TFLOPS against the peak, what two fidelity phases gain, decode's GB/s against the card's DRAM bandwidth with bf16 and bfp8 weights (and so what reads in flight and BFP8 gain: try other `DEPTH`s), and DRAM reads against the inputs: the numbers ttsim could not give (ROADMAP, stage 3) |
 
-For a hang, `Runtime.wait` names the stuck workers; read their PC snapshots (`0xFFB1_3138`, five words) with `chip.read32` to see where each core sits (ttsim does not model them, so this is untested too).
+For a hang, `Runtime.wait` names the stuck workers and, on a card, where each of their cores sits (`bh.PC_SNAPSHOT`, ISA `BabyRISCV/README.md`: BRISC, NCRISC, TRISC0-2); map a PC to the kernel's C through an ELF built from the same source. ttsim does not model those registers (reading one kills it), so this is untested too.
 
 ## Still unknown or untested
 

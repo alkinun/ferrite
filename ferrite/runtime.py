@@ -1,7 +1,7 @@
 # The runtime: resident firmware on each Tensix tile's BRISC and TRISCs, kernels launched on them without resetting
 # anything, and a command ring in host memory that one tile's BRISC, the dispatcher, reads by itself.
 import collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile
-from ferrite import bh
+from ferrite import bh, pci
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
 # 4 + 4i). A worker: a mailbox [go, kernel, arguments, workers] [done, the dispatcher's x | y << 6, scratch, index]
@@ -438,5 +438,7 @@ class Runtime:
       current = self.chip.read32(*self.dispatcher, OUTBOX)
       n = next((n for launch, n in self.workers if launch % 2**32 == current), 0)
       stuck = [c for c in self.cores[:n] if self.chip.read32(*c, MAILBOX + 16) != current]
-      raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}") from None
+      pcs = lambda c: " ".join(f"{self.chip.read32(*c, bh.PC_SNAPSHOT + 4 * i):#x}" for i in range(5))  # where its cores sit
+      where = "".join(f"\n  {c}: BRISC, NCRISC, TRISC0-2 at {pcs(c)}" for c in stuck[:4]) if isinstance(self.chip.pci, pci.Card) else ""
+      raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}{where}") from None
     self.reclaim()

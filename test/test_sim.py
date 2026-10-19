@@ -75,6 +75,11 @@ def test_dram(chip):
   for bank, ((x, y), d) in enumerate(zip(bh.DRAM, data)):
     for port in range(3): assert chip.read(x, y + port, addr, len(d)) == d, f"bank {bank} port {port}"
 
+def test_card_wants_root():
+  # pci.Card's first check, which needs no card: without root it says so, rather than failing on a sysfs write later
+  if os.geteuid() == 0: pytest.skip("as root, Card would go on to open the device")
+  with pytest.raises(PermissionError, match="root"): pci.Card("0000:00:00.0")
+
 def test_hello(chip):
   assert set(hello(chip, chip.tensix[0], chip.tensix[-1], 30).values()) == {832040}
 

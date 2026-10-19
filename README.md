@@ -24,6 +24,7 @@ Needs Python 3, clang and lld, and Tenstorrent's simulator, ttsim, built for Bla
 need numpy. Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (as root). It has not met one yet:
 `NOTES.md` has the plan for the first day on a p150.
 
+    TTSIM=/path/to/libttsim.so python3 -m ferrite.chip       # what the card says about itself: clock, cores, DRAM
     TTSIM=/path/to/libttsim.so python3 -m ferrite.hello      # every worker computes fib(30); one more dispatches
     TTSIM=/path/to/libttsim.so python3 -m pytest test        # every step, on the simulator
     TTSIM=/path/to/libttsim.so python3 -m ferrite.bench      # a matmul's speed and DRAM reads

@@ -39,6 +39,7 @@ AICLK = 1.35e9  # Hz, the cores' and Tensix's clock (ISA BabyRISCV/README.md); t
 MVMUL_FLOPS = 2 * 8 * 16 * 16  # an MVMUL a cycle, one fidelity phase: Dst[8x16] += SrcB[8x16] @ SrcA[16x16]
 SOFT_RESET = 0xFFB121B0  # RISCV_DEBUG_REG_SOFT_RESET_0: a set bit holds that core in reset
 WALL_CLOCK = 0xFFB121F0  # RISCV_DEBUG_REG_WALL_CLOCK_L: the tile's clock cycles, the low 32 bits (ISA DebugTimestamper.md)
+PC_SNAPSHOT = 0xFFB13138  # each core's pc, a word each: BRISC, NCRISC, TRISC0-2 (ISA BabyRISCV/README.md; not in ttsim)
 BRISC, TRISC0, TRISC1, TRISC2, NCRISC = 1 << 11, 1 << 12, 1 << 13, 1 << 14, 1 << 18
 ALL_CORES = BRISC | TRISC0 | TRISC1 | TRISC2 | NCRISC  # power-on value
 BRISC_STACK_TOP = 0xFFB00000 + 8 * 1024  # end of BRISC's private data RAM; BRISC starts at PC 0 in L1
