@@ -53,9 +53,11 @@ NIU_REGS = {  # offsets from NIU. A request: target and return addresses (64 bit
   "LEN": 0x20, "AT_DATA": 0x28, "CMD": 0x40, "CLEAR_OUTSTANDING": 0x60, "ID_LOGICAL": 0x148,  # this tile's translated x | y << 6
   "INITIATOR": 0x800,  # four request initiators, each keeping its registers between requests
   "WR_ACKS": 0x204, "READS": 0x208,  # write acknowledgements and read responses had
-  "OUTSTANDING": 0x240}  # requests in flight with transaction id 0 (the packet tag's bits 10-13), then a word for each of ids 1-15
+  "OUTSTANDING": 0x240,  # requests in flight with transaction id 0 (the packet tag's bits 10-13), then a word for each of ids 1-15
+  "OUTGOING": 0x280}  # writes with transaction id 0 whose data the NIU has yet to read out of L1
 NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING counts them
            "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,  # a write to a rectangle: broadcast, path reserve, static VC
+           "POST": 0x02 | 1 << 7,  # a write with no acknowledgement, on a static VC (class 0): two to one place stay in order
            "ATOMIC": 1, "INCREMENT": 1 << 12 | 31 << 2,  # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of word 0
            "MAX_PACKET": 16384}
 NIU_READS = NIU + NIU_REGS["READS"]  # NIU_MST_RD_RESP_RECEIVED: read requests answered, one a request (bench's DRAM reads)

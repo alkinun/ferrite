@@ -17,7 +17,7 @@ MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x104
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_COUNTS = 8  # SYNC's words that start each launch at 0 (a kernel writes the rest before reading them)
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
-STAGING_ROOM = bh.L1_SIZE - STAGING
+STAGE = 1 << 16  # the most of the ring the dispatcher reads into STAGING at once
 
 # Prepended to every device program: NoC transfers through NIU 0 (bh.NIU_REGS, bh.NOC_CMD), noc_read and noc_write by
 # request initiator 0, noc_get and noc_put by 1 and 2, which the firmware presets at boot (noc_setup).
@@ -201,13 +201,16 @@ void trisc_loop(unsigned i) {{
 
 # A command is a 16-byte header [length, kernel address, argument bytes, workers], then the arguments; the whole is
 # 64-byte aligned. Length 0 means: the rest of the ring is unused. The kernel is already in every worker's L1
-# (Runtime.load). The arguments and the go are each one multicast to every worker, whether the launch is for all of
-# them or for the first `workers`, and the workers count themselves done in one word. A multicast's acknowledgements
-# come one per worker, so they are counted on the acknowledgement counter, and the request counter (up once, down once
-# per worker) is cleared after. One launch runs at a time, but the next one's command is read and its arguments
-# written while it runs (into the other argument buffer), so it goes the moment the last worker reports. When it is
-# done, its [go, last report] times on the dispatcher's wall clock go into a ring of TIMES entries in host memory after
-# the commands, then [read pointer, launches done] into the status: a profile of every launch, on the chip's own clock.
+# (Runtime.load). The dispatcher reads all the commands the host has written since it last looked (to the ring's end,
+# at most STAGE bytes) in one read, since a read of host memory waits on PCIe, and runs them from its L1. The arguments
+# and the go are each one multicast to every worker, whether the launch is for all of them or for the first `workers`,
+# and the workers count themselves done in one word. A multicast's acknowledgements come one per worker, so they are
+# counted on the acknowledgement counter, and the request counter (up once, down once per worker) is cleared after.
+# One launch runs at a time, but the next one's arguments are written while it runs (into the other argument buffer),
+# so it goes the moment the last worker reports. When it is done, its [go, last report] times on the dispatcher's wall
+# clock go into a ring of TIMES entries in host memory after the commands, then [read pointer, launches done] into the
+# status: a profile of every launch, on the chip's own clock. Both are posted writes on one static VC, so they arrive
+# in that order and the dispatcher never waits on PCIe for them, only for their bytes to have left its outbox.
 TIMES = 1024
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
@@ -231,26 +234,31 @@ static void go(void) {{ unsigned acks = NIU(WR_ACKS) + CONFIG[7]; NIU1(CMD) = 1;
 static unsigned clock(void) {{ return *(volatile unsigned *){bh.WALL_CLOCK:#x}; }}
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
-  unsigned size = CONFIG[3], rptr = 0, launches = 0;
+  unsigned size = CONFIG[3], rptr = 0, launches = 0, me = noc_me();
   unsigned ready = 0, ready_n = 0, ready_end = 0;  // a launch whose arguments and go are in place (0: none)
   unsigned running = 0, running_end = 0, reports = 0, began = 0;  // the launch the workers are on; the count once it
                                                                   // is done; when its go went
   unsigned long long times = ring + size;  // launch n's [go, last report] at times + n % TIMES * 16
-  volatile unsigned *cmd = (volatile unsigned *){STAGING:#x};
+  unsigned staged = 0, first = 0;  // the ring's bytes [first, staged) are in STAGING
   NIU1(TARG_LO) = {OUTBOX:#x}; NIU1(TARG_MID) = 0; NIU1(TARG_HI) = noc_me(); NIU1(RET_LO) = {MAILBOX:#x}; NIU1(RET_MID) = 0;
   NIU1(RET_HI) = CONFIG[6]; NIU1(PACKET_TAG) = 0; NIU1(CTRL) = MCAST; NIU1(LEN) = 16;
   for (;;) {{
     asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
     if (!ready && CONFIG[0] != rptr) {{  // the next command, while the last launch runs
-      unsigned long long at = ring + rptr % size;
-      noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at, {STAGING:#x}, 16);
-      noc_wait();
-      if (cmd[0] == 0) {{ rptr += size - rptr % size; continue; }}
-      noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, at + 16, {STAGING + 16:#x}, cmd[0] - 16);
-      noc_wait();
+      if (rptr == staged) {{  // all the host has written since, to the ring's end, at most STAGE bytes: one read
+        unsigned n = CONFIG[0] - rptr, left = size - rptr % size;
+        n = n < left ? n : left;
+        n = n < {STAGE} ? n : {STAGE};
+        noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, ring + rptr % size, {STAGING:#x}, n);
+        noc_wait();
+        first = rptr; staged = rptr + n;
+      }}
+      volatile unsigned *cmd = (volatile unsigned *)({STAGING:#x} + rptr - first);
+      if (cmd[0] == 0) {{ staged = rptr += size - rptr % size; continue; }}
+      if (cmd[0] > staged - rptr) {{ staged = rptr; continue; }}  // cut short at STAGE bytes: read again from its start
       ready = ++launches;  // its arguments go into the buffer the running launch is not using
       unsigned args = {ARGS:#x} + ready % 2 * {ARGS_SIZE};
-      multicast({STAGING + 16:#x}, args, cmd[2]);
+      multicast((unsigned)cmd + 16, args, cmd[2]);
       ready_n = cmd[3]; ready_end = rptr += cmd[0];
       OUT[0] = ready; OUT[1] = cmd[1]; OUT[2] = args; OUT[3] = ready_n;  // its go, written now:
       l1_settle({OUTBOX:#x});  // the running launch's go has gone already
@@ -267,11 +275,11 @@ void loop(void) {{
       running = ready; running_end = ready_end; reports += ready_n; ready = 0;
     }}
     if (done) {{  // only now, so the host hears late rather than the next launch going late
+      while (NIU(OUTGOING)) {{}}  // the last launch's times and status have left the outbox
       OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished;
-      noc_write({OUTBOX + 32:#x}, {bh.PCIE[0]}, {bh.PCIE[1]}, times + done % {TIMES} * 16, 8);
-      noc_wait();  // its times are there before the host hears it is done
-      noc_write({OUTBOX + 16:#x}, {bh.PCIE[0]}, {bh.PCIE[1]}, status, 8);
-      noc_wait();
+      l1_settle({OUTBOX + 16:#x});
+      noc_issue({OUTBOX + 32:#x}, me, times + done % {TIMES} * 16, {bh.PCIE[0] | bh.PCIE[1] << 6}, POST, 8);  // its times, then
+      noc_issue({OUTBOX + 16:#x}, me, status, {bh.PCIE[0] | bh.PCIE[1] << 6}, POST, 8);  // that it is done: in that order
     }}
   }}
 }}
@@ -363,7 +371,7 @@ class Runtime:
     body = struct.pack(f"<{2 + len(args)}I", units or n, 0, *args)
     assert len(body) <= ARGS_SIZE, f"{len(body)} bytes of arguments, room for {ARGS_SIZE}"
     length = -(-(16 + len(body)) // 64) * 64
-    assert length <= STAGING_ROOM, f"a {length}-byte command does not fit"
+    assert length <= STAGE, f"a {length}-byte command does not fit"
     return struct.pack("<4I", length, kernel, len(body), n) + body.ljust(length - 16, b"\0"), n
 
   def send(self, cmds, launches):
