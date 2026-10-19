@@ -86,22 +86,24 @@ class Tensor:
     as fit (readback_kernel), and they are read there: read over the BARs, each load would wait on PCIe."""
     self.realize()
     n, rows, cols, ct, tb = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32), tile_bytes(self.dtype)
-    per, tiles, kernel = len(self.rt.back) // tb, bytearray(), _cached(("readback", self.dtype), lambda: readback_kernel(self.dtype))
+    v = 32 if self.dtype in BFP else min(rows, 32)  # the rows a tile sends (readback_kernel), their bytes, and where each face starts
+    slot, faces = tb if v == 32 else 32 * v * n, [16 * n * f for f in (0, min(v, 16), 2 * min(v, 16), 2 * min(v, 16) + max(v - 16, 0))]
+    per, tiles, kernel = len(self.rt.back) // slot, bytearray(), _cached(("readback", self.dtype), lambda: readback_kernel(self.dtype))
     for start in range(0, self.tiles, per):
       k = min(per, self.tiles - start)
       self.rt.launch(kernel, (start, self.addr, self.bstride, self.stride, self.offset, ct, self.tiles // self.batch, self.rep,
-                              self.rt.back_bus & 0xFFFFFFFF, self.rt.back_bus >> 32), units=k, name="readback")
+                              self.rt.back_bus & 0xFFFFFFFF, self.rt.back_bus >> 32, v), units=k, name="readback")
       self.rt.wait()
-      tiles += self.rt.back[:k * tb]
+      tiles += self.rt.back[:k * slot]
     out = bytearray(n * self.batch * rows * cols)
     for b, i in ((b, i) for b in range(self.batch) for i in range(self.tiles // self.batch)):
       r0, c0, base = i // ct * 32, i % ct * 32, b * rows * cols
-      tile = bytes(tiles[(b * (self.tiles // self.batch) + i) * tb:][:tb])
+      tile = bytes(tiles[(b * (self.tiles // self.batch) + i) * slot:][:slot])
       if self.dtype in BFP: tile = _bf16s(tile, self.dtype)
       for face in range(4):
         c, k = c0 + face % 2 * 16, min(16, cols - c0 - face % 2 * 16)
         for row, r in enumerate(range(r0 + face // 2 * 16, min(r0 + face // 2 * 16 + 16, rows))):
-          at = (face * 256 + row * 16) * n
+          at = faces[face] + row * 16 * n
           if k > 0: out[n * (base + r * cols + c):n * (base + r * cols + c + k)] = tile[at:at + n * k]
     return bytes(out)
 

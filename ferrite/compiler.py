@@ -1088,19 +1088,28 @@ void kmain(volatile unsigned *a) {{
 def readback_kernel(dtype):
   """A tensor's tiles into host memory (Runtime.back) for tobytes, since a read of DRAM over the BARs waits on PCIe for
   each load: args [first unit, units, the first tile, the tensor's address, tile strides for batch and row, tile offset,
-  tile columns, tiles a matrix, repeat, host address low and high]. BRISC alone, a tile a unit, its tiles in order from
-  the first, through two L1 buffers, so a tile's read overlaps the last one's write."""
-  n = tile_bytes(dtype)
+  tile columns, tiles a matrix, repeat, host address low and high, rows a tile]. BRISC alone, a tile a unit, its tiles
+  in order from the first, through two L1 buffers, so a tile's read overlaps the last one's write. A tensor of fewer than
+  32 rows sends each face's rows that hold values and no more (a token's logits: one row of each), back to back; a
+  block float's tiles go whole."""
+  n, item = tile_bytes(dtype), 0 if dtype in BFP else ITEMSIZE[dtype]
   return compile_kernel(f"""
 {BANKS}
 void kmain(volatile unsigned *a) {{
   unsigned long long host = a[10] | (unsigned long long)a[11] << 32;
+  unsigned v = a[12], slot = {f"v * 32 * {item}" if item else n};  // the rows sent, and their bytes
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned k = a[0] + u, t = a[2] + k, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b / a[9] * a[4] + i * a[5] + j + a[6];
     unsigned l1 = {DATA:#x} + u % 2 * {n};
+    unsigned long long to = host + (unsigned long long)k * slot;
     noc_get(BANK(from), a[3] + from / 8 * {n}, l1, {n});
-    noc_wait();  // and the write out of this buffer two tiles ago is done
-    noc_write(l1, {bh.PCIE[0]}, {bh.PCIE[1]}, host + k * {n}, {n});
+    noc_wait();  // and the writes out of this buffer two tiles ago are done
+    if (slot == {n}) noc_write(l1, {bh.PCIE[0]}, {bh.PCIE[1]}, to, {n});
+    else for (unsigned f = 0; f < 4; f++) {{  // faces 0 and 1 hold rows 0-15, 2 and 3 rows 16-31
+      unsigned r = f < 2 ? (v < 16 ? v : 16) : (v > 16 ? v - 16 : 0);
+      if (r) noc_write(l1 + f * {256 * item}, {bh.PCIE[0]}, {bh.PCIE[1]}, to, r * {16 * item});
+      to += r * {16 * item};
+    }}
   }}
   noc_wait();
 }}""")
