@@ -1,6 +1,6 @@
 # The device interface at the PCIe level: config space, BARs, and host memory the device can DMA to.
 # Two backends with the same methods: Sim (ttsim's libttsim.so) and Card (a real card through sysfs).
-import ctypes, mmap, os, time
+import ctypes, gc, mmap, os, time
 from ferrite import bh
 
 class Sim:
@@ -81,8 +81,11 @@ class Card:
     it goes back to the kernel's pool once nothing refers to it (a Runtime's ring and status live as long as it does)."""
     assert size <= 1 << 21, "one hugepage at a time"
     MAP_HUGETLB, MAP_LOCKED = 0x40000, 0x2000
-    try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED)
-    except OSError: raise MemoryError("no free 2 MiB hugepage for memory the card can reach: echo 4 > /proc/sys/vm/nr_hugepages") from None
+    for tries in (1, 0):  # a Runtime dropped in a reference cycle (its numbers' tensors refer to it) holds its page until collected
+      try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED); break
+      except OSError:
+        if not tries: raise MemoryError("no free 2 MiB hugepage for memory the card can reach: echo 4 > /proc/sys/vm/nr_hugepages") from None
+        gc.collect()
     with open("/proc/self/pagemap", "rb") as f:
       f.seek(ctypes.addressof(ctypes.c_char.from_buffer(buf)) // mmap.PAGESIZE * 8)
       pfn = int.from_bytes(f.read(8), "little") & ((1 << 55) - 1)
