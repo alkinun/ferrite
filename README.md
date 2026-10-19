@@ -56,7 +56,7 @@ transformers' models run, generate and fine-tune unchanged.
 
 ## Speed
 
-Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 3 to 18 times
+Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 4 to 18 times
 fewer cycles of control work, reading as little DRAM. The simulator times only that control work, not the math or the
 DRAM, so how fast either is on a real card waits for one; `COMPARE.md` has the numbers and what carries over.
 

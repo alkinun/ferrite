@@ -1,21 +1,21 @@
 # ferrite and TT-NN
 
 The same ops through ferrite and through Tenstorrent's own stack (tt-metal with TT-NN), on the same simulator, counted
-the same way. Measured 2026-10-19: ferrite at aa08e0f, tt-metal at 9f98dee9 (2026-10-17) with TT-NN in C++, ttsim
+the same way. Measured 2026-10-19: ferrite at 9d20e4e, tt-metal at 9f98dee9 (2026-10-17) with TT-NN in C++, ttsim
 v1.11.5 (the version tt-metal names in `tt_metal/ttsim-version`), Blackhole. bf16 in tile layout in DRAM, matmuls at
 full precision (HiFi4) in both; each op is one launch in ferrite and one program in TT-NN.
 
 | op | ferrite | TT-NN, fast dispatch | TT-NN, slow dispatch | DRAM reads, ferrite | DRAM reads, TT-NN |
 |---|---|---|---|---|---|
-| matmul 512x768 @ 768x3072 | **1.5k cycles** | 7.8k | 3.3k | 1.00x the inputs | 1.00x |
+| matmul 512x768 @ 768x3072 | **1.56k cycles** | 7.8k | 3.3k | 1.00x the inputs | 1.00x |
 | matmul 32x768 @ 768x3072 (a token) | **0.58k** | 6.9k | 1.8k | 1.00x | 1.00x |
-| the same, weights in bfp8 | **1.5k** | 6.9k | 1.8k | 0.53x the bf16 bytes | 0.53x |
-| softmax 64x768, along rows | **1.4k** | 4.5k | 3.7k | **1.00x** | 1.50x |
-| layer norm 64x768, along rows | **0.44k** | 2.4k | 1.4k | **1.08x** | 1.17x |
-| add 32x32 (one tile: launch cost) | **0.29k** | 5.3k | 0.8k | 1.00x | 1.00x |
+| the same, weights in bfp8 | **0.77k** | 6.9k | 1.8k | 0.53x the bf16 bytes | 0.53x |
+| softmax 64x768, along rows | **1.22k** | 4.5k | 3.7k | **1.00x** | 1.50x |
+| layer norm 64x768, along rows | **0.43k** | 2.4k | 1.4k | **1.08x** | 1.17x |
+| add 32x32 (one tile: launch cost) | **0.30k** | 5.3k | 0.8k | 1.00x | 1.00x |
 
-ferrite does each op in 3 to 18 times fewer cycles than TT-NN with fast dispatch, which dispatches from cores on the
-chip as ferrite does, and in 1.2 to 3 times fewer than TT-NN's kernels alone (slow dispatch, where the host does the
+ferrite does each op in 4 to 18 times fewer cycles than TT-NN with fast dispatch, which dispatches from cores on the
+chip as ferrite does, and in 2 to 3 times fewer than TT-NN's kernels alone (slow dispatch, where the host does the
 dispatching at no cost here). Both read each input from DRAM about once.
 
 ## How it was counted
