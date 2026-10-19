@@ -820,7 +820,7 @@ def test_fuzz(chip, monkeypatch):
          "relu": lambda a: np.maximum(a, 0), "exp": np.exp, "exp2": np.exp2, "log": np.log, "log2": np.log2, "sin": np.sin,
          "cos": np.cos, "sqrt": np.sqrt, "recip": lambda a: 1 / a, "max": np.maximum, "cmplt": lambda a, b: (a < b) * 1.0,
          "cmpne": lambda a, b: (a != b) * 1.0, "keep": lambda c, x: np.where(c != 0, x, 0), "drop": lambda c, y: np.where(c != 0, 0, y),
-         "cast": lambda a: a}
+         "cast": lambda a: a, "ftob": lambda a: ((np.float32(a).view(np.uint32) + 0x8000) & 0xFFFF0000).view(np.float32)}
     f |= {k: lambda a, k=k: getattr(a, k[:3])(int(k[3]), keepdims=True) for k in compiler.FOLDS}  # sum0, max2, ...
     return f[e[0]](*v)
   realize = Tensor.realize

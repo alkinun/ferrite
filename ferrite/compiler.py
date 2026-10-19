@@ -287,6 +287,9 @@ SFPU |= {
   "ftoi": ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0), ins("SFPEXMAN", vd=2, vc=0), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=-23 & 0xFFF),
                 ins("SFPSHFT", vd=2, vc=1), FLAGS_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), FLAGS_RESET, ins("SFPSETCC", vc=0),
                 ins("SFPIADD", vd=2, vc=ZERO, mod1=6), FLAGS_OFF, sfp_store(2, RAW)]),
+  # an fp32 value rounded to bf16 as the packer rounds it (half up: the bits plus 2^15, the low 16 cleared), still fp32
+  "ftob": ([ins("SFPLOADI", vd=2, mod0=2, imm16=0x8000), *sfp_bits(3, 0xFFFF0000)],
+           [sfp_load(), ins("SFPIADD", vd=0, vc=2, mod1=4), ins("SFPAND", vd=0, vc=3), sfp_store(0, RAW)]),
 }
 # Reductions along an axis (0: the batch, to one matrix; 1: rows, to one row; 2: columns, to one column): each tile
 # along it is x + 0 into Dst (the first in the result's half, the rest 128 rows further on, where the SFPU folds them

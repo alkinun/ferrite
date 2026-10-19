@@ -483,8 +483,7 @@ def _backward(t, g):
 def _parts(t):  # an fp32 matmul's operand as bf16 (hi, lo), no lo for a bf16 one; a transpose split first, its parts transposed as bf16
   if t.op == "T": return _pT(_parts(t.srcs[0]))
   if t.dtype == "bf16": return t, None
-  hi = t.bfloat16()
-  return hi, (t - hi).bfloat16()
+  return t.bfloat16(), (t - t._unary("ftob")).bfloat16()  # lo: t less itself rounded as the cast to bf16 rounds, in one kernel
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
 def _bf16x3(a, b):  # hi@hi + (hi@lo + lo@hi) in fp32, from two operands' parts
   (ah, al), (bh, bl) = a, b
