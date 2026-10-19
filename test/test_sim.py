@@ -1,6 +1,6 @@
 # Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
-import math, os, random, struct, sys, pytest
+import math, os, random, struct, sys, time, pytest
 import numpy as np
 from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
@@ -74,6 +74,16 @@ def test_dram(chip):
   for (x, y), d in zip(bh.DRAM, data): chip.write(x, y, addr, d)
   for bank, ((x, y), d) in enumerate(zip(bh.DRAM, data)):
     for port in range(3): assert chip.read(x, y + port, addr, len(d)) == d, f"bank {bank} port {port}"
+
+def test_cache_prune(tmp_path, monkeypatch):
+  # compiled images unused for a week go, once a process, before its first compile; a used one is touched, so it stays
+  import ferrite.runtime as runtime
+  monkeypatch.setattr(runtime, "CACHE", tmp_path)
+  old, new = tmp_path / "old", tmp_path / "new"
+  old.write_bytes(b"x"), new.write_bytes(b"y")
+  os.utime(old, (0, time.time() - 8 * 86400))
+  runtime._prune.__wrapped__()
+  assert not old.exists() and new.exists()
 
 def test_card_wants_root():
   # pci.Card's first check, which needs no card: without root it says so, rather than failing on a sysfs write later

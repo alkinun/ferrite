@@ -1,6 +1,6 @@
 # The runtime: resident firmware on each Tensix tile's BRISC and TRISCs, kernels launched on them without resetting
 # anything, and a command ring in host memory that one tile's BRISC, the dispatcher, reads by itself.
-import collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile
+import collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time
 from ferrite import bh, pci
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
@@ -84,15 +84,25 @@ CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".ca
 @functools.cache
 def _clang_version(): return subprocess.run(["clang", "--version"], capture_output=True, check=True).stdout
 
+@functools.cache
+def _prune(days=7):  # once a process, before its first compile: images unused for a week go (each use touches its file),
+  for f in CACHE.glob("*"):  # so what older code compiled does not pile up
+    try:
+      if f.stat().st_mtime < time.time() - days * 86400: f.unlink()
+    except FileNotFoundError: pass  # another process took it first
+
 def compile_rv32(src, base=0):
   """C source, after DEVICE, to a flat rv32 image linked at base: `.start` first, else `kmain`, then the rest. The code
   reaches its own functions and data by PC-relative addresses (medany, no linker relaxation, no jump tables), so the
   image runs wherever it is put; base only matters to firmware, which is put at 0. Images are kept in CACHE, named by
-  a hash of the compiler's version, its flags, the link script and the source."""
+  a hash of the compiler's version, its flags, the link script and the source, until a week goes by unused (_prune)."""
   link = (f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
           ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one section: .bss is zeros in the image
   cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
-  if cached.exists(): return cached.read_bytes()
+  if cached.exists():
+    os.utime(cached)
+    return cached.read_bytes()
+  _prune()
   if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")
   with tempfile.TemporaryDirectory() as d:
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
