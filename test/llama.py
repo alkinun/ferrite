@@ -4,9 +4,10 @@
 # size and a token's place is data, not a shape, so on ferrite every decode step launches the same kernels: after the
 # first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
 # starts), a token each a step.
-#   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8]
-# The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors. bfp8:
-# the weight matrices in bfp8 on the chip (numpy then has them as the chip does).
+#   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4]
+# The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors (or another
+# Llama's, SmolLM2-360M's say). bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and
+# the rest in bfp8 (numpy then has them as the chip does).
 import json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
@@ -108,9 +109,11 @@ def load(folder):
   return c, fuse(out)
 
 def upload(rt, weights, dtype="bf16"):  # the weights as ferrite Tensors, the matrices a matmul reads as its B (the
-  # blocks' and the output layer) cast to dtype on the chip
+  # blocks' and the output layer) cast to dtype on the chip; bfp4: the MLP's gate and up in bfp4 and the rest in bfp8, as
+  # TT's own LLM code keeps them in its performance mode
   t = {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
-  return t | {k: x.cast(dtype).realize() for k, x in t.items() if k == "embed.T" or k.startswith("layers.") and x.rows > 1}
+  cast = lambda k: dtype if dtype != "bfp4" else "bfp4" if k.endswith("gate_up_proj") else "bfp8"
+  return t | {k: x.cast(cast(k)).realize() for k, x in t.items() if k == "embed.T" or k.startswith("layers.") and x.rows > 1}
 
 def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip (upload), those not in bf16 as the chip has them
   return {name: values for name, (_, values) in weights.items()} | {k: gpt2.values(x) for k, x in (t or {}).items() if x.dtype != "bf16"}

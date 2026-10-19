@@ -1,16 +1,16 @@
-# Lazy tensors: bf16, fp32 or int32 (and bfp8 for a matmul's B), of any shape, batched or not, in DRAM as tiles (tile i
+# Lazy tensors: bf16, fp32 or int32 (and bfp8 or bfp4 for a matmul's B), of any shape, batched or not, in DRAM as tiles (tile i
 # in bank i % 8). Their ops build a tree that realizing turns into kernels (compiler.py): as much of it as one kernel
 # holds fused into one launch, and what one kernel cannot hold (a matmul's operands, a move, a cast below the root, a
 # reduction of another shape) realized first.
 import array, collections, math
 from ferrite import bh
-from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, tile_bytes, shared_k
-from ferrite.compiler import fused_kernel, gather_kernel, move_kernel, put_kernel, transpose_kernel
+from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32, ITEMSIZE, tile_bytes, shared_k
+from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, move_kernel, put_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
 class Tensor:
-  """batch x rows x cols of bf16, fp32, int32 or bfp8 (dtype; batch 1 unless said): in DRAM as 32x32 tiles, matrix after
+  """batch x rows x cols of bf16, fp32, int32, bfp8 or bfp4 (dtype; batch 1 unless said): in DRAM as 32x32 tiles, matrix after
   matrix, each in row-major tile order, tile i in bank i % 8; or, until realized, an op on other tensors. Realizing
   compiles the whole tree of unrealized ops under it into one kernel; a matmul's own operands are realized first, since
   each of its output tiles needs a whole row and column of them (a transposed B is read transposed rather than
@@ -61,7 +61,7 @@ class Tensor:
   def frombytes(cls, rt, rows, cols, data, batch=1, dtype="bf16"):
     """From dtype's values in row-major order (little-endian), matrix after matrix. Runs of 16 values are copied into
     tile order as they are, nothing per value, which is what makes a model's weights quick to load."""
-    assert dtype != "bfp8", "bfp8 is made on the chip, by cast"
+    assert dtype not in BFP, "a block float is made on the chip, by cast"
     t, n, tr, tc, data = cls(rt, rows, cols, batch=batch, dtype=dtype), ITEMSIZE[dtype], -(-rows // 32), -(-cols // 32), memoryview(data).cast("B")
     assert len(data) == n * batch * rows * cols, f"{len(data)} bytes for {batch} x {rows} x {cols} of {dtype}"
     for b, i in ((b, i) for b in range(batch) for i in range(tr * tc)):
@@ -77,16 +77,16 @@ class Tensor:
     return t
 
   def tobytes(self):
-    """dtype's values in row-major order, matrix after matrix, as frombytes takes them (bfp8's as bf16, each of its values
-    being one). Waits for the launches queued."""
+    """dtype's values in row-major order, matrix after matrix, as frombytes takes them (a block float's as bf16, each of
+    its values being one). Waits for the launches queued."""
     self.realize()
     self.rt.wait()
-    n, rows, cols, ct = 2 if self.dtype == "bfp8" else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32)
+    n, rows, cols, ct = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32)
     out = bytearray(n * self.batch * rows * cols)
     for b, i in ((b, i) for b in range(self.batch) for i in range(self.tiles // self.batch)):
       r0, c0, base = i // ct * 32, i % ct * 32, b * rows * cols
       tile = self.rt.chip.read(*self._where(b, i // ct, i % ct), tile_bytes(self.dtype))
-      if self.dtype == "bfp8": tile = _bf16s(tile)
+      if self.dtype in BFP: tile = _bf16s(tile, self.dtype)
       for face in range(4):
         c, k = c0 + face % 2 * 16, min(16, cols - c0 - face % 2 * 16)
         for row, r in enumerate(range(r0 + face // 2 * 16, min(r0 + face // 2 * 16 + 16, rows))):
@@ -96,7 +96,7 @@ class Tensor:
 
   def tolist(self):  # rows of numbers, or a list of those if this is a batch
     raw = self.tobytes()
-    if self.dtype in ("bf16", "bfp8"): raw = array.array("I", [b << 16 for b in array.array("H", raw)]).tobytes()
+    if self.dtype == "bf16" or self.dtype in BFP: raw = array.array("I", [b << 16 for b in array.array("H", raw)]).tobytes()
     values = array.array("i" if self.dtype == "int32" else "f", raw).tolist()
     m = [[values[(b * self.rows + r) * self.cols:(b * self.rows + r + 1) * self.cols] for r in range(self.rows)] for b in range(self.batch)]
     return m if self.batch > 1 else m[0]
@@ -294,7 +294,12 @@ class Tensor:
     assert all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)), f"cannot broadcast {a.shape} with {b.shape}"
     batch, rows, cols = map(max, a.shape, b.shape)
     return Tensor(self.rt, rows, cols, op, (a, b), batch, a.dtype)
-  def cast(self, dtype): return self if dtype == self.dtype else Tensor(self.rt, self.rows, self.cols, "cast", (self,), self.batch, dtype)
+  def cast(self, dtype):  # bfp4 is made at once, from the bf16 value, by a kernel of its own (bfp4_kernel, which says why)
+    if dtype == self.dtype: return self
+    if dtype != "bfp4": return Tensor(self.rt, self.rows, self.cols, "cast", (self,), self.batch, dtype)
+    x, out, tc = self.cast("bf16").realize(), Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), -(-self.cols // 32)
+    return out._run(_cached(("bfp4",), bfp4_kernel), out.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset, tc,
+                    -(-self.rows // 32) * tc, name="bfp4")
   def float(self): return self.cast("fp32")
   def bfloat16(self): return self.cast("bf16")
   def exp2(self): return self._unary("exp2")
@@ -363,7 +368,8 @@ class Tensor:
     if either operand is, unless said. fp32 operands go as bf16x3: each is hi + lo, both bf16, and hi@hi + hi@lo + lo@hi
     sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24. fidelity: the
     phases a bf16 product takes (FIDELITY unless said; compiler.matmul says what each leaves out); fp32's take all four.
-    x may be bfp8 (a weight cast once, read at about half a bf16's bytes) when self is bf16."""
+    x may be a block float (a weight cast once: bfp8, read at about half a bf16's bytes, or bfp4, a quarter) when self is
+    bf16."""
     fidelity = fidelity or FIDELITY
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
@@ -533,17 +539,17 @@ def _tree(t, inputs):
   computes in: t's, or for a cast or a matmul its operands'. The kernel sweeps along the axis of t's reductions (the
   first found; any along another axis compute first, on their own)."""
   dtype = t.srcs[0].dtype if t.op in ("cast", "matmul") else t.dtype
-  assert dtype != "bfp8", "bfp8 is read only as a matmul's B"
+  assert dtype not in BFP, "a block float is read only as a matmul's B"
   axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
   n = _ext(t, axis)  # the sweep is as long as t along the axis, unless t is one tile there: then its first reduction says
   return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
 
 def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)  # t's extent along an axis: matrices, or tiles
 
-def _bf16s(tile):  # a bfp8 tile's values as bf16 (the unpacker's way, ISA FormatConversion.md): normalized, 7 bits a value
-  out = array.array("H", bytes(2048))
+def _bf16s(tile, dtype):  # a block-float tile's values as bf16 (the unpacker's way, ISA FormatConversion.md): normalized,
+  out = array.array("H", bytes(2048))  # 7 bits a value (bfp4's 3 shifted up to bfp8's place)
   for i in range(1024):
-    x, e = tile[64 + i], tile[i // 16]
+    x, e = tile[64 + i] if dtype == "bfp8" else (tile[64 + i // 2] >> 4 * (i % 2) & 15) << 4, tile[i // 16]
     if not x & 127: out[i] = 0xFF80 if x >> 7 else 0  # a magnitude of 0 is 0, or with the sign set, -inf
     else:
       m = (x & 127) << 1
@@ -584,7 +590,7 @@ def _expr(t, shape, inputs, kernel):
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = t.srcs
     if b.op == "T": b = ("T", _expr(b.srcs[0].realize(), shape, inputs, kernel))
-    else: b = ("bfp8", _input(b.realize(), inputs)) if b.dtype == "bfp8" else _expr(b.realize(), shape, inputs, kernel)
+    else: b = (b.dtype, _input(b.realize(), inputs)) if b.dtype in BFP else _expr(b.realize(), shape, inputs, kernel)
     return ("matmul", _expr(a.realize(), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 

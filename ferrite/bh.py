@@ -120,7 +120,7 @@ UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC 
 # unpackers, packer, FPU or SFPU, or the config unit, are idle (ISA STALLWAIT.md: B and C bits)
 STALL_SYNC, STALL_PACK, STALL_UNPACK, STALL_CFG, STALL_SFPU, STALL_ALL = 1 << 1, 1 << 2, 1 << 3, 1 << 7, 1 << 8, 0x1FF
 WAIT_UNPACK0, WAIT_UNPACK, WAIT_PACK, WAIT_FPU, WAIT_SFPU, WAIT_CFG = 1 << 1, 0b110, 1 << 3, 1 << 4, 1 << 11, 1 << 12
-FP32, BF16, BFP8, INT32 = 0, 5, 6, 8  # data format codes (ISA Unpackers/FormatConversion.md)
+FP32, BF16, BFP8, BFP4, INT32 = 0, 5, 6, 7, 8  # data format codes (ISA Unpackers/FormatConversion.md)
 
 # Backend config: field -> (32-bit word index at TENSIX_CFG, first bit, width). The ISA docs defer these numbers to
 # tt-metal's cfg_defines.h; these are from ttsim's data/bh/tensix_regs.json and still need checking against silicon.

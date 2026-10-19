@@ -15,13 +15,15 @@ def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even a
   b = np.asarray(a, np.float32).view(np.uint32)
   return ((b + (0x8000 if packer else 0x7FFF + (b >> 16 & 1))) & 0xFFFF0000).view(np.float32).astype(np.float64)
 
-def bfp8(a):  # numpy's bfp8 of bf16 values, as the packer makes it: each run of 16 in a row shares its largest exponent,
-  bits = np.asarray(a, np.float32).view(np.uint32) >> 16  # each value keeps 7 bits of magnitude below it, rounded half up
+def bfp(a, dtype="bfp8"):  # numpy's bfp8 of bf16 values, as the packer makes it: each run of 16 in a row shares its
+  bits = np.asarray(a, np.float32).view(np.uint32) >> 16  # largest exponent, each value keeps 7 bits of magnitude below it,
+  # rounded half up (bfp4, as bfp4_kernel makes it: 3 bits, to the nearest)
   s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
   runs = lambda x: x.reshape(x.shape[0], -1, 16)
   top = runs(e).max(2, keepdims=True)
   shift = np.minimum(top - runs(e), 8)  # 8 and more leave 0
   q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
+  if dtype == "bfp4": q = np.where(shift < 4, np.minimum((runs(m) + (16 << shift)) >> (shift + 5), 7), 0) << 4  # nearest 3 bits
   return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(a.shape)
 
 def close(t, want, tol):  # a tensor's values within tol (relative, and absolute near 0) of numpy's
@@ -298,21 +300,22 @@ def test_matmul_fidelity(chip):
   for phases, bound in ((3, 2**-8), (2, 2**-8 + 2**-7)):
     assert np.all(np.abs(value(ta.matmul(tb, fidelity=phases))[0] - a @ b) <= bound * (np.abs(a) @ np.abs(b))), phases
 
-def test_bfp8(chip):
-  # a cast to bfp8 is bit for bit numpy's model of it (bfp8 above), exponents spread wide within each run; and a matmul by
-  # a bfp8 B (read at 1088 bytes a tile, not 2048) is bit for bit the bf16 matmul by its values, whichever way B comes in:
-  # streamed beside A (K past 256 tiles), with A's row kept (and shared, a token's), shared by multicast in three
-  # buffers, a block's column kept (a batch), and K split; and fused with what follows it and with a bf16 matmul,
-  # unpacker 0 switched to bfp8 for its steps and back
+@pytest.mark.parametrize("dtype", ["bfp8", "bfp4"])
+def test_bfp(chip, dtype):
+  # a cast to a block float is bit for bit numpy's model of it (bfp above), exponents spread wide within each run; and a
+  # matmul by a block-float B (read at 1088 bytes a tile for bfp8, 576 for bfp4, not 2048) is bit for bit the bf16 matmul
+  # by its values, whichever way B comes in: streamed beside A (K past 256 tiles), with A's row kept (and shared, a
+  # token's), shared by multicast in three buffers, a block's column kept (a batch), and K split; and fused with what
+  # follows it and with a bf16 matmul, unpacker 0 switched to the block float for its steps and back
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   rng = np.random.default_rng(5)
   a = bf16(rng.normal(0, 1, (64, 96)) * np.exp(rng.normal(0, 2, (64, 96))))
-  assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast("bfp8"))[0], bfp8(a))
+  assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast(dtype))[0], bfp(a, dtype))
   on = lambda *shape: Tensor.of(rt, rng.normal(0, 1, shape).tolist())
   for b, m, k, n in ((1, 64, 9000, 40), (1, 1, 768, 2304), (1, 100, 256, 200), (2, 100, 256, 96), (1, 32, 2048, 64)):
-    x, w = on(b, m, k), on(b, k, n).cast("bfp8")
+    x, w = on(b, m, k), on(b, k, n).cast(dtype)
     assert (x @ w).tolist() == (x @ Tensor.of(rt, w.tolist())).tolist(), (b, m, k, n)
-  x, w, v, bias = on(64, 192), on(192, 96).cast("bfp8"), on(192, 96), on(1, 96)  # K too short to split: one kernel
+  x, w, v, bias = on(64, 192), on(192, 96).cast(dtype), on(192, 96), on(1, 96)  # K too short to split: one kernel
   assert (x @ w + x @ v + bias).relu().tolist() == (x @ Tensor.of(rt, w.tolist()) + x @ v + bias).relu().tolist()
 
 def test_matmul_multicast(chip):
