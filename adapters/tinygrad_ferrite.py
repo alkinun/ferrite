@@ -90,9 +90,11 @@ class Evaluator:
   def chip_op(self, u, srcs):
     """u on the chip, or None if ferrite does not do it."""
     if u.op in ELEMENTWISE and (u.dtype not in DTYPES or any(isinstance(s, Value) and s.dtype not in DTYPES for s in srcs)): return None
+    if u.op in (Ops.AND, Ops.OR) and u.dtype is not dtypes.bool: return None  # bitwise, on the host
     shape = tuple(u.shape)
     groups = common_groups(shape, srcs)
-    whole = lambda t: Value(spread(t, shape, groups), View(shape), u.dtype)
+    as_u = lambda t: t.cast(DTYPES[u.dtype]) if DTYPES[u.dtype] else t  # ferrite gives some int32 ops in fp32 (a product)
+    whole = lambda t: Value(spread(as_u(t), shape, groups), View(shape), u.dtype)
     if u.op in UNARY: return whole(UNARY[u.op](self.operand(srcs[0], shape, groups)))
     if u.op in BINARY: return whole(BINARY[u.op](*(self.operand(s, shape, groups) for s in srcs)))
     if u.op is Ops.WHERE:
@@ -191,7 +193,7 @@ class Evaluator:
     h = u.src[0].buffer._buf
     if isinstance(x, Tensor) and constant(x) is None and u.dtype in DTYPES and h.value is None:
       h.value = Value(upload(array(x).reshape(u.shape), DTYPES[u.dtype]), View(x.shape), u.dtype)
-    elif isinstance(x, Value) and x.view.contiguous() and x.t.shape != fold(u.shape):
+    elif isinstance(x, Value) and x.whole() and x.t.shape != fold(u.shape):
       h.value = Value(materialize(Value(x.t, View(u.shape), x.dtype)).realize(), x.view, x.dtype)
     else: return None
     return Value(h.value.t, View(u.shape), u.dtype)
@@ -224,8 +226,8 @@ class Evaluator:
     n, npd = buf.nbytes // target.dtype.itemsize, npdtype(target.dtype)
     data = lambda: download(value) if isinstance(value, Value) else array(value) if isinstance(value, Tensor) else value
     if not on_ferrite(target): buf.copyin(memoryview(flat(data(), n, npd)))
-    elif isinstance(value, Value):  # kept in whatever three axes it has, if its view is it as it lies
-      t = value.t if value.view.contiguous() else materialize(value)
+    elif isinstance(value, Value):  # kept in whatever three axes it has, if its view is all of it as it lies
+      t = value.t if value.whole() else materialize(value)
       buf._buf.value, buf._buf.bytes = Value(t.realize(), View(value.shape), value.dtype), None
     else: buf._buf.bytes, buf._buf.value = flat(data(), n, npd), None
     return None
@@ -239,7 +241,9 @@ class FerriteAllocator(Allocator):
   def _alloc(self, size, options): return BufferStorage(Holder())
   def _copyin(self, dest, src): dest.bytes, dest.value = bytes(src), None
   def _copyout(self, dest, src):
-    if src.value is not None: dest[:] = np.ascontiguousarray(download(src.value)).tobytes()[:len(dest)]
+    if src.value is not None:  # a bool is 1 or 0 in whatever dtype it was computed in, and a byte here
+      a = download(src.value)
+      dest[:] = np.ascontiguousarray(a != 0 if src.value.dtype is dtypes.bool else a).tobytes()[:len(dest)]
     else: dest[:] = src.bytes[:len(dest)] if src.bytes is not None else bytes(len(dest))
 
 class FerriteDevice(Compiled):

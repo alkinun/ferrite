@@ -1007,6 +1007,11 @@ def test_tinygrad(tinygrad):
     assert np.abs(got - want).max() <= 1e-3 * (np.abs(want).max() + 1), (n, np.abs(got - want).max())  # a matmul to the FPU's 2^-11
   Tensor.ones(2, device="FERRITE").contiguous().realize().tolist()  # a buffer freed, then one of its size: nothing of it left
   assert Tensor.ones((), dtype=dtypes.int64, device="FERRITE").contiguous().item() == 1
+  ints = Tensor([[1, -8, 1], [32, 1, 6]], dtype=dtypes.int32, device="FERRITE")  # products come back int32, bitwise and on the host
+  assert (ints * ints).tolist() == [[1, 64, 1], [1024, 1, 36]] and (ints & 12).tolist() == [[0, 8, 0], [0, 0, 4]]
+  assert ints.argmax(1).tolist() == [0, 0]
+  assert (Tensor(a, device="FERRITE") > 0).any(1).tolist() == (a > 0).any(1).tolist()  # bools read back a byte each
+  assert (Tensor(np.arange(8, dtype=np.float32), device="FERRITE")[:4] * 2).tolist() == [0, 2, 4, 6]  # a view of part of a tensor
   def train(device):
     rng = np.random.default_rng(15)
     l1, l2 = nn.Linear(16, 32), nn.Linear(32, 10)

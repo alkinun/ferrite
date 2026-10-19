@@ -64,6 +64,7 @@ class Value:
   def __init__(self, t, view, dtype): self.t, self.view, self.dtype = t, view, dtype
   @property
   def shape(self): return self.view.shape
+  def whole(self): return self.view.contiguous() and math.prod(self.shape) == math.prod(self.t.shape)  # its tensor, all of it, as it lies
 
 def merge(view, groups):
   """(size, stride, lo, hi) for each group of view's axes taken as one, or None if a group's strides do not line up
@@ -94,8 +95,8 @@ def materialize(v, groups=None):
   swap blocks of axes (transposes); any other view goes through the host."""
   groups = groups or groups3(v.shape)
   shape3, t = tuple(math.prod(v.shape[k] for k in g) for g in groups), v.t
-  if v.view.contiguous() and t.shape == shape3: return t
-  if v.view.contiguous(): return t.reshape(*shape3)
+  if v.whole() and t.shape == shape3: return t
+  if v.whole(): return t.reshape(*shape3)
   m = merge(v.view, groups)
   swapped = [shape3[1] * shape3[2], 1, shape3[1]]  # the strides of t's last two axes swapped (a batch of 1 has any)
   if m is not None and all(n == 1 or s == w for n, (_, s, _, _), w in zip(shape3, m, swapped)) and v.view.offset == 0 and not v.view.mask \
@@ -147,7 +148,7 @@ def broadcast(v, shape):  # numpy's broadcasting of a value: axes aligned at the
   return Value(v.t, view.expand(shape), v.dtype)
 
 def common_groups(shape, values):  # how an elementwise op folds shape: as an operand's tensor already is, else fold's way
-  return next((g for v in values if isinstance(v, Value) and v.view.contiguous() and (g := grouping(shape, v.t.shape))), groups3(shape))
+  return next((g for v in values if isinstance(v, Value) and v.whole() and (g := grouping(shape, v.t.shape))), groups3(shape))
 
 def operand(v, shape, groups):
   """v as ferrite takes it in an elementwise op of shape folded in groups: a dimension of 1 broadcast as it is where the
@@ -171,9 +172,9 @@ def reduce(x, axes, op):
   w = x.view.permute(kept + list(axes))
   f = math.prod(x.shape[k] for k in axes)
   b, r, c = x.t.shape
-  front = x.view.contiguous() and list(axes) == list(range(len(axes)))
-  if w.contiguous() and c == f: t, along = x.t, [2]  # already its last axis, or last two, or first: no move
-  elif w.contiguous() and r * c == f: t, along = x.t, [2, 1]
+  w_whole, front = w.contiguous() and math.prod(w.shape) == b * r * c, x.whole() and list(axes) == list(range(len(axes)))
+  if w_whole and c == f: t, along = x.t, [2]  # already its last axis, or last two, or first: no move
+  elif w_whole and r * c == f: t, along = x.t, [2, 1]
   elif front and b == f: t, along = x.t, [0]
   elif front and b * r == f: t, along = x.t, [0, 1]
   else: t, along = materialize(Value(x.t, w, x.dtype), [[], list(range(len(kept))), list(range(len(kept), len(w.shape)))]), [2]
