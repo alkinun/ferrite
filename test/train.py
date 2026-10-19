@@ -14,8 +14,8 @@ import gpt2
 def text(): return "".join(open(os.path.join(os.path.dirname(__file__), "..", name)).read() for name in ("README.md", "LESSONS.md"))
 
 def init(c, seed=0):
-  """GPT-2's weights by its names, as float32 numpy: N(0, 0.02), the projections back into the residual scaled down by
-  the depth, layer norms 1 and biases 0."""
+  """GPT-2's weights by its names, as float32 numpy: N(0, 0.02) (the position embedding 0.01), the projections back
+  into the residual scaled down by the depth, layer norms 1 and biases 0."""
   rng, d, w = np.random.default_rng(seed), c.dim, {}
   normal = lambda *shape, std=0.02: rng.normal(0, std, shape).astype(np.float32)
   w["wte.weight"], w["wpe.weight"] = normal(c.vocab, d), normal(c.ctx, d, std=0.01)
@@ -65,7 +65,7 @@ def train(rt, steps, c=None, lr=3e-3, log=None, data=None):
   pw = {k: torch.tensor(a, requires_grad=True) for k, a in w.items()}
   opt = torch.optim.Adam(pw.values(), lr=lr)
   tmask, pmask, losses = Tensor.of(rt, mask.tolist(), "fp32"), torch.tensor(mask), []
-  @tensor.jit  # recorded on its second call and replayed from then on: the host builds nothing
+  @tensor.jit  # recorded on its second call and replayed from then on: the host only copies the inputs in
   def train_step(x, onehot, step_lr, bias2):  # the loss, each gradient into .grad, and Adam's update
     for t in tw.values(): t.grad = None
     loss = cross_entropy(forward(x, tw, tmask, c), onehot)

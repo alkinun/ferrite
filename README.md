@@ -72,7 +72,7 @@ has the numbers and what carries over.
   autograd. A tree of ops becomes one fused kernel; `jit` records a function's launches and replays them.
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
-- `ferrite/bh.py`: every Blackhole fact the code uses, as data.
+- `ferrite/bh.py`: Blackhole's facts as data: addresses, limits, instruction and config encodings.
 - `adapters/`: tinygrad and PyTorch on ferrite (and `views.py`, tensors of any rank as views of ferrite's).
 - `test/`: every step on the simulator (`test_sim.py`), and the models.
 

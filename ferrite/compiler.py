@@ -48,7 +48,7 @@ FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32, "int32": bh.INT32, "bfp8": bh.BFP8}
 def kernel_config(dtype="bf16", out="bf16", transposing=False):
   """A kernel's backend config. Unpackers read one whole tile each (1024 datums): bf16 into a SrcA/SrcB bank; fp32
   straight into Dst (unpacker 0 in context 1, where the 32-bit Dst row is channel 1's Y). Z picks the slot (the Z stride
-  is one tile). The FPU writes Dst in fp32. The packer reads 4 Dst rows per PACR (its Dst row stride is in bytes of out)
+  is one tile). The FPU writes Dst in fp32. The packer reads 4 Dst rows per PACR (its Dst row stride is in bytes of out, or of fp32 for bfp8)
   and writes them as out (fp32 to bf16 rounds); its channel 1 Y picks the slot (that Y stride is one tile of out). Base
   addresses are in 16-byte units, minus 1, and unpacker 0's rows are biased by 4 (64 datums). transposing: unpacker 0
   transposes each 16x16 face into SrcA."""
@@ -93,6 +93,7 @@ class Loop(list):  # words a TRISC pushes `times` times over, in a loop rather t
 #     posts SEM_L1 for each; unpack takes one per op packed since it last looked, before it reads any intermediate.
 #   unpack, pack -> BRISC: thread 0 posts SEM_UNPACKED once it has unpacked a frame's tiles (or a matmul step's pair),
 #     the pack thread SEM_PACKED once it has packed a result; their TRISCs count those into SYNC, where BRISC looks.
+#   In an fp32 or int32 kernel the math thread fills Dst itself, so it takes SEM_L1 and posts SEM_UNPACKED instead.
 UNPACKERS = bh.UNPACK0 | bh.UNPACK1
 def counters(mask, n):  # a thread's address counters for these units to 0, each instruction moving n datums
   return [ins("SETADCXY", cnt_set_mask=mask, bit_mask=0b1111), ins("SETADCZW", cnt_set_mask=mask, bit_mask=0b1111),
@@ -180,12 +181,12 @@ def sfp_bf16(r, x):  # one word, for a constant bf16 holds exactly
   return ins("SFPLOADI", vd=r, mod0=0, imm16=to_bf16(x))
 def mad(d, a, b, c, neg=0): return ins("SFPMAD", vd=d, va=a, vb=b, vc=c, mod1=neg)  # d = a * b + c; neg 1: -a, 2: -c
 def mul(d, a, b): return ins("SFPMUL", vd=d, va=a, vb=b, vc=9)
-ZERO, ONE, MINUS_ONE = 9, 10, 11  # constant LRegs
+CONSTS = bh.LREG_CONSTS  # constant LRegs
+ZERO, ONE, MINUS_ONE = CONSTS[0.0], CONSTS[1.0], CONSTS[-1.0]
 FLAGS_ON, FLAGS_RESET, FLAGS_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags
 NAN, INF = 0x7FC00000, 0x7F800000
 def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # flags on: keep the lanes where integer LReg e >= n
 def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n (LReg t is overwritten)
-CONSTS = {0.0: ZERO, 1.0: ONE, -1.0: MINUS_ONE}
 def poly(d, x, cs, temp):  # LReg d = cs[0] + cs[1] x + ... by Horner, each coefficient into temp as it is needed (0, +-1 are LRegs)
   words = sfp_const(d, cs[-1])
   for c in cs[-2::-1]: words += ([] if c in CONSTS else sfp_const(temp, c)) + [mad(d, d, x, CONSTS.get(c, temp))]
@@ -299,8 +300,8 @@ SFPU |= {
            [sfp_load(), ins("SFPIADD", vd=0, vc=2, mod1=4), ins("SFPAND", vd=0, vc=3), sfp_store(0, RAW)]),
 }
 # Reductions along an axis (0: the batch, to one matrix; 1: rows, to one row; 2: columns, to one column): each tile
-# along it is x + 0 into Dst (the first in the result's half, the rest 128 rows further on, where the SFPU folds them
-# in). Then each row or column of the tile is folded across its 32 and the result written to all of them, so the tile
+# along it is x + 0 into Dst (the first in the reduction's accumulator, the rest 128 rows past it, where the SFPU folds
+# them in). Then each row or column of the tile is folded across its 32 and the result written to all of them, so the tile
 # broadcasts along that axis as is (over the batch, the tiles were folded as they came and there is nothing left).
 FOLDS = {f"{f}{ax}": ax for f in ("sum", "max") for ax in range(3)}  # kind -> the axis it folds
 def fold(kind, d, t):  # LReg d = d op t (for max, t is left with the min)
@@ -435,11 +436,11 @@ FLAGS_B = 16  # FLAGS: A's flags (a grid row's workers), then from here B's (a g
 DEPTH = 4  # matmul steps whose reads may be in flight at once, each through a stream slot of B's (and of A's, if it streams)
 ZERO_SLOT, FRAMES = 0, 1 + 2 * DEPTH  # slot 0 is a zero tile, then B's stream slots and A's, two frames, the narrow ops, and
                                       # what stays in L1: A's rows, B's column or buffers, kept inputs
-UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the slots it reads are below this
+UNPACKABLE = bh.UNPACKABLE  # the slots an unpacker reads are below this
 B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")  # a matmul's bfp8 B, past the slots: regions (one, or mc's three
 # buffers), each the exponents of its slots, then their values (the unpacker's layout), at most B8_SLOTS slots: the
-# unpacker finds a slot's exponents by its first datum, which must stay below 65536
-B8_SLOTS = 64
+# unpacker finds a slot's exponents by its first datum, which must stay below bh.BFP_FIRST_DATUM
+B8_SLOTS = bh.BFP_FIRST_DATUM // 1024
 
 def shared_k(rt, grid, added=0):  # the longest K, in tiles, of a matmul of rt tile rows, with `added` inputs added to it,
   inputs, ops = 2 + added, 1 + added  # whose tiles the grid's workers share by multicast (mc): A's rows and B's three
@@ -490,8 +491,8 @@ static void send(void) {{  // the results packed so far go home, in the order th
     noc_put(OUT_SLOT(slot), BANK(t), out + t / 8 * {to}, {to}); noc_wait();
   }}
 }}
-// A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, B's slot two steps
-// back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
+// A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, a stream slot DEPTH
+// steps back. Thread 0 reports each frame and step in turn; events counts them the same way. Results go home meanwhile.
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
 // bfp8 tile t into slot s at B8, slot s % b8 of region s / b8: its 64 exponents among the region's exponents, its values
 // among theirs

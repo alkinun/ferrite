@@ -1,4 +1,5 @@
-# Blackhole facts, as data. Everything chip-specific lives here; NOTES.md says where each number comes from.
+# Blackhole facts, as data: addresses, sizes and limits, instruction and config encodings (an instruction's modifier
+# values stay where the compiler uses them). NOTES.md says where each number comes from.
 
 VENDOR, DEVICE = 0x1E52, 0xB140
 
@@ -145,6 +146,9 @@ TENSIX_CFG_FIELDS = {
 THREAD_CFG = {"StateID": 0, "MATH_Offset": 1, "DISABLE_IMPLIED_SRCA": 2, "DISABLE_IMPLIED_SRCB": 3, "SRCA_SET": 5,
               "CLR_DVALID": 7, "FIDELITY_BASE": 11, "UNPACK_MISC": 41}
 SRCA_SET_BY_ADDR = 1 << 2  # SrcA/SrcB rows come from the unpacker's address, which our UNPACRs rely on
+UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter (ISA ADCs.md): the tiles it reads are below this
+BFP_FIRST_DATUM = 1 << 16  # it finds a bfp tile's exponents by its first datum, which must stay below this
+LREG_CONSTS = {0.0: 9, 1.0: 10, -1.0: 11}  # SFPU registers that hold these constants (ISA LReg.md; 8 holds 0.8373)
 # Address modes, 8 slots each: AB: SrcAIncr | SrcBIncr << 8, DST: DestIncr | FidelityIncr << FIDELITY_INCR, PACK:
 # YsrcIncr, BIAS: the packer's. Row counters wrap at 64 (Src) and 1024 (Dst)
 ADDR_MOD_AB, ADDR_MOD_DST, ADDR_MOD_PACK, ADDR_MOD_BIAS, FIDELITY_INCR = 12, 28, 37, 47, 13

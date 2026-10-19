@@ -12,7 +12,7 @@ are ticked as tests show them. NOTES.md has the detail of what is built.
 - [x] Userspace PCIe driver, the NoC, ARC, resets: no Tenstorrent software at runtime
 - [x] Firmware on every core, resident kernels, a command ring: a launch is one PCIe write
 - [x] A compiler from the ISA docs: fused kernels for elementwise ops, matmul, SFPU ops, row reductions, views, batches
-- [x] GPT-2 small with the real weights, token for token the same as numpy (`test/gpt2.py`)
+- [x] GPT-2 small with the real weights, checked against numpy token by token (`test/gpt2.py`)
 
 Done: a real model generates text on ttsim with nothing from Tenstorrent but the simulator.
 

@@ -16,7 +16,7 @@ matmuls at full precision (HiFi4) in both; each op is one launch in ferrite and 
 
 ferrite does each op in 4 to 18 times fewer cycles than TT-NN with fast dispatch, which dispatches from cores on the
 chip as ferrite does, and in 2 to 3 times fewer than TT-NN's kernels alone (slow dispatch, where the host does the
-dispatching at no cost here). Both read each input from DRAM about once.
+dispatching at no cost here). ferrite reads each input from DRAM about once, TT-NN up to 1.5 times.
 
 ## End to end: SmolLM-135M
 
@@ -64,14 +64,14 @@ is 0.1 to 0.2 ms of Python a token (measured), TT's trace was not measured.
 - **DRAM traffic does.** A byte read from DRAM is a byte on the card. On a card big matmuls and decode wait on DRAM,
   and there the two read the same bytes.
 - **Dispatch does, in kind.** TT-NN with fast dispatch spends about 4.5k cycles of RISC-V work on an op (5.3k against
-  0.8k for one tile); ferrite's whole one-tile op is 0.29k: arguments and go multicast to every worker, completion
+  0.8k for one tile); ferrite's whole one-tile op is 0.30k: arguments and go multicast to every worker, completion
   written to host memory. A card adds NoC latency to both.
 - **Math time does not.** ttsim runs a queued Tensix instruction at no cost and counts a clock only while every pipe of
   a tile waits, one RISC-V instruction each (NOTES, "How ttsim counts"). So these cycles are each stack's control work
   around the math, not the math: HiFi2 costs what HiFi4 does here, though on a card it is half the multiplies. TT-NN
   multiplies at HiFi2 unless told; ferrite at HiFi4 unless told (`tensor.FIDELITY`).
 - **The host's work is not counted here,** and on a card it counts. ferrite issuing a GPT-2 token op by op took the
-  host 6.5 ms, while the card should need about 0.5 ms; replayed from a recording (`tensor.jit`), a GPT-2 or
+  host 7.3 ms, while the card should need about 0.5 ms; replayed from a recording (`tensor.jit`), a GPT-2 or
   SmolLM-135M token takes the host 0.1 ms. TT-NN's traces replay too; they were not measured here.
 
 Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.2 s; tt-metal builds its firmware when

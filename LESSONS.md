@@ -73,7 +73,7 @@ append a correction.
 6. **Know how a number was measured.** Every wait on ttsim ran it 1000 clocks at a time, so each was rounded up to the
    next 1000; a profile that waited after every launch put a training step at 766k cycles when it was 444k, and a
    one-tile add at 700 cycles when it was 390. Polling every 10 clocks costs a tenth more wall time. And a counter two
-   runs share counts both: TT-NN's matmul, run beside another TT-NN run, read 11.2k cycles, and 7.9k alone. (NOTES:
+   runs share counts both: TT-NN's matmul, run beside another TT-NN run, read 11.2k cycles, and 7.8k alone. (NOTES:
    "How ttsim counts"; COMPARE.md)
 7. **Read the simulator's clock before optimizing for it.** ttsim runs queued Tensix instructions at no cost and
    counts only the clocks where a tile's pipes all wait, one RISC-V instruction each. The MOP expander, planned as the
@@ -81,7 +81,7 @@ append a correction.
    each other instead, and fetches on BRISC's critical path: fetching a layer norm's inputs once took it from 2.6k
    cycles to 0.6k. (NOTES: "How ttsim counts")
 8. **What the simulator does not count, the card will.** ttsim counts the chip's clocks, never the host's: issuing a
-   GPT-2 token took ferrite's Python 10.8 ms, where the card should need 0.5 ms. Measure the host as well; replaying a
+   GPT-2 token took ferrite's Python 10.8 ms (7.3 ms now), where the card should need 0.5 ms. Measure the host as well; replaying a
    recorded token (`jit`) takes it to 0.1 ms. (NOTES: "The host's part, and replay")
 
 ## The compiler and runtime
@@ -162,7 +162,7 @@ append a correction.
     place, and a product was made whole before its sum. 52 s a step went to 25 by layout alone. (NOTES: "tinygrad on
     ferrite")
 24. **Let the framework lower itself.** PyTorch has two thousand aten ops; its own decompositions bring them down to the
-    sixty the adapter writes out, and a training run of its transformer layer reached the CPU for one op, attention's
+    seventy the adapter writes out, and a training run of its transformer layer reached the CPU for one op, attention's
     backward. A decomposition is code with its own purpose, though: the one for attention was written for export and
     returns the attention weights where the kernel returns their logsumexp. (NOTES: "PyTorch on ferrite")
 25. **Copy what is already together.** The move kernel found each datum on its own, though most moves are whole tiles (a

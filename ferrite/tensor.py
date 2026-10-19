@@ -1,7 +1,7 @@
 # Lazy tensors: bf16, fp32 or int32 (and bfp8 for a matmul's B), of any shape, batched or not, in DRAM as tiles (tile i
 # in bank i % 8). Their ops build a tree that realizing turns into kernels (compiler.py): as much of it as one kernel
-# holds fused into one launch, and what one kernel cannot hold (a matmul's operands, a move, a cast, a reduction of
-# another shape) realized first.
+# holds fused into one launch, and what one kernel cannot hold (a matmul's operands, a move, a cast below the root, a
+# reduction of another shape) realized first.
 import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, tile_bytes, shared_k
@@ -18,9 +18,10 @@ class Tensor:
   Any shape: the last tile row and column are padded, with zeros, except that a dimension of 1 fills its tile with
   copies (a row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. Every kernel leaves
   its result that way too, so a matmul can sum over a padded K.
-  A view (x[b], slices on tile boundaries, x.split(n)) shares its owner's DRAM: its tile (b, i, j) is tile
-  b * bstride + i * stride + j + offset. Any other movement (reshape, permute, expand, pad, other slices) is a copy,
-  made by move_kernel from a map over the source's elements; a chain of them is one copy.
+  A view (x[b], slices on tile boundaries, x.split(n), x.repeat_interleave(n)) shares its owner's DRAM: its tile
+  (b, i, j) is tile b // rep * bstride + i * stride + j + offset (rep 1 but for a repeat). Any other movement
+  (reshape, permute, expand, pad, other slices) is a copy, made by move_kernel from a map over the source's elements; a
+  chain of them is one copy.
   A tensor made from one that requires_grad remembers how (_ctx: op, operands, arguments), past realizing, for
   backward (see gradient)."""
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1, dtype="bf16"):
@@ -597,7 +598,8 @@ def jit(f):
   """f, a function of tensors that returns one, run from a recording: its first call runs as any would, its second is
   recorded (each launch, and the DRAM it takes, kept from then on), and each later call copies its inputs into the second
   call's and sends the recorded launches again as one block of commands, building and compiling nothing, so the host's part
-  is one write to the ring and one to the doorbell (a few, if its kernels do not fit in L1 together: a training step's).
+  is the inputs' copies (a launch each) and one write to the ring and one to the doorbell (a few, if its kernels do not
+  fit in L1 together: a training step's).
   Its inputs keep their shapes and dtypes; nothing else it reads may change, and it may not read back. Its result is
   the same tensor every call, written again by the next, and so is every tensor it made and kept (a gradient in .grad)."""
   calls, inputs, launches, out, block = 0, (), [], None, None

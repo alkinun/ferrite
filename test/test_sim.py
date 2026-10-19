@@ -381,6 +381,23 @@ def test_fused_cast(chip):
     t.srcs[0].realize()
     assert fused.tobytes() == t.realize().tobytes()
 
+def test_assign(chip):
+  # assign writes a tensor's new value in place, into its own DRAM, so views of it see the value and a recorded call
+  # (jit) can update weights: tile by tile when what computes it reads the tensor elementwise, and through a copy of
+  # its own when a matmul reads it, since a matmul reads whole rows and columns of what it may overwrite
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(17)
+  w0, m = (bf16(rng.uniform(-1, 1, shape)) for shape in ((64, 96), (96, 96)))
+  w, tm = Tensor.of(rt, w0.tolist()), Tensor.of(rt, m.tolist())
+  addr, view = w.addr, w[:, 32:64]
+  w.assign(w * 2 + 1)
+  assert w.addr == addr and np.allclose(value(view)[0], (w0 * 2 + 1)[:, 32:64], rtol=1e-2), "in place: a view sees it"
+  fresh = value(Tensor.of(rt, value(w)[0].tolist()) @ tm)
+  w.assign(w @ tm)
+  assert w.addr == addr and np.array_equal(value(w), fresh), "a matmul of itself, as a fresh one computes it"
+  step = tensor.jit(lambda x: w.assign(w + x))
+  for _ in range(4): step(Tensor.of(rt, np.ones((64, 96)).tolist()))
+  assert np.allclose(value(w), fresh + 4, rtol=1e-2, atol=0.05), "four updates, two of them replayed"
+
 def test_threads_wait(chip):
   # each TRISC feeds its thread as fast as it can and ttsim runs every instruction the moment it can, so only the waits
   # hold a thread back. The pack TRISC, with the least to push, has each pack queued before its math is done (SEM_DST);
@@ -406,7 +423,8 @@ def test_matmul_fusion(chip):
 def test_replay_keeps_pushes_small():
   # the TRISCs push one Tensix instruction a cycle (four when they come in a row), so what they push per tile is code
   # they fetch and time they take. The repeating runs (a matmul phase, a mul phase, 15 PACRs) are recorded in the
-  # threads' replay buffers once per kernel and replayed by one word each
+  # threads' replay buffers once per kernel and replayed by one word each, and an SFPU body's 32 runs a tile are a loop
+  # of its one REPLAY word
   c, slots = compiler, compiler.allocate({"mm", "mul"})
   tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
   assert tile("add") <= 26 and tile("mul") <= 27, "was 48 and 80 before replay"
@@ -441,7 +459,8 @@ def test_sfpu(chip):
   a, b, c = (Tensor.of(rt, [[bf(random.uniform(-1, 1)) for _ in range(64)] for _ in range(64)]) for _ in range(3))
   launches, fused = rt.launches, ((a @ b) + c).relu().tolist()
   assert rt.launches == launches + 1 and fused == unfused(((a @ b) + c).relu()).tolist()
-  # all three SFPU programs in one kernel: exp and recip fill the 32-entry replay buffer, so relu goes word by word
+  # all three SFPU programs in one kernel: exp's 38 words never fit the 32-entry replay buffer, so its runs go word by
+  # word, while recip's and relu's are replayed
   u = [[bf(random.uniform(-3, 3)) for _ in range(64)] for _ in range(64)]
   w = [[bf(random.choice((-1, 1)) * random.uniform(0.5, 2)) for _ in range(64)] for _ in range(64)]
   got = (Tensor.of(rt, u).exp().relu() + Tensor.of(rt, w).reciprocal()).tolist()
@@ -933,7 +952,8 @@ def test_train(chip):
   # stage 1's training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning to count
   # in fp32 with Adam (test/train.py learns README and LESSONS, which change with every edit: once, a new text put one
   # gradient past the bound). Every step's loss and gradients against PyTorch's on the same weights, to the matmul's
-  # 2^-11; the loss falling; and the first step the same as PyTorch's own
+  # 2^-11, the step recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1
+  # together, so a replay sends them in parts); the loss falling; and the first step the same as PyTorch's own
   pytest.importorskip("torch")
   losses = train.train(Runtime(chip, chip.tensix[0], chip.tensix[-1]), 5, data=" ".join(map(str, range(3000))))
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
