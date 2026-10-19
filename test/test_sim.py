@@ -1197,6 +1197,24 @@ def test_kv_cache(chip):
     ids.append(int(want.argmax()))
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
+def test_put(chip):
+  # rows into a tensor at places read on the chip (gather's inverse), against numpy: 70 rows (three tiles of places) of a
+  # batch of 3, into 200 places (seven tile rows), scattered and out of order, one place twice (the later row stays),
+  # bf16 and fp32; and a prompt's rows into their places in order, as a KV cache takes them
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
+  for dtype in ("bf16", "fp32"):
+    cache, x = rng.normal(0, 1, (3, 200, 96)).astype(np.float32), rng.normal(0, 1, (3, 70, 96)).astype(np.float32)
+    if dtype == "bf16": cache, x = bf16(cache), bf16(x)
+    places = [int(p) for p in rng.permutation(200)[:70]]
+    places[40] = places[7]
+    t = Tensor.of(rt, cache.tolist(), dtype)
+    t.put(Tensor.of(rt, [places], "int32"), Tensor.of(rt, x.tolist(), dtype))
+    for i, p in enumerate(places): cache[:, p] = x[:, i]
+    assert np.array_equal(value(t), cache), dtype
+  kv, rows = Tensor.of(rt, np.zeros((3, 64, 64)).tolist()), bf16(rng.normal(0, 1, (3, 40, 64)))
+  kv.put(Tensor.of(rt, [list(range(5, 45))], "int32"), Tensor.of(rt, rows.tolist()))
+  assert np.array_equal(value(kv)[:, 5:45], rows) and not value(kv)[:, :5].any() and not value(kv)[:, 45:].any()
+
 def test_batched_decode(chip):
   # four sequences decoding together, a token each a step, from prompts of different lengths: their KV caches side by
   # side in one (sequence u's places from row 32 u), each token seeing only its own sequence's places up to its own.

@@ -126,8 +126,9 @@ class Tensor:
     assert self.rep == 1, "into a tensor of its own, not a repeat"
     x, ids, ct = _plain(x.realize()), ids.realize(), -(-self.cols // 32)
     where = lambda t: (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)
+    tr = -(-self.rows // 32)
     return self.realize()._run(_cached(("put", self.dtype), lambda: put_kernel(self.dtype)), *where(self), *where(x), ids.addr,
-                               ids.offset, x.rows, ct, units=self.batch * ct, name="put")
+                               ids.offset, x.rows, ct, tr, units=self.batch * tr * ct, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
     if self.rep > 1: return (self + 0)._view(rows, cols, batch, offset, bstride, stride)  # of a repeat's copy
