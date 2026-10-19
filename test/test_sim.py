@@ -1186,7 +1186,7 @@ def test_llama_layer(chip, n):
   x, (cos, sin, turn) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, n)
   mask = np.triu(np.full((n, n), -1e9, np.float32), 1)
   on = lambda a: Tensor.of(rt, a.tolist())
-  cache, np_cache = [on(np.zeros((3, n, 64))) for _ in range(2)], [np.zeros((3, n, 64)) for _ in range(2)]
+  cache, np_cache = on(np.zeros((6, n, 64))), np.zeros((6, n, 64))
   places = Tensor.of(rt, [list(range(n))], "int32")
   got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn)), on(mask), cache, places)
   want = llama.layer(x, p, c, (np.float64(cos), np.float64(sin), turn), np.float64(mask), np_cache, range(n))

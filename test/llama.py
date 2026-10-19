@@ -34,29 +34,29 @@ def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 a
 def layer(x, p, c, rotary, mask, cache, rows):
   """One block: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as x @ w, so
   the Hugging Face ones transposed, q, k and v's side by side, and gate and up's), c: the config, rotary: (cos, sin,
-  turn), cache: this block's [keys, values], each with a row for every place, this call's written at its rows; mask:
-  -1e9 where a token must not look (gpt2.mask)."""
-  f, hd = fns(x), c.dim // c.heads
+  turn), the tables' rows for this call's places; cache: this block's keys' heads then its values', each with a row for
+  every place, this call's written at its rows; mask: -1e9 where a token must not look (gpt2.mask)."""
+  f, n = fns(x), c.heads + 2 * c.kv
   h = rms(x, p["input_layernorm"], c.eps)
-  qkv = h @ p["qkv_proj"]
-  qk = rope(f.split(qkv[:, :c.dim + c.kv * hd], c.heads + c.kv), *rotary)  # q's heads and k's as one batch
-  q, k, v = qk[:c.heads, :, :], qk[c.heads:, :, :], f.split(qkv[:, c.dim + c.kv * hd:], c.kv)
-  f.put(cache[0], rows, k), f.put(cache[1], rows, v)
-  k, v = (f.repeat(t, c.heads // c.kv) for t in cache)  # each key and value head for each query head of its group, in place
-  s = q @ f.t(k) * (1 / math.sqrt(hd))
+  qkv = rope(f.split(h @ p["qkv_proj"], n), f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])  # v's heads do not turn
+  f.put(cache, rows, qkv[c.heads:, :, :])  # this call's keys and values, at once
+  k, v = (f.repeat(t, c.heads // c.kv) for t in (cache[:c.kv, :, :], cache[c.kv:, :, :]))  # a head for each query's, in place
+  s = qkv[:c.heads, :, :] @ f.t(k) * (1 / math.sqrt(c.dim // c.heads))
   x = x + f.merge(f.softmax(s + mask) @ v) @ p["o_proj"]
   h = rms(x, p["post_attention_layernorm"], c.eps)
   gate_up, m = h @ p["gate_up_proj"], p["down_proj"].shape[-2]
   return x + (f.silu(gate_up[:, :m]) * gate_up[:, m:]) @ p["down_proj"]
 
-def rotary(c, n):  # cos and sin for places 0 to n - 1, as Hugging Face's (angles in fp32, the tables in bf16), and turn:
+def rotary(c, n):  # cos and sin for places 0 to n - 1, as Hugging Face's (angles in fp32, the tables in bf16), a head's
+  # for each of q's, k's and v's heads (v's 1 and 0: they do not turn, so one kernel turns them all), and turn:
   hd = c.dim // c.heads  # x @ turn is (-x2, x1), each of its entries one of x's, so exact
   inv = 1 / c.theta ** (np.arange(0, hd, 2, dtype=np.float32) / hd)
   angles = np.arange(n, dtype=np.float32)[:, None] * inv[None]
   bf16 = lambda a: ((a.astype(np.float32).view(np.uint32) + 0x7FFF + (a.astype(np.float32).view(np.uint32) >> 16 & 1)) & 0xFFFF0000).view(np.float32)
   turn = np.zeros((hd, hd), np.float32)
   turn[np.arange(hd // 2) + hd // 2, np.arange(hd // 2)], turn[np.arange(hd // 2), np.arange(hd // 2) + hd // 2] = -1, 1
-  return [bf16(np.concatenate([g(angles)] * 2, 1)) for g in (np.cos, np.sin)] + [turn]
+  heads = lambda t, v: np.concatenate([t] * (c.heads + c.kv) + [np.full_like(t, v)] * c.kv, 1)
+  return [bf16(heads(np.concatenate([g(angles)] * 2, 1), v)) for g, v in ((np.cos, 1), (np.sin, 0))] + [turn]
 
 def fuse(w):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls
   join = lambda *xs: tuple(map(join, *xs)) if isinstance(xs[0], tuple) else np.ascontiguousarray(np.concatenate(xs, 1))
@@ -66,21 +66,21 @@ def fuse(w):  # each block's q, k and v projections as one matrix, and its gate 
   return w
 
 def forward(ids, places, w, c, caches, starts=None):
-  """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (one
-  [keys, values] a block, each with a row for every place), and each sees the places up to its own. ids and places are
+  """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (a
+  block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids and places are
   rows: lists for numpy, int32 tensors for ferrite. starts: several sequences decoding together (a batch of users), their
   caches side by side, each token's sequence starting at its start's row and each token seeing only its own sequence;
   then the logits are every token's, the next token of each (rows: numpy arrays for numpy)."""
   f = fns(w["embed"])
   x, rows = f.rows(w["embed"], ids), places if starts is None else places + starts
-  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(rows, caches[0][0].shape[-2], starts)
+  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(rows, caches[0].shape[-2], starts)
   for l in range(c.layers):
     x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], rows)
   h = rms(x, w["norm"], c.eps)
   return (h if starts is not None else f.rows(h, [x.shape[-2] - 1])) @ w["embed.T"]
 
-def kv_cache(c, size, zeros):  # each block's [keys, values], a row for each of size places, made by zeros(shape)
-  return [[zeros((c.kv, size, c.dim // c.heads)) for _ in range(2)] for _ in range(c.layers)]
+def kv_cache(c, size, zeros):  # each block's keys' heads then its values', a row for each of size places, made by zeros(shape)
+  return [zeros((2 * c.kv, size, c.dim // c.heads)) for _ in range(c.layers)]
 
 def load(folder):
   """The config, and {name: (bf16 bits, the same as float32)} from model.safetensors (8 bytes of header size, a JSON header

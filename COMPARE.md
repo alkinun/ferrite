@@ -40,7 +40,7 @@ fewer, with a third as many launches. TT's two precision modes are within 0.1% o
 keeps the MLP's up and gate weights in bfp4 at LoFi and the rest in bfp8 at HiFi2, accuracy mode attention and the KV
 cache in bf16 at HiFi4 and the MLP in bfp8; the output layer is bfp8 in both. ttsim counts the RISC-V work around the
 math, which those settings barely change (ferrite's bfp8 costs it 10%, two reads a tile). TT's operations a token are
-82 for one block and 126 for two (counted untraced), so 44 a block where ferrite has 14.
+82 for one block and 126 for two (counted untraced), so 44 a block where ferrite has 13.
 
 At place 1000 TT's token costs what it does at place 5, and ferrite's 53k more: on ttsim, where tile work is free, a
 longer cache costs TT's attention no more control, while ferrite's grows with it (the attention kernel, one line of 32
