@@ -2,21 +2,24 @@
 # runtime. Realizing a FERRITE tensor hands tinygrad's tensor graph (its primitives on shaped tensors, before tinygrad
 # would schedule them into kernels) to ferrite op by op, and ferrite fuses and launches them its own way.
 # tinygrad's tensors have any rank and ferrite's three axes, so movement stays a view of a ferrite tensor (views.py),
-# folded into three axes when an op needs the data. A
-# multiply summed over axes both operands span, broadcast against each other elsewhere, is a matmul. What ferrite does
-# not do (the integer arithmetic of random numbers, other dtypes) runs on tinygrad's own CPU device and comes over.
+# folded into three axes when an op needs the data. A multiply summed over axes both operands span, broadcast against
+# each other elsewhere, is a matmul. What ferrite does not do (the integer arithmetic of random numbers, other dtypes)
+# runs on tinygrad's own CPU device and comes over. TinyJit replays a call's launches, as ferrite's own jit does.
 #   import adapters.tinygrad_ferrite, then DEV=FERRITE or Tensor(..., device="FERRITE")
 #   TTSIM=/path/to/libttsim.so python3 adapters/tinygrad_ferrite.py script.py [args]   # a tinygrad script, unchanged
 import collections, math, os, runpy, sys, types
 import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
-import tinygrad, tinygrad.tensor
+import tinygrad, tinygrad.tensor, tinygrad.engine.jit
+from tinygrad.helpers import JIT
+from tinygrad.engine.jit import JitError, _check_no_non_tensor_return, _prepare_jit_inputs
+from tinygrad.nn.state import get_parameters
 from tinygrad import Tensor, dtypes
 from tinygrad.dtype import _to_np_dtype
 from tinygrad.device import Allocator, BufferStorage, Compiled, Device
 from tinygrad.uop.ops import GroupOp, Ops, PatternMatcher, UOp, UPat, graph_rewrite, identity_element
 from tinygrad.schedule.prepare import resolve_function
-from views import View, Value, broadcast, common_groups, download, fold, grouping, indices, materialize, merge, operand, reduce, spread, upload
+from views import View, Value, broadcast, common_groups, download, fold, grouping, indices, materialize, merge, operand, reduce, runtime, spread, upload
 from ferrite import tensor  # after views, which puts ferrite on the path
 
 DTYPES = {dtypes.float32: "fp32", dtypes.bfloat16: "bf16", dtypes.int32: "int32", dtypes.bool: None}  # bool: 0 or 1, any dtype
@@ -34,6 +37,10 @@ def constant(t):  # a host value that is one number spread over a shape: the num
 def flat(a, n, npd):  # a host value as n values' bytes
   a = np.asarray(a)
   return np.ascontiguousarray(np.broadcast_to(a, (n,)) if a.ndim == 0 else a.reshape(-1), npd).tobytes()
+
+recording, hosted = None, [0]  # while TinyJit records a call: each buffer it changes, (holder, before), and its work on the host
+def on_host_now():  # work the host does in a call, with what it found there: a recording would not do it again
+  if recording is not None: hosted[0] += 1
 
 def to_chip(v, dtype):  # a host value (a tinygrad CPU tensor) as a chip value, in its own shape
   return Value(upload(array(v), DTYPES[dtype]), View(v.shape), dtype)
@@ -160,7 +167,7 @@ class Evaluator:
   def on_host(self, u, srcs):
     """u by tinygrad on its CPU device, lazily, so tinygrad fuses what runs there (its random numbers sum a padded view it
     never makes whole) and computes it only when the chip needs it."""
-    there = lambda s, v: (cpu(download(v)) if isinstance(v, Value) else v).cast(s.dtype).uop if isinstance(v, (Value, Tensor)) else s
+    there = lambda s, v: (on_host_now() or cpu(download(v)) if isinstance(v, Value) else v).cast(s.dtype).uop if isinstance(v, (Value, Tensor)) else s
     return Tensor(u.replace(src=tuple(there(s, v) for s, v in zip(u.src, srcs))))
 
   def eval(self, u, defer=True):
@@ -181,8 +188,8 @@ class Evaluator:
     if u.op is Ops.SINK: return None
     x = [self.read(s, v) for s, v in zip(u.src, srcs)]
     if u.op is Ops.RESHAPE and u.src[0].op is Ops.BUFFER and on_ferrite(u.src[0]) and (v := self.lay_out(u, x[0])) is not None: return v
-    if u.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.PAD):
-      return self.movement(u, x[0]) if isinstance(x[0], Value) else self.on_host(u, x)
+    if u.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.PAD):  # (symbolic shapes on the host)
+      return self.movement(u, x[0]) if isinstance(x[0], Value) and all(isinstance(d, int) for d in u.shape) else self.on_host(u, x)
     if u.op in BINARY or u.op is Ops.WHERE: x = [spread_to(v, u.shape) for v in x]
     if u.op is Ops.REDUCE and x[0] is DEFER:  # a product only sums read: a matmul, or the product after all
       if (mm := self.matmul(u)) is not None: return mm
@@ -197,9 +204,9 @@ class Evaluator:
     h = u.src[0].buffer._buf
     if isinstance(h, Part): return None
     if isinstance(x, Tensor) and constant(x) is None and u.dtype in DTYPES and h.value is None:
-      h.value = Value(upload(array(x).reshape(u.shape), DTYPES[u.dtype]), View(x.shape), u.dtype)
+      h.set(value=Value(upload(array(x).reshape(u.shape), DTYPES[u.dtype]), View(x.shape), u.dtype))
     elif isinstance(x, Value) and x.whole() and x.t.shape != fold(u.shape):
-      h.value = Value(materialize(Value(x.t, View(u.shape), x.dtype)).realize(), x.view, x.dtype)
+      h.set(value=Value(materialize(Value(x.t, View(u.shape), x.dtype)).realize(), x.view, x.dtype))
     else: return None
     return Value(h.value.t, View(u.shape), u.dtype)
 
@@ -219,7 +226,7 @@ class Evaluator:
       if h.value is not None: return Value(h.value.t, h.value.view, h.value.dtype)
       if h.bytes is None: return Tensor.zeros(buf.nbytes // v.dtype.itemsize, dtype=v.dtype, device="CPU")  # nothing stored yet
       if isinstance(h, Holder) and v.dtype in DTYPES and len(h.bytes) <= 32 * v.dtype.itemsize:  # a tile's row at most (an optimizer's numbers): up
-        h.value, h.bytes = Value(upload(np.frombuffer(h.bytes, npdtype(v.dtype)), DTYPES[v.dtype]), View(v.shape), v.dtype), None
+        h.set(value=Value(upload(np.frombuffer(h.bytes, npdtype(v.dtype)), DTYPES[v.dtype]), View(v.shape), v.dtype))
         return Value(h.value.t, h.value.view, h.value.dtype)
       return cpu(np.frombuffer(h.bytes, npdtype(v.dtype)))  # on the host until a use gives it a shape
     return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape))
@@ -242,20 +249,24 @@ class Evaluator:
       assert view is not None and on_ferrite(target) and isinstance(buf._buf, Holder), "a store into part of a buffer: FERRITE's, a view"
       a = np.frombuffer(contents(buf._buf) or bytes(buf.nbytes), npd).copy()
       a[indices(view)] = np.broadcast_to(host(value, target.dtype), view.shape)
-      buf._buf.bytes, buf._buf.value = a.tobytes(), None
+      buf._buf.set(a.tobytes())
       return None
     if isinstance(buf._buf, Part): raise NotImplementedError("a store into part of a FERRITE buffer")
     data = lambda: host(value, target.dtype)
-    if not on_ferrite(target): buf.copyin(memoryview(flat(data(), n, npd)))
-    elif isinstance(value, Value):  # kept in whatever three axes it has, if its view is all of it as it lies
-      t = value.t if value.whole() else materialize(value)
-      buf._buf.value, buf._buf.bytes = Value(t.realize(), View(value.shape), value.dtype), None
-    else: buf._buf.bytes, buf._buf.value = flat(data(), n, npd), None
+    if not on_ferrite(target): on_host_now(); buf.copyin(memoryview(flat(data(), n, npd)))
+    elif isinstance(value, Value):  # kept in whatever three axes it has, if its view is all of it as it lies, and copied if it
+      t = value.t if value.whole() else materialize(value)  # is computed already: a replay writes over its tensors in place
+      buf._buf.set(value=Value((t + 0 if t.op is None else t).realize(), View(value.shape), value.dtype))
+    else: buf._buf.set(flat(data(), n, npd))
     return None
 
 # tinygrad's side: the FERRITE device, its buffers, and the graphs it hands over
 class Holder:  # a FERRITE buffer's contents: bytes from the host, or a chip value (its own view and dtype)
   def __init__(self): self.bytes, self.value = None, None
+  def set(self, bytes=None, value=None):  # new contents (what they were noted while TinyJit records a call)
+    if recording is not None: recording.setdefault(id(self), (self, self.value))
+    if bytes is not None: on_host_now()
+    self.bytes, self.value = bytes, value
 
 def host(v, dtype):  # a chip value, host value or number as numpy, laid out as tinygrad has dtype (bf16 as its bits, a bool a byte)
   if isinstance(v, Value):
@@ -277,7 +288,7 @@ class FerriteAllocator(Allocator):
   def _alloc(self, size, options): return BufferStorage(Holder())
   def _copyin(self, dest, src):
     if isinstance(dest, Part): raise NotImplementedError("a copy into part of a FERRITE buffer")
-    dest.bytes, dest.value = bytes(src), None
+    dest.set(bytes(src))
   def _copyout(self, dest, src): dest[:] = c[:len(dest)] if (c := contents(src)) is not None else bytes(len(dest))
   def _offset(self, buf, size, offset): return Part(buf, offset, size)
 
@@ -306,9 +317,62 @@ sys.modules["tinygrad.runtime.ops_ferrite"], tinygrad.runtime.ops_ferrite = mod,
 if "FERRITE" not in Device._devices: Device._devices.append("FERRITE")
 tinygrad.tensor.create_linear_with_vars = schedule
 
-if __name__ == "__main__":  # a tinygrad script on ferrite, as it is (tinygrad's JIT replays schedules, which this does not make)
-  from tinygrad.helpers import DEV, JIT
+def on_chip(t):  # a FERRITE tensor's holder, if it is a whole buffer, its contents on the chip (bytes go up in its shape); or None
+  if t.uop.base.op is not Ops.BUFFER or not on_ferrite(t.uop.base) or t.dtype not in DTYPES: return None
+  h = t.uop.base.buffer.ensure_allocated()._buf
+  if not isinstance(h, Holder) or (h.value is None and h.bytes is None) or t.uop.base.buffer.nbytes != t.nbytes(): return None
+  if h.value is None: h.set(value=Value(upload(np.frombuffer(h.bytes, npdtype(t.dtype)).reshape(t.shape), DTYPES[t.dtype]), View((t.numel(),)), t.dtype))
+  return h
+
+_tinyjit = tinygrad.engine.jit._TinyJit.__call__
+def tinyjit(self, *args, **kwargs):
+  """tinygrad's TinyJit on FERRITE, tensor.jit's way: the first call runs, the second is recorded, and each later one copies
+  its inputs into the second's and sends its launches again as one block, running nothing on the host. Each buffer the
+  recorded call stored into has its new value copied back where the recording read it from. A call runs every time
+  instead if it works on the host with what it finds there (random numbers, whose counter lives there; a value brought
+  down), stores into a buffer in another layout, or takes an input that is not a whole buffer on the chip. tinygrad's
+  checks of the inputs and the result are its own (_prepare_jit_inputs)."""
+  global recording
+  given = [*args, *(v for _, v in sorted(kwargs.items()))]  # the inputs as tinygrad finds them: tensors, and those in a container
+  ins = [t for t in given if t.__class__ is Tensor]
+  ins += [t for x in given if isinstance(x, (tuple, list, dict)) for t in (x.values() if isinstance(x, dict) else x)
+          if t.__class__ is Tensor and not any(t is u for u in ins)]
+  if not JIT or Device.DEFAULT != "FERRITE" and not any(on_ferrite(t.uop) for t in ins): return _tinyjit(self, *args, **kwargs)
+  _, _, names, info = _prepare_jit_inputs(args, kwargs)  # tinygrad's checks of them, and the inputs realized
+  holders, self.cnt = [on_chip(t) for t in ins], self.cnt + 1
+  if recording is not None: raise RuntimeError("having TinyJit inside another TinyJit is not supported")
+  if self.cnt == 1 or getattr(self, "replay", None) is False or None in holders:
+    ret = self.fxn(*args, **kwargs)
+    if params := get_parameters(ret): Tensor.realize(*params)
+    return ret
+  if self.cnt == 2:
+    values, recording, hosted[0], self.inputs = [h.value for h in holders], {}, 0, (names, info)
+    try:
+      with tensor.Recording(runtime()) as rec:
+        ret = self.fxn(*args, **kwargs)
+        if params := get_parameters(ret): Tensor.realize(*params)
+        _check_no_non_tensor_return(ret)
+        back = [(h, old) for h, old in recording.values() if old is not None and h not in holders]  # (an input laid out
+        # anew is laid out anew each replay, from its copy)
+        self.replay = hosted[0] == 0 and all(isinstance(h.value, Value) and (h.value.t.shape, h.value.t.dtype) == (old.t.shape, old.t.dtype)
+                                           for h, old in back) and (rec, values, ret)
+        for h, old in back if self.replay else ():
+          if h.value.t is not old.t: old.t.assign(h.value.t)
+          h.value = Value(old.t, h.value.view, h.value.dtype)
+    finally: recording = None
+    if not rec.launches: raise JitError("didn't JIT anything!")
+    return ret
+  rec, values, ret = self.replay
+  if (names, info) != self.inputs: raise JitError(f"args mismatch in JIT: {names, info} where it recorded {self.inputs}")
+  for h, v in zip(holders, values):
+    if h.value.t is not v.t: v.t.assign(h.value.t)
+  rec.send()
+  return ret
+tinygrad.engine.jit._TinyJit.__call__ = tinyjit
+
+if __name__ == "__main__":  # a tinygrad script on ferrite, as it is
+  from tinygrad.helpers import DEV
   assert len(sys.argv) > 1, "usage: python3 adapters/tinygrad_ferrite.py script.py [its arguments]"
-  DEV.value, JIT.value = "FERRITE", 0
+  DEV.value = "FERRITE"
   sys.argv = sys.argv[1:]
   runpy.run_path(sys.argv[0], run_name="__main__")

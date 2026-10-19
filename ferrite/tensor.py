@@ -626,6 +626,19 @@ def _input(t, inputs):  # a realized tensor's number among a kernel's inputs, ad
   inputs.append(t)
   return len(inputs) - 1
 
+class Recording:
+  """Launches recorded once (rt.log, the DRAM they take kept) and sent again as one block of commands, packed into the
+  ring's bytes once, and again if the kernels they name have left L1 since (Runtime.evictions): every time, if they do
+  not fit at once, packing then sending parts itself. jit's, and the tinygrad adapter's TinyJit's."""
+  def __init__(self, rt): self.rt, self.launches, self.block = rt, [], None
+  def __enter__(self): self.rt.log = []; return self
+  def __exit__(self, *_): self.launches, self.rt.log = self.rt.log, None
+  def send(self):
+    if self.block is None or self.block[2] != self.rt.evictions:
+      evictions = self.rt.evictions
+      self.block = (*self.rt.block(self.launches), evictions)
+    self.rt.send(*self.block[:2])
+
 def jit(f):
   """f, a function of tensors that returns one, run from a recording: its first call runs as any would, its second is
   recorded (each launch, and the DRAM it takes, kept from then on), and each later call copies its inputs into the second
@@ -634,23 +647,19 @@ def jit(f):
   fit in L1 together: a training step's).
   Its inputs keep their shapes and dtypes; nothing else it reads may change, and it may not read back. Its result is
   the same tensor every call, written again by the next, and so is every tensor it made and kept (a gradient in .grad)."""
-  calls, inputs, launches, out, block = 0, (), [], None, None
+  calls, inputs, out, rec = 0, (), None, None
   def run(*xs):
-    nonlocal calls, inputs, launches, out, block
+    nonlocal calls, inputs, out, rec
     calls, rt = calls + 1, xs[0].rt
     if calls == 1: return f(*xs).realize()
     if calls == 2:
-      inputs, rt.log = [x.realize() for x in xs], []
-      try: out = f(*inputs).realize()
-      finally: launches, rt.log = rt.log, None
+      inputs = [x.realize() for x in xs]
+      with Recording(rt) as rec: out = f(*inputs).realize()
       return out
     for x, to in zip(xs, inputs):
       assert (x.shape, x.dtype) == (to.shape, to.dtype), f"{x.shape} {x.dtype} where the recording had {to.shape} {to.dtype}"
       if x is not to: (x + 0).realize(to)
-    if block is None or block[2] != rt.evictions:  # packed again if the kernels it names have left L1 since, so every
-      evictions = rt.evictions                      # time if they do not fit at once (packing then sends parts itself)
-      block = (*rt.block(launches), evictions)
-    rt.send(*block[:2])
+    rec.send()
     return out
   return run
 

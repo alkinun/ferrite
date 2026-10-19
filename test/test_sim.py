@@ -1000,8 +1000,9 @@ def test_tinygrad(tinygrad):
   # stage 4's first step: tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
   # ferrite runs it: elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad
   # writes one (a broadcast multiply, summed), softmax, a tinygrad function (inlined); then an MLP trained with Adam for
-  # three steps. All against tinygrad on its own CPU device, and on the chip (launches), not the host
-  from tinygrad import Tensor, dtypes, function, nn
+  # three steps, and a layer for five under TinyJit, replayed. All against tinygrad on its own CPU device, and on the chip
+  # (launches), not the host
+  from tinygrad import Tensor, TinyJit, dtypes, function, nn
   from tinygrad.helpers import Context
   import views
   rng, rt = np.random.default_rng(14), views.runtime()
@@ -1047,6 +1048,23 @@ def test_tinygrad(tinygrad):
     return losses
   want, got = train("CPU"), train("FERRITE")
   assert np.allclose(got, want, atol=1e-3) and got[-1] < got[0] - 0.3, (got, want)
+  def jitted(device):  # the same under TinyJit: on FERRITE its third call on replays the second's launches, the function not run
+    rng, calls = np.random.default_rng(15), []
+    l1 = nn.Linear(16, 10)
+    l1.weight, l1.bias = Tensor(rng.standard_normal((10, 16)).astype(np.float32) * 0.2, device=device), Tensor.zeros(10, device=device).contiguous()
+    opt = nn.optim.Adam([l1.weight, l1.bias], lr=1e-2)
+    @TinyJit
+    def step(x, y):
+      calls.append(1)
+      with Context(TRAINING=1):
+        opt.zero_grad()
+        loss = l1(x).sparse_categorical_crossentropy(y).backward()
+        opt.step()
+        return loss.realize()
+    data = [(rng.standard_normal((8, 16)).astype(np.float32), rng.integers(0, 10, 8).astype(np.int32)) for _ in range(5)]
+    return [step(Tensor(x, device=device).realize(), Tensor(y, device=device).realize()).item() for x, y in data], len(calls)
+  (want, _), (got, calls) = jitted("CPU"), jitted("FERRITE")
+  assert np.allclose(got, want, atol=1e-3) and calls == 2, (got, want, calls)
 
 def test_torch(chip, monkeypatch):
   # stage 4's second step: PyTorch on ferrite. A FerriteTensor is a torch.Tensor whose aten ops run on the chip, so eager
