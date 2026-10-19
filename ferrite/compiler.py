@@ -187,6 +187,9 @@ CONSTS = bh.LREG_CONSTS  # constant LRegs
 ZERO, ONE, MINUS_ONE = CONSTS[0.0], CONSTS[1.0], CONSTS[-1.0]
 FLAGS_ON, FLAGS_RESET, FLAGS_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags
 NAN, INF = 0x7FC00000, 0x7F800000
+def nans(x, t, inf, mask=False):  # LReg t where LReg x is NaN: |x| past inf's bits (LReg inf holds them) in SFPGT's
+  # order, as all ones (mask) or as lane flags, for an SFPMOV to give those lanes NaN (between FLAGS_ON and FLAGS_OFF)
+  return [*sfp_bits(inf, INF), ins("SFPABS", vd=t, vc=x, mod1=1), ins("SFPGT", vd=t, vc=inf, mod1=8 if mask else 1)]
 def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # flags on: keep the lanes where integer LReg e >= n
 def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n (LReg t is overwritten)
 def poly(d, x, cs, temp):  # LReg d = cs[0] + cs[1] x + ... by Horner, each coefficient into temp as it is needed (0, +-1 are LRegs)
@@ -204,7 +207,8 @@ def exp(base2):
   """2^x, or e^x: n = round(t), t = x log2(e) (adding and taking away 1.5 2^23 rounds to an integer, whose bits it
   leaves in the sum's low ones), r = (x - n) ln 2, or for e^x x - n ln 2 in two parts (Cody-Waite: n times 0.693359375 is
   exact), e^r by a polynomial, times 2^floor(n/2) and 2^ceil(n/2), each built from its exponent bits: the multiplies
-  overflow to inf, or flush to 0, exactly where the result does. x is first held to where |t| <= 150 (NaN to an end)."""
+  overflow to inf, or flush to 0, exactly where the result does. x is first held to where |t| <= 150, which sends a
+  NaN to an end, so a NaN is put back at the end (x again from Dst)."""
   (lim, t), ln2 = (150.0, 0) if base2 else (104.0, 5), math.log(2)
   return (sfp_const(1, ln2) if base2 else sfp_const(1, 1 / ln2) + sfp_const(2, 0.693359375) + sfp_const(3, ln2 - 0.693359375),
           [sfp_load(), sfp_bf16(4, -lim), ins("SFPSWAP", vd=4, vc=0, mod1=1), sfp_bf16(4, lim), ins("SFPSWAP", vd=0, vc=4, mod1=1),  # x within +-lim
@@ -214,7 +218,7 @@ def exp(base2):
            *poly(4, 5, EXP_P, 7), ins("SFPSHFT", vd=0, vc=6, mod1=7, imm12=-1 & 0xFFF), ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=1),
            ins("SFPSHFT", vd=6, mod1=3, imm12=-1 & 0xFFF),  # LReg 0, 6: floor(n/2), ceil(n/2), then each 2^ that, by its bits
            *[w for r in (0, 6) for w in (ins("SFPIADD", vd=r, vc=r, mod1=5, imm12=127), ins("SFPSHFT", vd=r, mod1=1, imm12=23), mul(4, 4, r))],
-           sfp_store(4)])
+           sfp_load(0), FLAGS_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), FLAGS_OFF, sfp_store(4)])
 
 def log(scale):
   """log2(x) scale: x = 2^e m with m in [sqrt(1/2), sqrt(2)) (from [1, 2), halved and e one more where above sqrt 2), so
@@ -249,10 +253,12 @@ SFPU = {
   "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, RAW)]),
   "exp": exp(False), "exp2": exp(True), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
   # 1/x: SFPARECIP's 7-bit estimate, then two Newton steps y += y * (1 - x * y). Only where x is a normal number:
-  # 0 and denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate
+  # 0 and denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate,
+  # and a NaN's (0) is NaN again
   "recip": ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent
                  FLAGS_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
-                 mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), FLAGS_OFF, sfp_store(1)]),
+                 mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), FLAGS_RESET,
+                 *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0), FLAGS_OFF, sfp_store(1)]),
   # sqrt(x) = x / sqrt(x): 1/sqrt(x) by the bit trick (0x5F3759DF - bits / 2, within 3.5%) and three Newton steps
   # y *= 1.5 - x/2 y^2 (two leave 5e-6, 80 ulps), then times x (x + 0 first, so -0 is 0), within 3 ulps. 0, inf and NaN
   # give themselves, a negative number NaN
@@ -274,9 +280,10 @@ INT32 = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne"
 CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # SFPU programs of a cast
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
-  "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
-                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 2, 4, True), *nans(1, 3, 4, True), ins("SFPOR", vd=2, vc=3),
+                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPNOT", vd=2, vc=2), ins("SFPAND", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 3, 4, True), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
+                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPOR", vd=1, vc=3), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
   "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
                       ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
