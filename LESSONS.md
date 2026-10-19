@@ -185,6 +185,14 @@ append a correction.
     into a view of it in place (`prims.copy_to`). That went to the CPU, which copied into a CPU tensor of its own and
     left ours alone, so a loss's padded labels were all -100 and the loss NaN, with no error anywhere. Write such ops
     out, and know what a fallback does with the tensor it was meant to write. (NOTES: "PyTorch on ferrite")
+30. **Keep what the backward needs.** The forward split each fp32 operand into bf16 parts and dropped them; the backward
+    split the same operands again, and the incoming gradient twice. Keeping the parts with the op, as PyTorch keeps its
+    saved tensors, took a training step from 696 launches to 540 (with lo in one kernel and transposes that cancel,
+    478). (NOTES: "Training")
+31. **Before making a copy faster, ask whether the reader could take the data where it lies.** Grouped-query attention
+    stacked 9 query heads into 3 groups and back: two moves and a copy a block, a third of a SmolLM block's cycles. A
+    view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 179k.
+    (NOTES: "A Llama-family model")
 
 ## Working method
 

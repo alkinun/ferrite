@@ -47,7 +47,7 @@ dispatching at no cost here). Both read each input from DRAM about once.
 Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.2 s; tt-metal builds its firmware when
 the device opens (0.9 s) and each op's kernels the first time (0.6 to 0.8 s). Both cache on disk.
 
-Size: ferrite is about 2,500 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python, not counting
+Size: ferrite is about 2,600 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python, not counting
 tests: tt-metal 540k, LLK 111k (44k of it Blackhole's), TT-NN 935k, UMD 56k, tt-kmd 10k.
 
 On 2026-10-18 (ferrite at bc715ac) it was the other way round for DRAM: ferrite's matmul read 6.9 times its inputs, its

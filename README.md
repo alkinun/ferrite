@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2500 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2600 lines of Python.
 Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
@@ -39,8 +39,8 @@ same model in numpy. SmolLM decodes with a KV cache, each token replayed from a 
     TTSIM=... python3 test/llama.py SmolLM-135M "The meaning of life is" 6
     The meaning of life is a question that has been asked
 
-Training: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSONS.md a character at a time, every
-step's loss and gradients the same as PyTorch's for the same weights (`test/train.py 300`).
+Training: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSONS.md a character at a time, each step
+replayed from a recording, its loss and gradients the same as PyTorch's for the same weights (`test/train.py 300`).
 
 Frameworks, outside ferrite: tinygrad's tensor graph runs on it as the FERRITE device, so tinygrad's own scripts run
 unchanged (its `examples/transformer.py` learns two-digit addition to 99.99% on the simulator); and PyTorch's, as a
