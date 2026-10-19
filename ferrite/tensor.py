@@ -259,13 +259,7 @@ class Tensor:
       reads = collections.Counter(id(s) for t in lazy for s in t.srcs)
       for x in [t.srcs[0] for t in lazy if t.op in COMBINE]:
         if reads[id(x)] > 1 and all(t.op not in COMBINE and t.op != "matmul" for t in _lazy(x, set())): x.realize()
-    while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): a value two of its ops read goes first, the
-      lazy = list(_lazy(self, set()))  # biggest that fits (the residual stream an RMSNorm reads twice), else down the
-      readers = collections.Counter(id(s) for t in lazy for s in {id(s): s for s in t.srcs}.values())  # heaviest branch,
-      shared = [t for t in lazy[1:] if readers[id(t)] > 1 and _ops(t, set()) <= 15]  # the first part that fits, so what is
-      t = max(shared, key=lambda s: _ops(s, set())) if shared else self  # on top (a layer norm, say) stays whole
-      while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
-      t.realize()
+    _fit(self)
     inputs = []
     e, dtype = _tree(self, inputs)
     key = (e, tuple(u.shape for u in inputs), dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs))
@@ -525,6 +519,17 @@ def _backward(t, g):
     return ((Tensor.of(t.rt, [[i] for i in range(x.rows)], "int32") == args[0]).bfloat16().matmul(g, x.dtype),)
   raise NotImplementedError(f"no backward for {op}")
 
+def _fit(t):
+  """Parts of t's tree computed first until the rest fits one kernel (SEM_L1 counts 15 ops): a value two of its ops read
+  goes first, the biggest that fits (the residual stream an RMSNorm reads twice), else down the heaviest branch the
+  first part that fits, so what is on top (a layer norm, say) stays whole."""
+  while _ops(t, set()) > 15:
+    lazy = list(_lazy(t, set()))
+    readers = collections.Counter(id(s) for u in lazy for s in {id(s): s for s in u.srcs}.values())
+    shared = [u for u in lazy[1:] if readers[id(u)] > 1 and _ops(u, set()) <= 15]
+    u = max(shared, key=lambda s: _ops(s, set())) if shared else t
+    while _ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: _ops(s, set()))
+    u.realize()
 def _terms(t):  # t, a sum not yet computed of computed tensors its shape, as those tensors; else None
   if t.op != "add" or any(s.shape != t.shape or s.dtype != t.dtype for s in t.srcs): return None
   terms = [[s] if s.op is None else _terms(s) for s in t.srcs]

@@ -888,10 +888,7 @@ def test_fuzz(chip, monkeypatch):
   realize = Tensor.realize
   def checked_realize(t):
     if t.op in (None, "T", "move"): return realize(t)  # data movement is test_movement's
-    while tensor._ops(t, set()) > 15:  # too big for one kernel: its parts first, as realize does, each checked too
-      u = t
-      while tensor._ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: tensor._ops(s, set()))
-      u.realize()
+    tensor._fit(t)  # too big for one kernel: its parts first, as realize does, each checked too
     inputs = []
     e, _ = tensor._tree(t, inputs)
     xs = [value(u) for u in inputs]
@@ -931,7 +928,7 @@ def test_fuzz(chip, monkeypatch):
       bb = b if rng.random() < 0.5 else 1
       return (leaf((b, r, k)) @ (leaf((bb, c, k)).T if rng.random() < 0.3 else leaf((bb, k, c)))) * (1 / k)  # B read transposed, or not
     return leaf(shape)
-  for n in range(30):  # sizes past 4 tiles make part-blocks of batched matmuls (unbatched ones share by multicast); every other tree is fp32
+  for n in range(int(os.environ.get("FUZZ", 30))):  # sizes past 4 tiles make part-blocks of batched matmuls (unbatched ones share by multicast); every other tree is fp32
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
     dtype = ("bf16", "fp32")[n % 2]
     gen(shape, 4).realize()
