@@ -292,6 +292,7 @@ class Runtime:
     buf, bus = chip.pci.alloc(64 + ring + 16 * TIMES)
     self.status, self.ring, self.times = buf[:64], buf[64:64 + ring], buf[64 + ring:]
     self.names = [""] * TIMES  # each of the last TIMES launches' name, for profile
+    self.numbers = {}  # (value, dtype) -> a tensor of that one number, uploaded once (tensor.py's constants)
     worker, dispatcher = compile_rv32(FIRMWARE), compile_rv32(DISPATCHER)
     assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
     (dx, dy), n = self.dispatcher, len(self.cores)

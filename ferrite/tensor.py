@@ -2,7 +2,7 @@
 # in bank i % 8). Their ops build a tree that realizing turns into kernels (compiler.py): as much of it as one kernel
 # holds fused into one launch, and what one kernel cannot hold (a matmul's operands, a move, a cast, a reduction of
 # another shape) realized first.
-import array, math
+import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, fused_kernel, gather_kernel, move_kernel, shared_k, tile_bytes, transpose_kernel
 
@@ -214,9 +214,10 @@ class Tensor:
     if any(t.op in COMBINE for t in _lazy(self, set())):  # rows are swept in passes, each recomputing what it reads:
       for t in [t for t in _lazy(self, set()) if t.op == "matmul" and t.srcs[0].cols > 256]: t.realize()  # long matmuls once
       # and an elementwise value that a reduction and something else both read: once, on as many workers as it has tiles
-      reads = [id(s) for t in _lazy(self, set()) for s in t.srcs]
-      for x in [t.srcs[0] for t in _lazy(self, set()) if t.op in COMBINE]:
-        if reads.count(id(x)) > 1 and all(t.op not in COMBINE and t.op != "matmul" for t in _lazy(x, set())): x.realize()
+      lazy = list(_lazy(self, set()))
+      reads = collections.Counter(id(s) for t in lazy for s in t.srcs)
+      for x in [t.srcs[0] for t in lazy if t.op in COMBINE]:
+        if reads[id(x)] > 1 and all(t.op not in COMBINE and t.op != "matmul" for t in _lazy(x, set())): x.realize()
     while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): down the heaviest branch, the first part
       t = self                    # that fits goes first, on its own, so what is on top (a layer norm, say) stays whole
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
@@ -224,12 +225,12 @@ class Tensor:
     inputs = []
     e, dtype = _tree(self, inputs)
     key = (e, tuple(u.shape for u in inputs), dtype, self.dtype, self.rt.grid)
-    kernel, units = _cached(key, lambda: fused_kernel(*key))
+    kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
     args = [v for t in [self] + inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
-    return self._run(kernel, *args, units=units, name=_name(e))
+    return self._run(kernel, *args, units=units, name=name)
   def assign(self, x):
     """x's value in this tensor, which stays the same object, as an optimizer updates a weight: x is computed into DRAM
     of its own, which this tensor takes (its old DRAM going back), and x becomes a view of it."""
@@ -254,11 +255,15 @@ class Tensor:
   def _unary(self, op):  # int32 goes through fp32, but for relu (a max with 0)
     if self.dtype == "int32" and op != "relu": return self.float()._unary(op)
     return Tensor(self.rt, self.rows, self.cols, op, (self,), self.batch, self.dtype)
+  def _number(self, v, dtype):  # a 1 x 1 tensor of v, uploaded once a runtime: a number in an expression costs no PCIe write
+    key = (v, dtype)
+    if key not in self.rt.numbers: self.rt.numbers[key] = Tensor.full(self.rt, 1, 1, v, dtype)
+    return self.rt.numbers[key]
   def _binop(self, op, x, reverse=False):
     """numpy's broadcasting: shapes match, or one side has 1 where the other does not. A number is a 1 x 1 tensor of
     this one's dtype (fp32 for a float with int32). Different dtypes meet in fp32, and so does int32 for what it does
     not do itself (mul: exact below 2^24)."""
-    if not isinstance(x, Tensor): x = Tensor.full(self.rt, 1, 1, x, "fp32" if self.dtype == "int32" and isinstance(x, float) else self.dtype)
+    if not isinstance(x, Tensor): x = self._number(x, "fp32" if self.dtype == "int32" and isinstance(x, float) else self.dtype)
     a, b = (x, self) if reverse else (self, x)
     if a.dtype != b.dtype or (a.dtype == "int32" and op not in INT32): a, b = a.float(), b.float()
     assert all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)), f"cannot broadcast {a.shape} with {b.shape}"
@@ -545,8 +550,10 @@ def _expr(t, shape, inputs, kernel):
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
 def _input(t, inputs):  # a realized tensor's number among a kernel's inputs, added if new
-  if all(t is not u for u in inputs): inputs.append(t)
-  return next(i for i, u in enumerate(inputs) if u is t)
+  for i, u in enumerate(inputs):
+    if u is t: return i
+  inputs.append(t)
+  return len(inputs) - 1
 
 # (expression, input shapes, dtype, result dtype, workers' grid) -> (image, units); a move or gather's name and dtype
 # (a transpose's: its shape) -> image
