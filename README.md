@@ -46,7 +46,8 @@ Training: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSON
 replayed from a recording, its loss and gradients the same as PyTorch's for the same weights (`test/train.py 300`).
 
 Frameworks, outside ferrite: tinygrad's tensor graph runs on it as the FERRITE device, so tinygrad's own scripts run
-unchanged (its `examples/transformer.py` learns two-digit addition to 99.99% on the simulator); and PyTorch's, as a
+unchanged (its `examples/transformer.py` learns two-digit addition to 99.99% on the simulator) and `TinyJit` replays a
+call's launches as ferrite's `jit` does; and PyTorch's, as a
 `FerriteTensor` whose aten ops run on the chip, so eager PyTorch, its autograd and its optimizers do, and Hugging Face
 transformers' models run, generate and fine-tune unchanged.
 
