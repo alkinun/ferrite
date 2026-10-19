@@ -76,6 +76,24 @@ about what TT's 1.87M cycles of control come to (1.39 ms); in bfp8 0.75 ms, 1.85
 gate and up in bfp4, as TT's performance mode keeps them (rounded to nearest, as TT's host conversion rounds; NOTES,
 "Weights in BFP8 and BFP4"), it reads what TT reads, 0.60 ms, 2.3 times faster, and writes the same tokens.
 
+### Where DRAM decides: SmolLM2-1.7B
+
+SmolLM2-1.7B (24 blocks 2048 wide, 32 heads, an MLP of 8192, `HuggingFaceTB/SmolLM2-1.7B`), which ferrite also runs
+unchanged: all three write the same tokens, " to be happy.".
+
+| | ferrite, bf16 weights | ferrite, bfp4 MLP (TT's layout) | TT `tt_transformers` |
+|---|---|---|---|
+| a decode token, replayed | **226k cycles** | **442k** | 2,129k (performance) |
+| the prompt's prefill, 5 tokens | **261k** | **469k** | 2,275k |
+| weights read a decode token | 3,423 MB | 1,416 MB | 1,416 MB (performance), 2,196 MB (accuracy) |
+| ... that at a p150's 512 GB/s | 6.68 ms | 2.76 ms | 2.76 ms, 4.29 ms |
+
+The cycles stop deciding it here. TT's 2.13M cycles of control come to 1.58 ms a token, under its weights' 2.76 ms, so
+on a card both would wait on DRAM, reading the same bytes in TT's layout: a 1.7B model's speed is how close each comes
+to the card's bandwidth, which only a card can measure. (Block floats cost ferrite twice the cycles of bf16 here: two
+reads a tile, its exponents and its values, and at 1.7B the weights' reads are most of a token's control.) ferrite's
+lead is in the work around the math, so it is largest where that work is: small models, a few users, and the host.
+
 ## How it was counted
 
 - **Cycles**: the chip clocks the host asked ttsim for (`libttsim_clock`), averaged over three runs of the op queued
