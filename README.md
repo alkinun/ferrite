@@ -5,70 +5,75 @@ Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no 
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
 
-It runs GPT-2 small with the real weights, so far on the simulator, checking every word against the same model in
-numpy (which matches Hugging Face's GPT-2):
+```python
+from ferrite import pci
+from ferrite.chip import Chip
+from ferrite.runtime import Runtime
+from ferrite.tensor import Tensor
 
-    TTSIM=/path/to/libttsim.so python3 test/gpt2.py model.safetensors "The meaning of life is" 8
-    The meaning of life is not the same as the meaning of death
-
-Each word's scores stay within about 1.5 of numpy's (they span about 100); where numpy's top two are closer than that,
-bf16 can pick the other one. A Llama-family model too, SmolLM-135M (grouped-query attention, RoPE, SwiGLU, a KV cache):
-
-    TTSIM=/path/to/libttsim.so python3 test/llama.py SmolLM-135M "The meaning of life is" 6
-    The meaning of life is a question that has been asked
-
-And it trains: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSONS.md a character at a time,
-each step's loss and gradients PyTorch's for the same weights, its loss falling as PyTorch's does:
-
-    TTSIM=/path/to/libttsim.so python3 test/train.py 300
-    every step: loss within 1e-04 of PyTorch's on the same weights, gradients within 1e-02
-    mean loss over 50 steps: 3.40 -> 3.12, PyTorch on its own 3.41 -> 3.07
-
-tinygrad runs on it too: ferrite is a tinygrad device, FERRITE, that takes tinygrad's tensor graph where tinygrad
-would schedule its own kernels and runs it on the chip. tinygrad's own scripts run unchanged: its transformer example
-learns two-digit addition on ttsim to 99.99% on its test set (10 rounds of 50 steps, about 7 hours):
-
-    TTSIM=/path/to/libttsim.so PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
-
-And PyTorch: a `FerriteTensor` is a torch.Tensor whose ops run on the chip, so eager PyTorch, its autograd and its
-optimizers do. Hugging Face transformers' own SmolLM-135M runs unchanged, and writes what PyTorch on the CPU writes:
-
-    from adapters.torch_ferrite import ferrite
-    model = ferrite(AutoModelForCausalLM.from_pretrained("SmolLM-135M"))
-    model.generate(ferrite(ids), max_new_tokens=6)    # The meaning of life is a question that has been asked
-
-## What is there
-
-- `ferrite/pci.py`, `ferrite/chip.py`: the card over PCIe (TLB windows onto the NoC, the ARC management core, DMA into
-  host memory), or ttsim's simulated card behind the same interface.
-- `ferrite/runtime.py`: firmware for each core, kernels that stay loaded, and a command ring in host memory that one core
-  reads by itself, so a launch costs the host one PCIe write.
-- `ferrite/tensor.py`: lazy tensors (any shape, batched, bf16, fp32 or int32, and bfp8 weights) whose expressions become
-  one fused kernel each: elementwise ops (tinygrad's primitives and what it builds from them: exp, log, sin, cos, sqrt,
-  comparisons, where), matmul, sums and maxes along any axis (so softmax and layer norm are one launch), transpose,
-  views, reshape, permute, expand, pad and slicing at any offset (a chain of them one copy), convolution and max
-  pooling, and autograd (tinygrad's rules) for all of it but slices with a step other than 1 or -1.
-- `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
-  Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
-- `ferrite/bh.py`: every Blackhole fact the code uses, as data. `NOTES.md` says where each comes from.
-- `adapters/tinygrad_ferrite.py`, `adapters/torch_ferrite.py`: tinygrad and PyTorch on ferrite, outside it (with
-  `adapters/views.py`, tensors of any rank as views of ferrite's).
+chip = Chip(pci.open_device())                       # the card, or the simulator when TTSIM is set
+rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])  # firmware on every Tensix core, one of them dispatching
+x = Tensor.of(rt, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+w = Tensor.of(rt, [[0.5, -1.0], [2.0, 0.25], [-1.0, 1.0]])
+print((x @ w).relu().softmax(-1).tolist())           # lazy: one fused kernel, launched when the value is read
+```
 
 ## Running
 
-Needs Python 3, clang and lld, and Tenstorrent's simulator, ttsim, built for Blackhole (`libttsim.so`). The tests also
-need numpy; the GPT-2 demo needs tiktoken and Hugging Face's `openai-community/gpt2` `model.safetensors`, the SmolLM
-demo its `HuggingFaceTB/SmolLM-135M` folder, and training PyTorch, as its reference.
+Needs Python 3, clang and lld, and Tenstorrent's simulator, ttsim, built for Blackhole (`libttsim.so`); the tests also
+need numpy. Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (as root). It has not met one yet:
+`NOTES.md` has the plan for the first day on a p150.
 
     TTSIM=/path/to/libttsim.so python3 -m ferrite.hello      # every worker computes fib(30); one more dispatches
     TTSIM=/path/to/libttsim.so python3 -m pytest test        # every step, on the simulator
-    TTSIM=/path/to/libttsim.so python3 -m ferrite.bench      # a matmul's speed and DRAM traffic
+    TTSIM=/path/to/libttsim.so python3 -m ferrite.bench      # a matmul's speed and DRAM reads
 
-Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (as root). It has not met one yet: `NOTES.md` has the
-bring-up plan for the first day on a p150.
+## What runs
 
-## Where it is going
+GPT-2 small and SmolLM-135M with their real weights (Hugging Face's `model.safetensors`), each word checked against the
+same model in numpy. SmolLM decodes with a KV cache, each token replayed from a recording, so a token costs the host
+0.1 ms. Both can keep their weight matrices in bfp8 (add `bfp8`), at about half the bytes.
 
-`ROADMAP.md`: from here to a general compiler, silicon, frameworks, many cards, and a chip of our own.
-`LESSONS.md`: what we have learned on the way.
+    TTSIM=... python3 test/gpt2.py model.safetensors "The meaning of life is" 8
+    The meaning of life is not the same as the meaning of death
+    TTSIM=... python3 test/llama.py SmolLM-135M "The meaning of life is" 6
+    The meaning of life is a question that has been asked
 
+Training: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSONS.md a character at a time, every
+step's loss and gradients the same as PyTorch's for the same weights (`test/train.py 300`).
+
+Frameworks, outside ferrite: tinygrad's tensor graph runs on it as the FERRITE device, so tinygrad's own scripts run
+unchanged (its `examples/transformer.py` learns two-digit addition to 99.99% on the simulator); and PyTorch's, as a
+`FerriteTensor` whose aten ops run on the chip, so eager PyTorch, its autograd and its optimizers do, and Hugging Face
+transformers' models run, generate and fine-tune unchanged.
+
+    TTSIM=... PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
+
+    from adapters.torch_ferrite import ferrite
+    model = ferrite(AutoModelForCausalLM.from_pretrained("SmolLM-135M"))
+    model.generate(ferrite(ids), max_new_tokens=6)
+
+## Speed
+
+Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 3 to 18 times
+fewer cycles of control work, reading as little DRAM. The simulator times only that control work, not the math or the
+DRAM, so how fast either is on a real card waits for one; `COMPARE.md` has the numbers and what carries over.
+
+## Code
+
+- `ferrite/pci.py`, `ferrite/chip.py`: the card over PCIe (TLB windows onto the NoC, the ARC management core, DMA into
+  host memory), or ttsim's simulated card behind the same interface.
+- `ferrite/runtime.py`: firmware for every core, kernels that stay loaded, and a command ring in host memory that one
+  core reads by itself, so a launch costs the host one PCIe write, and a recorded block of launches one too.
+- `ferrite/tensor.py`: lazy tensors of any shape, bf16, fp32, int32 or bfp8, with numpy's broadcasting and tinygrad's
+  autograd. A tree of ops becomes one fused kernel; `jit` records a function's launches and replays them.
+- `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
+  Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
+- `ferrite/bh.py`: every Blackhole fact the code uses, as data.
+- `adapters/`: tinygrad and PyTorch on ferrite (and `views.py`, tensors of any rank as views of ferrite's).
+- `test/`: every step on the simulator (`test_sim.py`), and the models.
+
+## Docs
+
+`NOTES.md`: how it works, and what is still unknown. `COMPARE.md`: ferrite against TT-NN. `ROADMAP.md`: where it goes,
+from here to silicon, many cards and a chip of our own. `LESSONS.md`: what the work has taught us.

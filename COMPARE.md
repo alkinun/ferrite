@@ -1,95 +1,58 @@
-# ferrite and tt-metal on ttsim
+# ferrite and TT-NN
 
 The same ops through ferrite and through Tenstorrent's own stack (tt-metal with TT-NN), on the same simulator, counted
-the same way. ttsim runs each Tensix instruction at once and its NoC and DRAM answer at once, so its cycles are not
-silicon time; what it does count fairly is what the RISC-V cores do and how many requests go over the NoC. Measured
-2026-10-18: ferrite at bc715ac, tt-metal at 9f98dee9 (2026-10-17) with TT-NN in C++, ttsim v1.11.5 (the version that
-tt-metal names in `tt_metal/ttsim-version`), Blackhole.
+the same way. Measured 2026-10-19: ferrite at aa08e0f, tt-metal at 9f98dee9 (2026-10-17) with TT-NN in C++, ttsim
+v1.11.5 (the version tt-metal names in `tt_metal/ttsim-version`), Blackhole. bf16 in tile layout in DRAM, matmuls at
+full precision (HiFi4) in both; each op is one launch in ferrite and one program in TT-NN.
+
+| op | ferrite | TT-NN, fast dispatch | TT-NN, slow dispatch | DRAM reads, ferrite | DRAM reads, TT-NN |
+|---|---|---|---|---|---|
+| matmul 512x768 @ 768x3072 | **1.5k cycles** | 7.8k | 3.3k | 1.00x the inputs | 1.00x |
+| matmul 32x768 @ 768x3072 (a token) | **0.58k** | 6.9k | 1.8k | 1.00x | 1.00x |
+| the same, weights in bfp8 | **1.5k** | 6.9k | 1.8k | 0.53x the bf16 bytes | 0.53x |
+| softmax 64x768, along rows | **1.4k** | 4.5k | 3.7k | **1.00x** | 1.50x |
+| layer norm 64x768, along rows | **0.44k** | 2.4k | 1.4k | **1.08x** | 1.17x |
+| add 32x32 (one tile: launch cost) | **0.29k** | 5.3k | 0.8k | 1.00x | 1.00x |
+
+ferrite does each op in 3 to 18 times fewer cycles than TT-NN with fast dispatch, which dispatches from cores on the
+chip as ferrite does, and in 1.2 to 3 times fewer than TT-NN's kernels alone (slow dispatch, where the host does the
+dispatching at no cost here). Both read each input from DRAM about once.
 
 ## How it was counted
 
 - **Cycles**: the chip clocks the host asked ttsim for (`libttsim_clock`), averaged over three runs of the op queued
-  back to back after a cached one. ferrite counts them itself (`pci.Sim`, which runs ttsim 10 clocks a poll; this
-  table first had ferrite's numbers polled every 1000 and rounded up); for tt-metal a shim in front of `libttsim.so`
-  adds them up. tt-metal's driver (UMD) clocks once each time it reads the device, so in both stacks
-  the host's own work costs nothing and a cycle is device work.
-- **Dispatch**: ferrite has one way, its dispatcher core. tt-metal has two: fast dispatch, where cores on the chip
-  dispatch as ferrite's does, and slow dispatch, where the host writes every kernel, argument and go itself (at no
-  cost in cycles here), which ttsim recommends. Fast dispatch is the like-for-like number; slow dispatch is the
-  kernels alone.
-- **DRAM reads**: ttsim's count of answered read requests per core per NoC (`NIU_MST_RD_RESP_RECEIVED`), summed
-  over the worker cores before and after. ferrite reads whole tiles, and TT-NN's matmul makes exactly one request per
-  input tile, so a request is a 2 KiB tile.
-- **Cores**: ferrite uses 119 workers and a dispatcher of ttsim's 120 Tensix cores; TT-NN uses 11x10 = 110 workers.
-- bf16, tile layout, in DRAM. Each op made one program in TT-NN (counted from its program cache) and one launch in
-  ferrite.
+  back to back after a cached one. ferrite counts them itself (`pci.Sim`, 10 clocks a poll); for tt-metal, a shim in
+  front of `libttsim.so` adds them up. tt-metal's driver (UMD) clocks once each time it reads the device, so in both
+  the host's own work costs nothing and a cycle is the chip's.
+- **DRAM reads**: ttsim's count of answered read requests (`NIU_MST_RD_RESP_RECEIVED`), summed over the workers. Both
+  read whole 2 KiB tiles; a bfp8 tile is 1,088 bytes, one request in TT-NN and two in ferrite (its exponents, its
+  values).
+- **Cores**: ferrite uses 119 workers and a dispatcher of ttsim's 120 Tensix cores; TT-NN 11x10 = 110 workers.
 
-## Results
+## What carries over to a card
 
-| op | ferrite | TT-NN, fast dispatch | TT-NN, slow dispatch | DRAM reads, ferrite | DRAM reads, TT-NN |
-|---|---|---|---|---|---|
-| matmul 512x768 @ 768x3072 | 17.0k cycles (HiFi4) | 7.9k (HiFi2, its default); 7.8k (HiFi4) | 3.4k; 3.3k | 18,432 tiles, 6.86x the inputs | 2,688 tiles, 1.00x |
-| softmax 64x768, along rows | 1.4k | 4.5k | 3.7k | 144 tiles, 3.00x | 72 tiles, 1.50x |
-| layer norm 64x768, along rows | 2.5k | 2.4k | 1.4k | 288 tiles, 6.00x | 56 tiles, 1.17x |
-| add 32x32 (one tile: launch cost) | 0.4k | 5.3k | 0.8k | 2 tiles | 2 tiles |
+- **DRAM traffic does.** A byte read from DRAM is a byte on the card. On a card big matmuls and decode wait on DRAM,
+  and there the two read the same bytes.
+- **Dispatch does, in kind.** TT-NN with fast dispatch spends about 4.5k cycles of RISC-V work on an op (5.3k against
+  0.8k for one tile); ferrite's whole one-tile op is 0.29k: arguments and go multicast to every worker, completion
+  written to host memory. A card adds NoC latency to both.
+- **Math time does not.** ttsim runs a queued Tensix instruction at no cost and counts a clock only while every pipe of
+  a tile waits, one RISC-V instruction each (NOTES, "How ttsim counts"). So these cycles are each stack's control work
+  around the math, not the math: HiFi2 costs what HiFi4 does here, though on a card it is half the multiplies. TT-NN
+  multiplies at HiFi2 unless told; ferrite at HiFi4 unless told (`tensor.FIDELITY`).
+- **The host's work is not counted here,** and on a card it counts. ferrite issuing a GPT-2 token op by op took the
+  host 6.5 ms, while the card should need about 0.5 ms; replayed from a recording (`tensor.jit`), a SmolLM-135M token
+  takes the host 0.1 ms. TT-NN's traces replay too; they were not measured here.
 
-Compiling, on this machine (host seconds, not cycles): ferrite builds a kernel with clang and lld in about 0.2 s.
-tt-metal builds its firmware when the device opens (0.9 s) and each op's kernels the first time (matmul 0.7 s,
-softmax 0.6 s, layer norm 0.8 s); its cache held 115 MB after these ops. Both cache on disk, and a cached run
-compiles nothing.
+Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.2 s; tt-metal builds its firmware when
+the device opens (0.9 s) and each op's kernels the first time (0.6 to 0.8 s). Both cache on disk.
 
-Size: ferrite is about 2,200 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python not counting
+Size: ferrite is about 2,500 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python, not counting
 tests: tt-metal 540k, LLK 111k (44k of it Blackhole's), TT-NN 935k, UMD 56k, tt-kmd 10k.
 
-Since then: ferrite's matmuls share their tiles between workers by multicast (NOTES, "Tiles shared between workers"):
-the matmul above reads 2,688 tiles, 1.00x its inputs, as TT-NN's does, each worker reading an equal share, in 1.8k
-cycles (NOTES, "Cutting the critical path"). A line's inputs stay in L1 between passes (NOTES, "Lines in passes"): the
-softmax reads 48 tiles, 1.00x, in 1.4k cycles, the layer norm 54, 1.12x (its constants, once a line), in 0.42k. The
-one-tile add is 0.27k (a queued launch alone, 220 cycles: NOTES, "Launch cost"). On ttsim these are RISC-V
-instructions on the critical path, not silicon time.
-
-A token's matmul, measured 2026-10-19 the same way (ferrite at ccf2610; the same tt-metal and ttsim): 32x768 @
-768x3072, one tile row, at HiFi4, with bf16 weights and with bfp8 (TT-NN's `BFLOAT8_B`, ferrite's `cast("bfp8")`).
-
-| op | ferrite | TT-NN, fast dispatch | TT-NN, slow dispatch | DRAM reads, both |
-|---|---|---|---|---|
-| matmul 32x768 @ 768x3072, bf16 weights | 0.58k cycles | 6.9k | 1.8k | 2,328 tiles, 1.00x |
-| the same, bfp8 weights | 1.50k | 6.9k | 1.8k | 2,328 tiles, 0.53x the bytes |
-
-Both read A's row once and share it (TT-NN multicasts it from one core, ferrite from the first grid row: NOTES, "A
-token's row, shared") and each weight tile once; TT-NN reads a bfp8 tile in one request, ferrite in two, its
-exponents and its values, the same 1,088 bytes. ferrite's bfp8 costs more ttsim cycles than its bf16 for that second
-request a tile (NOTES, "Weights in BFP8"); on silicon both stacks should wait on the same bytes from DRAM.
-
-## What carries over to silicon
-
-- **DRAM traffic does.** A byte read from DRAM is a byte on the card too. At bc715ac TT-NN's matmul read every input
-  tile once (one core reads it, then multicasts it to the others that need it) where each ferrite core read its own
-  copies, 6.9x the inputs; its softmax and layer norm read each row about once (1.5x and 1.17x) where ferrite's passes
-  read x again (3x and 6x). On silicon, where DRAM bandwidth bounds big matmuls and decode, that was TT-NN's largest
-  lead; ferrite has closed it since (1.00x, 1.00x, 1.12x).
-- **Launch work does, in kind.** With dispatch on the chip, TT-NN spends about 4.5k cycles of RISC-V work an op (fast
-  against slow dispatch: 5.3k against 0.8k for one tile, 7.9k against 3.4k for the matmul). ferrite's whole one-tile
-  op, launch included, was 0.4k (0.27k since): arguments and go multicast to every worker, completion written to host
-  memory. Silicon adds NoC latency to both. tt-metal's traces replay commands from DRAM instead of the host; they were
-  not measured here.
-- **Math time does not.** ttsim runs a queued Tensix instruction at no cost, however it got into the FIFO (pushed,
-  replayed or expanded from a MOP), and counts a clock only while a tile's pipes all wait, one RISC-V instruction each
-  (NOTES, "How ttsim counts"). So HiFi2 costs what HiFi4 does (3.4k against 3.3k) though HiFi4 is twice the MVMUL
-  passes, and the gap between the two matmuls is in their RISC-V code: profiled, ferrite's idle clocks are the cores
-  waiting on each other (the unpacker polling BRISC's fetches, BRISC waiting for flags and reports, the packer for
-  BRISC to send), not the math thread, which is already ahead. On the card, MVMULs take their real time, and the size
-  of either stack's overhead against them waits for silicon.
-- **Defaults differ.** TT-NN multiplies bf16 at HiFi2 with the packer accumulating in L1; ferrite at HiFi4, full
-  precision, unless told (`matmul(fidelity=2)`, or `tensor.FIDELITY = 2`, is HiFi2). A fair silicon comparison runs
-  both at the same fidelity.
-
-So at bc715ac, on ttsim: ferrite launched about 13x cheaper and compiled about 3x faster, in about 1/700 of the code;
-TT-NN read DRAM 2 to 7x less and spent far fewer RISC-V instructions waiting between its cores. Of ferrite's "Next for
-the compiler" items, these numbers ranked first multicast matmuls (3) and rows kept in L1 between passes (4), both
-done since; the MOP expander (1) turned out not to be what the gap was. Since then ferrite reads as little DRAM as
-TT-NN, and its matmul takes 1.8k cycles to TT-NN's 3.4k with slow dispatch and 7.9k with fast: ttsim's measure, the
-RISC-V work between the cores, not silicon time.
+On 2026-10-18 (ferrite at bc715ac) it was the other way round for DRAM: ferrite's matmul read 6.9 times its inputs, its
+softmax 3 and its layer norm 6, and the matmul took 17.0k cycles. Sharing tiles between workers by multicast and keeping
+a line's inputs in L1 between passes closed that (NOTES, "Tiles shared between workers", "Lines in passes").
 
 ## Reproducing
 
@@ -104,11 +67,9 @@ for CMake. Then, from `~/Desktop/tt`, with a toolchain file for the system's cla
 
 The shim (`sim/shim.c`, built to `sim/libttsim.so` beside a copy of `blackhole_140_arch.yaml` as
 `soc_descriptor.yaml`) and both measurement programs (`cmp/ttnn_ops.cpp`, `cmp/ferrite_ops.py`) are in
-`~/Desktop/tt`, outside this repository:
+`~/Desktop/tt`, outside this repository. Run them one at a time: the shim counts clocks in one file in `/dev/shm`, so
+two runs at once each count both.
 
     TTSIM=/path/to/libttsim.so python3 cmp/ferrite_ops.py
     TT_METAL_RUNTIME_ROOT=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so TT_METAL_DISABLE_SFPLOADMACRO=1 cmp/build/ttnn_ops
     TT_METAL_SLOW_DISPATCH_MODE=1 ... cmp/build/ttnn_ops    # the same, slow dispatch
-
-One at a time: the shim's count of clocks is one file in `/dev/shm`, so two runs at once each count both (run together,
-the matmul read 11.2k cycles for both modes).
