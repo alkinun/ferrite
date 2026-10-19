@@ -259,8 +259,11 @@ class Tensor:
       reads = collections.Counter(id(s) for t in lazy for s in t.srcs)
       for x in [t.srcs[0] for t in lazy if t.op in COMBINE]:
         if reads[id(x)] > 1 and all(t.op not in COMBINE and t.op != "matmul" for t in _lazy(x, set())): x.realize()
-    while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): down the heaviest branch, the first part
-      t = self                    # that fits goes first, on its own, so what is on top (a layer norm, say) stays whole
+    while _ops(self, set()) > 15:  # too big for one kernel (SEM_L1 counts 15): a value two of its ops read goes first, the
+      lazy = list(_lazy(self, set()))  # biggest that fits (the residual stream an RMSNorm reads twice), else down the
+      readers = collections.Counter(id(s) for t in lazy for s in {id(s): s for s in t.srcs}.values())  # heaviest branch,
+      shared = [t for t in lazy[1:] if readers[id(t)] > 1 and _ops(t, set()) <= 15]  # the first part that fits, so what is
+      t = max(shared, key=lambda s: _ops(s, set())) if shared else self  # on top (a layer norm, say) stays whole
       while _ops(t, set()) > 15: t = max((s for s in t.srcs if s.op), key=lambda s: _ops(s, set()))
       t.realize()
     inputs = []
