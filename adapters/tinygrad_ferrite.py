@@ -14,7 +14,7 @@ import tinygrad, tinygrad.tensor
 from tinygrad import Tensor, dtypes
 from tinygrad.dtype import _to_np_dtype
 from tinygrad.device import Allocator, BufferStorage, Compiled, Device
-from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, graph_rewrite
+from tinygrad.uop.ops import GroupOp, Ops, PatternMatcher, UOp, UPat, graph_rewrite, identity_element
 from tinygrad.schedule.prepare import resolve_function
 from views import View, Value, broadcast, common_groups, download, fold, grouping, materialize, merge, operand, reduce, spread, upload
 from ferrite import tensor  # after views, which puts ferrite on the path
@@ -61,6 +61,7 @@ BINARY = {Ops.ADD: lambda a, b: a + b, Ops.SUB: lambda a, b: a - b, Ops.MUL: lam
           Ops.CMPEQ: lambda a, b: a.eq(b) if chip(a) else b.eq(a), Ops.FDIV: lambda a, b: a * b.reciprocal() if chip(b) else a / b,
           Ops.AND: lambda a, b: a * b, Ops.OR: lambda a, b: a.maximum(b) if chip(a) else b.maximum(a)}  # AND and OR of bools only
 ELEMENTWISE = {*UNARY, *BINARY, Ops.WHERE, Ops.CAST}
+EMPTIABLE = GroupOp.Elementwise | GroupOp.Movement | {Ops.REDUCE, Ops.COPY}  # ops whose value can have nothing in it
 
 def spread_to(v, shape):  # an operand of a binary op, numpy's way: on the chip a view, on the host tinygrad's
   if isinstance(v, Tensor): return v.reshape((1,) * (len(shape) - v.ndim) + v.shape).expand(shape)
@@ -120,7 +121,7 @@ class Evaluator:
     up = lambda s, v: to_chip(v, s.dtype) if isinstance(v, Tensor) and constant(v) is None else v  # a weight still on the host goes up
     a, b = (spread_to(up(s, self.read(s, self.values.get(s))), m.shape) for s in m.src)
     if not (isinstance(a, Value) and isinstance(b, Value)): return None
-    if a.view.mask or b.view.mask or a.dtype not in DTYPES or b.dtype not in DTYPES: return None
+    if a.view.mask or b.view.mask or not (dtypes.is_float(a.dtype) and a.dtype in DTYPES and dtypes.is_float(b.dtype) and b.dtype in DTYPES): return None
     shape, summed = m.shape, list(order[:u.arg[1]])
     full = lambda v, k: shape[k] == 1 or v.view.strides[k] != 0
     if not all(full(a, k) and full(b, k) for k in summed): return None
@@ -163,6 +164,9 @@ class Evaluator:
     return Tensor(u.replace(src=tuple(there(s, v) for s, v in zip(u.src, srcs))))
 
   def eval(self, u, defer=True):
+    if u.op in EMPTIABLE and 0 in u.shape: return Tensor.zeros(u.shape, dtype=u.dtype, device="CPU")  # nothing in it: on the host
+    if u.op is Ops.REDUCE and 0 in u.src[0].shape:  # a sum or max of nothing: the identity, on the host
+      return Tensor.full(u.shape, identity_element(u.arg[0], u.dtype), dtype=u.dtype, device="CPU")
     if defer and (u.op is Ops.MUL or u.op is Ops.PERMUTE and self.values.get(u.src[0]) is DEFER) and self.summed(u): return DEFER
     srcs = [self.values.get(s) for s in u.src]
     if u.op is not Ops.REDUCE: srcs = [self.force(s) if v is DEFER else v for s, v in zip(u.src, srcs)]  # a sum may make a matmul of them
@@ -191,6 +195,7 @@ class Evaluator:
     """A FERRITE buffer as a use reshapes it, laid out on the chip in that shape and kept so: bytes from the host go up in
     it, and a tensor kept in a shape its uses do not fold to (tinygrad makes weights flat) moves into it once. Else None."""
     h = u.src[0].buffer._buf
+    if isinstance(h, Part): return None
     if isinstance(x, Tensor) and constant(x) is None and u.dtype in DTYPES and h.value is None:
       h.value = Value(upload(array(x).reshape(u.shape), DTYPES[u.dtype]), View(x.shape), u.dtype)
     elif isinstance(x, Value) and x.whole() and x.t.shape != fold(u.shape):
@@ -208,11 +213,12 @@ class Evaluator:
     """The value of source s: a buffer's contents as they are now (a FERRITE one's chip value or bytes, another device's bytes)."""
     if not (isinstance(v, UOp) and v.op in (Ops.BUFFER, Ops.ALLOC)): return v
     buf = v.buffer
+    if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")
     if on_ferrite(v):
       h = buf.ensure_allocated()._buf
       if h.value is not None: return Value(h.value.t, h.value.view, h.value.dtype)
       if h.bytes is None: return Tensor.zeros(buf.nbytes // v.dtype.itemsize, dtype=v.dtype, device="CPU")  # nothing stored yet
-      if v.dtype in DTYPES and len(h.bytes) <= 32 * v.dtype.itemsize:  # a row of a tile at most (an optimizer's numbers): up as it is
+      if isinstance(h, Holder) and v.dtype in DTYPES and len(h.bytes) <= 32 * v.dtype.itemsize:  # a tile's row at most (an optimizer's numbers): up
         h.value, h.bytes = Value(upload(np.frombuffer(h.bytes, npdtype(v.dtype)), DTYPES[v.dtype]), View(v.shape), v.dtype), None
         return Value(h.value.t, h.value.view, h.value.dtype)
       return cpu(np.frombuffer(h.bytes, npdtype(v.dtype)))  # on the host until a use gives it a shape
@@ -222,7 +228,9 @@ class Evaluator:
     """value into the buffer target (a whole one, perhaps reshaped)."""
     while target.op in (Ops.RESHAPE, Ops.AFTER): target = target.src[0]
     assert target.op in (Ops.BUFFER, Ops.ALLOC), f"a store into {target.op}"
+    if target.buffer.nbytes == 0: return None
     buf = target.buffer.ensure_allocated()
+    if isinstance(buf._buf, Part): raise NotImplementedError("a store into part of a FERRITE buffer")
     n, npd = buf.nbytes // target.dtype.itemsize, npdtype(target.dtype)
     data = lambda: download(value) if isinstance(value, Value) else array(value) if isinstance(value, Tensor) else value
     if not on_ferrite(target): buf.copyin(memoryview(flat(data(), n, npd)))
@@ -236,15 +244,25 @@ class Evaluator:
 class Holder:  # a FERRITE buffer's contents: bytes from the host, or a chip value (its own view and dtype)
   def __init__(self): self.bytes, self.value = None, None
 
+def contents(h):  # a holder's bytes as tinygrad lays them out (a bool is a byte, whatever it was computed in), or None
+  if h.value is None: return h.bytes
+  a = download(h.value)
+  return np.ascontiguousarray(a != 0 if h.value.dtype is dtypes.bool else a).tobytes()
+
+class Part:  # part of a FERRITE buffer, as tinygrad views one at an offset: read from the whole each time, never written
+  value = None
+  def __init__(self, whole, offset, size): self.whole, self.offset, self.size = whole, offset, size
+  @property
+  def bytes(self): return None if (c := contents(self.whole)) is None else c[self.offset:self.offset + self.size]
+
 class FerriteAllocator(Allocator):
   lru = False  # a freed buffer would come back to a new one of its size with the old one's contents
   def _alloc(self, size, options): return BufferStorage(Holder())
-  def _copyin(self, dest, src): dest.bytes, dest.value = bytes(src), None
-  def _copyout(self, dest, src):
-    if src.value is not None:  # a bool is 1 or 0 in whatever dtype it was computed in, and a byte here
-      a = download(src.value)
-      dest[:] = np.ascontiguousarray(a != 0 if src.value.dtype is dtypes.bool else a).tobytes()[:len(dest)]
-    else: dest[:] = src.bytes[:len(dest)] if src.bytes is not None else bytes(len(dest))
+  def _copyin(self, dest, src):
+    if isinstance(dest, Part): raise NotImplementedError("a copy into part of a FERRITE buffer")
+    dest.bytes, dest.value = bytes(src), None
+  def _copyout(self, dest, src): dest[:] = c[:len(dest)] if (c := contents(src)) is not None else bytes(len(dest))
+  def _offset(self, buf, size, offset): return Part(buf, offset, size)
 
 class FerriteDevice(Compiled):
   def __init__(self, device): super().__init__(device, FerriteAllocator(self), [], None)

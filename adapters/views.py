@@ -34,7 +34,7 @@ class View:
     return View([self.shape[k] for k in order], [self.strides[k] for k in order], self.offset, self.mask and [self.mask[k] for k in order])
   def expand(self, shape):
     return View(shape, [0 if n != m else s for s, n, m in zip(self.strides, self.shape, shape)], self.offset,
-                self.mask and [(0, m) if n != m else w for w, n, m in zip(self.mask, self.shape, shape)])
+                self.mask and [(0, m if w[0] < w[1] else 0) if n != m else w for w, n, m in zip(self.mask, self.shape, shape)])  # padding stays padding
   def shrink(self, ranges):
     mask = self.mask and [(max(lo - a, 0), min(hi - a, b - a)) for (lo, hi), (a, b) in zip(self.mask, ranges)]
     return View([b - a for a, b in ranges], self.strides, self.offset + sum(a * s for (a, _), s in zip(ranges, self.strides)), mask)
@@ -47,7 +47,7 @@ class View:
     ones merged, or an old one split, and runs only merge where their strides line up."""
     if math.prod(shape) != math.prod(self.shape): return None
     if self.contiguous(): return View(shape)
-    if self.mask is not None and any(w != (0, n) for w, n in zip(self.mask, self.shape) if n > 1): return None
+    if self.mask is not None and any(w != (0, n) for w, n in zip(self.mask, self.shape)): return None  # (an axis of 1 may be all padding)
     old = [(n, s) for n, s in zip(self.shape, self.strides) if n > 1]
     strides, i = [], 0
     for n in shape:
@@ -71,12 +71,13 @@ def merge(view, groups):
   (or it masks more than one axis)."""
   out = []
   for g in groups:
-    axes = [k for k in g if view.shape[k] > 1]
-    masked = [k for k in axes if view.mask and view.mask[k] != (0, view.shape[k])]
-    if len(axes) > 1 and masked: return None
+    axes, size = [k for k in g if view.shape[k] > 1], math.prod(view.shape[k] for k in g)
+    masked = [k for k in g if view.mask and view.mask[k] != (0, view.shape[k])]  # an axis of 1 too: it may be padding
     if any(view.strides[a] != view.strides[b] * view.shape[b] for a, b in zip(axes, axes[1:])): return None
-    lo, hi = view.mask[masked[0]] if masked else (0, math.prod(view.shape[k] for k in g))
-    out.append((math.prod(view.shape[k] for k in g), view.strides[axes[-1]] if axes else 0, lo, hi))
+    if any(view.mask[k][0] >= view.mask[k][1] for k in masked): lo, hi = 0, 0  # an axis of nothing but padding: so is the group
+    elif len(masked) > 1 or masked and len(axes) > 1: return None
+    else: lo, hi = view.mask[masked[0]] if masked else (0, size)
+    out.append((size, view.strides[axes[-1]] if axes else 0, lo, hi))
   return out
 
 def groups3(shape):  # fold's groups of axes
@@ -156,7 +157,7 @@ def operand(v, shape, groups):
   whole = [not v.view.mask or v.view.mask[k] == (0, n) for k, n in enumerate(v.view.shape)]  # nothing padded along it
   small = [1 if s == 0 and n > 1 and whole[k] else n for k, (n, s) in enumerate(zip(v.view.shape, v.view.strides))]
   view = View(small, [0 if n == 1 else s for n, s in zip(small, v.view.strides)], v.view.offset, v.view.mask and
-              [(0, 1) if n == 1 else w for w, n in zip(v.view.mask, small)])
+              [(0, 1) if n < m else w for w, n, m in zip(v.view.mask, small, v.view.shape)])  # a broadcast axis's, now 1
   sizes = lambda shp: [math.prod(shp[k] for k in g) for g in groups]
   if small != list(shape) and all(a in (b, 1) for a, b in zip(sizes(small), sizes(shape))): return materialize(Value(v.t, view, v.dtype), groups)
   return materialize(v, groups)

@@ -1015,6 +1015,11 @@ def test_tinygrad(tinygrad):
   assert ints.argmax(1).tolist() == [0, 0]
   assert (Tensor(a, device="FERRITE") > 0).any(1).tolist() == (a > 0).any(1).tolist()  # bools read back a byte each
   assert (Tensor(np.arange(8, dtype=np.float32), device="FERRITE")[:4] * 2).tolist() == [0, 2, 4, 6]  # a view of part of a tensor
+  assert (ints.T @ ints).tolist() == (np.array(ints.tolist()).T @ np.array(ints.tolist())).tolist()  # summed in fp32, no FPU
+  t = Tensor(a, device="FERRITE").realize()
+  assert t[1, 1:3].numpy().tolist() == a[1, 1:3].tolist()  # a buffer read through tinygrad's view of part of it (_offset)
+  assert t[:, :0].sum(1).numpy().tolist() == [[0] * 40] * 2 and t[:, :0].numpy().shape == (2, 0, 40)  # nothing to compute
+  assert (t[0, 0, :1].pad(((1, 0),))[0:1] * t[0, 0]).numpy().tolist() == [0] * 40  # padding stays padding, broadcast too
   def train(device):
     rng = np.random.default_rng(15)
     l1, l2 = nn.Linear(16, 32), nn.Linear(32, 10)
