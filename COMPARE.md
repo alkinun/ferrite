@@ -41,8 +41,8 @@ dispatching at no cost here). Both read each input from DRAM about once.
   around the math, not the math: HiFi2 costs what HiFi4 does here, though on a card it is half the multiplies. TT-NN
   multiplies at HiFi2 unless told; ferrite at HiFi4 unless told (`tensor.FIDELITY`).
 - **The host's work is not counted here,** and on a card it counts. ferrite issuing a GPT-2 token op by op took the
-  host 6.5 ms, while the card should need about 0.5 ms; replayed from a recording (`tensor.jit`), a SmolLM-135M token
-  takes the host 0.1 ms. TT-NN's traces replay too; they were not measured here.
+  host 6.5 ms, while the card should need about 0.5 ms; replayed from a recording (`tensor.jit`), a GPT-2 or
+  SmolLM-135M token takes the host 0.1 ms. TT-NN's traces replay too; they were not measured here.
 
 Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.2 s; tt-metal builds its firmware when
 the device opens (0.9 s) and each op's kernels the first time (0.6 to 0.8 s). Both cache on disk.
