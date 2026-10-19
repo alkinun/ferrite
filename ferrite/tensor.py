@@ -371,10 +371,11 @@ class Tensor:
   def matmul(self, x, dtype=None, fidelity=None):
     """Matrix by matrix through a batch (a batch of 1 repeats), summed in fp32 in Dst and written as dtype: bf16, or fp32
     if either operand is, unless said. fp32 operands go as bf16x3: each is hi + lo, both bf16, and hi@hi + hi@lo + lo@hi
-    sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24. fidelity: the
-    phases a bf16 product takes (FIDELITY unless said; compiler.matmul says what each leaves out); fp32's take all four.
-    x may be a block float (a weight cast once: bfp8, read at about half a bf16's bytes, or bfp4, a quarter) when self is
-    bf16."""
+    sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24; but the FPU
+    adds products 8 at a time to about 2^-11 of the largest (NOTES, "Matmul precision"), which bounds any matmul's
+    result. fidelity: the phases a bf16 product takes (FIDELITY unless said; compiler.matmul says what each leaves out);
+    fp32's take all four. x may be a block float (a weight cast once: bfp8, read at about half a bf16's bytes, or bfp4, a
+    quarter) when self is bf16."""
     fidelity = fidelity or FIDELITY
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
