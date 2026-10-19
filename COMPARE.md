@@ -57,6 +57,24 @@ is 0.1 to 0.2 ms of Python a token (measured), TT's trace was not measured. At 3
 ferrite 0.42 to 0.43 ms of control a step against its weights' 0.28 (bfp8) or 0.53 ms (bf16), and TT 1.36 ms against
 0.23 ms: about 60 to 75 thousand tokens a second against 23 thousand, if control is what ttsim counts.
 
+### A bigger one: SmolLM2-360M
+
+The same two programs on SmolLM2-360M (32 blocks 960 wide, 15 query heads sharing 5 key and value heads, Hugging Face's
+`HuggingFaceTB/SmolLM2-360M`), which ferrite runs unchanged: both write the same tokens, " to be happy".
+
+| | ferrite, bf16 weights | ferrite, bfp8 weights | TT `tt_transformers` |
+|---|---|---|---|
+| a decode token, replayed | **193k cycles** | **257k** | 1,873k (performance) |
+| the prompt's prefill, 5 tokens | **240k** | **300k** | 2,386k |
+| weights read a decode token | 724 MB | 384 MB | 306 MB (performance), 458 MB (accuracy) |
+| ... that at a p150's 512 GB/s | 1.41 ms | 0.75 ms | 0.60 ms, 0.89 ms |
+
+ferrite takes 7 to 10 times fewer cycles here too. What the cycles hide shows here: ttsim's count grows with launches,
+not with weights (ferrite's 193k against 180k for a model 2.7 times the size), while on a card a decode token's time
+grows with the bytes it reads. By the reckoning above, ferrite in bf16 would take 1.41 ms a token, its weights' time,
+about what TT's 1.87M cycles of control come to (1.39 ms); in bfp8 0.75 ms, 1.85 times faster. And TT reads less:
+its bfp4 MLP weights put its floor at 0.60 ms, under ferrite's in bfp8, so bfp4 is ferrite's next step for decode.
+
 ## How it was counted
 
 - **Cycles**: the chip clocks the host asked ttsim for (`libttsim_clock`), averaged over three runs of the op queued
