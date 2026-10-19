@@ -293,6 +293,7 @@ class Runtime:
     self.status, self.ring, self.times = buf[:64], buf[64:64 + ring], buf[64 + ring:]
     self.names = [""] * TIMES  # each of the last TIMES launches' name, for profile
     self.numbers = {}  # (value, dtype) -> a tensor of that one number, uploaded once (tensor.py's constants)
+    self.log, self.pinned = None, set()  # while a call is recorded (tensor.jit): its launches, and DRAM it took, never given back
     worker, dispatcher = compile_rv32(FIRMWARE), compile_rv32(DISPATCHER)
     assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
     (dx, dy), n = self.dispatcher, len(self.cores)
@@ -331,6 +332,7 @@ class Runtime:
     """Queue kernel, an image from compile_kernel, with the same arguments on every worker: [first unit, units, *args].
     Its work is `units` units (one per worker by default), shared evenly and in order among as many workers as there are
     units, and the first two arguments say which are this worker's. Loads it first if need be. name: its name in profile."""
+    if self.log is not None: self.log.append((kernel, args, units, name))
     kernel, n = self.load(kernel), min(units or len(self.cores), len(self.cores))
     body = struct.pack(f"<{2 + len(args)}I", units or n, 0, *args)
     assert len(body) <= ARGS_SIZE, f"{len(body)} bytes of arguments, room for {ARGS_SIZE}"
@@ -373,6 +375,7 @@ class Runtime:
       if room >= size:
         self.holes[i:i + 1] = [(addr + size, room - size)] if room > size else []
         self.used[addr] = size
+        if self.log is not None: self.pinned.add(addr)
         return addr
     if self.freed:  # what queued launches still hold may be enough
       self.wait()
@@ -381,7 +384,8 @@ class Runtime:
 
   def dram_free(self, addr):
     """Give back what dram_alloc returned, once the launches queued so far, which may still read or write it, are done;
-    it merges with the holes on either side."""
+    it merges with the holes on either side. DRAM a recorded call took stays, for its replays to write again."""
+    if addr in self.pinned: return
     self.freed.append((self.launches, addr))
     self.reclaim()
 

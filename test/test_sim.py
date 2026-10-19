@@ -156,6 +156,23 @@ def test_profile(chip):
   assert sorted((name, n) for name, n, _ in rows) == [("add", 4), ("matmul", 4), ("max2 sub exp sum2 recip mul", 4)], rows
   assert all(cycles > 0 for *_, cycles in rows) and 0.5 * elapsed < sum(cycles for *_, cycles in rows) <= elapsed
 
+def test_jit(chip, monkeypatch):
+  # tensor.jit records a function's second call and replays its launches after: each later call copies its inputs in
+  # and sends the same launches, building nothing (one realize, the copy, a call), and gets what the function would.
+  # A block of matmuls, a softmax and a layer norm, and its DRAM: what the recording took stays where the replays write
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rng = np.random.default_rng(7)
+  w, v = (Tensor.of(rt, bf16(rng.normal(0, 0.1, (96, 96))).tolist()) for _ in range(2))
+  f = lambda x: ((x @ w).relu() @ v).softmax().layernorm() * 2.0
+  step, realize, realized = tensor.jit(f), Tensor.realize, []
+  for call in range(4):
+    x = Tensor.of(rt, bf16(rng.normal(0, 1, (64, 96))).tolist())
+    if call == 3: monkeypatch.setattr(Tensor, "realize", lambda t, into=None: (realized.append(t), realize(t, into))[1])
+    y = step(x)
+    monkeypatch.setattr(Tensor, "realize", realize)
+    assert y.tobytes() == f(x).tobytes(), call
+  assert len(realized) == 1 and rt.pinned, realized
+
 def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))

@@ -235,6 +235,7 @@ class Tensor:
     """x's value in this tensor, which stays the same object, as an optimizer updates a weight: x is computed into DRAM
     of its own, which this tensor takes (its old DRAM going back), and x becomes a view of it."""
     assert self.op is None and self.owner is None and (x.shape, x.dtype) == (self.shape, self.dtype), "a whole tensor, its own shape and dtype"
+    assert self.rt.log is None, "a recorded call (jit) may not assign"
     x = (x if x.op else x + 0).realize()  # a copy of a tensor already computed, which keeps its own DRAM
     self.rt.dram_free(self.addr)
     self.addr, x.owner = x.addr, self
@@ -554,6 +555,29 @@ def _input(t, inputs):  # a realized tensor's number among a kernel's inputs, ad
     if u is t: return i
   inputs.append(t)
   return len(inputs) - 1
+
+def jit(f):
+  """f, a function of tensors that returns one, run from a recording: its first call runs as any would, its second is
+  recorded (each launch, and the DRAM it takes, kept from then on), and each later call copies its inputs into the second
+  call's and sends the recorded launches again, building and compiling nothing, so the host's part is writing the ring.
+  Its inputs keep their shapes and dtypes; nothing else it reads may change, and it may not read back or assign. Its
+  result is the same tensor every call, written again by the next."""
+  calls, inputs, launches, out = 0, (), [], None
+  def run(*xs):
+    nonlocal calls, inputs, launches, out
+    calls, rt = calls + 1, xs[0].rt
+    if calls == 1: return f(*xs).realize()
+    if calls == 2:
+      inputs, rt.log = [x.realize() for x in xs], []
+      try: out = f(*inputs).realize()
+      finally: launches, rt.log = rt.log, None
+      return out
+    for x, to in zip(xs, inputs):
+      assert (x.shape, x.dtype) == (to.shape, to.dtype), f"{x.shape} {x.dtype} where the recording had {to.shape} {to.dtype}"
+      if x is not to: (x + 0).realize(to)
+    for launch in launches: rt.launch(*launch)
+    return out
+  return run
 
 # (expression, input shapes, dtype, result dtype, workers' grid) -> (image, units); a move or gather's name and dtype
 # (a transpose's: its shape) -> image
