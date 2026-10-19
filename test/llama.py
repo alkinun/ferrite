@@ -32,18 +32,19 @@ def mask(places, size, group):  # -1e9 where a token would look past its place, 
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
-def rope(x, cos, sin):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 a head's halves
-  f, h = fns(x), x.shape[-1] // 2
-  return x * cos + f.cat(-x[:, :, h:], x[:, :, :h], axis=2) * sin
+def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 a head's halves, (-x2, x1) as x @ turn
+  return x * cos + (x @ turn) * sin
 
-def layer(x, p, c, cos, sin, mask, cache, places):
+def layer(x, p, c, rotary, mask, cache, places):
   """One block: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as x @ w, so
-  the Hugging Face ones transposed), c: the config, cache: this block's [keys, values], each with a row for every place,
-  this call's written at its places; mask: -1e9 where a token would see a place past its own."""
+  the Hugging Face ones transposed, q, k and v's side by side, and gate and up's), c: the config, rotary: (cos, sin,
+  turn), cache: this block's [keys, values], each with a row for every place, this call's written at its places; mask:
+  -1e9 where a token would see a place past its own."""
   f, n, hd = fns(x), x.shape[-2], c.dim // c.heads
   h = rms(x, p["input_layernorm"], c.eps)
-  q, k, v = (f.split(h @ p[w], heads) for w, heads in (("q_proj", c.heads), ("k_proj", c.kv), ("v_proj", c.kv)))
-  q, k = rope(q, cos, sin), rope(k, cos, sin)
+  qkv = h @ p["qkv_proj"]
+  qk = rope(f.split(qkv[:, :c.dim + c.kv * hd], c.heads + c.kv), *rotary)  # q's heads and k's as one batch
+  q, k, v = qk[:c.heads, :, :], qk[c.heads:, :, :], f.split(qkv[:, c.dim + c.kv * hd:], c.kv)
   f.put(cache[0], places, k), f.put(cache[1], places, v)
   k, v = cache
   group = c.heads // c.kv  # each key and value head serves this many query heads: their rows, one after another
@@ -51,13 +52,24 @@ def layer(x, p, c, cos, sin, mask, cache, places):
   y = f.reshape(f.softmax(s + mask) @ v, c.heads, n, hd)
   x = x + f.merge(y) @ p["o_proj"]
   h = rms(x, p["post_attention_layernorm"], c.eps)
-  return x + (f.silu(h @ p["gate_proj"]) * (h @ p["up_proj"])) @ p["down_proj"]
+  gate_up, m = h @ p["gate_up_proj"], p["down_proj"].shape[-2]
+  return x + (f.silu(gate_up[:, :m]) * gate_up[:, m:]) @ p["down_proj"]
 
-def rotary(c, n):  # cos and sin for places 0 to n - 1, as Hugging Face's: angles in fp32, the tables in bf16
-  inv = 1 / c.theta ** (np.arange(0, c.dim // c.heads, 2, dtype=np.float32) / (c.dim // c.heads))
+def rotary(c, n):  # cos and sin for places 0 to n - 1, as Hugging Face's (angles in fp32, the tables in bf16), and turn:
+  hd = c.dim // c.heads  # x @ turn is (-x2, x1), each of its entries one of x's, so exact
+  inv = 1 / c.theta ** (np.arange(0, hd, 2, dtype=np.float32) / hd)
   angles = np.arange(n, dtype=np.float32)[:, None] * inv[None]
   bf16 = lambda a: ((a.astype(np.float32).view(np.uint32) + 0x7FFF + (a.astype(np.float32).view(np.uint32) >> 16 & 1)) & 0xFFFF0000).view(np.float32)
-  return [bf16(np.concatenate([g(angles)] * 2, 1)) for g in (np.cos, np.sin)]
+  turn = np.zeros((hd, hd), np.float32)
+  turn[np.arange(hd // 2) + hd // 2, np.arange(hd // 2)], turn[np.arange(hd // 2), np.arange(hd // 2) + hd // 2] = -1, 1
+  return [bf16(np.concatenate([g(angles)] * 2, 1)) for g in (np.cos, np.sin)] + [turn]
+
+def fuse(w):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls
+  join = lambda *xs: tuple(map(join, *xs)) if isinstance(xs[0], tuple) else np.ascontiguousarray(np.concatenate(xs, 1))
+  for pre in {k[:k.index(".", 7) + 1] for k in w if k.startswith("layers.")}:
+    w[pre + "qkv_proj"] = join(*(w.pop(pre + n) for n in ("q_proj", "k_proj", "v_proj")))
+    w[pre + "gate_up_proj"] = join(w.pop(pre + "gate_proj"), w.pop(pre + "up_proj"))
+  return w
 
 def forward(ids, places, w, c, caches):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (one
@@ -65,9 +77,9 @@ def forward(ids, places, w, c, caches):
   rows: lists for numpy, int32 tensors for ferrite."""
   f, group = fns(w["embed"]), c.heads // c.kv
   x = f.rows(w["embed"], ids)
-  cos, sin, mask = f.rows(w["cos"], places), f.rows(w["sin"], places), f.mask(places, caches[0][0].shape[-2], group)
+  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), f.mask(places, caches[0][0].shape[-2], group)
   for l in range(c.layers):
-    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, cos, sin, mask, caches[l], places)
+    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], places)
   return f.rows(rms(x, w["norm"], c.eps), [x.shape[-2] - 1]) @ w["embed.T"]
 
 def kv_cache(c, size, zeros):  # each block's [keys, values], a row for each of size places, made by zeros(shape)
@@ -96,8 +108,8 @@ def load(folder):
     out[name] = (bits, (bits.astype(np.uint32) << 16).view(np.float32))
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = tuple(np.ascontiguousarray(a.T) for a in out["embed"])  # tied: the output layer is the embedding
-  for name, a in zip(("cos", "sin"), rotary(c, c.places)): out[name] = ((a.view(np.uint32) >> 16).astype(np.uint16), a)
-  return c, out
+  for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = ((a.view(np.uint32) >> 16).astype(np.uint16), a)
+  return c, fuse(out)
 
 def upload(rt, weights, dtype="bf16"):  # the weights as ferrite Tensors, the matrices a matmul reads as its B (the
   # blocks' and the output layer) cast to dtype on the chip

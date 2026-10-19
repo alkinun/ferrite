@@ -1091,7 +1091,7 @@ def smol(rng, layers, vocab=256):  # random weights in SmolLM-135M's shapes (as 
             "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
   w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
   w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
-  return c, w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin"), llama.rotary(c, 64)))
+  return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, 64))))
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_llama_layer(chip, n):
@@ -1102,12 +1102,12 @@ def test_llama_layer(chip, n):
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(12)
   c, w = smol(rng, 1)
   p = {k.removeprefix("layers.0."): v for k, v in w.items() if k.startswith("layers.0.")}
-  x, (cos, sin) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, n)
+  x, (cos, sin, turn) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, n)
   mask = np.tile(np.triu(np.full((n, n), -1e9, np.float32), 1), (3, 1))
   on = lambda a: Tensor.of(rt, a.tolist())
   cache, np_cache = [on(np.zeros((3, n, 64))) for _ in range(2)], [np.zeros((3, n, 64)) for _ in range(2)]
-  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, on(cos), on(sin), on(mask), cache, Tensor.of(rt, [list(range(n))], "int32"))
-  want = llama.layer(x, p, c, np.float64(cos), np.float64(sin), np.float64(mask), np_cache, range(n))
+  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn)), on(mask), cache, Tensor.of(rt, [list(range(n))], "int32"))
+  want = llama.layer(x, p, c, (np.float64(cos), np.float64(sin), turn), np.float64(mask), np_cache, range(n))
   change = np.abs(want - x).max()
   assert change > 0.5 and np.abs(np.array(got.tolist()) - want).max() < 0.03 * change, (np.abs(np.array(got.tolist()) - want).max(), change)
 
