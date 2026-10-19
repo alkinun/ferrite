@@ -914,10 +914,10 @@ def test_fuzz(chip, monkeypatch):
       # comparisons only of inputs: between computed values a rounding step flips them, so numpy cannot check them
       if kind == "where": return (leaf(shape) > 0).where(gen(s1, depth - 1), gen(s2, depth - 1))
       return getattr(gen(s1, depth - 1), rng.choice(["__add__", "__sub__", "__mul__", "maximum", "minimum"]))(gen(s2, depth - 1))
-    if kind == "unary":
+    if kind == "unary":  # sin and cos of a value held to +-8: of exp's 4e9 they are noise in fp32, and in numpy's float64
       x = gen(shape, depth - 1)
-      return rng.choice([x.relu, (x * 0.5).exp, (x * 0.5).exp2, x.sin, x.cos, (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt,
-                         (x * x + 1.0).log2, (x * x + 1.0).sqrt])()
+      return rng.choice([x.relu, (x * 0.5).exp, (x * 0.5).exp2, x.maximum(-8.0).minimum(8.0).sin, x.maximum(-8.0).minimum(8.0).cos,
+                         (x * x + 1.0).reciprocal, (x * x + 1.0).rsqrt, (x * x + 1.0).log2, (x * x + 1.0).sqrt])()
     if kind == "red" and 1 in shape:  # along an axis that is 1 here (the batch, rows or columns). Values stay near 1
       axis = int(rng.choice([ax for ax, d in enumerate(shape) if d == 1]))  # (means, not sums), or exp would turn
       n = int(rng.choice([2, 3] if axis == 0 else [20, 32, 70, 96, 192]))   # rounding into large errors

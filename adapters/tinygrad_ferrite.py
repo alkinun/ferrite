@@ -330,18 +330,19 @@ def tinyjit(self, *args, **kwargs):
   its inputs into the second's and sends its launches again as one block, running nothing on the host. Each buffer the
   recorded call stored into has its new value copied back where the recording read it from. A call runs every time
   instead if it works on the host with what it finds there (random numbers, whose counter lives there; a value brought
-  down), stores into a buffer in another layout, or takes an input that is not a whole buffer on the chip. tinygrad's
-  checks of the inputs and the result are its own (_prepare_jit_inputs)."""
+  down), stores into a buffer in another layout, takes an input that is not a whole buffer on the chip, or binds a
+  symbolic variable (a place in a sequence: the recording has its shapes for one value). tinygrad's checks of the
+  inputs and the result are its own (_prepare_jit_inputs)."""
   global recording
   given = [*args, *(v for _, v in sorted(kwargs.items()))]  # the inputs as tinygrad finds them: tensors, and those in a container
   ins = [t for t in given if t.__class__ is Tensor]
   ins += [t for x in given if isinstance(x, (tuple, list, dict)) for t in (x.values() if isinstance(x, dict) else x)
           if t.__class__ is Tensor and not any(t is u for u in ins)]
   if not JIT or Device.DEFAULT != "FERRITE" and not any(on_ferrite(t.uop) for t in ins): return _tinyjit(self, *args, **kwargs)
-  _, _, names, info = _prepare_jit_inputs(args, kwargs)  # tinygrad's checks of them, and the inputs realized
+  _, var_vals, names, info = _prepare_jit_inputs(args, kwargs)  # tinygrad's checks of them, and the inputs realized
   holders, self.cnt = [on_chip(t) for t in ins], self.cnt + 1
   if recording is not None: raise RuntimeError("having TinyJit inside another TinyJit is not supported")
-  if self.cnt == 1 or getattr(self, "replay", None) is False or None in holders:
+  if self.cnt == 1 or getattr(self, "replay", None) is False or None in holders or var_vals:
     ret = self.fxn(*args, **kwargs)
     if params := get_parameters(ret): Tensor.realize(*params)
     return ret
