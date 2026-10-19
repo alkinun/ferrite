@@ -4,7 +4,8 @@
 # another shape) realized first.
 import array, collections, math
 from ferrite import bh
-from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, fused_kernel, gather_kernel, move_kernel, put_kernel, shared_k, tile_bytes, transpose_kernel
+from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, tile_bytes, shared_k
+from ferrite.compiler import fused_kernel, gather_kernel, move_kernel, put_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 

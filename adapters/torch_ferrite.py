@@ -242,12 +242,14 @@ OPS = {  # aten op -> what it is on FerriteTensors (their in-place versions come
   aten._to_copy: to_copy, aten.to: lambda a, dtype=None, *rest, **k: to_copy(a, dtype if isinstance(dtype, torch.dtype) else k.get("dtype")),
   aten.gather: gather, aten.scatter: scatter_value, aten._scaled_dot_product_flash_attention_for_cpu_backward: attention_backward,
   aten.bitwise_not: lambda a: ew(lambda p: p.eq(0), [a]) if a.dtype is torch.bool else on_cpu(aten.bitwise_not.default, (a,), {}),
-  aten.bitwise_and: logical(lambda p, q: p.minimum(q), aten.bitwise_and.Tensor), aten.bitwise_or: logical(lambda p, q: p.maximum(q), aten.bitwise_or.Tensor),
+  aten.bitwise_and: logical(lambda p, q: p.minimum(q), aten.bitwise_and.Tensor),
+  aten.bitwise_or: logical(lambda p, q: p.maximum(q), aten.bitwise_or.Tensor),
   aten.max: most,
   aten._local_scalar_dense: lambda a: download(a.v).reshape(-1)[0].item(),
 }
 
-PRIMS = {prims.view_of: lambda a: FerriteTensor(a.v), prims.pow: lambda a, e: ew(POWERS[e], [a]) if e in POWERS else on_cpu(prims.pow.default, (a, e), {}),
+PRIMS = {prims.view_of: lambda a: FerriteTensor(a.v),
+         prims.pow: lambda a, e: ew(POWERS[e], [a]) if e in POWERS else on_cpu(prims.pow.default, (a, e), {}),
          prims.sum: lambda a, dims, output_dtype=None: reduction("sum", a, dims), prims.var: lambda a, dims, correction=1, output_dtype=None:
          variance(a, dims, correction), prims.broadcast_in_dim: broadcast_in_dim, prims.convert_element_type: lambda a, dtype: to_copy(a, dtype)}
 

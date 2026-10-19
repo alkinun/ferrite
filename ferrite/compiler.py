@@ -55,7 +55,8 @@ def kernel_config(dtype="bf16", out="bf16", transposing=False):
   base, fmt, pack = slot_base(dtype) // 16 - 1, FORMAT[dtype], FORMAT[out]
   late = bh.FP32 if out == "bfp8" else pack  # the packer's own format: bfp8 from fp32 rounds each value once, from bfp8 twice
   return config(Dstacc=late, Fp32_enabled=1, Zero_Flag_disabled_src=0, Read_32b_data=1, Edge_mask=0xFFFF, pack_reads_per_xy_plane=16,
-                PCK0_Ystride=16 * ITEMSIZE["fp32" if late == bh.FP32 else out], PCK0_ZW=0, PCK0_Ystride_1=tile_bytes(out), PCK0_ZW_1=0, PCK0_Base_1=0, PCK_dest_offset=0,
+                PCK0_Ystride=16 * ITEMSIZE["fp32" if late == bh.FP32 else out], PCK0_ZW=0, PCK0_Ystride_1=tile_bytes(out),
+                PCK0_ZW_1=0, PCK0_Base_1=0, PCK_dest_offset=0,
                 L1_Dest_addr=(slot_base(dtype) if out == dtype else OUTS) // 16 - 1, Disable_zero_compress=1, Pack_out_format=pack,
                 Exp_section_size=4,  # a bfp8 tile's 64 exponents, in 16 bytes
                 Pack_in_format=late, UNP0_add_dest_addr_cntr=0, UNP0_Ystride_1=64, UNP0_ZW_1=0, UNP1_ZW_1=0,
@@ -464,7 +465,8 @@ def _brisc(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0):  # m
 #define SLOT(i) ({slot_base(dtype):#x} + (i) * {tb})  // where the unpackers read slot i
 #define OUT_SLOT(i) ({slot_base(dtype) if out == dtype else OUTS:#x} + (i) * {to})  // and where the packer writes it
 {BANKS}
-static unsigned fetched, events, frame_done[2], stream_done[{DEPTH}], steps, sent, out, rows[16];  // rows: i + 1 of what each place in L1 holds (fresh)
+static unsigned fetched, events, frame_done[2], stream_done[{DEPTH}], steps, sent, out;
+static unsigned rows[16];  // i + 1 of what each place in L1 holds (fresh)
 // tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_get(BANK(t), base + t / 8 * {tb}, SLOT(slot), {tb}); }}
 // the same with its two off-diagonal faces swapped, half of transposing it (unpacker 0 does the rest)
