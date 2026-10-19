@@ -215,7 +215,9 @@ class Tensor:
 
   def split(self, n, axis=1):
     """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads.
-    The parts are whole tiles."""
+    The parts are whole tiles. A sum not yet computed of computed tensors (a matmul's parts of K) splits term by term,
+    and stays a sum."""
+    if terms := _terms(self): return sum((t.split(n, axis) for t in terms[1:]), terms[0].split(n, axis))
     assert self.batch == 1
     if axis: assert self.cols % (32 * n) == 0; return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
     assert self.rows % (32 * n) == 0
@@ -386,6 +388,8 @@ class Tensor:
     fp32's take all four. x may be a block float (a weight cast once: bfp8, read at about half a bf16's bytes, or bfp4, a
     quarter) when self is bf16."""
     fidelity = fidelity or FIDELITY
+    if x.tiles <= 16 and (terms := _terms(self)):  # by a small matrix, a sum not yet computed (RoPE's turn of a split K's
+      return sum((t.matmul(x, dtype, fidelity) for t in terms[1:]), terms[0].matmul(x, dtype, fidelity))  # parts): term by term
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
     if "fp32" in (self.dtype, x.dtype):  # one op to backward, which keeps its bf16 parts for its own two fp32 matmuls
@@ -518,6 +522,10 @@ def _backward(t, g):
     return ((Tensor.of(t.rt, [[i] for i in range(x.rows)], "int32") == args[0]).bfloat16().matmul(g, x.dtype),)
   raise NotImplementedError(f"no backward for {op}")
 
+def _terms(t):  # t, a sum not yet computed of computed tensors its shape, as those tensors; else None
+  if t.op != "add" or any(s.shape != t.shape or s.dtype != t.dtype for s in t.srcs): return None
+  terms = [[s] if s.op is None else _terms(s) for s in t.srcs]
+  return None if None in terms else [u for ts in terms for u in ts]
 def _parts(t):  # an fp32 matmul's operand as bf16 (hi, lo), no lo for a bf16 one; a transpose split first, its parts transposed as bf16
   if t.op == "T": return _pT(_parts(t.srcs[0]))
   if t.dtype == "bf16": return t, None
