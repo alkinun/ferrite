@@ -59,21 +59,25 @@ class Tensor:
 
   @classmethod
   def frombytes(cls, rt, rows, cols, data, batch=1, dtype="bf16"):
-    """From dtype's values in row-major order (little-endian), matrix after matrix. Runs of 16 values are copied into
-    tile order as they are, nothing per value, which is what makes a model's weights quick to load."""
+    """From dtype's values in row-major order (little-endian), matrix after matrix. A row's runs of 16 values go into
+    tile order as 8-byte words, a strided copy for each word of a run (its place in every tile of the row's band at
+    once), and each DRAM bank's tiles in one write: nothing per value, and little per tile, which is what makes a
+    model's weights quick to load."""
     assert dtype not in BFP, "a block float is made on the chip, by cast"
     t, n, tr, tc, data = cls(rt, rows, cols, batch=batch, dtype=dtype), ITEMSIZE[dtype], -(-rows // 32), -(-cols // 32), memoryview(data).cast("B")
     assert len(data) == n * batch * rows * cols, f"{len(data)} bytes for {batch} x {rows} x {cols} of {dtype}"
-    for b, i in ((b, i) for b in range(batch) for i in range(tr * tc)):
-      m, r0, c0, tile = data[n * b * rows * cols:n * (b + 1) * rows * cols], i // tc * 32, i % tc * 32, []
-      for face in range(4):  # 16 rows of 16, face by face (the tile layout, at the top)
-        c = c0 + face % 2 * 16
-        for r in range(r0 + face // 2 * 16, r0 + face // 2 * 16 + 16):
-          r = 0 if rows == 1 else r  # a dimension of 1 fills the tile; the rest pads with 0
-          at = n * (r * cols + c)
-          run = b"" if r >= rows else bytes(m[n * r:n * r + n]) * 16 if cols == 1 else bytes(m[at:at + n * max(0, min(16, cols - c))])
-          tile.append(run + bytes(16 * n - len(run)))
-      t.rt.chip.write(*t._where(b, i // tc, i % tc), b"".join(tile))
+    tb, run = tile_bytes(dtype), 2 * n  # bytes a tile; 8-byte words a run of 16 values (a face's row)
+    tiles = memoryview(bytearray(t.tiles * tb)).cast("Q")  # every tile in order, 0 where it pads
+    for b, r in ((b, r) for b in range(batch) for r in range(rows if rows > 1 else 32)):  # a row of 1 fills its tile
+      at = n * (b * rows + (r if rows > 1 else 0)) * cols
+      row = bytes(data[at:at + n]) * 32 if cols == 1 else bytes(data[at:at + n * cols]) + bytes(n * (32 * tc - cols))
+      src, first = memoryview(row).cast("Q"), (b * tr + r // 32) * tc * tb // 8 + r % 16 * run
+      for half, q in ((half, q) for half in (0, 1) for q in range(run)):  # word q of the runs in the left or right faces
+        start = first + (r % 32 // 16 * 2 + half) * tb // 32 + q  # (the tile layout, at the top)
+        tiles[start:start + tc * tb // 8:tb // 8] = src[half * run + q::2 * run]
+    tiles = tiles.cast("B")
+    for bank in range(len(bh.DRAM)):  # tile i is in bank i % 8, at addr + i // 8 tiles: each bank's are one run
+      t.rt.chip.write(*bh.DRAM[bank], t.addr, b"".join(tiles[i * tb:(i + 1) * tb] for i in range(bank, t.tiles, len(bh.DRAM))))
     return t
 
   def tobytes(self):

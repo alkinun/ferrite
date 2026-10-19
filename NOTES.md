@@ -459,7 +459,7 @@ Each is one launch, matching float64 to about 2% (softmax) and 0.05 + 2% (layer 
 - **Casts** between floats and integers are SFPU programs on the root's result before its pack: an integer to sign-magnitude, then `SFPCAST` to float (to nearest); a float to an integer toward zero by shifting its mantissa, hidden bit in (`SFPEXMAN`), by its exponent - 23 (`SFPSHFT` takes a signed amount from a register), 0 where the exponent is negative, negated where the sign is set. `SFPSTOCHRND` would round, but only into 16 bits.
 - **Mixing**: a float number with int32 makes fp32 (an int number stays int32), int32 with a float tensor meets in fp32, and `where` turns a condition of another dtype into 0 or 1 of the picked values' dtype first. Negation is `0 - x` for int32, exact, where `x * -1` would go through fp32.
 
-**Upload and download** (`frombytes`, `tobytes`) move a dtype's values in row-major order into tile order 16 values at a time, with no per-value Python work: GPT-2's 124M weights are on the chip in 5 s.
+**Upload and download** (`frombytes`, `tobytes`) move a dtype's values between row-major order and tile order with no per-value Python work. Upload goes by 8-byte words: each word of a row's runs of 16 values goes to its place in every tile of the row's band in one strided copy, and each DRAM bank's tiles (tile i is bank i % 8's) go in one write, about 15 times faster than a run at a time: GPT-2's 124M weights are on ttsim's chip in 2 s, SmolLM2-360M's in 6.
 
 ### Autograd
 
