@@ -101,15 +101,15 @@ SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem
                 ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SEMINIT", sem_sel=SEM_UNPACKED, max_value=15),
                 *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS], *counters(UNPACKERS, 1024)]
 SETUP_PACK, PACK_RUNS = counters(bh.PACK, 16), record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
-def at(word, v): return word + v if isinstance(v, int) else (word, v)  # v into the word's low field: a number, or a C
-                                                                          # expression, pushed with the word at run time
-def setadc(unpacker, slot): return at(ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0), slot)  # its Z: the slot
+def field(word, v): return word + v if isinstance(v, int) else (word, v)  # v into the word's low field: a number, or a C
+                                                                             # expression, pushed with the word at run time
+def setadc(unpacker, slot): return field(ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0), slot)  # its Z: the slot
 def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then handed to the FPU
   return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
 REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
 def fill(slot, row):  # an fp32 tile from an L1 slot straight into Dst rows row on, by unpacker 0 in context 1 (the math thread's)
-  return [setadc(bh.UNPACK0, slot), at(ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=1, channel_index=1, value=0), row),
+  return [setadc(bh.UNPACK0, slot), field(ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=1, channel_index=1, value=0), row),
           ins("UNPACR", last=1, ovrd_thread_id=1)]
 FILLED = [ins("STALLWAIT", stall_res=bh.STALL_SFPU | bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK0)]  # the SFPU and the sync unit wait for the fills
 def reconfigure(**fields):  # unpacker 0's config fields rewritten from thread 0, a byte at a time (RMWCIB keeps the rest
@@ -135,16 +135,16 @@ def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
 WALK = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),  # a step along B's column and A's row, both
         ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # kept in L1
-def aim(row): return at(ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=0), row)  # the FPU and SFPU at Dst row on
+def aim(row): return field(ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=0), row)  # the FPU and SFPU at Dst row on
 # In the programs, C's h is the first Dst row of the half the next op gets, 0 or DST_HALF: h ^= DST_HALF moves on
 def math_begin(zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
   return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), aim("h")] +
-          [at(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero])  # 16-row blocks
+          [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero])  # 16-row blocks
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU), ins("SEMPOST", sem_sel=SEM_DST)]
 def pack(row, slot, *done):  # 64 Dst rows from row into an L1 slot, then free them and post done
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
-          at(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=0), row),  # channel 0 Y: Dst row
-          at(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=0), slot),  # channel 1 Y: L1 slot
+          field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=0), row),  # channel 0 Y: Dst row
+          field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=0), slot),  # channel 1 Y: L1 slot
           ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
           ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + \
@@ -628,8 +628,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   SrcA), run at `phases` fidelity phases (4 unless said), and plain numbers for inputs. shapes: each input's (batch,
   rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting). dtype: what the
   inputs are and the kernel computes in; out: what its root is written as (a cast, or a matmul written as fp32: the
-  packer is switched to it for the root's pack); grid: the workers as Runtime.grid has them, for a matmul to share its tiles between them; reps: each input's
-  repeat (Tensor.repeat_interleave: its matrix b is the one stored at b // rep), 1 unless said.
+  packer is switched to it for the root's pack); grid: the workers as Runtime.grid has them, for a matmul to share its
+  tiles between them; reps: each input's repeat (Tensor.repeat_interleave: its matrix b is the one stored at b // rep),
+  1 unless said.
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
@@ -695,7 +696,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   root = visit(expr)[1]
   # a root packed as another dtype than the rest: the packer switched to it for the root's pack and back, unless it is alone
   config = kernel_config(dtype, out if len(ops) == 1 else dtype)
-  around = (tt(repack(config, kernel_config(dtype, out))), tt(repack(kernel_config(dtype, out), config))) if out != dtype and len(ops) > 1 else ("", "")
+  root_config = kernel_config(dtype, out)
+  around = (tt(repack(config, root_config)), tt(repack(root_config, config))) if out != dtype and len(ops) > 1 else ("", "")
   operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
   axes = {FOLDS[op["kind"]] for op in ops if op["kind"] in COMBINE}
@@ -895,12 +897,12 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
           c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
                       f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
         elif j == line_b:  # B's line in L1 across passes: fetched in the first pass that computes it, once the line before
-          at = f"{lines_at} + k * {kt}"  # has been done with it; A's row kept as below
+          line = f"{lines_at} + k * {kt}"  # has been done with it; A's row kept as below
           if p == computed[0]:
             c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({how}, a[{y}], {b_tile}, {at} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
+                        f"step({how}, a[{y}], {b_tile}, {line} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
           else: c[B].append(f"for (unsigned m = 0; m < {kt}; m++) kept_step();")
-          c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, at)])} {on} "
+          c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, line)])} {on} "
                       f"for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
         else:
           new = "0" if bcast else f"fresh({q}, b * {rt} + i_)"  # bcast: A's row is in already
