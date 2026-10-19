@@ -7,6 +7,7 @@ import math, os, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from ferrite import tensor
 from ferrite.tensor import Tensor
 import gpt2
 
@@ -26,23 +27,24 @@ def init(c, seed=0):
   w["ln_f.weight"], w["ln_f.bias"] = np.ones((1, d), np.float32), np.zeros((1, d), np.float32)
   return w
 
-def forward(ids, w, mask, c):  # the logits at every position: gpt2.forward's, the output layer tied to wte
+def forward(ids, w, mask, c):  # the logits at every position of c.ctx: gpt2.forward's, the output layer tied to wte
   f = gpt2.fns(w["wte.weight"])
-  x = f.rows(w["wte.weight"], ids) + f.rows(w["wpe.weight"], range(len(ids)))
+  x = f.rows(w["wte.weight"], ids) + f.rows(w["wpe.weight"], range(c.ctx))
   for l in range(c.layers): x = gpt2.layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask, c.heads)
   return gpt2.layernorm(x, w["ln_f.weight"], w["ln_f.bias"]) @ f.t(w["wte.weight"])
 
-def cross_entropy(logits, targets):  # the mean over positions of -log p(target), the targets picked out by a one-hot mask
-  onehot = Tensor.of(logits.rt, np.eye(logits.cols, dtype=np.float32)[targets].tolist(), "fp32")
-  return (logits.log_softmax() * onehot).sum() * (-1 / len(targets))
+def cross_entropy(logits, onehot):  # the mean over positions of -log p(target), the targets picked out by a one-hot mask
+  return (logits.log_softmax() * onehot).sum() * (-1 / logits.rows)
 
-def adam(params, state, step, lr, b1=0.9, b2=0.999, eps=1e-8):  # PyTorch's Adam, written the same way
+B1, B2, EPS = 0.9, 0.999, 1e-8  # Adam's, as PyTorch has them
+def adam(params, state, lr, bias2):
+  """PyTorch's Adam, written the same way: lr is the step's lr / (1 - B1^step) and bias2 its 1 / sqrt(1 - B2^step),
+  each a 1 x 1 tensor, so a recorded step (jit) takes them as inputs."""
   for p in params:
     g, (m, v) = p.grad.realize(), state[id(p)]
-    m.assign(m * b1 + g * (1 - b1))
-    v.assign(v * b2 + g * g * (1 - b2))
-    p.assign(p - m * (lr / (1 - b1**step)) / (v.sqrt() * (1 / math.sqrt(1 - b2**step)) + eps))
-    p.grad = None
+    m.assign(m * B1 + g * (1 - B1))
+    v.assign(v * B2 + g * g * (1 - B2))
+    p.assign(p - m * lr / (v.sqrt() * bias2 + EPS))
 
 def train(rt, steps, c=None, lr=3e-3, log=None, data=None):
   """steps of training on ferrite, and PyTorch beside it. Each step, PyTorch takes ferrite's weights as they are and
@@ -63,17 +65,23 @@ def train(rt, steps, c=None, lr=3e-3, log=None, data=None):
   pw = {k: torch.tensor(a, requires_grad=True) for k, a in w.items()}
   opt = torch.optim.Adam(pw.values(), lr=lr)
   tmask, pmask, losses = Tensor.of(rt, mask.tolist(), "fp32"), torch.tensor(mask), []
+  @tensor.jit  # recorded once and sent again as one block each step: the host builds and launches nothing
+  def train_step(x, onehot, step_lr, bias2):  # the loss, each gradient into .grad, and Adam's update
+    for t in tw.values(): t.grad = None
+    loss = cross_entropy(forward(x, tw, tmask, c), onehot)
+    loss.backward()
+    adam(tw.values(), state, step_lr, bias2)
+    return loss
   for step in range(1, steps + 1):
     start = time.time()
     at = int(rng.integers(0, len(ids) - c.ctx - 1))
     x, y = ids[at:at + c.ctx].tolist(), ids[at + 1:at + c.ctx + 1].tolist()
-    loss = cross_entropy(forward(x, tw, tmask, c), y)
-    loss.backward()
-    same = {k: torch.tensor(array(t), requires_grad=True) for k, t in tw.items()}  # PyTorch on ferrite's weights
+    same = {k: torch.tensor(array(t), requires_grad=True) for k, t in tw.items()}  # PyTorch on ferrite's weights, as they are
+    loss = train_step(Tensor.of(rt, [x], "int32"), Tensor.of(rt, np.eye(c.vocab, dtype=np.float32)[y].tolist(), "fp32"),
+                      Tensor.full(rt, 1, 1, lr / (1 - B1**step), "fp32"), Tensor.full(rt, 1, 1, 1 / math.sqrt(1 - B2**step), "fp32"))
     want = torch.nn.functional.cross_entropy(forward(x, same, pmask, c), torch.tensor(y))
     want.backward()
     grads = max(float(np.abs(array(t.grad) - same[k].grad.numpy()).max() / np.abs(same[k].grad.numpy()).max()) for k, t in tw.items())
-    adam(tw.values(), state, step, lr)
     opt.zero_grad()
     own = torch.nn.functional.cross_entropy(forward(x, pw, pmask, c), torch.tensor(y))
     own.backward()

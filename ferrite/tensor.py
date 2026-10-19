@@ -211,7 +211,7 @@ class Tensor:
     return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch, self.dtype)
 
   def realize(self, into=None):
-    """Compute it now, into DRAM of its own, or into the view `into` (see merge). Returns it, now realized."""
+    """Compute it now, into DRAM of its own, or into `into`'s: a view (merge) or a whole tensor (assign). Returns it, realized."""
     if self.op is None: return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       assert into is None, "a transpose or a move writes a tensor of its own"
@@ -244,13 +244,12 @@ class Tensor:
     args = [v for t in [self] + inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
     return self._run(kernel, *args, units=units, name=name)
   def assign(self, x):
-    """x's value in this tensor, which stays the same object, as an optimizer updates a weight: x is computed into DRAM
-    of its own, which this tensor takes (its old DRAM going back), and x becomes a view of it."""
+    """x's value in this tensor, in place, as an optimizer updates a weight: x is computed into its DRAM and becomes a
+    view of it. A kernel reads each tile of its elementwise inputs before it writes that tile, but a matmul reads whole
+    rows and columns, so one is computed first, on its own."""
     assert self.op is None and self.owner is None and (x.shape, x.dtype) == (self.shape, self.dtype), "a whole tensor, its own shape and dtype"
-    assert self.rt.log is None, "a recorded call (jit) may not assign"
-    x = (x if x.op else x + 0).realize()  # a copy of a tensor already computed, which keeps its own DRAM
-    self.rt.dram_free(self.addr)
-    self.addr, x.owner = x.addr, self
+    if any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
+    (x if x.op not in (None, "T", "move") else x + 0).realize(self)  # computed already, or a move: copied in by + 0
     return self
 
   def _run(self, kernel, *args, units=None, name=""):
@@ -578,9 +577,9 @@ def jit(f):
   """f, a function of tensors that returns one, run from a recording: its first call runs as any would, its second is
   recorded (each launch, and the DRAM it takes, kept from then on), and each later call copies its inputs into the second
   call's and sends the recorded launches again as one block of commands, building and compiling nothing, so the host's part
-  is one write to the ring and one to the doorbell.
-  Its inputs keep their shapes and dtypes; nothing else it reads may change, and it may not read back or assign. Its
-  result is the same tensor every call, written again by the next."""
+  is one write to the ring and one to the doorbell (a few, if its kernels do not fit in L1 together: a training step's).
+  Its inputs keep their shapes and dtypes; nothing else it reads may change, and it may not read back. Its result is
+  the same tensor every call, written again by the next, and so is every tensor it made and kept (a gradient in .grad)."""
   calls, inputs, launches, out, block = 0, (), [], None, None
   def run(*xs):
     nonlocal calls, inputs, launches, out, block
@@ -594,9 +593,9 @@ def jit(f):
     for x, to in zip(xs, inputs):
       assert (x.shape, x.dtype) == (to.shape, to.dtype), f"{x.shape} {x.dtype} where the recording had {to.shape} {to.dtype}"
       if x is not to: (x + 0).realize(to)
-    if block is None or block[2] != rt.evictions:  # packed again if the kernels it names have left L1 since
-      cmds = [rt.command(kernel, args, units) for kernel, args, units, _ in launches]
-      block = (b"".join(cmd for cmd, _ in cmds), [(launch[3], n) for launch, (_, n) in zip(launches, cmds)], rt.evictions)
+    if block is None or block[2] != rt.evictions:  # packed again if the kernels it names have left L1 since, so every
+      evictions = rt.evictions                      # time if they do not fit at once (packing then sends parts itself)
+      block = (*rt.block(launches), evictions)
     rt.send(*block[:2])
     return out
   return run

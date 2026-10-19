@@ -318,12 +318,12 @@ class Runtime:
     there go, once nothing queued can still be running them. Its TLB orders the writes strictly, so the kernel has
     landed before any later doorbell."""
     if kernel not in self.loaded:
-      size = -(-len(kernel) // 16) * 16
-      assert size <= ZEROS - KERNELS, f"kernel is {len(kernel)} bytes, room for {ZEROS - KERNELS}"
-      if self.room + size > ZEROS: self.evict()
+      assert len(kernel) <= ZEROS - KERNELS, f"kernel is {len(kernel)} bytes, room for {ZEROS - KERNELS}"
+      if self.evicts(kernel): self.evict()
       self.chip.write(*self.end, self.room, kernel, self.start)
-      self.loaded[kernel], self.room = self.room, self.room + size
+      self.loaded[kernel], self.room = self.room, self.room + -(-len(kernel) // 16) * 16
     return self.loaded[kernel]
+  def evicts(self, kernel): return kernel not in self.loaded and self.room + len(kernel) > ZEROS  # whether loading it would
 
   def evict(self):  # forget every loaded kernel, once the launches that use them are done
     self.wait()
@@ -334,8 +334,18 @@ class Runtime:
     Its work is `units` units (one per worker by default), shared evenly and in order among as many workers as there are
     units, and the first two arguments say which are this worker's. Loads it first if need be. name: its name in profile."""
     if self.log is not None: self.log.append((kernel, args, units, name))
-    cmd, n = self.command(kernel, args, units)
-    self.send(cmd, [(name, n)])
+    self.send(*self.block([(kernel, args, units, name)]))
+
+  def block(self, launches):
+    """Launches [(kernel, args, units, name)] as one block of commands for send, and each one's (name, workers), their
+    kernels loaded: the block holds where each is, so it can be sent again while none has left L1 (evictions). A kernel
+    that must evict the others sends the block so far first, since evicting waits for the launches sent."""
+    cmds, sent = [], []
+    for kernel, args, units, name in launches:
+      if cmds and self.evicts(kernel): self.send(b"".join(cmds), sent); cmds, sent = [], []
+      cmd, n = self.command(kernel, args, units)
+      cmds.append(cmd); sent.append((name, n))
+    return b"".join(cmds), sent
 
   def command(self, kernel, args=(), units=None):  # a launch as the ring holds it: its bytes, and how many workers it takes
     kernel, n = self.load(kernel), min(units or len(self.cores), len(self.cores))
