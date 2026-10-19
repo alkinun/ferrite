@@ -18,17 +18,15 @@ def fns(x):  # what numpy and ferrite spell differently
     return SimpleNamespace(rows=lambda a, ids: a[list(ids)], split=lambda a, n: a.reshape(a.shape[-2], n, -1).transpose(1, 0, 2),
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            softmax=lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True),
-                           cat=lambda a, b, axis: np.concatenate([a, b], axis), reshape=lambda a, *s: a.reshape(s),
                            mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), silu=lambda a: a / (1 + np.exp(-a)),
-                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b),
-                           mask=lambda places, size, group: np.tile(np.where(np.arange(size) > np.array(places)[:, None], -1e9, 0.0), (group, 1)))
+                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b), repeat=lambda a, n: np.repeat(a, n, 0),
+                           mask=lambda places, size: np.where(np.arange(size) > np.array(places)[:, None], -1e9, 0.0))
   return SimpleNamespace(rows=Tensor.gather, split=Tensor.split, merge=Tensor.merge, t=lambda a: a.T, softmax=Tensor.softmax,
-                         cat=lambda a, b, axis: a.cat(b, axis=axis), reshape=Tensor.reshape, mean=lambda a: a.mean(2),
-                         rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, mask=mask)
+                         mean=lambda a: a.mean(2),
+                         rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, repeat=Tensor.repeat_interleave, mask=mask)
 
-def mask(places, size, group):  # -1e9 where a token would look past its place, its row once for each query head of a group
-  m = ((Tensor.of(places.rt, [list(range(size))], "int32") > places.reshape(1, places.cols, 1)) * -1e9).cast("bf16")
-  return m.cat(*[m] * (group - 1), axis=1)
+def mask(places, size):  # -1e9 where a token would look past its place
+  return ((Tensor.of(places.rt, [list(range(size))], "int32") > places.reshape(1, places.cols, 1)) * -1e9).cast("bf16")
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
@@ -40,17 +38,15 @@ def layer(x, p, c, rotary, mask, cache, places):
   the Hugging Face ones transposed, q, k and v's side by side, and gate and up's), c: the config, rotary: (cos, sin,
   turn), cache: this block's [keys, values], each with a row for every place, this call's written at its places; mask:
   -1e9 where a token would see a place past its own."""
-  f, n, hd = fns(x), x.shape[-2], c.dim // c.heads
+  f, hd = fns(x), c.dim // c.heads
   h = rms(x, p["input_layernorm"], c.eps)
   qkv = h @ p["qkv_proj"]
   qk = rope(f.split(qkv[:, :c.dim + c.kv * hd], c.heads + c.kv), *rotary)  # q's heads and k's as one batch
   q, k, v = qk[:c.heads, :, :], qk[c.heads:, :, :], f.split(qkv[:, c.dim + c.kv * hd:], c.kv)
   f.put(cache[0], places, k), f.put(cache[1], places, v)
-  k, v = cache
-  group = c.heads // c.kv  # each key and value head serves this many query heads: their rows, one after another
-  s = f.reshape(q, c.kv, group * n, hd) @ f.t(k) * (1 / math.sqrt(hd))
-  y = f.reshape(f.softmax(s + mask) @ v, c.heads, n, hd)
-  x = x + f.merge(y) @ p["o_proj"]
+  k, v = (f.repeat(t, c.heads // c.kv) for t in cache)  # each key and value head for each query head of its group, in place
+  s = q @ f.t(k) * (1 / math.sqrt(hd))
+  x = x + f.merge(f.softmax(s + mask) @ v) @ p["o_proj"]
   h = rms(x, p["post_attention_layernorm"], c.eps)
   gate_up, m = h @ p["gate_up_proj"], p["down_proj"].shape[-2]
   return x + (f.silu(gate_up[:, :m]) * gate_up[:, m:]) @ p["down_proj"]
@@ -75,9 +71,9 @@ def forward(ids, places, w, c, caches):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (one
   [keys, values] a block, each with a row for every place), and each sees the places up to its own. ids and places are
   rows: lists for numpy, int32 tensors for ferrite."""
-  f, group = fns(w["embed"]), c.heads // c.kv
+  f = fns(w["embed"])
   x = f.rows(w["embed"], ids)
-  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), f.mask(places, caches[0][0].shape[-2], group)
+  rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), f.mask(places, caches[0][0].shape[-2])
   for l in range(c.layers):
     x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], places)
   return f.rows(rms(x, w["norm"], c.eps), [x.shape[-2] - 1]) @ w["embed.T"]

@@ -26,7 +26,7 @@ class Tensor:
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1, dtype="bf16"):
     self.rt, self.rows, self.cols, self.batch, self.op, self.srcs, self.dtype = rt, rows, cols, batch, op, srcs, dtype
     tr, tc = -(-rows // 32), -(-cols // 32)  # tile rows and columns
-    self.tiles, self.bstride, self.stride, self.offset, self.owner = batch * tr * tc, tr * tc, tc, 0, None
+    self.tiles, self.bstride, self.stride, self.offset, self.owner, self.rep = batch * tr * tc, tr * tc, tc, 0, None, 1
     self.addr = None if op else self._alloc()
     self.requires_grad, self.grad, self._ctx = False, None, None
     if op not in (None, "move", "view"): self._track(op, srcs)  # moves and views say what they are themselves
@@ -42,7 +42,7 @@ class Tensor:
     if self.addr is not None and self.owner is None: self.rt.dram_free(self.addr)
 
   def _where(self, b, i, j):  # tile (i, j) of matrix b in DRAM: (x, y, address)
-    t = b * self.bstride + i * self.stride + j + self.offset
+    t = b // self.rep * self.bstride + i * self.stride + j + self.offset
     return (*bh.DRAM[t % len(bh.DRAM)], self.addr + t // len(bh.DRAM) * tile_bytes(self.dtype))
 
   @classmethod
@@ -108,7 +108,8 @@ class Tensor:
       ids = Tensor.of(self.rt, [list(ids)], "int32")
     assert self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1), "rows of a matrix, by a row of int32"
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
-    return out._run(_cached(("gather", d), lambda: gather_kernel(d)), out.addr, self.realize().addr, self.stride, self.offset,
+    src = _plain(self.realize())
+    return out._run(_cached(("gather", d), lambda: gather_kernel(d)), out.addr, src.addr, src.stride, src.offset,
                     -(-self.cols // 32), ids.cols, ids.addr, ids.offset, name="gather")._track("gather", (self,), ids)
 
   def put(self, ids, x):
@@ -117,12 +118,14 @@ class Tensor:
     shape, so a decode step launches the same kernels each token (jit)."""
     assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "rows of x, by a row of int32 places"
     assert (x.batch, x.cols, x.dtype) == (self.batch, self.cols, self.dtype), f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"
-    x, ids, ct = x.realize(), ids.realize(), -(-self.cols // 32)
+    assert self.rep == 1, "into a tensor of its own, not a repeat"
+    x, ids, ct = _plain(x.realize()), ids.realize(), -(-self.cols // 32)
     where = lambda t: (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)
     return self.realize()._run(_cached(("put", self.dtype), lambda: put_kernel(self.dtype)), *where(self), *where(x), ids.addr,
                                ids.offset, x.rows, ct, units=self.batch * ct, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
+    if self.rep > 1: return (self + 0)._view(rows, cols, batch, offset, bstride, stride)  # of a repeat's copy
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
     v.op, v.addr, v.owner = None, self.realize().addr, self.owner or self
     v.offset, v.bstride, v.stride = self.offset + offset, bstride, self.stride if stride is None else stride
@@ -188,6 +191,13 @@ class Tensor:
       out, at = t.pad(widths) if out is None else out + t.pad(widths), at + t.shape[axis]
     return out
 
+  def repeat_interleave(self, n):
+    """Each matrix n times over, one after another along the batch (numpy's repeat), in place: kernels read matrix b as
+    the one stored at b // n. Grouped-query attention's keys and values, each head once for every query head it serves."""
+    v = self._view(self.rows, self.cols, self.batch * n, 0, self.bstride)
+    v.rep = n
+    return v._track("repeat", (self,), n)
+
   def split(self, n, axis=1):
     """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads.
     The parts are whole tiles."""
@@ -217,7 +227,7 @@ class Tensor:
     if self.op is None: return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       assert into is None, "a transpose or a move writes a tensor of its own"
-      x, op, self.op, self.srcs, d = self.srcs[0].realize(), self.op, None, (), self.dtype
+      x, op, self.op, self.srcs, d = _plain(self.srcs[0].realize()), self.op, None, (), self.dtype
       self.addr = self._alloc()
       where = (self.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset)
       if op == "T" and d == "bf16":
@@ -238,7 +248,7 @@ class Tensor:
       t.realize()
     inputs = []
     e, dtype = _tree(self, inputs)
-    key = (e, tuple(u.shape for u in inputs), dtype, self.dtype, self.rt.grid)
+    key = (e, tuple(u.shape for u in inputs), dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs))
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
@@ -475,6 +485,7 @@ def _backward(t, g):
   if op == "pad": return (g[tuple(slice(w[0], w[0] + n) for w, n in zip(args[0], x.shape))],)
   if op == "index": return (g.pad(((args[0], x.batch - args[0] - 1), (0, 0), (0, 0))),)
   if op == "split": return (g.merge() if args[0] else g.reshape(*x.shape),)
+  if op == "repeat": return (g.reshape(x.batch, args[0], x.rows * x.cols).sum(1).reshape(*x.shape),)
   if op == "merge": return (g.split(x.batch),)
   if op == "slice":  # back into place, zeros around it; a reversed axis reversed again
     assert all(abs(r.step) == 1 for r in args[0]), "a slice with a step has no backward yet"
@@ -490,6 +501,7 @@ def _parts(t):  # an fp32 matmul's operand as bf16 (hi, lo), no lo for a bf16 on
   if t.dtype == "bf16": return t, None
   return t.bfloat16(), (t - t._unary("ftob")).bfloat16()  # lo: t less itself rounded as the cast to bf16 rounds, in one kernel
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
+def _plain(t): return (t + 0).realize() if t.rep > 1 else t  # a repeat copied, for a kernel that reads tiles by their place
 def _bf16x3(a, b):  # hi@hi + (hi@lo + lo@hi) in fp32, from two operands' parts
   (ah, al), (bh, bl) = a, b
   out, lo = ah.matmul(bh, "fp32", 4), [p.matmul(q, "fp32", 4) for p, q in ((ah, bl), (al, bh)) if p is not None and q is not None]
@@ -523,7 +535,7 @@ def _tree(t, inputs):
   n = _ext(t, axis)  # the sweep is as long as t along the axis, unless t is one tile there: then its first reduction says
   return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
 
-def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)
+def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)  # t's extent along an axis: matrices, or tiles
 
 def _bf16s(tile):  # a bfp8 tile's values as bf16 (the unpacker's way, ISA FormatConversion.md): normalized, 7 bits a value
   out = array.array("H", bytes(2048))
@@ -543,7 +555,7 @@ def _name(e):  # a kernel's name in profiles: its ops, operands first, each once
     for c in e[1:]: walk(c)
     if e[0] not in ops: ops.append(e[0])
   walk(e)
-  return " ".join(ops)  # t's extent along an axis: matrices, or tiles
+  return " ".join(ops)
 
 def _expr(t, shape, inputs, kernel):
   """The tree of unrealized ops under t, for a kernel of shape (t's). kernel: [the axis it sweeps, the sweep's length
@@ -606,8 +618,8 @@ def jit(f):
     return out
   return run
 
-# (expression, input shapes, dtype, result dtype, workers' grid) -> (image, units); a move or gather's name and dtype
-# (a transpose's: its shape) -> image
+# (expression, input shapes, dtype, result dtype, workers' grid, input repeats) -> (image, units, name); a move, gather or
+# put's name and dtype (a transpose's: its shape) -> image
 kernels = {}
 def _cached(key, compile):
   if key not in kernels: kernels[key] = compile()

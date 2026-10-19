@@ -615,14 +615,15 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
   while (relayed < outputs) relay();
 }}"""
 
-def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
+def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub, mul and the binary SFPU ops, (op, x) for the
   unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, ("matmul", a, b[, phases]) where a is an input and b an
   input, ("T", input), read transposed, or ("bfp8", input), a bfp8 input (unpacker 0 makes it bf16 on its way into
   SrcA), run at `phases` fidelity phases (4 unless said), and plain numbers for inputs. shapes: each input's (batch,
   rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting). dtype: what the
   inputs are and the kernel computes in; out: what it writes (only a kernel of one op, a cast or a matmul, writes
-  another); grid: the workers as Runtime.grid has them, for a matmul to share its tiles between them.
+  another); grid: the workers as Runtime.grid has them, for a matmul to share its tiles between them; reps: each input's
+  repeat (Tensor.repeat_interleave: its matrix b is the one stored at b // rep), 1 unless said.
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
@@ -802,10 +803,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     if isinstance(r, int): return FRAMES + f * frame + r if r not in kept else kept[r] if narrow(r) else f"{kept[r]} + k"
     return FRAMES + (f * frame + inputs + r[1] if swept(r) else 2 * frame + r[1])
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
+  def matrix(r, base):  # the batch's part of r's tile number: matrix b's, or a repeat's b / rep
+    if size(r)[0] == 1: return ""
+    return f"b / {reps[r]} * a[{base + 1}] + " if reps and isinstance(r, int) and reps[r] > 1 else f"b * a[{base + 1}] + "
   def where(r, base):  # which tile of r (an input or the result, its [address, strides, offset] at a[base]) goes with b, i_, j
     s = size(r)
-    b, i, j = f"b * a[{base + 1}] + " if s[0] > 1 else "", "i_" if ext(s, 1) > 1 else 0, "j" if ext(s, 2) > 1 else 0
-    return f"{b}{i} * a[{base + 2}] + {j} + a[{base + 3}]"
+    i, j = "i_" if ext(s, 1) > 1 else 0, "j" if ext(s, 2) > 1 else 0
+    return f"{matrix(r, base)}{i} * a[{base + 2}] + {j} + a[{base + 3}]"
   tile = lambda i: where(i, arg(i))
   B, U, M, P = range(4)  # the programs: BRISC moves tiles; TRISC 0, 1, 2 feed the unpack, math and pack threads
   def math_end(j):  # the math thread's last words for op j: the root's padding in Dst goes to 0 first, in a tile at the edge
@@ -844,11 +848,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
           bt, bs = how == 1, 0 if how == 2 else 1  # B transposed; B's first stream slot (bfp8's are at B8)
           x, y = arg(op["x"]), arg(op["y"])
           bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
-          in_batch = f"b * a[{y + 1}] + " if shapes[op["y"]][0] > 1 else ""
+          in_batch = matrix(op["y"], y)
           b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
           on, off = (tt(haloize(1)), tt(haloize(0))) if bt else (tt(bfp8_b(b8)), tt(bfp8_b(0))) if how == 2 else ("", "")
           if mc and how == 2: on = " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp8_b(b8, r))} }}" for r in range(3))  # the column's buffer
-          a_tile = f"{f'b * a[{x + 1}] + ' if shapes[op['x']][0] > 1 else ''}i_ * a[{x + 2}] + m + a[{x + 3}]"
+          a_tile = f"{matrix(op['x'], x)}i_ * a[{x + 2}] + m + a[{x + 3}]"
           buf = mc and f"{0 if how == 2 else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a bfp8 B's in B8)
           if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
             gx_n, gy_n = mc
@@ -968,7 +972,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None):
     (gx_n, gy_n), (xs, ys), kt, x = bcast, grid, ops[matmuls[0]]["kt"], arg(ops[matmuls[0]]["x"])
     rects = [xs[gx_n - 1] | ys[g + gy_n - 1] << 6 | (xs[0] | ys[g] << 6) << 12 for g in range(0, nb * gy_n, gy_n)]  # each matrix's rows
     decls, tail = _array("rect", rects) + "\n", f"unflag({gx_n}, 0);"
-    in_batch = f"b * a[{x + 1}] + " if shapes[ops[matmuls[0]]["x"]][0] > 1 else ""
+    in_batch = matrix(ops[matmuls[0]]["x"], x)
     first = (f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, end = (gx + 1) * {kt} / {gx_n};\n"
              f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
              f"      share(SLOT({rows_at[0]} + e), (end - e) * {tile_bytes(dtype)}, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")

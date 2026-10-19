@@ -1103,7 +1103,7 @@ def test_llama_layer(chip, n):
   c, w = smol(rng, 1)
   p = {k.removeprefix("layers.0."): v for k, v in w.items() if k.startswith("layers.0.")}
   x, (cos, sin, turn) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, n)
-  mask = np.tile(np.triu(np.full((n, n), -1e9, np.float32), 1), (3, 1))
+  mask = np.triu(np.full((n, n), -1e9, np.float32), 1)
   on = lambda a: Tensor.of(rt, a.tolist())
   cache, np_cache = [on(np.zeros((3, n, 64))) for _ in range(2)], [np.zeros((3, n, 64)) for _ in range(2)]
   places = Tensor.of(rt, [list(range(n))], "int32")
