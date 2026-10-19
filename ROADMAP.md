@@ -43,6 +43,7 @@ Done: everything from stage 1 runs correctly on the card.
 
 - [ ] Matmul near the chip's peak, decode near its DRAM bandwidth
 - [x] Tiles multicast between cores: a matmul reads each input tile from DRAM once (`test_matmul_multicast`)
+- [x] A decode step replayed from a recording, the host's part of a SmolLM token 0.1 ms (`jit`, `test_kv_cache`)
 - [ ] What the simulator could not measure: several reads in flight (`DEPTH`), BFP8 weights (`cast("bfp8")`, exact on
       ttsim), and what fewer fidelity phases gain (`matmul(fidelity=)`, its accuracy measured on ttsim)
 - [ ] Benchmarks against Tenstorrent's own stack, published

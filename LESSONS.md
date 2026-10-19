@@ -80,6 +80,9 @@ append a correction.
    next step, only saves pushes, which it does not count; a PC profile of the idle clocks showed the cores waiting on
    each other instead, and fetches on BRISC's critical path: fetching a layer norm's inputs once took it from 2.6k
    cycles to 0.6k. (NOTES: "How ttsim counts")
+8. **What the simulator does not count, the card will.** ttsim counts the chip's clocks, never the host's: issuing a
+   GPT-2 token took ferrite's Python 10.8 ms, where the card should need 0.5 ms. Measure the host as well; replaying a
+   recorded token (`jit`) takes it to 0.1 ms. (NOTES: "The host's part, and replay")
 
 ## The compiler and runtime
 
