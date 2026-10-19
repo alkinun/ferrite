@@ -14,7 +14,8 @@ import tinygrad, tinygrad.tensor
 from tinygrad import Tensor, dtypes
 from tinygrad.dtype import _to_np_dtype
 from tinygrad.device import Allocator, BufferStorage, Compiled, Device
-from tinygrad.uop.ops import Ops, UOp
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, graph_rewrite
+from tinygrad.schedule.prepare import resolve_function
 from views import View, Value, broadcast, common_groups, download, fold, grouping, materialize, merge, operand, reduce, spread, upload
 from ferrite import tensor  # after views, which puts ferrite on the path
 
@@ -219,6 +220,7 @@ class Holder:  # a FERRITE buffer's contents: bytes from the host, or a chip val
   def __init__(self): self.bytes, self.value = None, None
 
 class FerriteAllocator(Allocator):
+  lru = False  # a freed buffer would come back to a new one of its size with the old one's contents
   def _alloc(self, size, options): return BufferStorage(Holder())
   def _copyin(self, dest, src): dest.bytes, dest.value = bytes(src), None
   def _copyout(self, dest, src):
@@ -229,7 +231,9 @@ class FerriteDevice(Compiled):
   def __init__(self, device): super().__init__(device, FerriteAllocator(self), [], None)
   def synchronize(self, timeout=None): pass  # reading a chip value back waits for what it needs
 
+inline = PatternMatcher([(UPat(Ops.CALL, name="c"), resolve_function)])  # a tinygrad function as its body, storing its outputs
 def run(sink):
+  sink = graph_rewrite(sink, inline, name="inline calls")
   users = collections.defaultdict(list)
   for u in (order := sink.toposort()):
     for s in u.src: users[s].append(u)

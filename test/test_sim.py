@@ -989,21 +989,24 @@ def tinygrad(chip):  # tinygrad with ferrite as its FERRITE device, on this proc
 def test_tinygrad(tinygrad):
   # stage 4's first step: tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
   # ferrite runs it: elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad
-  # writes one (a broadcast multiply, summed), softmax; then an MLP trained with Adam for three steps. All against
-  # tinygrad on its own CPU device, and on the chip (launches), not the host
-  from tinygrad import Tensor, nn
+  # writes one (a broadcast multiply, summed), softmax, a tinygrad function (inlined); then an MLP trained with Adam for
+  # three steps. All against tinygrad on its own CPU device, and on the chip (launches), not the host
+  from tinygrad import Tensor, dtypes, function, nn
   from tinygrad.helpers import Context
   import views
   rng, rt = np.random.default_rng(14), views.runtime()
   a, b, w = (rng.standard_normal(shape).astype(np.float32) for shape in ((2, 3, 40), (2, 3, 40), (40, 5)))
   cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.max(-1), lambda x, y, w: x.exp().log(),
            lambda x, y, w: (x > 0).where(x, y), lambda x, y, w: x @ w, lambda x, y, w: x.softmax(-1), lambda x, y, w: x.permute(2, 0, 1) - y.mean(),
-           lambda x, y, w: x.pad(((0, 0), (1, 2), (0, 0))) * 1.5, lambda x, y, w: x[:, 1:3, ::2].relu()]
+           lambda x, y, w: x.pad(((0, 0), (1, 2), (0, 0))) * 1.5, lambda x, y, w: x[:, 1:3, ::2].relu(),
+           lambda x, y, w: function(lambda p, q: p * 2 + q)(x, y)]
   for n, f in enumerate(cases):
     want = f(*(Tensor(v, device="CPU") for v in (a, b, w))).numpy()
     launches, got = rt.launches, f(*(Tensor(v, device="FERRITE") for v in (a, b, w))).numpy()
     assert rt.launches > launches and got.shape == want.shape, n
     assert np.abs(got - want).max() <= 1e-3 * (np.abs(want).max() + 1), (n, np.abs(got - want).max())  # a matmul to the FPU's 2^-11
+  Tensor.ones(2, device="FERRITE").contiguous().realize().tolist()  # a buffer freed, then one of its size: nothing of it left
+  assert Tensor.ones((), dtype=dtypes.int64, device="FERRITE").contiguous().item() == 1
   def train(device):
     rng = np.random.default_rng(15)
     l1, l2 = nn.Linear(16, 32), nn.Linear(32, 10)
