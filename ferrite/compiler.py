@@ -1085,6 +1085,26 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+def readback_kernel(dtype):
+  """A tensor's tiles into host memory (Runtime.back) for tobytes, since a read of DRAM over the BARs waits on PCIe for
+  each load: args [first unit, units, the first tile, the tensor's address, tile strides for batch and row, tile offset,
+  tile columns, tiles a matrix, repeat, host address low and high]. BRISC alone, a tile a unit, its tiles in order from
+  the first, through two L1 buffers, so a tile's read overlaps the last one's write."""
+  n = tile_bytes(dtype)
+  return compile_kernel(f"""
+{BANKS}
+void kmain(volatile unsigned *a) {{
+  unsigned long long host = a[10] | (unsigned long long)a[11] << 32;
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned k = a[0] + u, t = a[2] + k, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b / a[9] * a[4] + i * a[5] + j + a[6];
+    unsigned l1 = {DATA:#x} + u % 2 * {n};
+    noc_get(BANK(from), a[3] + from / 8 * {n}, l1, {n});
+    noc_wait();  // and the write out of this buffer two tiles ago is done
+    noc_write(l1, {bh.PCIE[0]}, {bh.PCIE[1]}, host + k * {n}, {n});
+  }}
+  noc_wait();
+}}""")
+
 def bfp4_kernel():
   """bf16 tiles as bfp4, args [first unit, units, out, x's address, tile strides for batch and row, tile offset, x's
   tile columns, tiles a matrix]. BRISC alone, a tile a unit: each run of 16 values (a face's row) shares its largest

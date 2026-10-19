@@ -309,8 +309,10 @@ class Runtime:
     ys = [y for y in sorted({y for _, y in self.cores}) if all((x, y) in self.cores for x in xs)]
     assert self.cores[:len(xs) * len(ys)] == [(x, y) for y in ys for x in xs], "whole rows first"
     self.grid = tuple(xs), tuple(ys)
-    buf, bus = chip.pci.alloc(64 + ring + 16 * TIMES)
-    self.status, self.ring, self.times = buf[:64], buf[64:64 + ring], buf[64 + ring:]
+    buf, bus = chip.pci.alloc(1 << 21)  # one hugepage: the status, the ring, the times, then tensors read back (tobytes)
+    back = 64 + ring + 16 * TIMES
+    assert back + 4096 <= 1 << 21, "a ring that leaves no room to read a tile back"
+    self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
     self.names = [""] * TIMES  # each of the last TIMES launches' name, for profile
     self.numbers = {}  # (value, dtype) -> a tensor of that one number, uploaded once (tensor.py's constants)
     self.log, self.pinned = None, set()  # while a call is recorded (tensor.jit): its launches, and DRAM it took, never given back

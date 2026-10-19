@@ -7,7 +7,7 @@ from ferrite.chip import Chip
 from ferrite.compiler import from_bf16, to_bf16
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
-from ferrite.runtime import DATA, KERNELS, Runtime, compile_kernel
+from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
 import gpt2, llama, train
 from types import SimpleNamespace
 
@@ -25,6 +25,9 @@ def bfp(a, dtype="bfp8"):  # numpy's bfp8 of bf16 values, as the packer makes it
   q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
   if dtype == "bfp4": q = np.where(shift < 4, np.minimum((runs(m) + (16 << shift)) >> (shift + 5), 7), 0) << 4  # nearest 3 bits
   return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(a.shape)
+
+def kernels(rt, since):  # launches after launch number `since`, not counting the reads back (tobytes is one)
+  return sum(rt.names[n % TIMES] != "readback" for n in range(since + 1, rt.launches + 1))
 
 def close(t, want, tol):  # a tensor's values within tol (relative, and absolute near 0) of numpy's
   got = np.array(t.tolist())
@@ -381,7 +384,7 @@ def test_fusion(chip):
       fused, launches = build(a, b, c, d), rt.launches
       lazy = [t for t in (fused, *fused.srcs, *fused.srcs[0].srcs, *fused.srcs[1].srcs) if t.op]
       got = fused.tolist()
-      assert rt.launches == launches + 1 and all(t.addr is None for t in lazy[1:]), "one kernel, intermediates stay on chip"
+      assert kernels(rt, launches) == 1 and all(t.addr is None for t in lazy[1:]), "one kernel, intermediates stay on chip"
       assert got == unfused(build(a, b, c, d)).tolist()
 
 def test_fused_cast(chip):
@@ -394,7 +397,7 @@ def test_fused_cast(chip):
                 lambda: (x * y - x).cast("bfp8"), lambda: (a * b + a).float(), lambda: a.softmax(-1).float(), lambda: (a @ c).float(),
                 lambda: (a * b + a).cast("bfp8")):
     launches, fused = rt.launches, build().realize()
-    assert rt.launches == launches + 1
+    assert kernels(rt, launches) == 1
     t = build()
     t.srcs[0].realize()
     assert fused.tobytes() == t.realize().tobytes()
@@ -435,7 +438,7 @@ def test_matmul_fusion(chip):
     a, b, c, d, e, f = (Tensor.of(rt, rnd(*shape)) for shape in ((64, 96), (96, 128), (64, 128), (64, 128), (64, 64), (64, 128)))
     for build in (lambda: (a @ b) + c, lambda: (a @ b) * d - c, lambda: (a @ b) + (e @ f)):
       launches, got = rt.launches, build().tolist()
-      assert rt.launches == launches + 1, "one kernel"
+      assert kernels(rt, launches) == 1, "one kernel"
       assert got == unfused(build()).tolist()
 
 def test_replay_keeps_pushes_small():
@@ -476,7 +479,7 @@ def test_sfpu(chip):
   # relu fused onto a matmul plus an add, one launch; rounding commutes with relu, so bit for bit as op by op
   a, b, c = (Tensor.of(rt, [[bf(random.uniform(-1, 1)) for _ in range(64)] for _ in range(64)]) for _ in range(3))
   launches, fused = rt.launches, ((a @ b) + c).relu().tolist()
-  assert rt.launches == launches + 1 and fused == unfused(((a @ b) + c).relu()).tolist()
+  assert kernels(rt, launches) == 1 and fused == unfused(((a @ b) + c).relu()).tolist()
   # all three SFPU programs in one kernel: exp's 38 words never fit the 32-entry replay buffer, so its runs go word by
   # word, while recip's and relu's are replayed
   u = [[bf(random.uniform(-3, 3)) for _ in range(64)] for _ in range(64)]
@@ -519,7 +522,7 @@ def test_elementwise(chip):
   # fused: a comparison, where and two unary ops are one kernel; a masked softmax, where the mask is -inf, not -1e9
   launches, got = rt.launches, (tx > 0).where(tx.log2(), tx.exp2())
   with np.errstate(all="ignore"): check(got, np.where(fx > 0, np.log2(fx), np.exp2(fx)), 2**-7)
-  assert rt.launches == launches + 1
+  assert kernels(rt, launches) == 1
   s, m = bf16(rng.uniform(-4, 4, (40, 64))), np.tril(np.ones((40, 64)))
   masked = np.where(m > 0, s, -np.inf)
   e = np.exp(masked - masked.max(1, keepdims=True))
@@ -554,14 +557,14 @@ def test_softmax_and_layernorm(chip):
     x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
     tx = Tensor.of(rt, x)
     launches, got = rt.launches, tx.softmax().tolist()
-    assert rt.launches == launches + 1
+    assert kernels(rt, launches) == 1
     for g, row in zip(got, x):
       want = [math.exp(v - max(row)) for v in row]
       assert all(abs(gv - w / sum(want)) <= 0.02 * w / sum(want) + 1e-4 for gv, w in zip(g, want))
     gamma, beta = [bf(random.uniform(0.5, 1.5)) for _ in range(cols)], [bf(random.uniform(-1, 1)) for _ in range(cols)]
     tg, tb = Tensor.of(rt, [gamma]), Tensor.of(rt, [beta])
     launches, got = rt.launches, (tx.layernorm() * tg + tb).tolist()
-    assert rt.launches == launches + 1
+    assert kernels(rt, launches) == 1
     for g, row in zip(got, x):
       mean = sum(row) / cols
       sd = math.sqrt(sum((v - mean) ** 2 for v in row) / cols + 1e-5)
@@ -579,12 +582,12 @@ def test_reduce_axes(chip):
     tx = Tensor.of(rt, x.tolist())
     for axis in (0, 1, 2):
       launches, top, total = rt.launches, value(tx.max(axis)), value(tx.sum(axis))
-      assert rt.launches == launches + 2 and top.tolist() == x.max(axis, keepdims=True).tolist()
+      assert kernels(rt, launches) == 2 and top.tolist() == x.max(axis, keepdims=True).tolist()
       assert np.allclose(total, x.sum(axis, keepdims=True), rtol=2**-8, atol=2**-8), np.abs(total - x.sum(axis, keepdims=True)).max()
     e = np.exp(x - x.max(1, keepdims=True))
     close((tx - tx.max(1)).exp() / (tx - tx.max(1)).exp().sum(1), e / e.sum(1, keepdims=True), 0.02)
     launches, got = rt.launches, tx.sum() * (1 / x.size)
-    assert abs(got.tolist()[0][0] - x.mean()) <= 2**-7 * abs(x.mean()) and rt.launches == launches + 3, "an axis a launch"
+    assert abs(got.tolist()[0][0] - x.mean()) <= 2**-7 * abs(x.mean()) and kernels(rt, launches) == 3, "an axis a launch"
     close(tx.sum(0) * tx[1] - 1.0, x.sum(0) * x[1] - 1, 2**-6)  # the batch sum, a view and a number in one kernel
     y = bf16(rng.uniform(-2, 2, (2, 45, 200)))  # reductions of another length than the result along the axis: first, alone
     ty = Tensor.of(rt, y.tolist())
@@ -689,7 +692,7 @@ def test_movement(chip):
   for t, want in cases: assert value(t).tolist() == want.reshape(t.shape).tolist(), (t.shape, want.shape)
   launches, t = rt.launches, tx.reshape(135, 70)[:, 7:100:2, ::-1].pad(((1, 0), (3, 1), (2, 5))).permute(2, 1, 0)[:, 1:4, 1:2].expand(77, 3, 40)
   want = np.broadcast_to(np.pad(x.reshape(1, 135, 70)[:, 7:100:2, ::-1], ((1, 0), (3, 1), (2, 5))).transpose(2, 1, 0)[:, 1:4, 1:2], (77, 3, 40))
-  assert value(t).tolist() == want.tolist() and rt.launches == launches + 1, "a chain of moves is one move"
+  assert value(t).tolist() == want.tolist() and kernels(rt, launches) == 1, "a chain of moves is one move"
   # the move kernel's ways, in fp32 (a word a datum): whole tiles as they are (a pad on tile boundaries) or transposed, runs
   # along x's rows (a reshape, an unaligned slice) and down its columns (attention's heads apart), datum by datum (a permute)
   y = rng.uniform(-2, 2, (2, 64, 96)).astype(np.float32)
@@ -753,7 +756,7 @@ def test_fp32(chip):
     x, y = f32(2, 45, 70), f32(2, 45, 70)
     tx, ty = Tensor.of(rt, x.tolist(), "fp32"), Tensor.of(rt, y.tolist(), "fp32")
     launches, got = rt.launches, value((tx + ty) * tx - ty * 1.5)
-    assert rt.launches == launches + 1 and got.tolist() == ((x + y) * x - y * np.float32(1.5)).tolist(), "one kernel, fp32's rounding"
+    assert kernels(rt, launches) == 1 and got.tolist() == ((x + y) * x - y * np.float32(1.5)).tolist(), "one kernel, fp32's rounding"
     for got, want in [(tx, x), ((tx < ty).where(tx, ty * 0.5), np.where(x < y, x, y * np.float32(0.5))), (tx.max(1), x.max(1, keepdims=True)),
                       (tx.T, x.transpose(0, 2, 1)), (tx[1][3:40:2, 5:66], x[1, 3:40:2, 5:66]), (tx[0].gather([44, 0, 7]), x[0, [44, 0, 7]])]:
       assert value(got).tolist() == np.asarray(want, np.float32).reshape(got.shape).tolist()
@@ -939,7 +942,7 @@ def test_mnist_mlp(chip):
   tx, tw1, tb1, tw2, tb2 = (Tensor.of(rt, a.tolist()) for a in (x, w1, b1, w2, b2))
   launches = rt.launches
   logits = np.array(((tx @ tw1 + tb1).relu() @ tw2 + tb2).tolist())
-  assert rt.launches == launches + 2
+  assert kernels(rt, launches) == 2
   want = np.maximum(x @ w1 + b1, 0) @ w2 + b2
   assert np.allclose(logits, want, rtol=0.02, atol=0.02), np.abs(logits - want).max()
   top2 = np.sort(want, 1)[:, -2:]

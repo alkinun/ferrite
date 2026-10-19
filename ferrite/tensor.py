@@ -5,7 +5,7 @@
 import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32, ITEMSIZE, tile_bytes, shared_k
-from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, move_kernel, put_kernel, transpose_kernel
+from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, move_kernel, put_kernel, readback_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -82,14 +82,21 @@ class Tensor:
 
   def tobytes(self):
     """dtype's values in row-major order, matrix after matrix, as frombytes takes them (a block float's as bf16, each of
-    its values being one). Waits for the launches queued."""
+    its values being one). Waits for the launches queued. The chip writes the tiles into host memory, as many at a time
+    as fit (readback_kernel), and they are read there: read over the BARs, each load would wait on PCIe."""
     self.realize()
-    self.rt.wait()
-    n, rows, cols, ct = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32)
+    n, rows, cols, ct, tb = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32), tile_bytes(self.dtype)
+    per, tiles, kernel = len(self.rt.back) // tb, bytearray(), _cached(("readback", self.dtype), lambda: readback_kernel(self.dtype))
+    for start in range(0, self.tiles, per):
+      k = min(per, self.tiles - start)
+      self.rt.launch(kernel, (start, self.addr, self.bstride, self.stride, self.offset, ct, self.tiles // self.batch, self.rep,
+                              self.rt.back_bus & 0xFFFFFFFF, self.rt.back_bus >> 32), units=k, name="readback")
+      self.rt.wait()
+      tiles += self.rt.back[:k * tb]
     out = bytearray(n * self.batch * rows * cols)
     for b, i in ((b, i) for b in range(self.batch) for i in range(self.tiles // self.batch)):
       r0, c0, base = i // ct * 32, i % ct * 32, b * rows * cols
-      tile = self.rt.chip.read(*self._where(b, i // ct, i % ct), tile_bytes(self.dtype))
+      tile = bytes(tiles[(b * (self.tiles // self.batch) + i) * tb:][:tb])
       if self.dtype in BFP: tile = _bf16s(tile, self.dtype)
       for face in range(4):
         c, k = c0 + face % 2 * 16, min(16, cols - c0 - face % 2 * 16)
