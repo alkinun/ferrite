@@ -803,11 +803,12 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   if kept_b is not None: top = max(top, kept_b + (3 if mc else 1) * ops[matmuls[0]]["kt"])  # past A's rows and B's buffers
   for r in range(inputs) if not reducing else ():
     if all(ext(shapes[r], ax) == 1 for ax in range(3)) and top < UNPACKABLE: single[r], top = top, top + 1
-  def slot(f, r):  # an input or swept op lives in the frame (or where it is kept), a narrow op in its own slot after both frames
-    if r == "zero": return ZERO_SLOT
+  def slot(r):  # an input or swept op lives in the tile's frame (C's fr: 0 or 1), unless kept; a narrow op in a slot of its
+    if r == "zero": return ZERO_SLOT  # own after both frames
     if r in single: return single[r]
-    if isinstance(r, int): return FRAMES + f * frame + r if r not in kept else kept[r] if narrow(r) else f"{kept[r]} + k"
-    return FRAMES + (f * frame + inputs + r[1] if swept(r) else 2 * frame + r[1])
+    if isinstance(r, int) and r in kept: return kept[r] if narrow(r) else f"{kept[r]} + k"
+    if isinstance(r, int) or swept(r): return f"{FRAMES + (r if isinstance(r, int) else inputs + r[1])} + fr * {frame}"
+    return FRAMES + 2 * frame + r[1]
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
   def matrix(r, base):  # the batch's part of r's tile number: matrix b's, or a repeat's b / rep
     if size(r)[0] == 1: return ""
@@ -824,13 +825,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     edge = [f"if ({at_end(2)}) {{ {tt(mask_columns('sum', cols % 32))} }}"] * (cols > 1 and cols % 32 > 0)
     edge += [f"if ({at_end(1)}) {{ {tt(mask_rows('sum', rows % 32))} }}"] * (rows > 1 and rows % 32 > 0)
     return " ".join(edge + [tt(MATH_END)])
-  def pslot(f, r):  # where the packer puts r: its slot, or for a result in another dtype, one at OUTS
-    return (f if swept(me) else 0) if out != dtype and r == me else slot(f, r)
-  def output(j, f):  # for the pack thread: where op j's result goes, if it is the root
-    return f"output({f if swept(me) else 0}, {pslot(f, me)}, {where(me, 2)}); " if j == root else ""
-  def fetch(f, p, r):  # BRISC's fetch of input r in pass p: into the frame, or into its kept slot in the first pass reading it,
+  def pslot(r):  # where the packer puts r: its slot, or for a result in another dtype, one at OUTS
+    return ("fr" if swept(me) else 0) if out != dtype and r == me else slot(r)
+  def output(j):  # for the pack thread: where op j's result goes, if it is the root
+    return f"output({'fr' if swept(me) else 0}, {pslot(me)}, {where(me, 2)}); " if j == root else ""
+  def fetch(p, r):  # BRISC's fetch of input r in pass p: into the frame, or into its kept slot in the first pass reading it,
     if r in single: return f"if (tiles == 1) get(a[{arg(r)}], {tile(r)}, {single[r]});"  # with the first tile (tiles counts it already)
-    if r not in kept: return f"get(a[{arg(r)}], {tile(r)}, {slot(f, r)});"  # once the line before has been read there
+    if r not in kept: return f"get(a[{arg(r)}], {tile(r)}, {slot(r)});"  # once the line before has been read there
     if p != passes_of(r)[0]: return ""
     return (f"if (k == 0) {{ reached(narrow_done); get(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
             f"reached(kept_done[k]); get(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
@@ -838,124 +839,121 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   if any(not narrow(r) for r in kept): decls += f"static unsigned kept_done[{L}];\n"
   passes = []
   for p, (reductions, swept_ops, once) in enumerate(plans):
-    bodies = []
-    for f in (0, 1):
-      c = [[], [], [], []]  # each program's C for this tile
-      c[B] += [f"reached(frame_done[{f}]);"] + [fetch(f, p, r) for r in sorted(reads[p])] + ["ready();"]
-      c[U].append("fetched();")
-      if dst: c[M].append("fetched();")
-      for j in once + swept_ops:
-        op, me_j = ops[j], ("op", j)
-        cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
-        pk = tt(pack("h", pslot(f, me_j), SEM_PACKED if j == root else SEM_L1))
-        pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
-        c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= {DST_HALF}; }}")
-        if op["kind"] == "matmul":
-          kt, bw, q, how = op["kt"], ext(op["shape"], 2), matmuls.index(j), op["how"]  # B's width in tiles; which matmul
-          bt, bs = how == 1, 0 if how == 2 else 1  # B transposed; B's first stream slot (bfp8's are at B8)
-          x, y = arg(op["x"]), arg(op["y"])
-          bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
-          in_batch = matrix(op["y"], y)
-          b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
-          on, off = (tt(haloize(1)), tt(haloize(0))) if bt else (tt(bfp8_b(b8)), tt(bfp8_b(0))) if how == 2 else ("", "")
-          if mc and how == 2: on = " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp8_b(b8, r))} }}" for r in range(3))  # the column's buffer
-          a_tile = f"{matrix(op['x'], x)}i_ * a[{x + 2}] + m + a[{x + 3}]"
-          buf = mc and f"{0 if how == 2 else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a bfp8 B's in B8)
-          if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
-            gx_n, gy_n = mc
-            gx, gy, a_n = f"unit % {bc}", f"unit / {bc}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {kt}"
-            part = lambda n, k, parts: (f"{k} * {n} / {parts}", f"({k} + 1) * {n} / {parts}")  # worker k's share of n tiles
-            (a0, a1), (b0, b1) = part(a_n, gx, gx_n), part(kt, gy, gy_n)
-            get_a = (f"for (unsigned e = {a0}; e < {a1}; e++) "
-                     f"{{ unsigned i_ = i0 + e / {kt}, m = e % {kt}; get(a[{x}], {a_tile}, {rows_at[q]} + e); }} "
-                     f"share(SLOT({rows_at[q]} + {a0}), ({a1} - {a0}) * {tile_bytes(dtype)}, row_rect[{gy}], {gx_n - 1}, {gx}, 1);")
-            get_b = f"for (unsigned m = {b0}; m < {b1}; m++) {('get', 'flipped', 'get8')[how]}(a[{y}], {b_tile}, {buf} + m); "
-            share_b = lambda l1, n: f"share({l1}, ({b1} - {b0}) * {n}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, jj + 1);"
-            if how == 2:  # in region jj % 3 of B8: the share's exponents, then its values
-              region = f"{B8} + jj % 3 * {kt * tile_bytes('bfp8')}"
-              get_b += (f"if ({gy_n - 1} && {b1} > {b0}) mcast({region} + 64 * ({b0}), ({b1} - {b0}) * 64, col_rect[{gx}], {gy_n - 1}); " +
-                        share_b(f"{region} + {64 * kt} + 1024 * ({b0})", 1024))
-            else: get_b += share_b(f"SLOT({buf} + {b0})", tile_bytes(dtype))
-            c[B].append(f"{{ if (ii == 0) {{ "  # a column's first tile: its column of B, and in the first column A's rows
-                        f"if (jj == 0) {{ {get_a} }} "
-                        # done with column jj - 2 here: this column's flag lets the others fill its buffer with jj + 1
-                        f"if (jj >= 2) reached(col_end[(jj + 1) % 3]); "
-                        f"{get_b} await({FLAGS_B}, {gy_n}, jj + 1); if (jj == 0) await(0, {gx_n}, 1); }} "
-                        f"for (unsigned m = 0; m < {kt}; m++) kept_step(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
-          elif kept_b is not None:  # A's bp rows and B's column in L1
-            c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
-                        f"for (unsigned m = 0; m < {kt}; m++) step({how}, a[{y}], {b_tile}, nb ? {0 if how == 2 else kept_b} + m : KEPT, "
-                        f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); tagged(0); }}")
-          if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
-            column = 0 if how == 2 else buf if mc else kept_b  # a bfp8 B's from the start of its region
-            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
-                        f"{on} for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
-          elif rows_at[q] is None:  # A's tile streams in beside B's, each step
-            c[B].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, {1 + DEPTH} + steps % {DEPTH}); tagged(0); }}")
-            c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
-                        f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
-          elif j == line_b:  # B's line in L1 across passes: fetched in the first pass that computes it, once the line before
-            at = f"{lines_at} + k * {kt}"  # has been done with it; A's row kept as below
-            if p == computed[0]:
-              c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                          f"step({how}, a[{y}], {b_tile}, {at} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
-            else: c[B].append(f"for (unsigned m = 0; m < {kt}; m++) kept_step();")
-            c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, at)])} {on} "
-                        f"for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
-          else:
-            new = "0" if bcast else f"fresh({q}, b * {rt} + i_)"  # bcast: A's row is in already
-            c[B].append(f"{cond}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
-            c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ "
-                        f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
-          c[M].append(f"{cond}{{ {tt(math_begin(True))} "
-                      f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases']))} }} "
-                      f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= {DST_HALF}; }}")
-          continue
-        drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
-        x, y = slot(f, op["x"]), slot(f, op["y"])
-        prog = sfpu([sfpu_name(op)], slots) if sfpu_op(op) else []
-        if dst:  # x into the op's Dst half, y 128 rows on, then the SFPU: all on the math thread
-          fills = fill(x, "h") + (fill(y, "h + 128") if op["y"] != "zero" else []) + FILLED
-          math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], slots))
-          c[M].append(f"{cond}{{ {drain}{math} {math_end(j)} h ^= {DST_HALF};{posted} }}")
-          continue
-        if op["kind"] in BINARY:  # x and y each into Dst for the SFPU: x in the op's half, y 128 rows on
-          unpacks, fpu = unpack(x, ZERO_SLOT) + unpack(y, ZERO_SLOT), elementwise("add", slots) + elementwise("add", slots, dst=128)
-        else: unpacks, fpu = unpack(x, y), elementwise(op["kind"], slots)
-        c[U].append(f"{cond}{{ {drain}{tt(unpacks)}{posted} }}")
-        math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], slots))
-        c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= {DST_HALF}; }}")
-      for acc, j in enumerate(reductions):
-        assert acc < len(ACCS), "two reductions a pass"
-        op, me_j, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
-        drain = "drain(); " if isinstance(x, tuple) else ""
-        edge = size(x)[axis] % 32 if axis and size(x)[axis] > 1 else 0  # the operand's rows or columns in its last tile, if cut short
-        end = f"k == {L - 1}" if swept(x) else "k == 0"  # the line's last tile (a narrow operand is one tile a line)
-        src = slot(f, x) if dst else None
-        def step(first):  # the last tile's padding must not count
-          plain, cut = tt(reduce_step(kind, slots, acc, first, 0, src)), tt(reduce_step(kind, slots, acc, first, edge, src))
-          return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
-        finish, posted = f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}', "" if j == root else " posted++;"
-        pk = tt(pack(ACCS[acc][0], pslot(f, me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
-        pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
-        unpacks = "" if dst else tt(unpack(slot(f, x), ZERO_SLOT))  # an fp32 step fills Dst itself
-        mine = M if dst else U  # who drains and counts
-        if swept(x):  # swept along the line
-          c[mine].append(f"{drain}{unpacks} if ({end}) {{{posted} }}")
-          c[M].append(f"if (k == 0) {{ {step(True)} }} else {{ {step(False)} }} if ({end}) {{ {finish} }}")
-        else:  # reduced in the pass's first tile
-          c[mine].append(f"if ({end}) {{ {drain}{unpacks}{posted} }}")
-          c[M].append(f"if ({end}) {{ {step(True)} {finish} }}")
-        c[P].append(f"if ({end}) {{ {output(j, f)}{pk} }}")
-      c[M if dst else U].append(tt(REPORT))
-      c[B].append(f"frame_done[{f}] = ++events;" + " narrow_done = events;" * (p == last_read(True)) +
-                  " kept_done[k] = events;" * (p == last_read(False)) + " line_done[k] = events;" * (p == computed[-1]))
-      bodies.append(c)
-    passes.append((bool(swept_ops or reductions), bodies))
+    c = [[], [], [], []]  # each program's C for a tile
+    c[B] += ["reached(frame_done[fr]);"] + [fetch(p, r) for r in sorted(reads[p])] + ["ready();"]
+    c[U].append("fetched();")
+    if dst: c[M].append("fetched();")
+    for j in once + swept_ops:
+      op, me_j = ops[j], ("op", j)
+      cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
+      pk = tt(pack("h", pslot(me_j), SEM_PACKED if j == root else SEM_L1))
+      pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
+      c[P].append(f"{cond}{{ {output(j)}{pk} h ^= {DST_HALF}; }}")
+      if op["kind"] == "matmul":
+        kt, bw, q, how = op["kt"], ext(op["shape"], 2), matmuls.index(j), op["how"]  # B's width in tiles; which matmul
+        bt, bs = how == 1, 0 if how == 2 else 1  # B transposed; B's first stream slot (bfp8's are at B8)
+        x, y = arg(op["x"]), arg(op["y"])
+        bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
+        in_batch = matrix(op["y"], y)
+        b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
+        on, off = (tt(haloize(1)), tt(haloize(0))) if bt else (tt(bfp8_b(b8)), tt(bfp8_b(0))) if how == 2 else ("", "")
+        if mc and how == 2: on = " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp8_b(b8, r))} }}" for r in range(3))  # the column's buffer
+        a_tile = f"{matrix(op['x'], x)}i_ * a[{x + 2}] + m + a[{x + 3}]"
+        buf = mc and f"{0 if how == 2 else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a bfp8 B's in B8)
+        if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
+          gx_n, gy_n = mc
+          gx, gy, a_n = f"unit % {bc}", f"unit / {bc}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {kt}"
+          part = lambda n, k, parts: (f"{k} * {n} / {parts}", f"({k} + 1) * {n} / {parts}")  # worker k's share of n tiles
+          (a0, a1), (b0, b1) = part(a_n, gx, gx_n), part(kt, gy, gy_n)
+          get_a = (f"for (unsigned e = {a0}; e < {a1}; e++) "
+                   f"{{ unsigned i_ = i0 + e / {kt}, m = e % {kt}; get(a[{x}], {a_tile}, {rows_at[q]} + e); }} "
+                   f"share(SLOT({rows_at[q]} + {a0}), ({a1} - {a0}) * {tile_bytes(dtype)}, row_rect[{gy}], {gx_n - 1}, {gx}, 1);")
+          get_b = f"for (unsigned m = {b0}; m < {b1}; m++) {('get', 'flipped', 'get8')[how]}(a[{y}], {b_tile}, {buf} + m); "
+          share_b = lambda l1, n: f"share({l1}, ({b1} - {b0}) * {n}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, jj + 1);"
+          if how == 2:  # in region jj % 3 of B8: the share's exponents, then its values
+            region = f"{B8} + jj % 3 * {kt * tile_bytes('bfp8')}"
+            get_b += (f"if ({gy_n - 1} && {b1} > {b0}) mcast({region} + 64 * ({b0}), ({b1} - {b0}) * 64, col_rect[{gx}], {gy_n - 1}); " +
+                      share_b(f"{region} + {64 * kt} + 1024 * ({b0})", 1024))
+          else: get_b += share_b(f"SLOT({buf} + {b0})", tile_bytes(dtype))
+          c[B].append(f"{{ if (ii == 0) {{ "  # a column's first tile: its column of B, and in the first column A's rows
+                      f"if (jj == 0) {{ {get_a} }} "
+                      # done with column jj - 2 here: this column's flag lets the others fill its buffer with jj + 1
+                      f"if (jj >= 2) reached(col_end[(jj + 1) % 3]); "
+                      f"{get_b} await({FLAGS_B}, {gy_n}, jj + 1); if (jj == 0) await(0, {gx_n}, 1); }} "
+                      f"for (unsigned m = 0; m < {kt}; m++) kept_step(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
+        elif kept_b is not None:  # A's bp rows and B's column in L1
+          c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
+                      f"for (unsigned m = 0; m < {kt}; m++) step({how}, a[{y}], {b_tile}, nb ? {0 if how == 2 else kept_b} + m : KEPT, "
+                      f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); tagged(0); }}")
+        if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
+          column = 0 if how == 2 else buf if mc else kept_b  # a bfp8 B's from the start of its region
+          c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
+                      f"{on} for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
+        elif rows_at[q] is None:  # A's tile streams in beside B's, each step
+          c[B].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) "
+                      f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, {1 + DEPTH} + steps % {DEPTH}); tagged(0); }}")
+          c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
+                      f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
+        elif j == line_b:  # B's line in L1 across passes: fetched in the first pass that computes it, once the line before
+          at = f"{lines_at} + k * {kt}"  # has been done with it; A's row kept as below
+          if p == computed[0]:
+            c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
+                        f"step({how}, a[{y}], {b_tile}, {at} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
+          else: c[B].append(f"for (unsigned m = 0; m < {kt}; m++) kept_step();")
+          c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, at)])} {on} "
+                      f"for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
+        else:
+          new = "0" if bcast else f"fresh({q}, b * {rt} + i_)"  # bcast: A's row is in already
+          c[B].append(f"{cond}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
+                      f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
+          c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ "
+                      f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
+        c[M].append(f"{cond}{{ {tt(math_begin(True))} "
+                    f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases']))} }} "
+                    f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= {DST_HALF}; }}")
+        continue
+      drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
+      x, y = slot(op["x"]), slot(op["y"])
+      prog = sfpu([sfpu_name(op)], slots) if sfpu_op(op) else []
+      if dst:  # x into the op's Dst half, y 128 rows on, then the SFPU: all on the math thread
+        fills = fill(x, "h") + (fill(y, "h + 128") if op["y"] != "zero" else []) + FILLED
+        math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], slots))
+        c[M].append(f"{cond}{{ {drain}{math} {math_end(j)} h ^= {DST_HALF};{posted} }}")
+        continue
+      if op["kind"] in BINARY:  # x and y each into Dst for the SFPU: x in the op's half, y 128 rows on
+        unpacks, fpu = unpack(x, ZERO_SLOT) + unpack(y, ZERO_SLOT), elementwise("add", slots) + elementwise("add", slots, dst=128)
+      else: unpacks, fpu = unpack(x, y), elementwise(op["kind"], slots)
+      c[U].append(f"{cond}{{ {drain}{tt(unpacks)}{posted} }}")
+      math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], slots))
+      c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= {DST_HALF}; }}")
+    for acc, j in enumerate(reductions):
+      assert acc < len(ACCS), "two reductions a pass"
+      op, me_j, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
+      drain = "drain(); " if isinstance(x, tuple) else ""
+      edge = size(x)[axis] % 32 if axis and size(x)[axis] > 1 else 0  # the operand's rows or columns in its last tile, if cut short
+      end = f"k == {L - 1}" if swept(x) else "k == 0"  # the line's last tile (a narrow operand is one tile a line)
+      src = slot(x) if dst else None
+      def step(first):  # the last tile's padding must not count
+        plain, cut = tt(reduce_step(kind, slots, acc, first, 0, src)), tt(reduce_step(kind, slots, acc, first, edge, src))
+        return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
+      finish, posted = f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}', "" if j == root else " posted++;"
+      pk = tt(pack(ACCS[acc][0], pslot(me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
+      pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
+      unpacks = "" if dst else tt(unpack(slot(x), ZERO_SLOT))  # an fp32 step fills Dst itself
+      mine = M if dst else U  # who drains and counts
+      if swept(x):  # swept along the line
+        c[mine].append(f"{drain}{unpacks} if ({end}) {{{posted} }}")
+        c[M].append(f"if (k == 0) {{ {step(True)} }} else {{ {step(False)} }} if ({end}) {{ {finish} }}")
+      else:  # reduced in the pass's first tile
+        c[mine].append(f"if ({end}) {{ {drain}{unpacks}{posted} }}")
+        c[M].append(f"if ({end}) {{ {step(True)} {finish} }}")
+      c[P].append(f"if ({end}) {{ {output(j)}{pk} }}")
+    c[M if dst else U].append(tt(REPORT))
+    c[B].append("frame_done[fr] = ++events;" + " narrow_done = events;" * (p == last_read(True)) +
+                " kept_done[k] = events;" * (p == last_read(False)) + " line_done[k] = events;" * (p == computed[-1]))
+    passes.append((bool(swept_ops or reductions), c))
   def program(c):  # the loops all four programs share, around each one's part of a tile
-    tile_c = lambda b: f"if (tiles++ & 1) {{ {' '.join(b[1][c])} }} else {{ {' '.join(b[0][c])} }}"
+    tile_c = lambda b: f"{{ unsigned fr = tiles++ & 1; {' '.join(b[c])} }}"  # the tile's frame, by turns
     if not reducing:  # a unit is a block: its tiles column by column, those past the matrix's edge left out
       return f"""  unsigned unit = a[0], b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = unit % {bc} * {bq};
   for (unsigned u = 0; u < a[1]; u++, unit++) {{
