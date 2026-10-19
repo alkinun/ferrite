@@ -4,7 +4,7 @@
 # another shape) realized first.
 import array, collections, math
 from ferrite import bh
-from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, fused_kernel, gather_kernel, move_kernel, shared_k, tile_bytes, transpose_kernel
+from ferrite.compiler import ACCS, COMBINE, FOLDS, INT32, ITEMSIZE, fused_kernel, gather_kernel, move_kernel, put_kernel, shared_k, tile_bytes, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -109,6 +109,17 @@ class Tensor:
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     return out._run(_cached(("gather", d), lambda: gather_kernel(d)), out.addr, self.realize().addr, self.stride, self.offset,
                     -(-self.cols // 32), ids.cols, ids.addr, ids.offset, name="gather")._track("gather", (self,), ids)
+
+  def put(self, ids, x):
+    """x's rows into rows ids of each matrix of this tensor, in place: gather's inverse, ids an int32 tensor of one row
+    read on the chip. A KV cache of a fixed size takes a token's keys at its place this way, the place data rather than a
+    shape, so a decode step launches the same kernels each token (jit)."""
+    assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "rows of x, by a row of int32 places"
+    assert (x.batch, x.cols, x.dtype) == (self.batch, self.cols, self.dtype), f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"
+    x, ids, ct = x.realize(), ids.realize(), -(-self.cols // 32)
+    where = lambda t: (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)
+    return self.realize()._run(_cached(("put", self.dtype), lambda: put_kernel(self.dtype)), *where(self), *where(x), ids.addr,
+                               ids.offset, x.rows, ct, units=self.batch * ct, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)

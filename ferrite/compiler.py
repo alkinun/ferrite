@@ -1019,6 +1019,37 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+def put_kernel(dtype):
+  """Rows of x into rows of a tensor, in place (gather's inverse), args [first unit, units, then the tensor's and x's
+  address, tile strides for batch and row, and tile offset, the int32 row of the n rows' places' address and tile offset,
+  n, the tensor's tile columns]. BRISC alone: a unit is a tile column of one matrix, so no two workers write one tile; for
+  each row, the tile it goes into and the tile it comes from in (and every 32 rows, the places' next tile), its two runs
+  (left and right face) copied, and the tile written back."""
+  t, face, run = tile_bytes(dtype), tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]
+  return compile_kernel(f"""
+#define TILE {DATA:#x}
+#define FROM {DATA + t:#x}
+#define IDS {DATA + 2 * t:#x}
+{BANKS}
+static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // place r of the 32, in row 0
+static unsigned at(unsigned r, unsigned f) {{ return (r % 32 / 16 * 2 + f) * {face} + r % 16 * {run}; }}  // row r's run in face f
+void kmain(volatile unsigned *a) {{
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned unit = a[0] + u, b = unit / a[13], j = unit % a[13];
+    for (unsigned i = 0; i < a[12]; i++) {{
+      if (i % 32 == 0) {{ unsigned it = a[11] + i / 32; noc_get(BANK(it), a[10] + it / 8 * 4096, IDS, 4096); noc_wait(); }}
+      unsigned r = id(i % 32), to = b * a[3] + r / 32 * a[4] + j + a[5], from = b * a[7] + i / 32 * a[8] + j + a[9];
+      noc_get(BANK(to), a[2] + to / 8 * {t}, TILE, {t});
+      noc_get(BANK(from), a[6] + from / 8 * {t}, FROM, {t});
+      noc_wait();
+      for (unsigned f = 0; f < 2; f++)
+        for (unsigned k = 0; k < {run // 4}; k++) ((volatile unsigned *)(TILE + at(r, f)))[k] = ((volatile unsigned *)(FROM + at(i, f)))[k];
+      noc_write(TILE, BANK(to), a[2] + to / 8 * {t}, {t});
+      noc_wait();
+    }}
+  }}
+}}""")
+
 def transpose_kernel(rows, cols):
   """x.T for x of (rows, cols), each matrix of a batch, args [first unit, units, out, x's address, tile strides for batch
   and row, tile offset]: result tile (i, j) is x's tile (j, i) transposed. BRISC fetches that tile with its off-diagonal

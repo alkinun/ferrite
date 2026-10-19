@@ -1,6 +1,8 @@
 # A Llama-family model on ferrite (SmolLM-135M: RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache): the real
 # weights, greedy generation, each step checked against the same model in numpy (the same bf16 weights, float32 math).
-# The model is written once, for ferrite Tensors and numpy arrays alike, as test/gpt2.py is.
+# The model is written once, for ferrite Tensors and numpy arrays alike, as test/gpt2.py is. Its KV cache has a fixed
+# size and a token's place is data, not a shape, so on ferrite every decode step launches the same kernels: after the
+# first two, each is a replay (tensor.jit).
 #   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8]
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors. bfp8:
 # the weight matrices in bfp8 on the chip (numpy then has them as the chip does).
@@ -8,7 +10,7 @@ import json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ferrite.tensor import Tensor
+from ferrite.tensor import Tensor, jit
 import gpt2
 
 def fns(x):  # what numpy and ferrite spell differently
@@ -17,10 +19,16 @@ def fns(x):  # what numpy and ferrite spell differently
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            softmax=lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True),
                            cat=lambda a, b, axis: np.concatenate([a, b], axis), reshape=lambda a, *s: a.reshape(s),
-                           mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), silu=lambda a: a / (1 + np.exp(-a)))
+                           mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), silu=lambda a: a / (1 + np.exp(-a)),
+                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b),
+                           mask=lambda places, size, group: np.tile(np.where(np.arange(size) > np.array(places)[:, None], -1e9, 0.0), (group, 1)))
   return SimpleNamespace(rows=Tensor.gather, split=Tensor.split, merge=Tensor.merge, t=lambda a: a.T, softmax=Tensor.softmax,
                          cat=lambda a, b, axis: a.cat(b, axis=axis), reshape=Tensor.reshape, mean=lambda a: a.mean(2),
-                         rsqrt=Tensor.rsqrt, silu=Tensor.silu)
+                         rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, mask=mask)
+
+def mask(places, size, group):  # -1e9 where a token would look past its place, its row once for each query head of a group
+  m = ((Tensor.of(places.rt, [list(range(size))], "int32") > places.reshape(1, places.cols, 1)) * -1e9).cast("bf16")
+  return m.cat(*[m] * (group - 1), axis=1)
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
@@ -28,41 +36,42 @@ def rope(x, cos, sin):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 
   f, h = fns(x), x.shape[-1] // 2
   return x * cos + f.cat(-x[:, :, h:], x[:, :, :h], axis=2) * sin
 
-def layer(x, p, c, cos, sin, mask, cache):
+def layer(x, p, c, cos, sin, mask, cache, places):
   """One block: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as x @ w, so
-  the Hugging Face ones transposed), c: the config, cache: this block's [keys, values], grown by this call's."""
+  the Hugging Face ones transposed), c: the config, cache: this block's [keys, values], each with a row for every place,
+  this call's written at its places; mask: -1e9 where a token would see a place past its own."""
   f, n, hd = fns(x), x.shape[-2], c.dim // c.heads
   h = rms(x, p["input_layernorm"], c.eps)
   q, k, v = (f.split(h @ p[w], heads) for w, heads in (("q_proj", c.heads), ("k_proj", c.kv), ("v_proj", c.kv)))
   q, k = rope(q, cos, sin), rope(k, cos, sin)
-  if cache[0] is not None: k, v = f.cat(cache[0], k, 1), f.cat(cache[1], v, 1)
-  cache[:] = k, v
+  f.put(cache[0], places, k), f.put(cache[1], places, v)
+  k, v = cache
   group = c.heads // c.kv  # each key and value head serves this many query heads: their rows, one after another
   s = f.reshape(q, c.kv, group * n, hd) @ f.t(k) * (1 / math.sqrt(hd))
-  y = f.reshape(f.softmax(s if mask is None else s + mask) @ v, c.heads, n, hd)
+  y = f.reshape(f.softmax(s + mask) @ v, c.heads, n, hd)
   x = x + f.merge(y) @ p["o_proj"]
   h = rms(x, p["post_attention_layernorm"], c.eps)
   return x + (f.silu(h @ p["gate_proj"]) * (h @ p["up_proj"])) @ p["down_proj"]
 
-def rotary(c, start, n):  # cos and sin for positions start.., as Hugging Face's: angles in fp32, the tables in bf16
+def rotary(c, n):  # cos and sin for places 0 to n - 1, as Hugging Face's: angles in fp32, the tables in bf16
   inv = 1 / c.theta ** (np.arange(0, c.dim // c.heads, 2, dtype=np.float32) / (c.dim // c.heads))
-  angles = np.arange(start, start + n, dtype=np.float32)[:, None] * inv[None]
+  angles = np.arange(n, dtype=np.float32)[:, None] * inv[None]
   bf16 = lambda a: ((a.astype(np.float32).view(np.uint32) + 0x7FFF + (a.astype(np.float32).view(np.uint32) >> 16 & 1)) & 0xFFFF0000).view(np.float32)
   return [bf16(np.concatenate([g(angles)] * 2, 1)) for g in (np.cos, np.sin)]
 
-def forward(ids, w, c, caches, rt=None):
-  """The logits for the token after ids, which follow len(caches' keys) tokens already seen (their keys and values in
-  caches, one [keys, values] a block, grown here)."""
-  f, start = fns(w["embed"]), 0 if caches[0][0] is None else caches[0][0].shape[-2]
-  n, group = len(ids), c.heads // c.kv
-  causal = np.triu(np.full((n, start + n), -1e9, np.float32), start + 1)
-  cos, sin = rotary(c, start, n)
-  mask = np.tile(causal, (group, 1)) if n > 1 else None
-  if rt: cos, sin, mask = (Tensor.of(rt, a.tolist()) if a is not None else None for a in (cos, sin, mask))
+def forward(ids, places, w, c, caches):
+  """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (one
+  [keys, values] a block, each with a row for every place), and each sees the places up to its own. ids and places are
+  rows: lists for numpy, int32 tensors for ferrite."""
+  f, group = fns(w["embed"]), c.heads // c.kv
   x = f.rows(w["embed"], ids)
+  cos, sin, mask = f.rows(w["cos"], places), f.rows(w["sin"], places), f.mask(places, caches[0][0].shape[-2], group)
   for l in range(c.layers):
-    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, cos, sin, mask, caches[l])
-  return f.rows(rms(x, w["norm"], c.eps), [n - 1]) @ w["embed.T"]
+    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, cos, sin, mask, caches[l], places)
+  return f.rows(rms(x, w["norm"], c.eps), [x.shape[-2] - 1]) @ w["embed.T"]
+
+def kv_cache(c, size, zeros):  # each block's [keys, values], a row for each of size places, made by zeros(shape)
+  return [[zeros((c.kv, size, c.dim // c.heads)) for _ in range(2)] for _ in range(c.layers)]
 
 def load(folder):
   """The config, and {name: (bf16 bits, the same as float32)} from model.safetensors (8 bytes of header size, a JSON header
@@ -70,7 +79,7 @@ def load(folder):
   weights transposed (so x @ w), vectors as one-row matrices."""
   j = json.load(open(os.path.join(folder, "config.json")))
   c = SimpleNamespace(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=j["num_hidden_layers"],
-                      eps=j["rms_norm_eps"], theta=j["rope_theta"])
+                      eps=j["rms_norm_eps"], theta=j["rope_theta"], places=j["max_position_embeddings"])
   path = os.path.join(folder, "model.safetensors")
   with open(path, "rb") as fh:
     size = struct.unpack("<Q", fh.read(8))[0]
@@ -87,6 +96,7 @@ def load(folder):
     out[name] = (bits, (bits.astype(np.uint32) << 16).view(np.float32))
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = tuple(np.ascontiguousarray(a.T) for a in out["embed"])  # tied: the output layer is the embedding
+  for name, a in zip(("cos", "sin"), rotary(c, c.places)): out[name] = ((a.view(np.uint32) >> 16).astype(np.uint16), a)
   return c, out
 
 def upload(rt, weights, dtype="bf16"):  # the weights as ferrite Tensors, the matrices a matmul reads as its B (the
@@ -125,11 +135,15 @@ def main():
   w = arrays(weights, t)
   print(f"{sum(bits.size for k, (bits, _) in weights.items() if k != 'embed.T') / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
   ids, agree = enc.encode(prompt), 0
-  caches, np_caches, new = [[None, None] for _ in range(c.layers)], [[None, None] for _ in range(c.layers)], ids
+  size = -(-(len(ids) + steps) // 32) * 32  # a row for each place the generation reaches, in whole tiles
+  kv, np_kv = kv_cache(c, size, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), kv_cache(c, size, np.zeros)
+  on = lambda row: Tensor.of(rt, [row], "int32")  # a row of ids or places, on the chip
+  step, new = jit(lambda ids, places: forward(ids, places, t, c, kv)), ids  # a token at a time, replayed from the third
   print(prompt, end="", flush=True)
-  for _ in range(steps):  # the prompt once, then a token at a time, each reading the keys and values cached so far
-    start = time.time()
-    got, want = logits(forward(new, t, c, caches, rt)), forward(new, w, c, np_caches)[0]
+  for i in range(steps):  # the prompt at once, then a token at a time, each seeing the keys and values cached so far
+    start, places = time.time(), list(range(len(ids) - len(new), len(ids)))
+    got = logits(forward(on(new), on(places), t, c, kv) if i == 0 else step(on(new), on(places)))
+    want = forward(new, places, w, c, np_kv)[0]
     agree += int(got.argmax()) == int(want.argmax())
     new = [int(want.argmax())]  # numpy's pick, so that one near tie does not send the two down different paths
     ids += new

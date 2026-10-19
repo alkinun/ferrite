@@ -1091,38 +1091,45 @@ def smol(rng, layers, vocab=256):  # random weights in SmolLM-135M's shapes (as 
             "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
   w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
   w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
-  return c, w | {"embed.T": w["embed"].T.copy()}
+  return c, w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin"), llama.rotary(c, 64)))
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_llama_layer(chip, n):
   # a Llama block (RMSNorm, RoPE, grouped-query attention, a SwiGLU MLP) in SmolLM-135M's shapes (576 wide, 9 query heads
-  # sharing 3 key and value heads, MLP 1536) on n tokens, against the same code (test/llama.py) in numpy, float64, with
-  # the same bf16 weights and rotary tables. Every intermediate is bf16 here, so the block's change to x must match to
-  # within 3% of its size
+  # sharing 3 key and value heads, MLP 1536) on n tokens, its keys and values put into a cache of n places, against the
+  # same code (test/llama.py) in numpy, float64, with the same bf16 weights and rotary tables. Every intermediate is bf16
+  # here, so the block's change to x must match to within 3% of its size
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(12)
   c, w = smol(rng, 1)
   p = {k.removeprefix("layers.0."): v for k, v in w.items() if k.startswith("layers.0.")}
-  x, (cos, sin) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, 0, n)
+  x, (cos, sin) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, n)
   mask = np.tile(np.triu(np.full((n, n), -1e9, np.float32), 1), (3, 1))
   on = lambda a: Tensor.of(rt, a.tolist())
-  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, on(cos), on(sin), on(mask), [None, None])
-  want = llama.layer(x, p, c, np.float64(cos), np.float64(sin), np.float64(mask), [None, None])
+  cache, np_cache = [on(np.zeros((3, n, 64))) for _ in range(2)], [np.zeros((3, n, 64)) for _ in range(2)]
+  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, on(cos), on(sin), on(mask), cache, Tensor.of(rt, [list(range(n))], "int32"))
+  want = llama.layer(x, p, c, np.float64(cos), np.float64(sin), np.float64(mask), np_cache, range(n))
   change = np.abs(want - x).max()
   assert change > 0.5 and np.abs(np.array(got.tolist()) - want).max() < 0.03 * change, (np.abs(np.array(got.tolist()) - want).max(), change)
 
 def test_kv_cache(chip):
-  # a two-block Llama decoding with a KV cache: 5 prompt tokens, then 3 more one at a time, each reading the keys and
-  # values cached so far (grown by cat), against numpy doing the same; and numpy's cached logits equal its full recompute
+  # a two-block Llama decoding with a KV cache of 32 places: 5 prompt tokens, then 5 more one at a time, each putting its
+  # keys and values at its place (data, not a shape) and seeing those before, against numpy doing the same. Every step
+  # launches the same kernels, so from the third it is a replay (tensor.jit); and numpy's cached logits equal its full
+  # recompute
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(13)
   c, w = smol(rng, 2)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
-  caches, np_caches, ids = [[None, None], [None, None]], [[None, None], [None, None]], [7, 200, 31, 64, 5]
-  for step in range(4):
-    new = ids if step == 0 else ids[-1:]
-    got, want = llama.logits(llama.forward(new, t, c, caches, rt)), llama.forward(new, w, c, np_caches)[0]
-    assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (step, np.abs(got - want).max(), np.abs(want).max())
+  kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
+  on = lambda row: Tensor.of(rt, [row], "int32")
+  step, ids = tensor.jit(lambda ids, places: llama.forward(ids, places, t, c, kv)), [7, 200, 31, 64, 5]
+  for i in range(6):
+    new = ids if i == 0 else ids[-1:]
+    places = list(range(len(ids) - len(new), len(ids)))
+    got = llama.logits(llama.forward(on(new), on(places), t, c, kv) if i == 0 else step(on(new), on(places)))
+    want = llama.forward(new, places, w, c, np_kv)[0]
+    assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (i, np.abs(got - want).max(), np.abs(want).max())
     ids.append(int(want.argmax()))
-  assert caches[0][0].shape == (c.kv, 8, 64) and np.allclose(want, llama.forward(ids[:-1], w, c, [[None, None], [None, None]])[0], atol=1e-3)
+  assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
 @pytest.mark.skipif("LLAMA" not in os.environ, reason="LLAMA=/path/to/SmolLM-135M (Hugging Face HuggingFaceTB/SmolLM-135M) runs it")
 def test_llama_model(chip):
@@ -1132,9 +1139,11 @@ def test_llama_model(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   c, weights = llama.load(os.environ["LLAMA"])
   w, t = llama.arrays(weights), llama.upload(rt, weights)
-  caches, np_caches, new = [[None, None] for _ in range(c.layers)], [[None, None] for _ in range(c.layers)], [504, 2455, 282, 1029, 314]
+  kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
+  new, places = [504, 2455, 282, 1029, 314], list(range(5))
   for _ in range(2):
-    got, want = llama.logits(llama.forward(new, t, c, caches, rt)), llama.forward(new, w, c, np_caches)[0]
+    got = llama.logits(llama.forward(Tensor.of(rt, [new], "int32"), Tensor.of(rt, [places], "int32"), t, c, kv))
+    want = llama.forward(new, places, w, c, np_kv)[0]
     assert np.abs(got - want).max() < 1 and got.argmax() == want.argmax(), (np.abs(got - want).max(), got.argmax(), want.argmax())
-    new = [int(want.argmax())]
+    new, places = [int(want.argmax())], [places[-1] + 1]
   assert new == [1962], "a [question]"
