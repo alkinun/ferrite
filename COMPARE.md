@@ -1,9 +1,9 @@
 # ferrite and TT-NN
 
-The same ops through ferrite and through Tenstorrent's own stack (tt-metal with TT-NN), on the same simulator, counted
-the same way. Measured 2026-10-19: ferrite at 9d20e4e, tt-metal at 9f98dee9 (2026-10-17) with TT-NN in C++, ttsim
-v1.11.5 (the version tt-metal names in `tt_metal/ttsim-version`), Blackhole. bf16 in tile layout in DRAM, matmuls at
-full precision (HiFi4) in both; each op is one launch in ferrite and one program in TT-NN.
+The same ops, and the same LLM, through ferrite and through Tenstorrent's own stack (tt-metal with TT-NN), on the same
+simulator, counted the same way. Measured 2026-10-19: ferrite at 9d20e4e, tt-metal at 9f98dee9 (2026-10-17) with TT-NN
+in C++, ttsim v1.11.5 (the version tt-metal names in `tt_metal/ttsim-version`), Blackhole. bf16 in tile layout in DRAM,
+matmuls at full precision (HiFi4) in both; each op is one launch in ferrite and one program in TT-NN.
 
 | op | ferrite | TT-NN, fast dispatch | TT-NN, slow dispatch | DRAM reads, ferrite | DRAM reads, TT-NN |
 |---|---|---|---|---|---|
@@ -17,6 +17,36 @@ full precision (HiFi4) in both; each op is one launch in ferrite and one program
 ferrite does each op in 4 to 18 times fewer cycles than TT-NN with fast dispatch, which dispatches from cores on the
 chip as ferrite does, and in 2 to 3 times fewer than TT-NN's kernels alone (slow dispatch, where the host does the
 dispatching at no cost here). Both read each input from DRAM about once.
+
+## End to end: SmolLM-135M
+
+The whole model, on the same simulator: Tenstorrent's own LLM code (tt-metal's `models/tt_transformers`, built and run
+as its `simple_text_demo` does, decode traced) against ferrite's (`test/llama.py`, decode replayed by `tensor.jit`).
+Both prefill "The meaning of life is" (SmolLM's ids 504 2455 282 1029 314), then decode a token at a time from a KV
+cache, and both write the same tokens, " a question that has been".
+
+| | ferrite, bf16 weights | ferrite, bfp8 weights | TT `tt_transformers` |
+|---|---|---|---|
+| a decode token, replayed | **180k cycles** | **199k** | 1,602k (performance or accuracy mode) |
+| the prompt's prefill, 5 tokens | **224k** | **243k** | 2,108k (performance; 3,064k the first time) |
+| launches a decode token | **443** | **443** | about 1,360 TT-NN operations, each one or more programs |
+| weights read a decode token | 269 MB | 143 MB | 116 MB (performance), 168 MB (accuracy) |
+| ... that at a p150's 512 GB/s | 0.53 ms | 0.28 ms | 0.23 ms, 0.33 ms |
+
+ferrite decodes a token in 8 to 9 times fewer simulated cycles than TT's own model code, and prefills in 9 times
+fewer, with a third as many launches. TT's two precision modes are within 0.1% of each other here: performance mode
+keeps the MLP's up and gate weights in bfp4 at LoFi and the rest in bfp8 at HiFi2, accuracy mode attention and the KV
+cache in bf16 at HiFi4 and the MLP in bfp8; the output layer is bfp8 in both. ttsim counts the RISC-V work around the
+math, which those settings barely change (ferrite's bfp8 costs it 10%, two reads a tile). TT's operations a token are
+82 for one block and 126 for two (counted untraced), so 44 a block where ferrite has 14.
+
+What it could mean on a card: if silicon's RISC-V control work is anything like ttsim's count (in-order cores, about
+an instruction a clock at 1.35 GHz), TT's 1.6M cycles are 1.2 ms of control a token, five times its 0.23 ms of DRAM
+in performance mode, while ferrite's 0.13 to 0.15 ms are under its DRAM time (0.28 ms in bfp8). Then ferrite decodes
+as fast as its weights can be read and TT does not. ttsim's NoC and DRAM answer at once, so a card adds latency to
+both, and only a card can say how far apart they are; SmolLM-135M is small, so control is a large share of its time,
+and in a bigger model DRAM is a larger share for both. Both replay a decode step, so the host's part is small: ferrite's
+is 0.1 to 0.2 ms of Python a token (measured), TT's trace was not measured.
 
 ## How it was counted
 
@@ -65,11 +95,21 @@ for CMake. Then, from `~/Desktop/tt`, with a toolchain file for the system's cla
       -DENABLE_DISTRIBUTED=OFF -DBUILD_PROGRAMMING_EXAMPLES=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF
     ninja -C tt-metal/build_Release install
 
-The shim (`sim/shim.c`, built to `sim/libttsim.so` beside a copy of `blackhole_140_arch.yaml` as
-`soc_descriptor.yaml`) and both measurement programs (`cmp/ttnn_ops.cpp`, `cmp/ferrite_ops.py`) are in
-`~/Desktop/tt`, outside this repository. Run them one at a time: the shim counts clocks in one file in `/dev/shm`, so
-two runs at once each count both.
+The shim (`sim/shim.c`, built to `sim/libttsim.so` beside a copy of `blackhole_140_arch.yaml` as `soc_descriptor.yaml`)
+and the measurement programs (`cmp/ttnn_ops.cpp`, `cmp/ferrite_ops.py`, and for SmolLM `cmp/ttnn_smollm.py`,
+`cmp/ferrite_smollm.py`) are in `~/Desktop/tt`, outside this repository. Run them one at a time: the shim counts clocks
+in one file in `/dev/shm`, so two runs at once each count both.
 
     TTSIM=/path/to/libttsim.so python3 cmp/ferrite_ops.py
     TT_METAL_RUNTIME_ROOT=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so TT_METAL_DISABLE_SFPLOADMACRO=1 cmp/build/ttnn_ops
     TT_METAL_SLOW_DISPATCH_MODE=1 ... cmp/build/ttnn_ops    # the same, slow dispatch
+
+SmolLM-135M through TT's Python API needs `tools` on the path (its `tracy` module), the token ids given rather than
+TT's tokenizer (which fails on this model: no `<unk>` in its vocabulary), and the prefill warmup off (it runs TT's
+on-device sampling, which uses an SFPU instruction ttsim does not model, `SFPCONFIG` mode 8):
+
+    TTSIM=/path/to/libttsim.so python3 cmp/ferrite_smollm.py bf16 4    # or bfp8
+    HF_MODEL=/path/to/SmolLM-135M TT_METAL_RUNTIME_ROOT=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so \
+      TT_METAL_DISABLE_SFPLOADMACRO=1 LD_LIBRARY_PATH=$PWD/tt-metal/build_Release/lib \
+      PYTHONPATH=$PWD/tt-metal:$PWD/tt-metal/ttnn:$PWD/tt-metal/tools python3 cmp/ttnn_smollm.py performance 4    # or accuracy
+    COUNT_OPS=1 ... cmp/ttnn_smollm.py performance 2 1    # TT-NN operations a token, untraced, one block (2 for two)
