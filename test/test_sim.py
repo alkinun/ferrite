@@ -366,6 +366,21 @@ def test_fusion(chip):
       assert rt.launches == launches + 1 and all(t.addr is None for t in lazy[1:]), "one kernel, intermediates stay on chip"
       assert got == unfused(build(a, b, c, d)).tolist()
 
+def test_fused_cast(chip):
+  # a cast at the root of a tree is in its kernel: the packer is switched to the result's format for the root's pack and
+  # back. Bit for bit what casting the computed value gives (a bf16 kernel's result is rounded first, as its pack would)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(16)
+  x, y = (Tensor.of(rt, rng.normal(0, 2, (70, 100)).astype(np.float32).tolist(), "fp32") for _ in range(2))
+  a, b, c = (Tensor.of(rt, rng.normal(0, 2, shape).tolist()) for shape in ((70, 100), (70, 100), (100, 40)))
+  for build in (lambda: (x * 3 + y).bfloat16(), lambda: (x * 50 + y).cast("int32"), lambda: (x * y).sum(1).bfloat16(),
+                lambda: (x * y - x).cast("bfp8"), lambda: (a * b + a).float(), lambda: a.softmax(-1).float(), lambda: (a @ c).float(),
+                lambda: (a * b + a).cast("bfp8")):
+    launches, fused = rt.launches, build().realize()
+    assert rt.launches == launches + 1
+    t = build()
+    t.srcs[0].realize()
+    assert fused.tobytes() == t.realize().tobytes()
+
 def test_threads_wait(chip):
   # each TRISC feeds its thread as fast as it can and ttsim runs every instruction the moment it can, so only the waits
   # hold a thread back. The pack TRISC, with the least to push, has each pack queued before its math is done (SEM_DST);

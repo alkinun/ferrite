@@ -65,7 +65,7 @@ def train(rt, steps, c=None, lr=3e-3, log=None, data=None):
   pw = {k: torch.tensor(a, requires_grad=True) for k, a in w.items()}
   opt = torch.optim.Adam(pw.values(), lr=lr)
   tmask, pmask, losses = Tensor.of(rt, mask.tolist(), "fp32"), torch.tensor(mask), []
-  @tensor.jit  # recorded once and sent again as one block each step: the host builds and launches nothing
+  @tensor.jit  # recorded on its second call and replayed from then on: the host builds nothing
   def train_step(x, onehot, step_lr, bias2):  # the loss, each gradient into .grad, and Adam's update
     for t in tw.values(): t.grad = None
     loss = cross_entropy(forward(x, tw, tmask, c), onehot)

@@ -514,16 +514,18 @@ def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (fi
   return (first, end) if first < end else (0, 0)
 
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are whole tensors, realized first, not tiles in the same kernel
-def _lazy(t, seen):  # the unrealized ops under t, t first
+def _below(t, root):  # what a kernel for t computes along with it: not a whole op's operands, unless it is the root's cast
+  return t.srcs if t.op not in WHOLE or root and t.op == "cast" else ()
+def _lazy(t, seen, root=True):  # the unrealized ops under t, t first
   if t.op is None or id(t) in seen: return
   seen.add(id(t))
   yield t
-  for s in () if t.op in WHOLE else t.srcs: yield from _lazy(s, seen)
+  for s in _below(t, root): yield from _lazy(s, seen, False)
 
-def _ops(t, seen):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
+def _ops(t, seen, root=True):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
   if t.op is None or id(t) in seen: return 0
   seen.add(id(t))
-  return 1 + (0 if t.op in WHOLE else sum(_ops(s, seen) for s in t.srcs))
+  return 1 + sum(_ops(s, seen, False) for s in _below(t, root))
 
 def _tree(t, inputs):
   """The expression a kernel for t computes (fused_kernel's), realized tensors as numbers into inputs, and the dtype it
@@ -566,7 +568,7 @@ def _expr(t, shape, inputs, kernel):
   if t.op is None:
     assert t.dtype == kernel[3], f"a {t.dtype} input to a {kernel[3]} kernel"
     return _input(t, inputs)
-  if t is kernel[4] and t.op == "cast": return ("cast", _expr(t.srcs[0].realize(), shape, inputs, kernel))
+  if t is kernel[4] and t.op == "cast": return ("cast", _expr(t.srcs[0], shape, inputs, kernel))
   if t is not kernel[4] and (t.dtype != kernel[3] or t.op == "cast" or (t.op == "matmul" and kernel[3] != "bf16")):
     return _expr(t.realize(), shape, inputs, kernel)
   axis = kernel[0]

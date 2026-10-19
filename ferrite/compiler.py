@@ -119,6 +119,12 @@ def reconfigure(**fields):  # unpacker 0's config fields rewritten from thread 0
             for b in range(first // 8, (first + width + 7) // 8)]
   return ([ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_UNPACK0)] + writes +
           [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)])
+def repack(old, new):  # the packer's config from old to new (kernel_configs), from the pack thread: the bytes that
+  # differ, written once the packer is idle, and its next pack held until they are
+  writes = [ins(f"RMWCIB{b}", cfg_reg_addr=w, data=new[w] >> 8 * b & 255, mask=255) for w in sorted(new) for b in range(4)
+            if (old[w] ^ new[w]) >> 8 * b & 255]
+  return ([ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_PACK)] + writes +
+          [ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_CFG)])
 def haloize(on): return reconfigure(SEC0_Haloize_mode=on)  # unpacker 0 transposes each 16x16 face into SrcA (or stops)
 def bfp8_b(slots, region=0):  # unpacker 0 reads bfp8 from a region of `slots` slots at B8 (a matmul's B: every slot's
   # exponents, then their values), each value into SrcA as the bf16 it is; with 0, bf16 from the slots again
@@ -621,8 +627,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   input, ("T", input), read transposed, or ("bfp8", input), a bfp8 input (unpacker 0 makes it bf16 on its way into
   SrcA), run at `phases` fidelity phases (4 unless said), and plain numbers for inputs. shapes: each input's (batch,
   rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting). dtype: what the
-  inputs are and the kernel computes in; out: what it writes (only a kernel of one op, a cast or a matmul, writes
-  another); grid: the workers as Runtime.grid has them, for a matmul to share its tiles between them; reps: each input's
+  inputs are and the kernel computes in; out: what its root is written as (a cast, or a matmul written as fp32: the
+  packer is switched to it for the root's pack); grid: the workers as Runtime.grid has them, for a matmul to share its tiles between them; reps: each input's
   repeat (Tensor.repeat_interleave: its matrix b is the one stored at b // rep), 1 unless said.
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
@@ -672,16 +678,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
-    elif e[0] == "cast":  # into Dst and out again in the other format, through an SFPU program between floats and ints
-      x = visit(e[1])
-      op = dict(kind="add", x=x, y="zero", shape=size(x), posts=[CASTS[dtype, out]] if (dtype, out) in CASTS else [])
-    elif e[0] in SFPU and e[0] not in BINARY:
-      x = visit(e[1])
-      if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below
-        ops[x[1]]["posts"].append(e[0])
+    elif e[0] == "cast" or e[0] in SFPU and e[0] not in BINARY:  # a unary op, or the root's cast (packed as out, after an
+      x = visit(e[1])                                              # SFPU program between floats and ints, if need be)
+      posts = ([CASTS[dtype, out]] if (dtype, out) in CASTS else []) if e[0] == "cast" else [e[0]]
+      if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below (a bf16 one rounded first,
+        ops[x[1]]["posts"] += ["ftob"] * (e[0] == "cast" and dtype == "bf16") + posts  # as its own pack would round it)
         refs[e] = x
         return x
-      op = dict(kind="add", x=x, y="zero", shape=size(x), posts=[e[0]])  # operand + 0 into Dst, then the SFPU
+      op = dict(kind="add", x=x, y="zero", shape=size(x), posts=posts)  # operand + 0 into Dst, then the SFPU
     else:
       x, y = visit(e[1]), visit(e[2])
       op = dict(kind=e[0], x=x, y=y, shape=tuple(map(max, size(x), size(y))))
@@ -689,7 +693,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     refs[e] = ("op", len(ops) - 1)
     return refs[e]
   root = visit(expr)[1]
-  assert out == dtype or len(ops) == 1, "only a kernel of one op packs in another dtype"
+  # a root packed as another dtype than the rest: the packer switched to it for the root's pack and back, unless it is alone
+  config = kernel_config(dtype, out if len(ops) == 1 else dtype)
+  around = (tt(repack(config, kernel_config(dtype, out))), tt(repack(kernel_config(dtype, out), config))) if out != dtype and len(ops) > 1 else ("", "")
   operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
   axes = {FOLDS[op["kind"]] for op in ops if op["kind"] in COMBINE}
@@ -842,6 +848,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
         op, me_j = ops[j], ("op", j)
         cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
         pk = halves([pack(DST_HALF * h, pslot(f, me_j), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])
+        pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
         c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= 1; }}")
         if op["kind"] == "matmul":
           kt, bw, q, how = op["kt"], ext(op["shape"], 2), matmuls.index(j), op["how"]  # B's width in tiles; which matmul
@@ -932,6 +939,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
           return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
         finish, posted = f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}', "" if j == root else " posted++;"
         pk = tt(pack(ACCS[acc][0], pslot(f, me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
+        pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
         unpacks = "" if dst else tt(unpack(slot(f, x), ZERO_SLOT))  # an fp32 step fills Dst itself
         mine = M if dst else U  # who drains and counts
         if swept(x):  # swept along the line
@@ -977,7 +985,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
              f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
              f"      share(SLOT({rows_at[0]} + e), (end - e) * {tile_bytes(dtype)}, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
   brisc = _brisc(total, (first if bcast else "") + program(B), dtype, out, decls, tail, b8)
-  image = compile_kernel(brisc, _unpacker(program(U), kernel_config(dtype, out)), _math(slots, program(M), dst), _packer(program(P)))
+  image = compile_kernel(brisc, _unpacker(program(U), config), _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 
 def _rows(dtype):  # C shared by gather and move: the banks, copies inside this L1, and a row filling its tile
