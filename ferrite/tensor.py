@@ -207,7 +207,9 @@ class Tensor:
   def T(self):
     """The transpose (of each matrix of a batch). A matmul reads it as its B straight from this tensor, transposing
     tiles as they come in; anything else realizes it in a kernel of its own (transpose_kernel). The unpacker transposes
-    only on its way into SrcA, so fp32 and int32 move instead (an fp32 matmul transposes its bf16 parts)."""
+    only on its way into SrcA, so fp32 and int32 move instead (an fp32 matmul transposes its bf16 parts). The transpose
+    of one not yet made is what it transposes."""
+    if self.op == "T": return self.srcs[0]
     return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch, self.dtype)
 
   def realize(self, into=None):
@@ -458,10 +460,14 @@ def _backward(t, g):
            "cast": lambda: g.cast(x.dtype)}
   if op in unary: return (unary[op](),)
   g = _full(g, t.shape)  # movement and matmul need every element of it
-  if op == "matmul" and args:  # fp32: from the forward's parts, transposed, and g's, made once for both
-    gp, (xp, yp) = _parts(g), args
-    return (_unbroadcast(_bf16x3(gp, _pT(yp)).cast(x.dtype), x.shape), _unbroadcast(_bf16x3(_pT(xp), gp).cast(y.dtype), y.shape))
-  if op == "matmul": return (_unbroadcast(g.matmul(y.T, x.dtype), x.shape), _unbroadcast(x.T.matmul(g, y.dtype), y.shape))
+  if op == "matmul":  # a transposed B's gradient is made transposed, (g.T @ x).T, which the transpose's own takes back
+    turn = y._ctx is not None and y._ctx[0] == "T"
+    if args:  # fp32: from the forward's parts, transposed, and g's, made once for both
+      gp, (xp, yp) = _parts(g), args
+      gx, gy = _bf16x3(gp, _pT(yp)), _bf16x3(_pT(gp), xp) if turn else _bf16x3(_pT(xp), gp)
+    else: gx, gy = g.matmul(y.T, x.dtype), g.T.matmul(x, y.dtype) if turn else x.T.matmul(g, y.dtype)
+    gx, gy = _unbroadcast(gx.cast(x.dtype), x.shape), gy.cast(y.dtype)
+    return gx, _unbroadcast(gy, (y.batch, y.cols, y.rows)).T if turn else _unbroadcast(gy, y.shape)
   if op == "T": return (g.T,)
   if op == "reshape": return (g.reshape(*x.shape),)
   if op == "permute": return (g.permute(*sorted(range(3), key=args[0].__getitem__)),)
