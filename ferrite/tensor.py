@@ -570,12 +570,13 @@ def _input(t, inputs):  # a realized tensor's number among a kernel's inputs, ad
 def jit(f):
   """f, a function of tensors that returns one, run from a recording: its first call runs as any would, its second is
   recorded (each launch, and the DRAM it takes, kept from then on), and each later call copies its inputs into the second
-  call's and sends the recorded launches again, building and compiling nothing, so the host's part is writing the ring.
+  call's and sends the recorded launches again as one block of commands, building and compiling nothing, so the host's part
+  is one write to the ring and one to the doorbell.
   Its inputs keep their shapes and dtypes; nothing else it reads may change, and it may not read back or assign. Its
   result is the same tensor every call, written again by the next."""
-  calls, inputs, launches, out = 0, (), [], None
+  calls, inputs, launches, out, block = 0, (), [], None, None
   def run(*xs):
-    nonlocal calls, inputs, launches, out
+    nonlocal calls, inputs, launches, out, block
     calls, rt = calls + 1, xs[0].rt
     if calls == 1: return f(*xs).realize()
     if calls == 2:
@@ -586,7 +587,10 @@ def jit(f):
     for x, to in zip(xs, inputs):
       assert (x.shape, x.dtype) == (to.shape, to.dtype), f"{x.shape} {x.dtype} where the recording had {to.shape} {to.dtype}"
       if x is not to: (x + 0).realize(to)
-    for launch in launches: rt.launch(*launch)
+    if block is None or block[2] != rt.evictions:  # packed again if the kernels it names have left L1 since
+      cmds = [rt.command(kernel, args, units) for kernel, args, units, _ in launches]
+      block = (b"".join(cmd for cmd, _ in cmds), [(launch[3], n) for launch, (_, n) in zip(launches, cmds)], rt.evictions)
+    rt.send(*block[:2])
     return out
   return run
 

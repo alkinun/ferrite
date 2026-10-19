@@ -282,6 +282,7 @@ class Runtime:
     self.holes, self.used, self.freed = [(0, bh.DRAM_BANK_SIZE)], {}, []  # DRAM: free (address, size) in order,
     # address -> size, and (launches queued, address) of what was freed while launches queued before might still use it
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS  # kernels in L1: image -> address; where the next goes
+    self.evictions = 0  # how many times the loaded kernels have gone (a recorded command names them by address)
     *self.cores, self.dispatcher = cores  # the dispatcher is end, the rectangle's last
     # The workers as a grid of whole rows (all but the dispatcher's), for kernels that multicast along rows and columns:
     # (x of each column, y of each row), worker gy * columns + gx at (x[gx], y[gy])
@@ -326,31 +327,41 @@ class Runtime:
 
   def evict(self):  # forget every loaded kernel, once the launches that use them are done
     self.wait()
-    self.loaded, self.room = {}, KERNELS
+    self.loaded, self.room, self.evictions = {}, KERNELS, self.evictions + 1
 
   def launch(self, kernel, args=(), units=None, name=""):
     """Queue kernel, an image from compile_kernel, with the same arguments on every worker: [first unit, units, *args].
     Its work is `units` units (one per worker by default), shared evenly and in order among as many workers as there are
     units, and the first two arguments say which are this worker's. Loads it first if need be. name: its name in profile."""
     if self.log is not None: self.log.append((kernel, args, units, name))
+    cmd, n = self.command(kernel, args, units)
+    self.send(cmd, [(name, n)])
+
+  def command(self, kernel, args=(), units=None):  # a launch as the ring holds it: its bytes, and how many workers it takes
     kernel, n = self.load(kernel), min(units or len(self.cores), len(self.cores))
     body = struct.pack(f"<{2 + len(args)}I", units or n, 0, *args)
     assert len(body) <= ARGS_SIZE, f"{len(body)} bytes of arguments, room for {ARGS_SIZE}"
     length = -(-(16 + len(body)) // 64) * 64
-    cmd = struct.pack("<4I", length, kernel, len(body), n) + body.ljust(length - 16, b"\0")
-    size, at = len(self.ring), self.wptr % len(self.ring)
+    assert length <= STAGING_ROOM, f"a {length}-byte command does not fit"
+    return struct.pack("<4I", length, kernel, len(body), n) + body.ljust(length - 16, b"\0"), n
+
+  def send(self, cmds, launches):
+    """Commands, back to back, into the ring, then the doorbell: the host's one PCIe write for all of them. launches: each
+    one's (name, workers)."""
+    size, at, length = len(self.ring), self.wptr % len(self.ring), len(cmds)
     skip = size - at if at + length > size else 0  # commands never wrap: mark the tail unused and start over
-    assert length <= STAGING_ROOM and length + skip <= size, f"a {length}-byte command does not fit"
+    assert length + skip <= size, f"{length} bytes of commands, a ring of {size}"
     self.until(lambda: (self.wptr - self.read_status(0)) % 2**32 + skip + length <= size, "free space in the ring")
     if skip:
       self.ring[at:at + 4] = bytes(4)
       self.wptr, at = self.wptr + skip, 0
-    self.ring[at:at + length] = cmd
+    self.ring[at:at + length] = cmds
     self.wptr += length
-    self.launches += 1
-    self.names[self.launches % TIMES] = name
-    self.workers.append((self.launches, n))
-    self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))  # the launch's one PCIe write
+    for name, n in launches:
+      self.launches += 1
+      self.names[self.launches % TIMES] = name
+      self.workers.append((self.launches, n))
+    self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
 
   def profile(self, since):
     """The launches after launch number `since` by name, once they are done: [(name, launches, cycles)], most cycles
