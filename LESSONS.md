@@ -126,7 +126,9 @@ append a correction.
     regression. Its oracle, numpy without bf16 rounding, cannot judge a comparison of two computed values (a rounding
     step flips it), so comparisons in random trees only see exact inputs.
 13. **Test at the precision you claim.** Every result went home as bf16, so tests compared at 2^-8 and two coarser
-    things hid under it: the FPU's 12-bit sums and exp's 4e-4 (exp is fp32-grade now). fp32 results showed both.
+    things hid under it: the FPU's 12-bit sums and exp's 4e-4 (exp is fp32-grade now). fp32 results showed both. And
+    test every op you claim it for: sqrt was left out of the fp32 check and sat at 80 ulps (two Newton steps where
+    three were needed) until tinygrad's asin, built on it, missed by 7e-6.
 14. **Model the device program to tell its bugs from its algorithm's.** sin was 3e-7 off where its polynomial was
     1.7e-7. A numpy model of the same fp32 steps matched the device to 6e-8, so the code was right and the method was
     not: folding near a half-turn carried 0.5's rounding into a small result. Reducing by half-turns, in x, fixed it.

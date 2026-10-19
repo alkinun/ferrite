@@ -253,12 +253,13 @@ SFPU = {
   "recip": ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent
                  FLAGS_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
                  mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), FLAGS_OFF, sfp_store(1)]),
-  # sqrt(x) = x / sqrt(x): 1/sqrt(x) by the bit trick (0x5F3759DF - bits / 2, within 3.5%) and two Newton steps
-  # y *= 1.5 - x/2 y^2, then times x (x + 0 first, so -0 is 0). 0, inf and NaN give themselves, a negative number NaN
+  # sqrt(x) = x / sqrt(x): 1/sqrt(x) by the bit trick (0x5F3759DF - bits / 2, within 3.5%) and three Newton steps
+  # y *= 1.5 - x/2 y^2 (two leave 5e-6, 80 ulps), then times x (x + 0 first, so -0 is 0), within 3 ulps. 0, inf and NaN
+  # give themselves, a negative number NaN
   "sqrt": (sfp_const(2, struct.unpack("<f", struct.pack("<I", 0x5F3759DF))[0]) + sfp_const(3, 1.5) + sfp_const(4, 0.5),
            [sfp_load(), mad(0, 0, ONE, ZERO), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF),  # LReg 1 = bits of x >> 1
             ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +  # LReg 1 = magic - LReg 1 as integers; LReg 5 = x/2
-           [w for _ in range(2) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, neg=1), mul(1, 1, 6))] +
+           [w for _ in range(3) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, neg=1), mul(1, 1, 6))] +
            [mul(1, 1, 0), ins("SFPEXEXP", vd=6, vc=0, mod1=1), FLAGS_ON, at_least(6, 255, 5), ins("SFPMOV", vd=1, vc=0), FLAGS_RESET,
             below(6, 1, 5), ins("SFPMOV", vd=1, vc=0), FLAGS_RESET, ins("SFPSETCC", vc=0), *sfp_bits(1, NAN), FLAGS_OFF, sfp_store(1)]),
 }

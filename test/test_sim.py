@@ -764,6 +764,7 @@ def test_fp32(chip):
     w, v = np.float64(x * np.float32(4)), np.float64(x * x + np.float32(0.5))  # the transcendentals to a step or two of fp32 (2^-23 is
     for got, want, scale in [((tx * 4.0).exp(), np.exp(w), np.exp(w)), ((tx * 4.0).exp2(), np.exp2(w), np.exp2(w)),  # 1.2e-7): relative,
                              ((tx * tx + 0.5).log(), np.log(v), np.abs(np.log(v))), ((tx * tx + 0.5).log2(), np.log2(v), np.abs(np.log2(v))),
+                             ((tx * tx + 0.5).sqrt(), np.sqrt(v), np.sqrt(v)), ((tx * tx + 0.5).rsqrt(), 1 / np.sqrt(v), 1 / np.sqrt(v)),
                              ((tx * 32.0).sin(), np.sin(w * 8), 1), ((tx * 32.0).cos(), np.cos(w * 8), 1)]:  # sin and cos absolute
       assert (np.abs(value(got) - want) / scale).max() <= 3e-7, (np.abs(value(got) - want) / scale).max()
     b = bf16(x)
