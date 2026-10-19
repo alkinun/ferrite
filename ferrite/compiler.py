@@ -101,15 +101,15 @@ SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem
                 ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SEMINIT", sem_sel=SEM_UNPACKED, max_value=15),
                 *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS], *counters(UNPACKERS, 1024)]
 SETUP_PACK, PACK_RUNS = counters(bh.PACK, 16), record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
-def setadc(unpacker, slot):  # its Z: the slot, a number or a C expression (then (word, expression): pushed with it added)
-  word = ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0)
-  return word + slot if isinstance(slot, int) else (word, slot)
+def at(word, v): return word + v if isinstance(v, int) else (word, v)  # v into the word's low field: a number, or a C
+                                                                          # expression, pushed with the word at run time
+def setadc(unpacker, slot): return at(ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0), slot)  # its Z: the slot
 def unpack(a, b):  # slot a into SrcA and slot b into SrcB, each bank then handed to the FPU
   return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
 REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
 def fill(slot, row):  # an fp32 tile from an L1 slot straight into Dst rows row on, by unpacker 0 in context 1 (the math thread's)
-  return [setadc(bh.UNPACK0, slot), ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=1, channel_index=1, value=row),
+  return [setadc(bh.UNPACK0, slot), at(ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=1, channel_index=1, value=0), row),
           ins("UNPACR", last=1, ovrd_thread_id=1)]
 FILLED = [ins("STALLWAIT", stall_res=bh.STALL_SFPU | bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK0)]  # the SFPU and the sync unit wait for the fills
 def reconfigure(**fields):  # unpacker 0's config fields rewritten from thread 0, a byte at a time (RMWCIB keeps the rest
@@ -135,15 +135,16 @@ def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
 WALK = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),  # a step along B's column and A's row, both
         ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # kept in L1
-def aim(row): return ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=row)  # the FPU and SFPU at Dst row on
-def math_begin(half, zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
-  return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), aim(DST_HALF * half)] +
-          [ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=4 * half + b) for b in range(4) if zero])  # 16-row blocks
+def aim(row): return at(ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=0), row)  # the FPU and SFPU at Dst row on
+# In the programs, C's h is the first Dst row of the half the next op gets, 0 or DST_HALF: h ^= DST_HALF moves on
+def math_begin(zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
+  return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), aim("h")] +
+          [at(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero])  # 16-row blocks
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU), ins("SEMPOST", sem_sel=SEM_DST)]
 def pack(row, slot, *done):  # 64 Dst rows from row into an L1 slot, then free them and post done
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
-          ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=row),  # channel 0 Y: Dst row
-          ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=slot),  # channel 1 Y: L1 slot
+          at(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=0), row),  # channel 0 Y: Dst row
+          at(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=0), slot),  # channel 1 Y: L1 slot
           ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
           ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + \
@@ -413,7 +414,6 @@ def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU jus
 
 def _array(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
 BANKS = _array("bank", [x | y << 6 for x, y in bh.DRAM]) + "\n#define BANK(t) bank[(t) % 8] & 63, bank[(t) % 8] >> 6  // tile t's bank's x, y"
-def halves(programs): return f"if (h) {{ {tt(programs[1])} }} else {{ {tt(programs[0])} }}"  # one program per Dst half, by h
 
 def tt(words):
   """C for a TRISC to push words to its thread as .ttinsn instructions: each word rotated left by 2 and written into
@@ -598,7 +598,7 @@ static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  /
 {KMAIN}
   {tt(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + [FLAGS_OFF])} {_pushes(math_runs(slots))}
   while (!peek(READY)) {{}}  // the backend config and the semaphores
-  unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
+  unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets, by its first row
 {body}
 }}"""
 
@@ -616,7 +616,7 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
 {KMAIN}
   {tt(thread() + SETUP_PACK)} {_pushes(PACK_RUNS)}
   while (!peek(READY)) {{}}
-  unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets
+  unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets, by its first row
 {body}
   while (relayed < outputs) relay();
 }}"""
@@ -847,9 +847,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
       for j in once + swept_ops:
         op, me_j = ops[j], ("op", j)
         cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
-        pk = halves([pack(DST_HALF * h, pslot(f, me_j), SEM_PACKED if j == root else SEM_L1) for h in (0, 1)])
+        pk = tt(pack("h", pslot(f, me_j), SEM_PACKED if j == root else SEM_L1))
         pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
-        c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= 1; }}")
+        c[P].append(f"{cond}{{ {output(j, f)}{pk} h ^= {DST_HALF}; }}")
         if op["kind"] == "matmul":
           kt, bw, q, how = op["kt"], ext(op["shape"], 2), matmuls.index(j), op["how"]  # B's width in tiles; which matmul
           bt, bs = how == 1, 0 if how == 2 else 1  # B transposed; B's first stream slot (bfp8's are at B8)
@@ -909,24 +909,24 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
                         f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
             c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ "
                         f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
-          c[M].append(f"{cond}{{ {halves([math_begin(h, True) for h in (0, 1)])} "
+          c[M].append(f"{cond}{{ {tt(math_begin(True))} "
                       f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases']))} }} "
-                      f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= 1; }}")
+                      f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= {DST_HALF}; }}")
           continue
         drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
         x, y = slot(f, op["x"]), slot(f, op["y"])
         prog = sfpu([sfpu_name(op)], slots) if sfpu_op(op) else []
         if dst:  # x into the op's Dst half, y 128 rows on, then the SFPU: all on the math thread
-          fills = lambda h: fill(x, DST_HALF * h) + (fill(y, DST_HALF * h + 128) if op["y"] != "zero" else []) + FILLED
-          math = halves([math_begin(h, False) + fills(h) + prog + sfpu(op['posts'], slots) for h in (0, 1)])
-          c[M].append(f"{cond}{{ {drain}{math} {math_end(j)} h ^= 1;{posted} }}")
+          fills = fill(x, "h") + (fill(y, "h + 128") if op["y"] != "zero" else []) + FILLED
+          math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], slots))
+          c[M].append(f"{cond}{{ {drain}{math} {math_end(j)} h ^= {DST_HALF};{posted} }}")
           continue
         if op["kind"] in BINARY:  # x and y each into Dst for the SFPU: x in the op's half, y 128 rows on
           unpacks, fpu = unpack(x, ZERO_SLOT) + unpack(y, ZERO_SLOT), elementwise("add", slots) + elementwise("add", slots, dst=128)
         else: unpacks, fpu = unpack(x, y), elementwise(op["kind"], slots)
         c[U].append(f"{cond}{{ {drain}{tt(unpacks)}{posted} }}")
-        math = halves([math_begin(h, op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], slots) for h in (0, 1)])
-        c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= 1; }}")
+        math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], slots))
+        c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= {DST_HALF}; }}")
       for acc, j in enumerate(reductions):
         assert acc < len(ACCS), "two reductions a pass"
         op, me_j, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
@@ -1084,8 +1084,8 @@ def transpose_kernel(rows, cols):
     _brisc("a[1]", loop(*[f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} * a[5] + t % {per} / {ct} + a[6], "
                           f"{frame(f)[0]}); ready(); frame_done[{f}] = ++events;" for f in (0, 1)])),
     _unpacker(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]), kernel_config(transposing=True)),
-    _math({}, loop(*[halves([math_begin(h, False) + elementwise("add", {}) + MATH_END for h in (0, 1)]) + " h ^= 1;"] * 2)),  # padding stays 0
-    _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + halves([pack(DST_HALF * h, frame(f)[1], SEM_PACKED) for h in (0, 1)]) + " h ^= 1;"
+    _math({}, loop(*[tt(math_begin(False) + elementwise("add", {}) + MATH_END) + f" h ^= {DST_HALF};"] * 2)),  # padding stays 0
+    _packer(loop(*[f"output({f}, {frame(f)[1]}, t); " + tt(pack("h", frame(f)[1], SEM_PACKED)) + f" h ^= {DST_HALF};"
                    for f in (0, 1)])))
 
 MOVE_SLOTS = 127  # x's tiles cached in L1 by a move, by tile number mod a prime, so power-of-two strides spread out
