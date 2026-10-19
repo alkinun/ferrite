@@ -191,7 +191,7 @@ append a correction.
     casts fused at a kernel's root, 427). (NOTES: "Training")
 31. **Before making a copy faster, ask whether the reader could take the data where it lies.** Grouped-query attention
     stacked 9 query heads into 3 groups and back: two moves and a copy a block, a third of a SmolLM block's cycles. A
-    view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 179k.
+    view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 180k.
     (NOTES: "A Llama-family model")
 
 ## Working method
