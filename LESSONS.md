@@ -83,6 +83,12 @@ append a correction.
 8. **What the simulator does not count, the card will.** ttsim counts the chip's clocks, never the host's: issuing a
    GPT-2 token took ferrite's Python 10.8 ms (7.3 ms now), where the card should need 0.5 ms. Measure the host as well; replaying a
    recorded token (`jit`) takes it to 0.1 ms. (NOTES: "The host's part, and replay")
+9. **A round trip the simulator answers at once is a microsecond on the card.** ttsim answers a read of host memory
+   and acknowledges a write to it in no time, so a design that makes a few a launch looks free there: the dispatcher
+   read each command's header and then its body and waited for two status writes' acknowledgements, and `tobytes`
+   read DRAM over the BARs a few bytes a round trip (a token's logits were 3 MB). Price each PCIe round trip from the
+   ISA and the bus: the dispatcher now reads all the host has written in one read and posts its status, and results
+   come back by the chip's own writes into host memory. (NOTES: "The dispatcher", "Waiting")
 
 ## The compiler and runtime
 
@@ -193,6 +199,16 @@ append a correction.
     stacked 9 query heads into 3 groups and back: two moves and a copy a block, a third of a SmolLM block's cycles. A
     view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 180k.
     (NOTES: "A Llama-family model")
+
+32. **Run the framework's own tests.** tinygrad's `test_ops`, unchanged on the FERRITE device, found what our tests of
+    the adapter never reached: an int product labelled int32 where ferrite made it in fp32, bools copied back as the
+    bytes they were computed in, a freed buffer handed on with its old contents, a padding mask dropped on an axis of
+    1, zero-size shapes, views at an offset. 266 of its 420 passed, then 339; most of the rest is the FPU's matmul
+    precision. (NOTES: "tinygrad on ferrite")
+33. **When a tree must be cut, cut where it is shared.** A kernel holds 15 ops, and past that the realizer cut down the
+    heaviest branch, which in an RMSNorm over a long residual stream is its sum of squares: the stream was added up in
+    two kernels and the norm took three. Computing first the value two of its ops read made it two, and a SmolLM token
+    25 launches fewer. (NOTES: "Next for the compiler")
 
 ## Working method
 
