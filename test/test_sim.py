@@ -89,9 +89,11 @@ def test_cache_prune(tmp_path, monkeypatch):
   assert not old.exists() and new.exists()
 
 def test_card_wants_root():
-  # pci.Card's first check, which needs no card: without root it says so, rather than failing on a sysfs write later
+  # pci.Card's and pci.reset's first check, which needs no card: without root each says so, rather than failing on a
+  # sysfs write later
   if os.geteuid() == 0: pytest.skip("as root, Card would go on to open the device")
   with pytest.raises(PermissionError, match="root"): pci.Card("0000:00:00.0")
+  with pytest.raises(PermissionError, match="root"): pci.reset("0000:00:00.0")  # and so does a reset
 
 def test_hello(chip):
   assert set(hello(chip, chip.tensix[0], chip.tensix[-1], 30).values()) == {832040}
@@ -194,9 +196,15 @@ def test_jit(chip, monkeypatch):
   assert len(realized) == 1 and rt.pinned, realized
 
 def test_hung_kernel_times_out(chip):
+  # a launch that never finishes is named, with each stuck worker's report: which of its cores are still in it (here
+  # BRISC, then TRISC1 and BRISC, which waits for it), its kernel's counters, and its NoC requests in flight
   rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))
-  with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]"): rt.wait(timeout=0.2)
+  with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]\n  \(1, 2\): launch 1 not finished by "
+                     r"BRISC\n    SYNC fetched 0, .*; FLAGS set: none\n    NoC requests in flight by id: none"): rt.wait(timeout=0.2)
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  rt.launch(compile_kernel(None, None, "void kmain(volatile unsigned *a) { for (;;); }"))
+  with pytest.raises(TimeoutError, match=r"\(1, 2\): launch 1 not finished by BRISC, TRISC1\n"): rt.wait(timeout=0.2)
 
 def test_dram_is_freed(chip):
   # first fit, 64-byte aligned; a freed block merges with the holes on both sides; a tensor gives its DRAM back once

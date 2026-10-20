@@ -98,10 +98,41 @@ class Card:
 def _write(path, s):
   with open(path, "w") as f: f.write(s)
 
-def open_device():
-  """TTSIM=/path/to/libttsim.so selects the simulator; otherwise the first Blackhole on the PCI bus."""
-  if "TTSIM" in os.environ: return Sim(os.environ["TTSIM"])
+def find_card():
+  """The first Blackhole on the PCI bus, by its sysfs name (domain:bus:device.function)."""
   for bdf in sorted(os.listdir("/sys/bus/pci/devices")):
     ids = [int(open(f"/sys/bus/pci/devices/{bdf}/{f}").read(), 16) for f in ("vendor", "device")]
-    if ids == [bh.VENDOR, bh.DEVICE]: return Card(bdf)
+    if ids == [bh.VENDOR, bh.DEVICE]: return bdf
   raise RuntimeError("no Blackhole on the PCI bus; set TTSIM=/path/to/libttsim.so to use the simulator")
+
+def open_device():
+  """TTSIM=/path/to/libttsim.so selects the simulator; otherwise the first Blackhole on the PCI bus."""
+  return Sim(os.environ["TTSIM"]) if "TTSIM" in os.environ else Card(find_card())
+
+def reset(bdf, timeout=10.0):
+  """Reset the whole chip, as tt-kmd's ASIC reset does, for a card whose NoC or firmware hangs (a hung kernel needs
+  none: the next Runtime resets the cores it uses). Two config writes fire the PCIe controller's interface timer, and
+  PCI_COMMAND's parity bit marks the reset coming: it is done when that bit is clear again, or when the card has left the
+  bus and come back. Then the kernel enumerates the card again (remove, rescan), which restores its config space as at
+  boot. Nothing may have the card open. Untested on silicon (NOTES.md)."""
+  if os.geteuid() != 0: raise PermissionError("a reset wants root: it writes the card's config space and sysfs")
+  path, deadline, gone = f"/sys/bus/pci/devices/{bdf}", time.monotonic() + timeout, False
+  fd = os.open(f"{path}/config", os.O_RDWR | os.O_SYNC)
+  command = int.from_bytes(os.pread(fd, 2, 0x04), "little")
+  os.pwrite(fd, (command | bh.RESET_MARKER).to_bytes(2, "little"), 0x04)
+  for off, val in zip(bh.RESET_TIMER, (1, 0x11)): os.pwrite(fd, val.to_bytes(4, "little"), off)
+  os.close(fd)
+  def back():  # whether the reset is over
+    nonlocal gone
+    if not os.path.exists(path): gone = True; return False
+    try:
+      with open(f"{path}/config", "rb") as f: f.seek(0x04); return gone or not int.from_bytes(f.read(2), "little") & bh.RESET_MARKER
+    except OSError: return False  # its config space does not answer yet
+  while not back():
+    if time.monotonic() > deadline: raise TimeoutError(f"{bdf} did not come back from its reset within {timeout}s")
+    time.sleep(0.1)
+  _write(f"{path}/remove", "1")
+  _write("/sys/bus/pci/rescan", "1")
+  while not os.path.exists(f"{path}/config"):
+    if time.monotonic() > deadline: raise TimeoutError(f"{bdf} did not come back from a rescan within {timeout}s")
+    time.sleep(0.1)

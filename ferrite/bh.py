@@ -2,6 +2,9 @@
 # values stay where the compiler uses them). NOTES.md says where each number comes from.
 
 VENDOR, DEVICE = 0x1E52, 0xB140
+# Config-space offsets of the PCIe controller's interface timer, its target then its control (kmd pcie.c): target 1, then
+# control 0x11 (enabled, its interrupt forced pending) resets the whole chip. PCI_COMMAND's parity bit marks a reset coming
+RESET_TIMER, RESET_MARKER = (0x934, 0x930), 1 << 6
 
 # BAR0 (512 MiB): 202 TLB windows of 2 MiB from offset 0, then registers. BAR4 (32 GiB): 8 TLB windows of 4 GiB.
 TLB_WINDOW, TLB_COUNT = 1 << 21, 201  # TLB 201, the last 2 MiB one, is tt-kmd's; we leave it alone

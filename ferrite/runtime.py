@@ -17,6 +17,7 @@ from ferrite import bh, pci
 MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_COUNTS = 8  # SYNC's words that start each launch at 0 (a kernel writes the rest before reading them)
+SYNC_NAMES = ("fetched", "unpacked", "ready", "packed", "sent", "issued")  # the first of them, as compiled kernels count
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
 STAGE = 1 << 16  # the most of the ring the dispatcher reads into STAGING at once
 
@@ -459,7 +460,27 @@ class Runtime:
       if current == (self.launches + 1) % 2**32: raise TimeoutError(f"{e}: all done, but the status never reached the host") from None
       n = next((n for launch, n in self.workers if launch % 2**32 == current), 0)
       stuck = [c for c in self.cores[:n] if self.chip.read32(*c, MAILBOX + 16) != current]
-      pcs = lambda c: " ".join(f"{self.chip.read32(*c, bh.PC_SNAPSHOT + 4 * i):#x}" for i in range(5))  # where its cores sit
-      where = "".join(f"\n  {c}: BRISC, NCRISC, TRISC0-2 at {pcs(c)}" for c in stuck[:4]) if isinstance(self.chip.pci, pci.Card) else ""
-      raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}{where}") from None
+      reports = "".join(f"\n  {self.report(c, current)}" for c in stuck[:4])
+      raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}{reports}") from None
     self.reclaim()
+
+  def report(self, core, launch):
+    """What a worker says about a launch it has not finished, for a hang: which of its cores are still in it, the
+    counters its kernel's cores talk through (SYNC, FLAGS), its NoC requests in flight by transaction id, and on a card
+    where each core's pc is."""
+    x, y = core
+    words = lambda addr, n: struct.unpack(f"<{n}I", self.chip.read(x, y, addr, 4 * n))
+    niu = lambda off: self.chip.read32(x, y, bh.NIU + off)
+    mail, triscs, sync, flags = words(MAILBOX, 8), words(TRISCS, 4), words(SYNC, len(SYNC_NAMES)), words(FLAGS, 32)
+    if mail[0] != launch: return f"{core}: never saw the go of launch {launch} (its last: {mail[0]})"
+    left = [name for name, done in (("BRISC", mail[4]), *zip(("TRISC0", "TRISC1", "TRISC2"), triscs[1:])) if done != launch]
+    lines = [f"{core}: launch {launch} not finished by {', '.join(left) or 'none: its report to the dispatcher is lost'}"
+             + ("" if triscs[0] == launch else f" (BRISC never started the TRISCs: their go is {triscs[0]})"),
+             "SYNC " + ", ".join(f"{name} {v}" for name, v in zip(SYNC_NAMES, sync)) + "; FLAGS set: "
+             + (", ".join(f"{i}={v}" for i, v in enumerate(flags) if v) or "none"),
+             f"NoC requests in flight by id: {({i: n for i in range(16) if (n := niu(bh.NIU_REGS['OUTSTANDING'] + 4 * i))}) or 'none'}; "
+             f"write acknowledgements {niu(bh.NIU_REGS['WR_ACKS'])}, read responses {niu(bh.NIU_REGS['READS'])}"]
+    if isinstance(self.chip.pci, pci.Card):  # ttsim does not model the pc snapshots (reading one stops it)
+      lines.append("pc " + ", ".join(f"{name} {self.chip.read32(x, y, bh.PC_SNAPSHOT + 4 * i):#x}"
+                                     for i, name in enumerate(("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2"))))
+    return "\n    ".join(lines)

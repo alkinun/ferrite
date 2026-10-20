@@ -12,11 +12,11 @@ def tlb_config(**fields):
   return cfg
 
 class Chip:
-  def __init__(self, pci):
+  def __init__(self, pci, boot=2.0):  # boot: seconds to wait for ARC's firmware (minutes after a reset: umd allows 300)
     assert (ids := pci.cfg_read(0)) == bh.VENDOR | bh.DEVICE << 16, f"not a Blackhole: {ids:#x}"
     self.pci, self.tlb, self.target = pci, 0, None  # TLB 0 is the shared window; map hands out the rest
     self.free_tlbs = iter(range(1, bh.TLB_COUNT))
-    self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == 5, "report ARC firmware ready")
+    self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == 5, "report ARC firmware ready", boot)
     self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
     t = self.telemetry()
     self.tensix = [(x, y) for y in bh.TENSIX_Y for x in bh.TENSIX_X[:t[bh.TAG_TENSIX_COLS].bit_count()]]
@@ -90,10 +90,15 @@ class Chip:
 
   def halt(self, x, y, start=None): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES, start)  # hold all five cores in reset
 
-if __name__ == "__main__":  # what a card says about itself: the first thing to run on one (or on ttsim, with TTSIM set)
+if __name__ == "__main__":  # what a card says about itself: the first thing to run on one (or on ttsim, with TTSIM set);
+  import os, sys            # with `reset`, after resetting it (pci.reset), for a card whose NoC or firmware hangs
   from ferrite import pci
-  dev = pci.open_device()
-  chip = Chip(dev)
+  if sys.argv[1:] == ["reset"]:
+    assert "TTSIM" not in os.environ, "ttsim has no reset: a new process starts it afresh"
+    pci.reset(bdf := pci.find_card())
+    dev = pci.Card(bdf)
+  else: dev = pci.open_device()
+  chip = Chip(dev, 300 if sys.argv[1:] == ["reset"] else 2)
   t = chip.telemetry()
   banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]
   print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware up, Tensix powered; AI clock {t.get(bh.TAG_AICLK, 0)} MHz; "

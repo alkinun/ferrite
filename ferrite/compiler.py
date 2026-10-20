@@ -10,7 +10,7 @@
 # so face f lands in rows 16f..16f+15, and Dst holds the result the same way.
 import math, struct
 from ferrite import bh
-from ferrite.runtime import DATA, FLAGS, SYNC, ZEROS, compile_kernel
+from ferrite.runtime import DATA, FLAGS, SYNC, SYNC_NAMES, ZEROS, compile_kernel
 
 ITEMSIZE = {"bf16": 2, "fp32": 4, "int32": 4}  # the dtypes, by bytes a value; a tile is 1024 values
 # A bf16 tile is one SrcA/SrcB bank (64 rows of 16), 64 Dst rows. A block float's tile (BFP: the bytes of its values) is 64
@@ -474,7 +474,7 @@ def shared_k(rt, grid, added=0):  # the longest K, in tiles, of a matmul of rt t
 # once the backend config and semaphores are set up; PACKED, how many results the pack thread has packed, from TRISC2,
 # with where each goes in RING (four entries [slot, tile]); SENT, how many of those BRISC has sent home.
 SYNC_WORDS = f"""
-enum {{ FETCHED, UNPACKED, READY, PACKED, SENT, ISSUED, RING = 8 }};
+enum {{ {", ".join(name.upper() for name in SYNC_NAMES)}, RING = 8 }};
 #define SYNC ((volatile unsigned *){SYNC:#x})
 static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return SYNC[i]; }}  // fresh: the L0 cache sees no other core's writes
 """
