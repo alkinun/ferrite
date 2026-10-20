@@ -125,9 +125,11 @@ class Tensor:
   def put(self, ids, x):
     """x's rows into rows ids of each matrix of this tensor, in place: gather's inverse, ids an int32 tensor of one row
     read on the chip. A KV cache of a fixed size takes a token's keys at its place this way, the place data rather than a
-    shape, so a decode step launches the same kernels each token (jit)."""
+    shape, so a decode step launches the same kernels each token (jit). Into a bfp8 tensor, x is bf16, each of its runs
+    of 16 rounded as cast("bfp8") rounds."""
     assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "rows of x, by a row of int32 places"
-    assert (x.batch, x.cols, x.dtype) == (self.batch, self.cols, self.dtype), f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"
+    assert (x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype == "bfp8" else self.dtype), \
+      f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"  # into bfp8 (a bfp8 KV cache), bf16 rows rounded on the way
     assert self.rep == 1, "into a tensor of its own, not a repeat"
     x, ids, ct = _plain(x.realize()), ids.realize(), -(-self.cols // 32)
     where = lambda t: (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)
@@ -619,7 +621,9 @@ def _expr(t, shape, inputs, kernel):
   if t.op in ("T", "move"): return _expr(t.realize(), shape, inputs, kernel)  # kernels of their own (a matmul's B may be read transposed, below)
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
     a, b = t.srcs
-    if b.op == "T": b = ("T", _expr(b.srcs[0].realize(), shape, inputs, kernel))
+    if b.op == "T":  # read transposed; a block float (a bfp8 key cache) as it is, transposed on its way in too
+      src = b.srcs[0].realize()
+      b = ("T" + src.dtype, _input(src, inputs)) if src.dtype in BFP else ("T", _expr(src, shape, inputs, kernel))
     else: b = (b.dtype, _input(b.realize(), inputs)) if b.dtype in BFP else _expr(b.realize(), shape, inputs, kernel)
     return ("matmul", _expr(a.realize(), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))

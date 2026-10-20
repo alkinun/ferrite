@@ -706,11 +706,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   def visit(e):
     if isinstance(e, int): return e
     if e in refs: return refs[e]
-    if e[0] == "matmul":  # B is an input, or (how, input): ("T", input) that input transposed, ("bfp8", input) a block float
-      how, y = e[2] if isinstance(e[2], tuple) else ("", e[2])
-      a = shapes[e[1]]
-      op = dict(kind="matmul", x=e[1], y=y, how=2 if how in BFP else ("", "T").index(how), wt=how if how in BFP else None, kt=ext(a, 2),
-                shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if how == "T" else 2]), phases=e[3] if len(e) > 3 else 4)
+    if e[0] == "matmul":  # B is an input, or (how, input): ("T", input) that input transposed, ("bfp8", input) a block float,
+      how, y = e[2] if isinstance(e[2], tuple) else ("", e[2])  # ("Tbfp8", input) a block float transposed (a bfp8 key cache)
+      a, bt, wt = shapes[e[1]], how.startswith("T"), how.removeprefix("T") or None
+      op = dict(kind="matmul", x=e[1], y=y, how=2 if wt else int(bt), bt=bt, wt=wt, kt=ext(a, 2),  # how: B fetched as a bf16 tile (0, 1) or a block float's (2)
+                shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if bt else 2]), phases=e[3] if len(e) > 3 else 4)
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
@@ -758,7 +758,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   sfpu_name = lambda op: ops_of.get(op["kind"], op["kind"] if dtype != "int32" else None)  # a binary op's program
   sfpu_op = lambda op: op["kind"] in BINARY or (dst and op.get("y", "zero") != "zero")
   assert dtype != "int32" or all(sfpu_name(op) for op in ops if sfpu_op(op)), "an int32 kernel adds, subtracts, compares and picks"
-  slots = allocate({"mmT" if op["how"] == 1 else "mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul" and not dst} |
+  slots = allocate({"mmT" if op["bt"] else "mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul" and not dst} |
                    {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE} |
                    {sfpu_name(op) for op in ops if sfpu_op(op)})
   frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
@@ -892,13 +892,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
       c[P].append(f"{cond}{{ {output(j)}{pk} h ^= {DST_HALF}; }}")
       if op["kind"] == "matmul":
         kt, bw, q, how = op["kt"], ext(op["shape"], 2), matmuls.index(j), op["how"]  # B's width in tiles; which matmul
-        bt, bs = how == 1, 0 if how == 2 else 1  # B transposed; B's first stream slot (a block float's are at B8)
+        bt, bs = op["bt"], 0 if how == 2 else 1  # B transposed; B's first stream slot (a block float's are at B8)
         x, y = arg(op["x"]), arg(op["y"])
         bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
         in_batch = matrix(op["y"], y)
         b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
-        on, off = (tt(haloize(1)), tt(haloize(0))) if bt else (tt(bfp_b(wt, b8)), tt(bfp_b(wt, 0))) if how == 2 else ("", "")
-        if mc and how == 2: on = " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp_b(wt, b8, r))} }}" for r in range(3))  # the column's buffer
+        on = tt(haloize(1) * bt + (bfp_b(wt, b8) if how == 2 else []))  # unpacker 0 transposing faces, reading a block float
+        off = tt(haloize(0) * bt + (bfp_b(wt, 0) if how == 2 else []))
+        if mc and how == 2: on = tt(haloize(1) * bt) + " " + " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp_b(wt, b8, r))} }}" for r in range(3))
         a_tile = f"{matrix(op['x'], x)}i_ * a[{x + 2}] + m + a[{x + 3}]"
         buf = mc and f"{0 if how == 2 else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a block float's in B8)
         if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
@@ -1082,15 +1083,37 @@ def put_kernel(dtype):
   one tile, and as many work as it has tiles. It reads the places (32 to a tile), and for each row that lands in its
   tile, its tile once, the row's tile of x once for every row in it, the row's two runs (left and right face) copied;
   then its tile written back, if any row came. 32 rows that fill its tile in order (a prompt's, from a tile's first
-  place) make it their tile of x as it is."""
-  t, face, run = tile_bytes(dtype), tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]
+  place) make it their tile of x as it is.
+  Into bfp8 (a bfp8 KV cache), x is bf16 and each run of 16 is rounded as the packer rounds a cast: to its largest
+  exponent, half up, 7 bits of magnitude (a 0 without its sign, which the unpacker would read as -inf)."""
+  bfp = dtype == "bfp8"
+  t, s, run = tile_bytes(dtype), tile_bytes("bf16" if bfp else dtype), 16 * ITEMSIZE["bf16" if bfp else dtype]  # bytes in a tile of the tensor, of x, in x's run
+  copy = ("for (unsigned f = 0; f < 2; f++) pack(FROM + at(i, f), TILE, r, f);" if bfp else
+          f"for (unsigned f = 0; f < 2; f++) for (unsigned k = 0; k < {run // 4}; k++) "
+          f"((volatile unsigned *)(TILE + at(r, f)))[k] = ((volatile unsigned *)(FROM + at(i, f)))[k];")
+  whole = (f"noc_get(BANK(from), a[6] + from / 8 * {s}, FROM, {s}); noc_wait(); "
+           f"for (unsigned r = 0; r < 32; r++) for (unsigned f = 0; f < 2; f++) pack(FROM + at(r, f), TILE, r, f);" if bfp else
+           f"noc_get(BANK(from), a[6] + from / 8 * {t}, TILE, {t}); noc_wait();")
   return compile_kernel(f"""
 #define TILE {DATA:#x}
-#define FROM {DATA + t:#x}
-#define IDS {DATA + 2 * t:#x}
+#define FROM {DATA + 4096:#x}
+#define IDS {DATA + 8192:#x}
 {BANKS}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // place r of the 32, in row 0
-static unsigned at(unsigned r, unsigned f) {{ return (r % 32 / 16 * 2 + f) * {face} + r % 16 * {run}; }}  // row r's run in face f
+static unsigned at(unsigned r, unsigned f) {{ return (r % 32 / 16 * 2 + f) * {s // 4} + r % 16 * {run}; }}  // row r's run in face f, in x
+// the run of 16 bf16 values at src as row r's run in face f of the bfp8 tile at tile: its exponent, then its values
+static void pack(unsigned src, unsigned tile, unsigned r, unsigned f) {{
+  volatile unsigned short *v = (volatile unsigned short *)src;
+  unsigned top = 0, n = (r % 32 / 16 * 2 + f) * 16 + r % 16;
+  for (unsigned k = 0; k < 16; k++) {{ unsigned e = v[k] >> 7 & 255; if (e > top) top = e; }}
+  ((volatile unsigned char *)tile)[n] = top;
+  for (unsigned k = 0; k < 16; k++) {{
+    unsigned b = v[k], e = b >> 7 & 255, m = (b & 127) | (e ? 128 : 0), shift = top - e < 8 ? top - e : 8;
+    unsigned q = (m + (1u << shift)) >> (shift + 1);
+    if (q > 127) q = 127;
+    ((volatile unsigned char *)tile)[64 + n * 16 + k] = q ? (b >> 15) << 7 | q : 0;
+  }}
+}}
 void kmain(volatile unsigned *a) {{
   unsigned ct = a[13], tiles = a[14] * ct;
   for (unsigned u = 0; u < a[1]; u++) {{
@@ -1103,15 +1126,14 @@ void kmain(volatile unsigned *a) {{
         noc_get(BANK(it), a[10] + it / 8 * 4096, IDS, 4096);
         noc_wait();
         for (unsigned k = 0; whole && k < 32; k++) whole = id(k) == 32 * ti + k;
-        if (whole) {{ noc_get(BANK(from), a[6] + from / 8 * {t}, TILE, {t}); noc_wait(); mine = 1; i += 31; continue; }}
+        if (whole) {{ {whole} mine = 1; i += 31; continue; }}
       }}
       unsigned r = id(i % 32);
       if (r / 32 != ti) continue;
       if (!mine) {{ noc_get(BANK(to), a[2] + to / 8 * {t}, TILE, {t}); mine = 1; }}
-      if (from != held) {{ noc_get(BANK(from), a[6] + from / 8 * {t}, FROM, {t}); held = from; }}
+      if (from != held) {{ noc_get(BANK(from), a[6] + from / 8 * {s}, FROM, {s}); held = from; }}
       noc_wait();
-      for (unsigned f = 0; f < 2; f++)
-        for (unsigned k = 0; k < {run // 4}; k++) ((volatile unsigned *)(TILE + at(r, f)))[k] = ((volatile unsigned *)(FROM + at(i, f)))[k];
+      {copy}
     }}
     if (mine) {{ noc_write(TILE, BANK(to), a[2] + to / 8 * {t}, {t}); noc_wait(); }}
   }}

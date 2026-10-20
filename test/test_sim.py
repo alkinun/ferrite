@@ -1236,6 +1236,26 @@ def test_put(chip):
   kv.put(Tensor.of(rt, [list(range(5, 45))], "int32"), Tensor.of(rt, rows.tolist()))
   assert np.array_equal(value(kv)[:, 5:45], rows) and not value(kv)[:, :5].any() and not value(kv)[:, 45:].any()
 
+def test_bfp8_cache(chip):
+  # a KV cache in bfp8, as Tenstorrent's models keep theirs: put writes bf16 rows into a bfp8 tensor, each run of 16
+  # rounded as cast("bfp8") rounds (numpy's bfp, bit for bit: one row, rows in two tiles, a prompt's whole tile, the
+  # edges), and attention reads it in place, its keys transposed (unpacker 0 transposing faces of block floats) and its
+  # values as they are, each key and value head serving two query heads: both matmuls bit for bit the bf16 ones by the
+  # same values
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(16)
+  cache = Tensor.of(rt, np.zeros((4, 96, 64)).tolist()).cast("bfp8").realize()  # 2 key heads, then 2 value heads
+  want = np.zeros((4, 96, 64))
+  for places in ([5], [33, 34, 70], list(range(32, 64)), [0, 95]):
+    x = bf16(rng.normal(0, 2, (4, len(places), 64)) * 10.0 ** rng.integers(-3, 3, (4, len(places), 1)))
+    cache.put(Tensor.of(rt, [places], "int32"), Tensor.of(rt, x.tolist()))
+    want[:, places] = np.stack([bfp(m) for m in x])
+    assert np.array_equal(value(cache), want), places
+  same = Tensor.of(rt, want.tolist())  # the same values in bf16
+  q, s = (Tensor.of(rt, bf16(rng.normal(0, 1, shape)).tolist()) for shape in ((4, 5, 64), (4, 5, 96)))
+  for c in (cache, same): c.keys, c.values = c[0:2, :, :].repeat_interleave(2), c[2:4, :, :].repeat_interleave(2)
+  assert value(q @ cache.keys.T).tolist() == value(q @ same.keys.T).tolist()
+  assert value(s @ cache.values).tolist() == value(s @ same.values).tolist()
+
 def test_batched_decode(chip):
   # four sequences decoding together, a token each a step, from prompts of different lengths: their KV caches side by
   # side in one (sequence u's places from row 32 u), each token seeing only its own sequence's places up to its own.
