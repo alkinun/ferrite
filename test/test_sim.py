@@ -1298,6 +1298,32 @@ def test_kv_cache(chip):
     ids.append(int(want.argmax()))
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
+@pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
+def test_llama_8b_shapes(chip):
+  # one block in Llama-3.1-8B's shapes (4096 wide, 32 query heads sharing 8 KV heads, an MLP of 14336, Llama 3's RoPE
+  # scaling), random weights, at TT's performance precision: B2's matmuls, casts and attention at their real sizes (the
+  # logits over a vocabulary of 2048), a 64-token prompt and two decode steps against numpy. On ttsim the upload's casts
+  # (the MLP's 4096 x 28672 to bfp4 is 114,688 tiles) take minutes, past Runtime.wait's default
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(8)
+  rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+  c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=1, eps=1e-5, theta=500000.0, rope=rope, vocab=2048, ffn=14336, places=96)
+  bits = lambda shape, scale, mean=0.0: gpt2.bf16_bits(rng.normal(mean, scale, shape))
+  w = {"layers.0.input_layernorm": bits((1, 4096), 0.1, 1), "layers.0.post_attention_layernorm": bits((1, 4096), 0.1, 1),
+       "layers.0.qkv_proj": bits((4096, 6144), 0.02), "layers.0.o_proj": bits((4096, 4096), 0.02), "layers.0.gate_up_proj": bits((4096, 28672), 0.02),
+       "layers.0.down_proj": bits((14336, 4096), 0.02), "norm": bits((1, 4096), 0.1, 1), "embed": bits((2048, 4096), 1.0)}
+  w |= {"embed.T": np.ascontiguousarray(w["embed"].T)} | {k: gpt2.bf16_bits(a) for k, a in zip(("cos", "sin", "turn"), llama.rotary(c, c.places))}
+  weights, c.precision = {k: llama.Weight(lambda v=v: v) for k, v in w.items()}, llama.precision(c, "tt")
+  t = llama.upload(rt, weights, c.precision)
+  rt.wait(3600)
+  arrays, on = llama.arrays(weights, t), lambda row: Tensor.of(rt, [row], "int32")
+  kv, np_kv = llama.kv_cache(c, 96, llama.zeros(rt, "bfp8")), llama.kv_cache(c, 96, np.zeros)
+  prompt = [int(i) for i in rng.integers(0, 2048, 64)]
+  for new, places in ((prompt, list(range(64))), ([5], [64]), ([9], [65])):
+    out = llama.forward(on(new), on(places), t, c, kv).realize()
+    rt.wait(600)
+    got, want = llama.logits(out), llama.forward(new, places, arrays, c, np_kv)[0]
+    assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.02 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
+
 def test_chunked_prefill(chip):
   # a long prompt a chunk at a time (llama.prefill, as B3's 32,768 tokens must go: attention's scores a chunk by the cache,
   # not the prompt squared): 70 tokens in chunks of 32, 32 and 6, each chunk's keys and values cached before the next
