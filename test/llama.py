@@ -4,11 +4,11 @@
 # size and a token's place is data, not a shape, so on ferrite every decode step launches the same kernels: after the
 # first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
 # starts), a token each a step.
-#   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4]
+#   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors (or another
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).
 # bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and the rest in bfp8 (numpy then has
-# them as the chip does). A model too big to check in numpy on the host (over 2 billion weights) is generated unchecked.
+# them as the chip does), tt: TT's performance precision, formats and fidelity phases both (precision). A model too big to check in numpy on the host (over 2 billion weights) is generated unchecked.
 import functools, json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
@@ -22,31 +22,50 @@ def fns(x):  # what numpy and ferrite spell differently
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            softmax=lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True),
                            mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), silu=lambda a: a / (1 + np.exp(-a)),
-                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b), repeat=lambda a, n: np.repeat(a, n, 0))
+                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b), repeat=lambda a, n: np.repeat(a, n, 0),
+                           mm=lambda a, b, phases: a @ b)
   return SimpleNamespace(rows=Tensor.gather, split=Tensor.split, merge=Tensor.merge, t=lambda a: a.T, softmax=Tensor.softmax,
-                         mean=lambda a: a.mean(2),
-                         rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, repeat=Tensor.repeat_interleave)
+                         mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, repeat=Tensor.repeat_interleave,
+                         mm=lambda a, b, phases: a.matmul(b, fidelity=phases))  # numpy's products are exact at any phases
+
+def precision(c, mode="bf16"):
+  """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
+  block, head (block None), and attention, whose B is the cache (block "decode" or "prefill", format None). bf16, bfp8, or
+  bfp4 (the MLP's gate and up in bfp4, the rest in bfp8): four phases, exact products. tt: tt_transformers' performance
+  mode at tt-metal 9f98dee9 (ROADMAP, "TT's performance precision"): the MLP's gate and up in bfp4 at one phase, the other
+  matrices and the output layer in bfp8 at two, attention at two phases in decode and four in prefill; and for
+  Llama-3.1-8B (32 blocks 4096 wide) its last block's gate and up in bfp8 at two, as its
+  model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has them."""
+  tt, fmt = mode == "tt", lambda op: "bfp4" if op == "gate_up" else "bfp8"
+  p = {(op, l): (fmt(op), 1 if op == "gate_up" else 2) if tt else (fmt(op) if mode == "bfp4" else mode, 4)
+       for l in range(c.layers) for op in ("qkv", "o", "gate_up", "down")}
+  if tt and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
+  p["head", None] = ("bfp8", 2) if tt else ("bfp8" if mode == "bfp4" else mode, 4)
+  return p | {("attention", "decode"): (None, 2 if tt else 4), ("attention", "prefill"): (None, 4)}
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
 def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 a head's halves, (-x2, x1) as x @ turn
   return x * cos + (x @ turn) * sin
 
-def layer(x, p, c, rotary, mask, cache, rows):
-  """One block: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as x @ w, so
-  the Hugging Face ones transposed, q, k and v's side by side, and gate and up's), c: the config, rotary: (cos, sin,
-  turn), the tables' rows for this call's places; cache: this block's keys' heads then its values', each with a row for
-  every place, this call's written at its rows; mask: -1e9 where a token must not look (gpt2.mask)."""
+def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
+  """One block, block l: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as
+  x @ w, so the Hugging Face ones transposed, q, k and v's side by side, and gate and up's), c: the config (its precision,
+  if it has one, says each matmul's fidelity phases), rotary: (cos, sin, turn), the tables' rows for this call's places;
+  cache: this block's keys' heads then its values', each with a row for every place, this call's written at its rows;
+  mask: -1e9 where a token must not look (gpt2.mask); prefill: a prompt's tokens at once, not decode's."""
   f, n = fns(x), c.heads + 2 * c.kv
+  phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c.eps)
-  qkv = rope(f.split(h @ p["qkv_proj"], n), f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])  # v's heads do not turn
-  f.put(cache, rows, qkv[c.heads:, :, :])  # this call's keys and values, at once
+  qkv = rope(f.split(f.mm(h, p["qkv_proj"], phases("qkv")), n), f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
+  f.put(cache, rows, qkv[c.heads:, :, :])  # this call's keys and values, at once (v's heads do not turn)
   k, v = (f.repeat(t, c.heads // c.kv) for t in (cache[:c.kv, :, :], cache[c.kv:, :, :]))  # a head for each query's, in place
-  s = qkv[:c.heads, :, :] @ f.t(k) * (1 / math.sqrt(c.dim // c.heads))
-  x = x + f.merge(f.softmax(s + mask) @ v) @ p["o_proj"]
+  attention = phases("attention", "prefill" if prefill else "decode")
+  s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(c.dim // c.heads))
+  x = x + f.mm(f.merge(f.mm(f.softmax(s + mask), v, attention)), p["o_proj"], phases("o"))
   h = rms(x, p["post_attention_layernorm"], c.eps)
-  gate_up, m = h @ p["gate_up_proj"], p["down_proj"].shape[-2]
-  return x + (f.silu(gate_up[:, :m]) * gate_up[:, m:]) @ p["down_proj"]
+  gate_up, m = f.mm(h, p["gate_up_proj"], phases("gate_up")), p["down_proj"].shape[-2]
+  return x + f.mm(f.silu(gate_up[:, :m]) * gate_up[:, m:], p["down_proj"], phases("down"))
 
 def frequencies(c):  # RoPE's, a head's half of them, in fp32 as Hugging Face computes them; with Llama 3's scaling
   hd = c.dim // c.heads  # (rope_type llama3), long wavelengths slowed down by its factor, short ones kept, and those
@@ -93,10 +112,12 @@ def forward(ids, places, w, c, caches, starts=None):
   f = fns(w["embed"])
   x, rows = f.rows(w["embed"], ids), places if starts is None else places + starts
   rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(rows, caches[0].shape[-2], starts)
+  prefill = starts is None and x.shape[-2] > 1
   for l in range(c.layers):
-    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], rows)
+    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], rows, l, prefill)
   h = rms(x, w["norm"], c.eps)
-  return (h if starts is not None else f.rows(h, [x.shape[-2] - 1])) @ w["embed.T"]
+  head = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]
+  return f.mm(h if starts is not None else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], head)
 
 def kv_cache(c, size, zeros):  # each block's keys' heads then its values', a row for each of size places, made by zeros(shape)
   return [zeros((2 * c.kv, size, c.dim // c.heads)) for _ in range(c.layers)]
@@ -135,15 +156,14 @@ def load(folder, places=4096):
   for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: (a.view(np.uint32) >> 16).astype(np.uint16))
   return c, fuse(out)
 
-def upload(rt, weights, dtype="bf16"):  # the weights as ferrite Tensors, one at a time, the matrices a matmul reads as
-  # its B (the blocks' and the output layer) cast to dtype on the chip; bfp4: the MLP's gate and up in bfp4 and the rest
-  # in bfp8, as TT's own LLM code keeps them in its performance mode
-  cast = lambda k: dtype if dtype != "bfp4" else "bfp4" if k.endswith("gate_up_proj") else "bfp8"
+def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a time, the matrices a matmul reads as its
+  # B (the blocks' and the output layer) cast on the chip to the format prec (precision's) gives them, bf16 without one
   t = {}
   for name, w in weights.items():
     bits = w.bits()
     x = t[name] = Tensor.frombytes(rt, *bits.shape, bits.tobytes())
-    if name == "embed.T" or name.startswith("layers.") and x.rows > 1: t[name] = x.cast(cast(name)).realize()
+    key = ("head", None) if name == "embed.T" else (name.split(".")[2].removesuffix("_proj"), int(name.split(".")[1])) if name.endswith("_proj") else None
+    if prec and key: t[name] = x.cast(prec[key][0]).realize()
   return t
 
 def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip (upload), those not in bf16 as the chip has them
@@ -170,14 +190,15 @@ def main():
   from ferrite.chip import Chip
   from ferrite.runtime import Runtime
   folder, prompt, steps = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "The meaning of life is", int(sys.argv[3]) if len(sys.argv) > 3 else 8
-  dtype = sys.argv[4] if len(sys.argv) > 4 else "bf16"
+  mode = sys.argv[4] if len(sys.argv) > 4 else "bf16"
   enc, chip = tokenizer(folder), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   start = time.time()
   ids, agree = enc.encode(prompt), 0
   size = -(-(len(ids) + steps) // 32) * 32  # a row for each place the generation reaches, in whole tiles
   c, weights = load(folder, size)
-  t = upload(rt, weights, dtype)
+  c.precision = precision(c, mode)
+  t = upload(rt, weights, c.precision)
   count = sum(x.rows * x.cols for k, x in t.items() if k not in ("embed.T", "cos", "sin", "turn"))
   w = arrays(weights, t) if count < 2e9 else None  # numpy's float32 copy of a bigger one would not fit the host
   print(f"{count / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")

@@ -1266,6 +1266,26 @@ def test_kv_cache(chip):
     ids.append(int(want.argmax()))
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
+def test_llama_precision(chip):
+  # TT's performance precision (llama.precision "tt"): each matmul's weights in its format (the MLP's gate and up in bfp4,
+  # the rest and the output layer in bfp8) and at its fidelity phases (one for gate and up, two for the rest, attention
+  # two in decode and four in prefill), Llama-3.1-8B's last block's gate and up in bfp8 at two; numpy, given the same
+  # block-float values but exact products, picks the same tokens, its logits within 1% of their span
+  big = SimpleNamespace(layers=32, dim=4096)
+  assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
+  assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(5)
+  c, w = smol(rng, 2)
+  c.precision = llama.precision(c, "tt")
+  t = llama.upload(rt, {k: llama.Weight(lambda v=v: (np.float32(v).view(np.uint32) >> 16).astype(np.uint16)) for k, v in w.items()}, c.precision)
+  assert {k: x.dtype for k, x in t.items() if "proj" in k or k == "embed.T"} == {k: "bfp4" if "gate_up" in k else "bfp8" for k in t if "proj" in k or k == "embed.T"}
+  arrays = w | {k: gpt2.values(x) for k, x in t.items() if x.dtype != "bf16"}
+  kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
+  on = lambda row: Tensor.of(rt, [row], "int32")
+  for ids, places in (([7, 200, 31], [0, 1, 2]), ([5], [3])):  # the prompt, then a token decoded
+    got, want = llama.logits(llama.forward(on(ids), on(places), t, c, kv)), llama.forward(ids, places, arrays, c, np_kv)[0]
+    assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.01 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
+
 def test_put(chip):
   # rows into a tensor at places read on the chip (gather's inverse), against numpy: 70 rows (three tiles of places) of a
   # batch of 3, into 200 places (seven tile rows), scattered and out of order, one place twice (the later row stays),
