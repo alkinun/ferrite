@@ -120,7 +120,7 @@ def reset(bdf, timeout=10.0):
   fd = os.open(f"{path}/config", os.O_RDWR | os.O_SYNC)
   command = int.from_bytes(os.pread(fd, 2, 0x04), "little")
   os.pwrite(fd, (command | bh.RESET_MARKER).to_bytes(2, "little"), 0x04)
-  for off, val in zip(bh.RESET_TIMER, (1, 0x11)): os.pwrite(fd, val.to_bytes(4, "little"), off)
+  for off, val in bh.RESET_TIMER: os.pwrite(fd, val.to_bytes(4, "little"), off)
   os.close(fd)
   def back():  # whether the reset is over
     nonlocal gone

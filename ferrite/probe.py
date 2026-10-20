@@ -6,7 +6,7 @@
 # wall clock. On ttsim the numbers mean nothing (Tensix instructions take no time there, the NoC and DRAM answer at once):
 # it only checks that each probe runs.
 #   TTSIM=/path/to/libttsim.so python3 -m ferrite.probe [MiB]   # MiB: how much to upload and read back (8)
-import functools, struct, sys, time
+import functools, sys, time
 from ferrite import bh, pci
 from ferrite.chip import Chip
 from ferrite.compiler import (BANKS, DST_HALF, FRAMES, MATH_END, _math, _packer, _unpacker, allocate, kernel_config, math_begin,
@@ -22,7 +22,7 @@ DRAM_READS = CLOCK + BANKS + f"""
 void kmain(volatile unsigned *a) {{
   unsigned d = a[3], t0 = CLOCK;
   for (unsigned r = 0; r < a[4]; r++) {{
-    for (unsigned i = 0; i < d; i++) {{ unsigned t = a[0] * d + i; noc_get(BANK(t), a[2] + t / 8 * 2048, {DATA:#x} + i * 2048, 2048); }}
+    for (unsigned i = 0; i < d; i++) {{ unsigned t = a[0] * d + i; noc_get(BANK(t), AT(a[2], t, 2048), {DATA:#x} + i * 2048, 2048); }}
     noc_wait();
   }}
   a[5] = CLOCK - t0;
@@ -72,7 +72,7 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
   k, rows, hz = kernels(), [], chip.telemetry().get(bh.TAG_AICLK, bh.AICLK / 1e6) * 1e6
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   first, workers = rt.cores[0], len(rt.cores)
-  result = lambda core, i: struct.unpack("<I", chip.read(*core, rt.args() + 4 * i, 4))[0]
+  result = lambda core, i: chip.read32(*core, rt.args() + 4 * i)
   def timed(kernel, args, units, core=first, at=3):  # one launch; the cycles one core wrote, or the launch's if at is None
     since = rt.launches
     rt.launch(kernel, args, units)
@@ -94,16 +94,15 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
   rows.append(("SFPU exp of a tile", timed(k["exp"], (n,), 1) / n, None, "cycles"))
   # DRAM: one worker, then all, by reads in flight (bandwidth from the slowest worker's cycles)
   for depth in (1, 2, 4, 8):
-    at = rt.dram_alloc(-(-workers * depth // 8) * 2048)
+    at = rt.dram_alloc(-(-workers * depth // len(bh.DRAM)) * 2048)
     one = 2048 * depth * rounds / max(timed(k["dram"], (at, depth, rounds), 1, at=5), 1) * hz / 1e9
     timed(k["dram"], (at, depth, rounds), workers, at=5)
     every = 2048 * depth * rounds * workers / max(max(result(c, 5) for c in rt.cores), 1) * hz / 1e9
-    rows += [(f"DRAM reads, {depth} in flight: one worker", one, None, "GB/s"), (f"DRAM reads, {depth} in flight: all workers", every, 512, "GB/s")]
+    rows += [(f"DRAM reads, {depth} in flight: one worker", one, None, "GB/s"), (f"DRAM reads, {depth} in flight: all workers", every, bh.DRAM_GBPS, "GB/s")]
     rt.dram_free(at)
   # NoC: a word there and back, between neighbours and across the grid
-  xy = lambda c: c[0] | c[1] << 6
   for name, j in (("neighbours", 1), ("far apart", workers - 1)):
-    cycles = timed(k["ping"], (0, j, xy(first), xy(rt.cores[j]), rounds, rt.launches << 16), workers, at=8)
+    cycles = timed(k["ping"], (0, j, bh.noc_xy(*first), bh.noc_xy(*rt.cores[j]), rounds, rt.launches << 16), workers, at=8)
     rows.append((f"NoC round trip, {name}", cycles / rounds, None, "cycles"))
   # PCIe: upload into DRAM through the BARs, and back by the chip's writes into host memory
   start = time.perf_counter()

@@ -4,7 +4,7 @@
 # reduction of another shape) realized first.
 import array, collections, math
 from ferrite import bh
-from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, tile_bytes, shared_k
+from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
 from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, move_kernel, put_kernel, readback_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
@@ -37,6 +37,7 @@ class Tensor:
   def requires_grad_(self, on=True):
     self.requires_grad = on
     return self
+  def _where(self): return self.addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset  # for a kernel: tiles
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
 
   def __del__(self):  # its DRAM goes back once nothing refers to it (and no queued launch can still use it)
@@ -132,13 +133,12 @@ class Tensor:
       f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"  # into bfp8 (a bfp8 KV cache), bf16 rows rounded on the way
     assert self.rep == 1, "into a tensor of its own, not a repeat"
     x, ids, ct = _plain(x.realize()), ids.realize(), -(-self.cols // 32)
-    where = lambda t: (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)
     tr = -(-self.rows // 32)
-    return self.realize()._run(_cached(("put", self.dtype), lambda: put_kernel(self.dtype)), *where(self), *where(x), ids.addr,
+    return self.realize()._run(_cached(("put", self.dtype), lambda: put_kernel(self.dtype)), *self._where(), *x._where(), ids.addr,
                                ids.offset, x.rows, ct, tr, units=self.batch * tr * ct, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
-    if self.rep > 1: return (self + 0)._view(rows, cols, batch, offset, bstride, stride)  # of a repeat's copy
+    assert self.rep == 1, "a view's offsets and strides are the stored tensor's, which a repeat's matrices are not"
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
     v.op, v.addr, v.owner = None, self.realize().addr, self.owner or self
     v.offset, v.bstride, v.stride = self.offset + offset, bstride, self.stride if stride is None else stride
@@ -148,6 +148,7 @@ class Tensor:
     """x[b], one matrix of a batch; x[rows, cols] of every matrix, or x[batch, rows, cols], with slices (any step). A
     slice of whole tiles (starting on tile boundaries, ending on one or at the end, step 1) is a view, read in place;
     any other is a copy (_move)."""
+    if self.rep > 1: return (self + 0)[key]  # of a repeat's copy, whose matrices are stored one after another
     if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)._track("index", (self,), key)
     assert isinstance(key, tuple) and len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
     ranges = [range(*k.indices(n)) for k, n in zip((slice(None),) * (3 - len(key)) + tuple(key), self.shape)]
@@ -207,6 +208,7 @@ class Tensor:
   def repeat_interleave(self, n):
     """Each matrix n times over, one after another along the batch (numpy's repeat), in place: kernels read matrix b as
     the one stored at b // n. Grouped-query attention's keys and values, each head once for every query head it serves."""
+    if self.rep > 1: return (self + 0).repeat_interleave(n)  # of a repeat's copy
     v = self._view(self.rows, self.cols, self.batch * n, 0, self.bstride)
     v.rep = n
     return v._track("repeat", (self,), n)
@@ -245,7 +247,7 @@ class Tensor:
       assert into is None, "a transpose or a move writes a tensor of its own"
       x, op, self.op, self.srcs, d = _plain(self.srcs[0].realize()), self.op, None, (), self.dtype
       self.addr = self._alloc()
-      where = (self.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset)
+      where = (self.addr, *x._where())
       if op == "T" and d == "bf16":
         return self._run(_cached(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols)), *where, name="transpose")
       if op == "T": self.map = (0, x.rows * x.cols, 1, x.cols, 0, 0, 0, *self.shape)
@@ -259,7 +261,7 @@ class Tensor:
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
-    args = [v for t in [self] + inputs for v in (t.addr, t.bstride if t.batch > 1 else 0, t.stride, t.offset)]
+    args = [v for t in [self] + inputs for v in t._where()]
     return self._run(kernel, *args, units=units, name=name)
   def assign(self, x):
     """x's value in this tensor, in place, as an optimizer updates a weight: x is computed into its DRAM and becomes a
@@ -304,7 +306,7 @@ class Tensor:
     if dtype == self.dtype: return self
     if dtype != "bfp4": return Tensor(self.rt, self.rows, self.cols, "cast", (self,), self.batch, dtype)
     x, out, tc = _plain(self.cast("bf16").realize()), Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), -(-self.cols // 32)
-    return out._run(_cached(("bfp4",), bfp4_kernel), out.addr, x.addr, x.bstride if x.batch > 1 else 0, x.stride, x.offset, tc,
+    return out._run(_cached(("bfp4",), bfp4_kernel), out.addr, *x._where(), tc,
                     -(-self.rows // 32) * tc, name="bfp4")
   def float(self): return self.cast("fp32")
   def bfloat16(self): return self.cast("bf16")
@@ -573,10 +575,9 @@ def _tree(t, inputs):
   dtype = t.srcs[0].dtype if t.op in ("cast", "matmul") else t.dtype
   assert dtype not in BFP, "a block float is read only as a matmul's B"
   axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
-  n = _ext(t, axis)  # the sweep is as long as t along the axis, unless t is one tile there: then its first reduction says
+  n = ext(t.shape, axis)  # the sweep is as long as t along the axis, unless t is one tile there: then its first reduction says
   return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
 
-def _ext(t, ax): return t.shape[ax] if ax == 0 else -(-t.shape[ax] // 32)  # t's extent along an axis: matrices, or tiles
 
 def _bf16s(tile, dtype):  # a block-float tile's values as bf16 (the unpacker's way, ISA FormatConversion.md): normalized,
   out = array.array("H", bytes(2048))  # 7 bits a value (bfp4's 3 shifted up to bfp8's place)
@@ -614,7 +615,7 @@ def _expr(t, shape, inputs, kernel):
   if any(t.shape[ax] != shape[ax] for ax in range(3) if ax != axis): return _expr(t.realize(), shape, inputs, kernel)
   if t.op in COMBINE:
     if FOLDS[t.op] != axis: return _expr(t.realize(), shape, inputs, kernel)
-    n = _ext(t.srcs[0], axis)
+    n = ext(t.srcs[0].shape, axis)
     if n > 1 and kernel[1] is None: kernel[1] = n
     if (n > 1 and n != kernel[1]) or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)): return _expr(t.realize(), shape, inputs, kernel)
     kernel[2].add(id(t))

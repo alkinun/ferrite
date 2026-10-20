@@ -15,7 +15,7 @@ import bz2, glob, json, os, platform, re, statistics, subprocess, sys, tempfile,
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ferrite import pci
+from ferrite import bh, pci
 import gpt2, llama
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -83,7 +83,6 @@ def model(folder, s, places):  # the model's config at TT's performance precisio
   return c, {k: v for k, v in w.items() if not k.startswith("layers.") or int(k.split(".")[1]) < c.layers}
 
 def ferrite(folder, prompt, after, top5, book, s):
-  from ferrite import bh
   from ferrite.chip import Chip
   from ferrite.runtime import Runtime
   from ferrite.tensor import Tensor, jit
@@ -133,7 +132,7 @@ def ferrite(folder, prompt, after, top5, book, s):
   t = llama.upload(rt, w, c.precision)
   tps = decode(t, c, 1)
   read = bytes_per_token(t, c, len(prompt) + (s.steps + 1) / 2)
-  out["B2 decode, batch 1"] = {"tokens/s": tps, "GB a token": read / 1e9, "effective DRAM bandwidth": tps * read / 512e9}
+  out["B2 decode, batch 1"] = {"tokens/s": tps, "GB a token": read / 1e9, "effective DRAM bandwidth": tps * read / (bh.DRAM_GBPS * 1e9)}
   tps = decode(t, c, s.users)
   out[f"B2 decode, batch {s.users}"] = {"tokens/s a user": tps, "tokens/s": tps * s.users}
   top1, five, _ = llama.accuracy(rt, t, c, prompt, after, top5, s.accuracy)
@@ -198,7 +197,7 @@ def ttnn(folder, prompt, after, top5, book, s):
   c, _ = model(folder, s, 1)
   if "tokens/s" in out["B2 decode, batch 1"]:
     read = bytes_per_token(weights(c), c, len(prompt) + (s.steps + 1) / 2)
-    out["B2 decode, batch 1"] |= {"GB a token": read / 1e9, "effective DRAM bandwidth": out["B2 decode, batch 1"]["tokens/s"] * read / 512e9}
+    out["B2 decode, batch 1"] |= {"GB a token": read / 1e9, "effective DRAM bandwidth": out["B2 decode, batch 1"]["tokens/s"] * read / (bh.DRAM_GBPS * 1e9)}
   out[f"B2 decode, batch {s.users}"] = demo(f"b2-batch-{s.users}", "batch-32 and not log-probs", ("tokens/s a user", "tokens/s"), *decoding,
                                             *(("--batch_size", str(s.users)) if s.users != 32 else ()), text=text)
   out["B2 token accuracy"] = demo("b2-accuracy", "ci-token-matching", ("top-1", "top-5"), "--max_generated_tokens", str(s.accuracy))

@@ -18,10 +18,11 @@ ITEMSIZE = {"bf16": 2, "fp32": 4, "int32": 4}  # the dtypes, by bytes a value; a
 # m * 2^(exponent - 133)) or 3 (bfp4, two to a byte, the low one first: bfp8's top 3, which the unpacker shifts back)
 BFP = {"bfp8": 1024, "bfp4": 512}
 def tile_bytes(dtype): return 64 + BFP[dtype] if dtype in BFP else 1024 * ITEMSIZE[dtype]
+def ext(shape, ax): return shape[ax] if ax == 0 else -(-shape[ax] // 32)  # extent along an axis: matrices, or tiles
 def slot_base(dtype): return DATA - tile_bytes(dtype)  # L1 tile slots of a kernel computing in dtype: slot i at base + i *
                                                         # its tile, so slot 0 is (part of) the runtime's zeros. The unpackers'
                                                         # Z and the packer's channel 1 Y counters pick them
-OUTS = 0x17E000  # the result of a kernel that packs in another dtype than it computes in: two 4 KiB tiles, one per frame
+OUTS = bh.L1_SIZE - 2 * 4096  # the result of a kernel that packs in another dtype than it computes in: two 4 KiB tiles, one per frame
 DST_HALF = 64  # Dst rows of one result in fp32; Dst holds two, so math fills one half while pack drains the other
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2  # results in Dst to pack, outputs packed but not reported, and
                                                        # intermediates packed into L1 but not yet waited for
@@ -403,7 +404,9 @@ def run(slots, name, count=None):  # the first count words of a run: one REPLAY 
 def runs(slots, name, times): return [Loop(times, run(slots, name))]  # a C loop: the math thread runs ahead of its pushes anyway
 def math_runs(slots): return [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]  # recorded at setup
 
-def release(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvalid: both Src banks go back to the unpackers
+def release(word):  # the same ELW*/MVMUL with clear_dvalid set: both Src banks go back to the unpackers
+  first, width = bh.TENSIX_OPS["MVMUL"][1]["clear_dvalid"]
+  return word | ((1 << width) - 1) << first
 def phased(slots, name, phases):  # a run of MATH_RUNS, once each fidelity phase, the last word releasing both Src banks
   words = MATH_RUNS[name]
   return [ins("SETRWC", bit_mask=0b1111)] + run(slots, name) * (phases - 1) + run(slots, name, len(words) - 1) + [release(words[-1])]
@@ -447,7 +450,9 @@ def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU jus
           SFPU[u][0] + runs(slots, u, 32)]
 
 def _array(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
-BANKS = _array("bank", [x | y << 6 for x, y in bh.DRAM]) + "\n#define BANK(t) bank[(t) % 8] & 63, bank[(t) % 8] >> 6  // tile t's bank's x, y"
+BANKS = _array("bank", [bh.noc_xy(x, y) for x, y in bh.DRAM]) + f"""
+#define BANK(t) bank[(t) % {len(bh.DRAM)}] & 63, bank[(t) % {len(bh.DRAM)}] >> 6  // tile t's bank's x, y
+#define AT(base, t, size) ((base) + (t) / {len(bh.DRAM)} * (size))  // and its address there, of a tensor at base: tiles of size bytes"""
 
 def tt(words):
   """C for a TRISC to push words to its thread as .ttinsn instructions: each word rotated left by 2 and written into
@@ -511,18 +516,18 @@ def _brisc(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0, wt="b
 {BANKS}
 static unsigned fetched, events, frame_done[2], stream_done[{DEPTH}], steps, sent, out;
 static unsigned rows[16];  // i + 1 of what each place in L1 holds (fresh)
-// tile t of a tensor at DRAM address base: bank t % 8, row t / 8 of the bank
-static void get(unsigned base, unsigned t, unsigned slot) {{ noc_get(BANK(t), base + t / 8 * {tb}, SLOT(slot), {tb}); }}
+// tile t of a tensor at DRAM address base (BANK, AT)
+static void get(unsigned base, unsigned t, unsigned slot) {{ noc_get(BANK(t), AT(base, t, {tb}), SLOT(slot), {tb}); }}
 // the same with its two off-diagonal faces swapped, half of transposing it (unpacker 0 does the rest)
 static void flipped(unsigned base, unsigned t, unsigned slot) {{
   for (unsigned f = 0; f < 4; f++)
-    noc_get(BANK(t), base + t / 8 * {tb} + f * {tb // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {tb // 4}, {tb // 4});
+    noc_get(BANK(t), AT(base, t, {tb}) + f * {tb // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {tb // 4}, {tb // 4});
 }}
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
 static void send(void) {{  // the results packed so far go home, in the order they were packed
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1);
-    noc_put(OUT_SLOT(slot), BANK(t), out + t / 8 * {to}, {to}); noc_wait();
+    noc_put(OUT_SLOT(slot), BANK(t), AT(out, t, {to}), {to}); noc_wait();
   }}
 }}
 // A slot is fetched into again once thread 0 has unpacked what was there: the frame two tiles back, a stream slot DEPTH
@@ -531,7 +536,7 @@ static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
 // block-float tile t into slot s at B8, slot s % b8 of region s / b8: its 64 exponents among the region's exponents, its
 // values among theirs
 static void getb(unsigned base, unsigned t, unsigned s) {{
-  unsigned at = base + t / 8 * {tile_bytes(wt)}, r = {B8:#x} + s / {max(b8, 1)} * {b8 * tile_bytes(wt)}, z = s % {max(b8, 1)};
+  unsigned at = AT(base, t, {tile_bytes(wt)}), r = {B8:#x} + s / {max(b8, 1)} * {b8 * tile_bytes(wt)}, z = s % {max(b8, 1)};
   noc_get(BANK(t), at, r + 64 * z, 64);
   noc_get(BANK(t), at + 64, r + {64 * b8} + {BFP[wt]} * z, {BFP[wt]});
 }}
@@ -700,8 +705,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
       count(c)
   count(expr)
   out, dst = out or dtype, dtype != "bf16"  # dst: the math thread fills Dst itself and the SFPU does the math
-  ext = lambda s, ax: s[ax] if ax == 0 else -(-s[ax] // 32)  # a shape's extent along an axis: matrices, or tiles
-  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also how, wt, kt, phases); refs: expr -> input number or ("op", j)
+  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also how, bt, wt, kt, phases); refs: expr -> input number or ("op", j)
   size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (batch, rows, columns)
   def visit(e):
     if isinstance(e, int): return e
@@ -812,8 +816,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   decls, tail = "", ""  # BRISC's tables and statics for a multicast matmul or kept inputs, and its last words
   if mc:
     (gx_n, gy_n), (xs, ys) = mc, grid
-    decls = (_array("row_rect", [xs[gx_n - 1] | y << 6 | (xs[0] | y << 6) << 12 for y in ys[:gy_n]]) +
-             _array("col_rect", [x | ys[gy_n - 1] << 6 | (x | ys[0] << 6) << 12 for x in xs[:gx_n]]))
+    decls = (_array("row_rect", [bh.noc_rect((xs[0], y), (xs[gx_n - 1], y)) for y in ys[:gy_n]]) +
+             _array("col_rect", [bh.noc_rect((x, ys[0]), (x, ys[gy_n - 1])) for x in xs[:gx_n]]))
     tail = f"unflag({gx_n}, {gy_n});"
   def plan(p):  # pass p's reductions, the swept ops it computes (operands first), and the narrow ops it works out once
     reductions, swept_ops = [j for j in sweep if sweep[j] == p], []
@@ -1018,7 +1022,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   total = f"a[1] * {L if swept(me) else 1}" if reducing else "tiles"  # results this worker sends home
   if bcast:  # before its first tile, each worker waits for A's row, which the first grid row of its matrix's reads and multicasts
     (gx_n, gy_n), (xs, ys), kt, x = bcast, grid, ops[matmuls[0]]["kt"], arg(ops[matmuls[0]]["x"])
-    rects = [xs[gx_n - 1] | ys[g + gy_n - 1] << 6 | (xs[0] | ys[g] << 6) << 12 for g in range(0, nb * gy_n, gy_n)]  # each matrix's rows
+    rects = [bh.noc_rect((xs[0], ys[g]), (xs[gx_n - 1], ys[g + gy_n - 1])) for g in range(0, nb * gy_n, gy_n)]  # each matrix's rows
     decls, tail = _array("rect", rects) + "\n", f"unflag({gx_n}, 0);"
     in_batch = matrix(ops[matmuls[0]]["x"], x)
     first = (f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, end = (gx + 1) * {kt} / {gx_n};\n"
@@ -1056,7 +1060,7 @@ static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] == 1 ? 1 : 32, it = a[9] + i;  // it: the indices' tile
-    noc_get(BANK(it), a[8] + it / 8 * 4096, IDS, 4096);
+    noc_get(BANK(it), AT(a[8], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")});
     copy({ZEROS:#x}, SLOT, {tb});  // the rows past the end stay zero
     noc_wait();
     for (unsigned r = 0; r < rows; r++) {{
@@ -1065,13 +1069,13 @@ void kmain(volatile unsigned *a) {{
         volatile unsigned *to = (volatile unsigned *)(SLOT + face * {fb} + r % 16 * {run});
         if (row >= a[7]) continue;
         unsigned n = id(r), from = n / 32 * a[4] + j + a[5], at = (n % 32 / 16 * 2 + face % 2) * {fb} + n % 16 * {run};
-        noc_get(BANK(from), a[3] + from / 8 * {tb} + at / 64 * 64, BLOCK, 64);
+        noc_get(BANK(from), AT(a[3], from, {tb}) + at / 64 * 64, BLOCK, 64);
         noc_wait();
         for (unsigned k = 0; k < {run // 4}; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
       }}
     }}
     if (rows == 1) row_down(SLOT);
-    noc_write(SLOT, BANK(t), a[2] + t / 8 * {tb}, {tb});
+    noc_write(SLOT, BANK(t), AT(a[2], t, {tb}), {tb});
     noc_wait();
   }}
 }}""")
@@ -1091,9 +1095,9 @@ def put_kernel(dtype):
   copy = ("for (unsigned f = 0; f < 2; f++) pack(FROM + at(i, f), TILE, r, f);" if bfp else
           f"for (unsigned f = 0; f < 2; f++) for (unsigned k = 0; k < {run // 4}; k++) "
           f"((volatile unsigned *)(TILE + at(r, f)))[k] = ((volatile unsigned *)(FROM + at(i, f)))[k];")
-  whole = (f"noc_get(BANK(from), a[6] + from / 8 * {s}, FROM, {s}); noc_wait(); "
+  whole = (f"noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}); noc_wait(); "
            f"for (unsigned r = 0; r < 32; r++) for (unsigned f = 0; f < 2; f++) pack(FROM + at(r, f), TILE, r, f);" if bfp else
-           f"noc_get(BANK(from), a[6] + from / 8 * {t}, TILE, {t}); noc_wait();")
+           f"noc_get(BANK(from), AT(a[6], from, {t}), TILE, {t}); noc_wait();")
   return compile_kernel(f"""
 #define TILE {DATA:#x}
 #define FROM {DATA + 4096:#x}
@@ -1123,19 +1127,19 @@ void kmain(volatile unsigned *a) {{
       unsigned from = b * a[7] + i / 32 * a[8] + j + a[9];
       if (i % 32 == 0) {{
         unsigned it = a[11] + i / 32, whole = i + 32 <= a[12];
-        noc_get(BANK(it), a[10] + it / 8 * 4096, IDS, 4096);
+        noc_get(BANK(it), AT(a[10], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")});
         noc_wait();
         for (unsigned k = 0; whole && k < 32; k++) whole = id(k) == 32 * ti + k;
         if (whole) {{ {whole} mine = 1; i += 31; continue; }}
       }}
       unsigned r = id(i % 32);
       if (r / 32 != ti) continue;
-      if (!mine) {{ noc_get(BANK(to), a[2] + to / 8 * {t}, TILE, {t}); mine = 1; }}
-      if (from != held) {{ noc_get(BANK(from), a[6] + from / 8 * {s}, FROM, {s}); held = from; }}
+      if (!mine) {{ noc_get(BANK(to), AT(a[2], to, {t}), TILE, {t}); mine = 1; }}
+      if (from != held) {{ noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}); held = from; }}
       noc_wait();
       {copy}
     }}
-    if (mine) {{ noc_write(TILE, BANK(to), a[2] + to / 8 * {t}, {t}); noc_wait(); }}
+    if (mine) {{ noc_write(TILE, BANK(to), AT(a[2], to, {t}), {t}); noc_wait(); }}
   }}
 }}""")
 
@@ -1156,7 +1160,7 @@ void kmain(volatile unsigned *a) {{
     unsigned k = a[0] + u, t = a[2] + k, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b / a[9] * a[4] + i * a[5] + j + a[6];
     unsigned l1 = {DATA:#x} + u % 2 * {n};
     unsigned long long to = host + (unsigned long long)k * sent;
-    noc_get(BANK(from), a[3] + from / 8 * {n}, l1, {n});
+    noc_get(BANK(from), AT(a[3], from, {n}), l1, {n});
     noc_wait();  // and the writes out of this buffer two tiles ago are done
     if (sent == {n}) noc_write(l1, {bh.PCIE[0]}, {bh.PCIE[1]}, to, {n});
     else for (unsigned f = 0; f < 4; f++) {{  // faces 0 and 1 hold rows 0-15, 2 and 3 rows 16-31
@@ -1186,7 +1190,7 @@ static unsigned nibble(unsigned b, unsigned top) {{  // bf16 b's 3 bits under ex
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b * a[4] + i * a[5] + j + a[6], tops = 0;
-    noc_get(BANK(from), a[3] + from / 8 * 2048, IN, 2048);
+    noc_get(BANK(from), AT(a[3], from, {tile_bytes("bf16")}), IN, {tile_bytes("bf16")});
     noc_wait();
     for (unsigned r = 0; r < 64; r++) {{  // a run: 8 words of 2 values, its largest exponent, then 2 words of 8 nibbles
       unsigned v[8], top = 0;
@@ -1204,7 +1208,7 @@ void kmain(volatile unsigned *a) {{
         ((volatile unsigned *)(OUT + 64 + 8 * r))[w] = word;
       }}
     }}
-    noc_write(OUT, BANK(t), a[2] + t / 8 * {tile_bytes("bfp4")}, {tile_bytes("bfp4")});
+    noc_write(OUT, BANK(t), AT(a[2], t, {tile_bytes("bfp4")}), {tile_bytes("bfp4")});
     noc_wait();
   }}
 }}""")
@@ -1254,7 +1258,7 @@ static unsigned held[{MOVE_SLOTS}];  // tile number + 1 of what each cache slot 
 static volatile datum *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
   unsigned s = t % {MOVE_SLOTS};
   if (held[s] == t + 1) return (volatile datum *)(CACHE + s * {tb});
-  noc_get(BANK(t), base + t / 8 * {tb}, CACHE + s * {tb}, {tb});
+  noc_get(BANK(t), AT(base, t, {tb}), CACHE + s * {tb}, {tb});
   noc_wait();
   held[s] = t + 1;
   return (volatile datum *)(CACHE + s * {tb});
@@ -1288,13 +1292,13 @@ void kmain(volatile unsigned *a) {{
     unsigned e = e0 + b * sb + i * 32 * sr + j * 32 * sc, row = e / xc % xr, col = e % xc;  // where the tile starts in x
     unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
     if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32 && row % 32 == 0 && row + 32 <= xr && col % 32 == 0 && col + 32 <= xc) {{
-      if (whole) {{ noc_get(BANK(src), base + src / 8 * {tb}, OUT, {tb}); noc_wait(); }}  // x's tile src as it is
+      if (whole) {{ noc_get(BANK(src), AT(base, src, {tb}), OUT, {tb}); noc_wait(); }}  // x's tile src as it is
       else {{  // x's tile src transposed: face (fr, fc) is its face (fc, fr) transposed
-        volatile datum *x = fetch(base, src);
+        tile = fetch(base, src);  // held, as the lines below expect of held_t
         held_t = src;
         for (unsigned f = 0; f < 4; f++)
           for (unsigned r = 0; r < 16; r++)
-            for (unsigned c = 0; c < 16; c++) out[f * 256 + r * 16 + c] = x[(f % 2 * 2 + f / 2) * 256 + c * 16 + r];
+            for (unsigned c = 0; c < 16; c++) out[f * 256 + r * 16 + c] = tile[(f % 2 * 2 + f / 2) * 256 + c * 16 + r];
       }}
     }} else {{
       copy({ZEROS:#x}, OUT, {tb});  // padding and what lies outside the bounds stay 0
@@ -1338,7 +1342,7 @@ void kmain(volatile unsigned *a) {{
         for (int r = r0; r < r1; r++) for (unsigned c = 1; c < 32; c++) out[at(r, c)] = out[at(r, 0)];
       if (rows == 1 && r1) row_down(OUT);
     }}
-    noc_write(OUT, BANK(t), a[2] + t / 8 * {tb}, {tb});
+    noc_write(OUT, BANK(t), AT(a[2], t, {tb}), {tb});
     noc_wait();
   }}
 }}""")

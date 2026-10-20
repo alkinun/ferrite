@@ -15,19 +15,25 @@ class Chip:
   def __init__(self, pci, boot=2.0):  # boot: seconds to wait for ARC's firmware (minutes after a reset: umd allows 300)
     assert (ids := pci.cfg_read(0)) == bh.VENDOR | bh.DEVICE << 16, f"not a Blackhole: {ids:#x}"
     self.pci, self.tlb, self.target = pci, 0, None  # TLB 0 is the shared window; map hands out the rest
-    self.free_tlbs = iter(range(1, bh.TLB_COUNT))
-    self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == 5, "report ARC firmware ready", boot)
+    self.free_tlbs, self.kept = iter(range(1, bh.TLB_COUNT)), {}
+    self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
     self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
     t = self.telemetry()
     self.tensix = [(x, y) for y in bh.TENSIX_Y for x in bh.TENSIX_X[:t[bh.TAG_TENSIX_COLS].bit_count()]]
-    banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]
-    self.wait(lambda: all(self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 1 for b in banks), "finish GDDR training", 60)
+    self.banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]  # the DRAM banks firmware enabled
+    self.wait(lambda: all(self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 1 for b in self.banks), "finish GDDR training", 60)
 
   def map(self, x, y, addr, start=None, tlb=None):
-    """Point a TLB (by default a fresh one, kept for good) at the 2 MiB block holding NoC address (x, y, addr), or for
-    writes at that block in every Tensix of the rectangle from start to (x, y); return the BAR0 offset that reaches addr."""
-    if tlb is None and (tlb := next(self.free_tlbs, None)) is None: raise RuntimeError(f"all {bh.TLB_COUNT} TLBs are taken")
+    """Point a TLB at the 2 MiB block holding NoC address (x, y, addr), or for writes at that block in every Tensix of
+    the rectangle from start to (x, y); return the BAR0 offset that reaches addr. Without tlb, one of its own, kept for
+    good: the one that block was given before, if any (each Runtime's doorbell is its dispatcher's, so runtimes after
+    the first take no more)."""
     base = addr & ~(bh.TLB_WINDOW - 1)
+    if tlb is None:
+      if (x, y, base, start) not in self.kept:
+        if (free := next(self.free_tlbs, None)) is None: raise RuntimeError(f"all {bh.TLB_COUNT} TLBs are taken")
+        self.kept[x, y, base, start] = free
+      tlb = self.kept[x, y, base, start]
     mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
     cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast)
     for i in range(3): self.pci.write(0, bh.TLB_CONFIG + 12 * tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
@@ -76,7 +82,7 @@ class Chip:
     self.wait(lambda: self.read32(x, y, resp_w) != rptr, f"answer ARC message {header & 0xFF:#x}", timeout)
     resp = struct.unpack("<8I", self.read(x, y, q + entry * (1 + n + rptr % n), entry))
     self.write32(x, y, resp_r, (rptr + 1) % (2 * n))
-    assert resp[0] & 0xFF < 240, f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}"
+    assert resp[0] & 0xFF < bh.ARC_FAILED, f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}"
     return resp
 
   def telemetry(self):
@@ -100,8 +106,7 @@ if __name__ == "__main__":  # what a card says about itself: the first thing to 
   else: dev = pci.open_device()
   chip = Chip(dev, 300 if sys.argv[1:] == ["reset"] else 2)
   t = chip.telemetry()
-  banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]
   fw = ".".join(str(t.get(bh.TAG_FIRMWARE, 0) >> s & 255) for s in (24, 16, 8))
   print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware {fw} up, Tensix powered; AI clock {t.get(bh.TAG_AICLK, 0)} MHz; "
-        f"{len(chip.tensix)} Tensix in {len(chip.tensix) // len(bh.TENSIX_Y)} columns; DRAM banks {banks} trained")
+        f"{len(chip.tensix)} Tensix in {len(chip.tensix) // len(bh.TENSIX_Y)} columns; DRAM banks {chip.banks} trained")
   print("telemetry:", " ".join(f"{tag}={value:#x}" for tag, value in sorted(t.items())))

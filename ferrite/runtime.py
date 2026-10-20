@@ -280,8 +280,8 @@ void loop(void) {{
       while (NIU(OUTGOING)) {{}}  // the last launch's times and status have left the outbox
       OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished;
       l1_settle({OUTBOX + 16:#x});
-      noc_issue({OUTBOX + 32:#x}, me, times + done % {TIMES} * 16, {bh.PCIE[0] | bh.PCIE[1] << 6}, POST, 8);  // its times, then
-      noc_issue({OUTBOX + 16:#x}, me, status, {bh.PCIE[0] | bh.PCIE[1] << 6}, POST, 8);  // that it is done: in that order
+      noc_issue({OUTBOX + 32:#x}, me, times + done % {TIMES} * 16, {bh.noc_xy(*bh.PCIE)}, POST, 8);  // its times, then
+      noc_issue({OUTBOX + 16:#x}, me, status, {bh.noc_xy(*bh.PCIE)}, POST, 8);  // that it is done: in that order
     }}
   }}
 }}
@@ -325,9 +325,9 @@ class Runtime:
     chip.write(*end, 0, worker, start)
     chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
     for i, (x, y) in enumerate(self.cores):  # mailbox, TRISCs' go and done, SYNC, FLAGS: zero, but for whom to report to and the index
-      chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, dx | dy << 6, 0, i).ljust(ARGS - MAILBOX, b"\0"))
+      chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, bh.noc_xy(dx, dy), 0, i).ljust(ARGS - MAILBOX, b"\0"))
     chip.write(dx, dy, 0, dispatcher)
-    rect = end[0] | end[1] << 6 | (start[0] | start[1] << 6) << 12  # a multicast's NOC_RET_ADDR_HI
+    rect = bh.noc_rect(start, end)
     chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
     chip.write(dx, dy, DONE, bytes(4))
     chip.write(dx, dy, OUTBOX, bytes(64))  # what a dispatcher before this one left there would read as this one's (wait)

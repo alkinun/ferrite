@@ -2,9 +2,9 @@
 # values stay where the compiler uses them). NOTES.md says where each number comes from.
 
 VENDOR, DEVICE = 0x1E52, 0xB140
-# Config-space offsets of the PCIe controller's interface timer, its target then its control (kmd pcie.c): target 1, then
-# control 0x11 (enabled, its interrupt forced pending) resets the whole chip. PCI_COMMAND's parity bit marks a reset coming
-RESET_TIMER, RESET_MARKER = (0x934, 0x930), 1 << 6
+# The PCIe controller's interface timer (kmd pcie.c): config-space (offset, value) writes in order, its target 1, then its
+# control 0x11 (enabled, its interrupt forced pending), reset the whole chip. PCI_COMMAND's parity bit marks a reset coming
+RESET_TIMER, RESET_MARKER = ((0x934, 1), (0x930, 0x11)), 1 << 6
 
 # BAR0 (512 MiB): 202 TLB windows of 2 MiB from offset 0, then registers. BAR4 (32 GiB): 8 TLB windows of 4 GiB.
 TLB_WINDOW, TLB_COUNT = 1 << 21, 201  # TLB 201, the last 2 MiB one, is tt-kmd's; we leave it alone
@@ -20,11 +20,13 @@ MCAST_VC = 2  # multicast on a static VC must use class 2 (umd does, ISA NoC/Mem
 TENSIX_X, TENSIX_Y = (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16), range(2, 12)
 DRAM = [(17 + b // 4, 12 + 3 * (b % 4)) for b in range(8)]  # bank b; each bank also answers at y+1 and y+2
 DRAM_BANK_SIZE = 0xFF000000  # what ttsim models (4080 MiB); a p150 has 4 GiB a bank, whether firmware keeps any is unknown
+DRAM_GBPS = 512  # a p150's GDDR6 bandwidth, all banks together (Tenstorrent's specification)
 PCIE = (19, 24)
 ARC = (8, 0)  # rows 0 and 1 are not translated
 
 # ARC, the management core, through its reset unit's scratch registers
-ARC_BOOT_STATUS = 0x80030408  # SCRATCH_RAM[2]: low 3 bits are 5 once firmware is up and taking messages
+ARC_BOOT_STATUS, ARC_READY = 0x80030408, 5  # SCRATCH_RAM[2]: its low 3 bits are 5 once firmware is up and taking messages
+ARC_FAILED = 240  # a response's low byte from here up is an error code
 ARC_QUEUES = 0x8003042C  # SCRATCH_RAM[11]: address of the message queue control block {base, entries | count << 8}
 ARC_IRQ = 0x80030100, 1 << 16  # ARC_MISC_CNTL IRQ0: tells ARC to look at its queues
 ARC_TELEMETRY = 0x80030434, 0x80030430  # SCRATCH_RAM[13], [12]: addresses of {version, count, tag | index << 16}, values
@@ -65,6 +67,8 @@ NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING cou
            "ATOMIC": 1, "INCREMENT": 1 << 12 | 31 << 2,  # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of word 0
            "MAX_PACKET": 16384}
 NIU_READS = NIU + NIU_REGS["READS"]  # NIU_MST_RD_RESP_RECEIVED: read requests answered, one a request (bench's DRAM reads)
+def noc_xy(x, y): return x | y << 6  # a tile, as a request's *_HI registers and ID_LOGICAL give it
+def noc_rect(start, end): return noc_xy(*end) | noc_xy(*start) << 12  # a multicast's rectangle, start to end (its RET_HI)
 TENSIX_CFG = 0xFFEF0000  # Tensix backend config bank 0, one word per register; BRISC and TRISCs only, not the NoC
 CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: writing bit 0 (BRISC) .. bit 4 (NCRISC) drops that core's instruction cache
 

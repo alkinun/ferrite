@@ -25,7 +25,7 @@ def bench(chip, m, k, n, weights="bf16", repeat=3):
   rt.wait()
   seconds, read = (chip.pci.now() - start) / repeat, (reads() - read) / repeat
   ta, tb = -(-m // 32) * -(-k // 32), -(-k // 32) * -(-n // 32)  # each input's tiles
-  once = ta * 2048 + tb * tile_bytes(weights)
+  once = ta * tile_bytes("bf16") + tb * tile_bytes(weights)
   return seconds, 2 * m * k * n / seconds / 1e12, once / seconds / 1e9, read / (ta + tb * (2 if weights in BFP else 1))
 
 if __name__ == "__main__":

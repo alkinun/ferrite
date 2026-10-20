@@ -68,10 +68,14 @@ def test_dma(chip):
   assert bytes(buf[1024:1040]) == data[::-1]
 
 def test_l1(chip):
-  # write every target before reading any back, so two targets that alias each other fail
+  # write every target before reading any back, so two targets that alias each other fail; then the same through a TLB
+  # of its own (map), which a second ask for that block gets again rather than another (each Runtime's doorbell)
   addr, data = bh.L1_SIZE - 65536, {xy: random.randbytes(65536) for xy in (chip.tensix[0], chip.tensix[-1])}
   for (x, y), d in data.items(): chip.write(x, y, addr, d)
   for (x, y), d in data.items(): assert chip.read(x, y, addr, len(d)) == d, f"Tensix {x},{y}"
+  (x, y), d = next(iter(data.items()))
+  at = chip.map(x, y, addr)
+  assert chip.map(x, y, addr) == at and chip.pci.read(0, at, 64) == d[:64]
 
 def test_dram(chip):
   addr, data = bh.TLB_WINDOW - 2048, [random.randbytes(4096) for _ in bh.DRAM]  # straddles two 2 MiB windows
@@ -649,7 +653,8 @@ def test_any_shape(chip):
 def test_views_transpose_gelu(chip):
   # views are read in place: tile-aligned slices as inputs to elementwise ops and to matmuls, like a GPT-2 layer's
   # 64-column attention heads. Transpose is exact, of odd shapes and of views, and turns a filled row into a filled
-  # column. gelu against numpy, within the bf16 rounding of its steps
+  # column. A repeat of heads (grouped-query attention's) indexed, sliced and repeated again reads the right ones. gelu
+  # against numpy, within the bf16 rounding of its steps
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(1)
   def make(rows, cols, lo=-2.0, hi=2.0):
     a = bf16(rng.uniform(lo, hi, (rows, cols)))
@@ -663,6 +668,10 @@ def test_views_transpose_gelu(chip):
   close(q @ k.T, y[:, 64:128] @ y[:, 128:192].T, 2**-6)
   assert tx.gather([5, 0, 69, 37, 5]).tolist() == x[[5, 0, 69, 37, 5]].tolist()  # rows from both tile rows, one twice
   close(tx + tx.gather([7]), x + x[7], 2**-7)  # a single row fills its tile, so it broadcasts
+  heads = ty[:, 0:128].split(2).repeat_interleave(2)  # heads 0, 0, 1, 1
+  assert heads[1].tolist() == y[:, 0:64].tolist() and heads[2].tolist() == y[:, 64:128].tolist()
+  assert heads[1:3, :, :].tolist() == [y[:, 0:64].tolist(), y[:, 64:128].tolist()]
+  assert heads.repeat_interleave(2)[5].tolist() == y[:, 64:128].tolist()  # heads 0, 0, 0, 0, 1, 1, 1, 1
   close(tx.gelu(), gelu(x), 0.02)
 
 def test_batch(chip):
