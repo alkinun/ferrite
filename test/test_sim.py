@@ -986,26 +986,20 @@ def test_train(chip):
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
-@pytest.fixture
-def tinygrad(chip):  # tinygrad with ferrite as its FERRITE device, on this process's chip (TINYGRAD=/path/to/tinygrad, or installed)
-  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
-  pytest.importorskip("tinygrad")
-  from adapters import tinygrad_ferrite
-  import views  # the adapters' shared layer, on the path the adapter put it on
-  views.RT = views.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
-  return tinygrad_ferrite
-
-def test_tinygrad(tinygrad):
-  # stage 4's first step: tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
+def test_tinygrad(chip):
+  # stage 4: tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
   # ferrite runs it: elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad
   # writes one (a broadcast multiply, summed), softmax, a tinygrad function (inlined); integers and bools, a view of part
   # of a buffer, stores into parts of one, and tensors with nothing in them; then an MLP trained with Adam for three
   # steps, and a layer for five under TinyJit, replayed. All against tinygrad on its own CPU device, and on the chip
   # (launches), not the host
+  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])  # (TINYGRAD=/path/to/tinygrad, or installed)
+  pytest.importorskip("tinygrad")
+  from adapters import tinygrad_ferrite
   from tinygrad import Tensor, TinyJit, dtypes, function, nn
   from tinygrad.helpers import Context
-  import views
-  rng, rt = np.random.default_rng(14), views.runtime()
+  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])  # FERRITE on this process's chip
+  rng = np.random.default_rng(14)
   a, b, w = (rng.standard_normal(shape).astype(np.float32) for shape in ((2, 3, 40), (2, 3, 40), (40, 5)))
   cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.max(-1), lambda x, y, w: x.exp().log(),
            lambda x, y, w: (x > 0).where(x, y), lambda x, y, w: x @ w, lambda x, y, w: x.softmax(-1), lambda x, y, w: x.permute(2, 0, 1) - y.mean(),
@@ -1067,91 +1061,6 @@ def test_tinygrad(tinygrad):
     return [step(Tensor(x, device=device).realize(), Tensor(y, device=device).realize()).item() for x, y in data], len(calls)
   (want, _), (got, calls) = jitted("CPU"), jitted("FERRITE")
   assert np.allclose(got, want, atol=1e-3) and calls == 2, (got, want, calls)
-
-def test_torch(chip, monkeypatch):
-  # stage 4's second step: PyTorch on ferrite. A FerriteTensor is a torch.Tensor whose aten ops run on the chip, so eager
-  # PyTorch, its autograd and torch.optim.Adam do: elementwise ops, reductions, a matmul, softmax, layer norm, gelu (erf),
-  # slices, cat and cross entropy; an MLP for three Adam steps, and PyTorch's own TransformerEncoderLayer (attention, its
-  # backward written in PyTorch's ops) for two. All against PyTorch on the CPU, and none of it falling back to the CPU
-  torch = pytest.importorskip("torch")
-  from adapters import torch_ferrite as tf
-  import views
-  views.RT = views.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
-  fell_back, on_cpu = [], tf.on_cpu
-  monkeypatch.setattr(tf, "on_cpu", lambda func, args, kwargs: (fell_back.append(str(func)), on_cpu(func, args, kwargs))[1])
-  torch.manual_seed(16)
-  a, b, w = torch.randn(2, 3, 40), torch.randn(2, 3, 40), torch.randn(40, 5)
-  F = torch.nn.functional
-  cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.amax(-1), lambda x, y, w: x.exp().log(),
-           lambda x, y, w: torch.where(x > 0, x, y), lambda x, y, w: x @ w, lambda x, y, w: x.softmax(-1), lambda x, y, w: x[:, 1:3, ::2].relu(),
-           lambda x, y, w: F.layer_norm(x, (40,)), lambda x, y, w: F.gelu(x), lambda x, y, w: torch.cat([x, y], 1) * 1,
-           lambda x, y, w: F.cross_entropy(x.reshape(6, 40), torch.tensor([1, 2, 3, 4, 5, 6]))]
-  for n, f in enumerate(cases):
-    want, got = f(a, b, w), f(tf.ferrite(a), tf.ferrite(b), tf.ferrite(w)).cpu()
-    assert (got - want).abs().max() <= 1e-3 * (want.abs().max() + 1), (n, (got - want).abs().max())
-  i, h = tf.ferrite(torch.tensor([[1, -2], [3, 4]])), tf.ferrite(a.bfloat16())  # dtypes as PyTorch makes them
-  assert torch.equal((i + 0.5).cpu(), torch.tensor([[1.5, -1.5], [3.5, 4.5]])) and (i > 0).sum().cpu().dtype is torch.int64
-  assert (h + tf.ferrite(a)).cpu().dtype is torch.float32 and torch.equal(torch.full_like(h, 1.5).cpu(), torch.full_like(a.bfloat16(), 1.5))
-  assert torch.equal(F.pad(tf.ferrite(torch.tensor([float("inf"), 1.0])), (1, 1)).cpu(), torch.tensor([0, float("inf"), 1, 0]))  # no NaN
-  def train(model, x, y, loss, steps, on_chip):
-    torch.manual_seed(17)
-    model, x, y = model(), x(), y()
-    if on_chip: model, x, y = tf.ferrite(model), tf.ferrite(x), tf.ferrite(y)
-    opt, losses = torch.optim.Adam(model.parameters(), lr=1e-2), []
-    for _ in range(steps):
-      opt.zero_grad()
-      l = loss(model(x), y)
-      l.backward(); opt.step(); losses.append(l.item())
-    return losses
-  mlp = (lambda: torch.nn.Sequential(torch.nn.Linear(16, 32), torch.nn.ReLU(), torch.nn.Linear(32, 10)), lambda: torch.randn(8, 16),
-         lambda: torch.randint(0, 10, (8,)), F.cross_entropy, 3)
-  block = (lambda: torch.nn.TransformerEncoderLayer(64, 4, 128, dropout=0.0, batch_first=True), lambda: torch.randn(4, 6, 64),
-           lambda: torch.zeros(1), lambda out, _: out.pow(2).mean(), 2)
-  for setup in (mlp, block):
-    want, got = train(*setup, on_chip=False), train(*setup, on_chip=True)
-    assert np.allclose(got, want, atol=1e-3), (got, want)
-  assert not fell_back, fell_back
-
-def test_transformers(chip, monkeypatch):
-  # stage 4: someone else's model, unchanged. Hugging Face transformers' own Llama (SmolLM's architecture: RMSNorm, RoPE,
-  # grouped-query attention, SwiGLU, tied embeddings), small and with random weights, through the PyTorch adapter: its
-  # logits, greedy generate with its KV cache, and three Adam steps, against PyTorch on the CPU from the same weights
-  # (at a learning rate of 1e-3: at 1e-2, Adam turns gradients that nearly cancel into full steps of either sign, and
-  # fp32 matmuls as bf16x3 drift 0.01 apart in two steps), with nothing on the CPU but generate's integer bitwise and. With LLAMA set,
-  # SmolLM-135M's real weights too, all 30 blocks (85 s on ttsim)
-  transformers = pytest.importorskip("transformers")
-  import torch
-  from adapters import torch_ferrite as tf
-  import views
-  views.RT = views.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
-  fell_back, on_cpu = [], tf.on_cpu
-  monkeypatch.setattr(tf, "on_cpu", lambda func, args, kwargs: (fell_back.append(str(func)), on_cpu(func, args, kwargs))[1])
-  config = transformers.LlamaConfig(vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
-                                    num_key_value_heads=2, tie_word_embeddings=True, pad_token_id=0)
-  def model(): torch.manual_seed(18); return transformers.LlamaForCausalLM(config)
-  ids = torch.tensor([[1, 5, 9, 200, 31, 7]])
-  with torch.no_grad():
-    want, got = model()(ids).logits, tf.ferrite(model())(tf.ferrite(ids)).logits.cpu()
-    assert (got - want).abs().max() < 1e-3, (got - want).abs().max()
-    assert torch.equal(tf.ferrite(model()).generate(tf.ferrite(ids), max_new_tokens=4, do_sample=False).cpu(),
-                       model().generate(ids, max_new_tokens=4, do_sample=False))
-  def train(on_chip):
-    m, x = (tf.ferrite(model()), tf.ferrite(ids)) if on_chip else (model(), ids)
-    opt, losses = torch.optim.Adam(m.parameters(), lr=1e-3), []
-    for _ in range(3):
-      opt.zero_grad()
-      loss = m(x, labels=x).loss
-      loss.backward(); opt.step(); losses.append(loss.item())
-    return losses
-  want, got = train(False), train(True)
-  assert np.allclose(got, want, atol=1e-3), (got, want)
-  if "LLAMA" in os.environ:
-    with torch.no_grad():
-      smol = lambda: transformers.AutoModelForCausalLM.from_pretrained(os.environ["LLAMA"], torch_dtype=torch.float32)
-      ids = torch.tensor([[504, 2455, 282, 1029, 314]])  # "The meaning of life is"
-      want, got = smol()(ids).logits, tf.ferrite(smol())(tf.ferrite(ids)).logits.cpu()
-      assert (got - want).abs().max() < 0.1 and got[0, -1].argmax() == want[0, -1].argmax(), (got - want).abs().max()
-  assert set(fell_back) <= {"aten.bitwise_and.Tensor"}, fell_back
 
 @pytest.mark.parametrize("n, dtype, size", [(16, "bf16", 0), (40, "bf16", 0), (40, "bfp8", 0), (16, "bf16", 64)])
 def test_gpt2_layer(chip, n, dtype, size):

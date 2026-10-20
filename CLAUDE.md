@@ -1,6 +1,6 @@
 # ferrite
 
-ferrite is Tenstorrent's software done right: the whole stack for Blackhole, from PCIe up to a compiler, small enough to read. Frameworks (tinygrad, PyTorch) plug in on top through thin adapters; they are not part of ferrite.
+ferrite is Tenstorrent's software done right: the whole stack for Blackhole, from PCIe up to a compiler, small enough to read. tinygrad plugs in on top through a thin adapter, and PyTorch through tinygrad's own frontend; neither is part of ferrite.
 
 ## Design
 
@@ -30,7 +30,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `ferrite/compiler.py`: Tensix instructions from the ISA. A fused kernel is four programs (BRISC moves tiles; each TRISC feeds one Tensix thread: unpack, math or pack): elementwise ops and SFPU programs, matmuls (blocks, tiles shared between workers by multicast, reads in flight, bfp8 and bfp4 weights), reductions along any axis in passes, movement, `gather` and `put`.
 - `ferrite/tensor.py`: `Tensor`: lazy, any shape, bf16, fp32, int32, bfp8 or bfp4, numpy's broadcasting, views, tinygrad's ops and autograd. Realizing turns a tree of ops into as few kernels as fit; `jit` records a function's launches and replays them.
 - `ferrite/hello.py`: fib(n) on every worker, the one-command demo. `ferrite/bench.py`: a matmul's speed and DRAM reads (ROADMAP, stage 3).
-- `adapters/`: tinygrad (`tinygrad_ferrite.py`: the FERRITE device, and a runner for tinygrad's scripts unchanged) and PyTorch (`torch_ferrite.py`: `FerriteTensor`, `ferrite(model)`) on ferrite, outside it; `views.py`: tensors of any rank as views of ferrite's.
+- `adapters/tinygrad_ferrite.py`: tinygrad on ferrite, outside it: the FERRITE device (tinygrad's tensors of any rank as views of ferrite's), and a runner for tinygrad's scripts unchanged. PyTorch runs through tinygrad's own frontend (`extra/torch_backend` in tinygrad), not an adapter of ours.
 - `test/test_sim.py`: every step, on ttsim (or on a card when `TTSIM` is not set). `test/gpt2.py`, `test/llama.py`: GPT-2 small and SmolLM-135M, written once for ferrite Tensors and numpy, generating from the real weights, checked against numpy step by step. `test/train.py`: a small GPT trained on ferrite in fp32 with Adam, checked against PyTorch.
 - `NOTES.md`: how ferrite works, and what is still unknown. `LESSONS.md`: what the work has taught us; add to it as we go, and keep it short and true. `ROADMAP.md`: the stages from here. `COMPARE.md`: ferrite against TT-NN.
 
@@ -47,6 +47,6 @@ Needs clang and lld on PATH, and ttsim's `libttsim.so` built for Blackhole (outs
     TTSIM=/path/to/libttsim.so python3 test/train.py 300
     TTSIM=/path/to/libttsim.so PYTHONPATH=path/to/tinygrad python3 adapters/tinygrad_ferrite.py path/to/tinygrad/examples/transformer.py
 
-The tests need numpy; `test/gpt2.py` and `test/llama.py` also tiktoken; `test/gpt2.py` the weights (Hugging Face `openai-community/gpt2`, `model.safetensors`), and `GPT2=path/to/model.safetensors` adds the whole model to the tests; `test/llama.py` wants Hugging Face's `HuggingFaceTB/SmolLM-135M` folder (config.json, tokenizer.json, model.safetensors), and `LLAMA=path/to/folder` adds it to the tests; `test/train.py` and `test_train` want PyTorch, as the reference; `test_tinygrad` wants tinygrad (`TINYGRAD=path/to/tinygrad`, or installed), `test_torch` PyTorch, `test_transformers` transformers too (and SmolLM's weights with `LLAMA`), and the adapters numpy. `FUZZ=n` runs n of `test_fuzz`'s expressions rather than 30. Without `TTSIM`, `pci.open_device()` looks for a real Blackhole on the PCI bus.
+The tests need numpy; `test/gpt2.py` and `test/llama.py` also tiktoken; `test/gpt2.py` the weights (Hugging Face `openai-community/gpt2`, `model.safetensors`), and `GPT2=path/to/model.safetensors` adds the whole model to the tests; `test/llama.py` wants Hugging Face's `HuggingFaceTB/SmolLM-135M` folder (config.json, tokenizer.json, model.safetensors), and `LLAMA=path/to/folder` adds it to the tests; `test/train.py` and `test_train` want PyTorch, as the reference; `test_tinygrad` wants tinygrad (`TINYGRAD=path/to/tinygrad`, or installed), and the adapter numpy. `FUZZ=n` runs n of `test_fuzz`'s expressions rather than 30. Without `TTSIM`, `pci.open_device()` looks for a real Blackhole on the PCI bus.
 
 The simulator is a process-wide singleton that kills the process on any contract violation (bad address, bad TLB config, a semaphore taken while empty): a test run that stops early means the code did something the hardware would not like. pytest hides ttsim's `ERROR:` line; run with `-s` to see it.

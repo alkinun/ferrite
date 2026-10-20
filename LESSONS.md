@@ -168,44 +168,36 @@ append a correction.
     through the host, short axes padded every tile, flat weights and transposes were moved where they could be read in
     place, and a product was made whole before its sum. 52 s a step went to 25 by layout alone. (NOTES: "tinygrad on
     ferrite")
-24. **Let the framework lower itself.** PyTorch has two thousand aten ops; its own decompositions bring them down to the
-    seventy the adapter writes out, and a training run of its transformer layer reached the CPU for one op, attention's
-    backward. A decomposition is code with its own purpose, though: the one for attention was written for export and
-    returns the attention weights where the kernel returns their logsumexp. (NOTES: "PyTorch on ferrite")
-25. **Copy what is already together.** The move kernel found each datum on its own, though most moves are whole tiles (a
+24. **Copy what is already together.** The move kernel found each datum on its own, though most moves are whole tiles (a
     pad on tile boundaries), tiles transposed (an fp32 `.T`) or runs along a row or down a column. Copying those as they
     are took a training step's moves from 450k cycles to 28k, and tinygrad's transformer step from 6.1M to 2.9M. Which
     way to sweep mattered as much: attention's heads run 6 datums along a row and 32 down a column. (NOTES: "Movement")
-26. **Work out a cost's floor before trying to lower it.** The benchmark's matmul read its inputs 6.9 times over, and
+25. **Work out a cost's floor before trying to lower it.** The benchmark's matmul read its inputs 6.9 times over, and
     bigger blocks looked like the fix; but 96 workers making 16 result tiles each from 4 rows and 4 columns is already
     the fewest reads a worker can make alone, so only sharing between workers could go lower. Multicast took it to 1.0,
     and the grid it needed put idle workers to use as well (a 4-row matmul went from 6 workers to 48). (NOTES: "Tiles
     shared between workers")
-27. **Whoever everyone waits on sets the pace.** A leader per grid row and column read every shared tile while the rest
+26. **Whoever everyone waits on sets the pace.** A leader per grid row and column read every shared tile while the rest
     waited for its flag: its 24 reads a column, about 36 instructions each, were the whole of a matmul's time on ttsim.
     Cheaper requests took it from 8.9k cycles to 7.0k; a share of the reads for every worker, to 1.7k. (NOTES: "Cutting
     the critical path")
-28. **Wait where waiting is free.** Several reads in flight need someone to see each step's reads land. BRISC, which
+27. **Wait where waiting is free.** Several reads in flight need someone to see each step's reads land. BRISC, which
     everyone waits on, took 30 more instructions a step to watch them (a GPT-2 token 111k cycles to 147k); thread 0's
     TRISC, which waits for those tiles anyway, watches them for 3k. (NOTES: "Reads in flight")
-29. **In place is part of what an op means.** PyTorch's decomposition of padding fills a tensor, then copies the input
-    into a view of it in place (`prims.copy_to`). That went to the CPU, which copied into a CPU tensor of its own and
-    left ours alone, so a loss's padded labels were all -100 and the loss NaN, with no error anywhere. Write such ops
-    out, and know what a fallback does with the tensor it was meant to write. (NOTES: "PyTorch on ferrite")
-30. **Keep what the backward needs.** The forward split each fp32 operand into bf16 parts and dropped them; the backward
+28. **Keep what the backward needs.** The forward split each fp32 operand into bf16 parts and dropped them; the backward
     split the same operands again, and the incoming gradient twice. Keeping the parts with the op, as PyTorch keeps its
     saved tensors, took a training step from 696 launches to 540 (with lo in one kernel, transposes that cancel and
     casts fused at a kernel's root, 427). (NOTES: "Training")
-31. **Before making a copy faster, ask whether the reader could take the data where it lies.** Grouped-query attention
+29. **Before making a copy faster, ask whether the reader could take the data where it lies.** Grouped-query attention
     stacked 9 query heads into 3 groups and back: two moves and a copy a block, a third of a SmolLM block's cycles. A
     view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 180k
     (156k now). (NOTES: "A Llama-family model")
-32. **Run the framework's own tests.** tinygrad's `test_ops`, unchanged on the FERRITE device, found what our tests of
+30. **Run the framework's own tests.** tinygrad's `test_ops`, unchanged on the FERRITE device, found what our tests of
     the adapter never reached: an int product labelled int32 where ferrite made it in fp32, bools copied back as the
     bytes they were computed in, a freed buffer handed on with its old contents, a padding mask dropped on an axis of
     1, zero-size shapes, views at an offset. 266 of its 420 passed, then 339, now 356; most of the rest is the FPU's
     matmul precision. (NOTES: "tinygrad on ferrite")
-33. **When a tree must be cut, cut where it is shared.** A kernel holds 15 ops, and past that the realizer cut down the
+31. **When a tree must be cut, cut where it is shared.** A kernel holds 15 ops, and past that the realizer cut down the
     heaviest branch, which in an RMSNorm over a long residual stream is its sum of squares: the stream was added up in
     two kernels and the norm took three. Computing first the value two of its ops read made it two, and a SmolLM token
     25 launches fewer. (NOTES: "Next for the compiler")

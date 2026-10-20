@@ -55,10 +55,10 @@ Done: competitive numbers, and for every gap, a known reason.
 ## Stage 4: other people's code
 
 - [x] A tinygrad backend (tinygrad is built on almost the same primitives): `adapters/tinygrad_ferrite.py`, `test_tinygrad`
-- [x] A PyTorch adapter: `adapters/torch_ferrite.py`, `test_torch`
-- [x] Models and training scripts written for those frameworks run unchanged: tinygrad's `examples/transformer.py`
-      trains to 99.99% on ttsim; Hugging Face transformers' own Llama runs, generates and fine-tunes through the
-      PyTorch adapter, and runs SmolLM-135M's real weights (`test_transformers`)
+- [x] Models and training scripts written for tinygrad run unchanged: its `examples/transformer.py` trains to 99.99%
+      on ttsim
+- PyTorch comes through tinygrad's own frontend (`extra/torch_backend`), which runs on FERRITE as on any tinygrad
+  device: ferrite keeps no PyTorch adapter of its own
 
 Done: someone else's model trains on a Tenstorrent card through ferrite.
 

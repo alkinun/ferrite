@@ -45,17 +45,12 @@ MLP in bfp4 too, as Tenstorrent's own code keeps it: add `bfp4`).
 Training: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSONS.md a character at a time, each step
 replayed from a recording, its loss and gradients the same as PyTorch's for the same weights (`test/train.py 300`).
 
-Frameworks, outside ferrite: tinygrad's tensor graph runs on it as the FERRITE device, so tinygrad's own scripts run
+tinygrad, outside ferrite: its tensor graph runs on ferrite as the FERRITE device, so tinygrad's own scripts run
 unchanged (its `examples/transformer.py` learns two-digit addition to 99.99% on the simulator) and `TinyJit` replays a
-call's launches as ferrite's `jit` does. PyTorch runs on it too: a `FerriteTensor`'s aten ops run on the chip, so
-eager PyTorch, its autograd and its optimizers do, and Hugging Face transformers' models run, generate and fine-tune
-unchanged.
+call's launches as ferrite's `jit` does. PyTorch code comes the same way, through tinygrad's own PyTorch frontend
+(`extra/torch_backend` in tinygrad: the `"tiny"` device).
 
     TTSIM=... PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
-
-    from adapters.torch_ferrite import ferrite
-    model = ferrite(AutoModelForCausalLM.from_pretrained("SmolLM-135M"))
-    model.generate(ferrite(ids), max_new_tokens=6)
 
 ## Speed
 
@@ -78,7 +73,7 @@ is on a real card waits for one; `COMPARE.md` has the numbers and what carries o
 - `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
   Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
 - `ferrite/bh.py`: Blackhole's facts as data: addresses, limits, instruction and config encodings.
-- `adapters/`: tinygrad and PyTorch on ferrite (and `views.py`, tensors of any rank as views of ferrite's).
+- `adapters/tinygrad_ferrite.py`: tinygrad on ferrite, and PyTorch through tinygrad's frontend.
 - `test/`: every step on the simulator (`test_sim.py`), and the models.
 
 ## Docs
