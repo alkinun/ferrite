@@ -1286,6 +1286,24 @@ def test_llama_precision(chip):
     got, want = llama.logits(llama.forward(on(ids), on(places), t, c, kv)), llama.forward(ids, places, arrays, c, np_kv)[0]
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.01 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
 
+def test_token_accuracy(chip):
+  # llama.accuracy, Tenstorrent's token accuracy (ROADMAP, Measurement): a prompt prefilled, then each step fed the
+  # reference's token whatever the model picked. Against a reference made the same way from numpy (its five most likely
+  # at each place) the chip's picks are numpy's top-1 throughout, and a reference that is wrong at one place costs top-1
+  # exactly that step
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(6)
+  c, w = smol(rng, 2)
+  t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
+  tokens = [int(i) for i in rng.integers(0, 256, 44)]
+  prompt, after, top5, kv = tokens[:36], tokens[36:], [], llama.kv_cache(c, 64, np.zeros)
+  for i in range(8):
+    ids, places = (prompt, range(36)) if i == 0 else ([after[i - 1]], [35 + i])
+    top5.append([int(k) for k in np.argsort(-llama.forward(ids, places, w, c, kv)[0])[:5]])
+  assert llama.accuracy(rt, t, c, prompt, after, top5, 8)[:2] == (1, 1)
+  top5[3] = top5[3][1:] + top5[3][:1]  # its most likely last: still among the five
+  top1, five, picks = llama.accuracy(rt, t, c, prompt, after, top5, 8)
+  assert (top1, five) == (7 / 8, 1) and picks[3] == top5[3][-1], (top1, five, picks)
+
 def test_put(chip):
   # rows into a tensor at places read on the chip (gather's inverse), against numpy: 70 rows (three tiles of places) of a
   # batch of 3, into 200 places (seven tile rows), scattered and out of order, one place twice (the later row stays),

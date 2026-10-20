@@ -5,6 +5,7 @@
 # first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
 # starts), a token each a step.
 #   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
+#   ... python3 test/llama.py path/to/model path/to/<model>.refpt [steps] [mode]   # token accuracy, Tenstorrent's way
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors (or another
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).
 # bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and the rest in bfp8 (numpy then has
@@ -171,6 +172,31 @@ def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip
 
 def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector
 
+def zeros(rt): return lambda shape: Tensor.frombytes(rt, shape[1], shape[2], bytes(2 * math.prod(shape)), shape[0])  # bf16 0s, for kv_cache
+
+def reference(path):
+  """Tenstorrent's reference file for a model (tt_transformers' tests/reference_outputs/<model>.refpt, made by its
+  tests/generate_reference_hf.py): the first 1,024 tokens of A Tale of Two Cities, and at each place the Hugging Face
+  model's five most likely next tokens. The prompt (the first half of the tokens), the tokens after it, and the five at
+  each place from the prompt's last on (so the i-th are for the token after the i-th step's input)."""
+  import torch
+  data = torch.load(path)
+  tokens = data["reference_tokens"][0].tolist()
+  half = len(tokens) // 2
+  return tokens[:half], tokens[half:], data["top5_tokens"][half - 1:].tolist()
+
+def accuracy(rt, t, c, prompt, after, top5, steps=500):
+  """Tenstorrent's token accuracy (simple_text_demo.py's TokenAccuracy) of the model on the chip: the prompt prefilled,
+  then each step fed the reference's next token whatever the model predicted (teacher forcing), the steps replayed
+  (jit). (top-1, top-5, the model's tokens): the shares of steps whose most likely token is the reference model's most
+  likely, or among its five."""
+  n, on = len(prompt), lambda row: Tensor.of(rt, [row], "int32")
+  kv = kv_cache(c, -(-(n + steps) // 32) * 32, zeros(rt))
+  step = jit(lambda ids, places: forward(ids, places, t, c, kv))
+  picks = [int(logits(forward(on(prompt), on(list(range(n))), t, c, kv)).argmax())]
+  for i in range(steps - 1): picks.append(int(logits(step(on([after[i]]), on([n + i]))).argmax()))
+  return sum(p == f[0] for p, f in zip(picks, top5)) / steps, sum(p in f for p, f in zip(picks, top5)) / steps, picks
+
 def tokenizer(folder):
   """tiktoken over tokenizer.json's byte-level BPE (ids in merge order, so they are the ranks), split as it says."""
   import tiktoken
@@ -191,6 +217,16 @@ def main():
   from ferrite.runtime import Runtime
   folder, prompt, steps = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "The meaning of life is", int(sys.argv[3]) if len(sys.argv) > 3 else 8
   mode = sys.argv[4] if len(sys.argv) > 4 else "bf16"
+  if prompt.endswith(".refpt"):  # token accuracy against Tenstorrent's reference file, `steps` steps (500 as it runs it)
+    first, after, top5 = reference(prompt)
+    chip = Chip(pci.open_device())
+    rt, start = Runtime(chip, chip.tensix[0], chip.tensix[-1]), time.time()
+    c, weights = load(folder, -(-(len(first) + steps) // 32) * 32)
+    c.precision = precision(c, mode)
+    t = upload(rt, weights, c.precision)
+    print(f"weights on the chip in {time.time() - start:.0f}s, {mode}")
+    top1, top5_share, _ = accuracy(rt, t, c, first, after, top5, steps)
+    return print(f"token accuracy over {steps} steps after a {len(first)}-token prompt: top-1 {100 * top1:.1f}%, top-5 {100 * top5_share:.1f}%")
   enc, chip = tokenizer(folder), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   start = time.time()
@@ -202,7 +238,7 @@ def main():
   count = sum(x.rows * x.cols for k, x in t.items() if k not in ("embed.T", "cos", "sin", "turn"))
   w = arrays(weights, t) if count < 2e9 else None  # numpy's float32 copy of a bigger one would not fit the host
   print(f"{count / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
-  kv, np_kv = kv_cache(c, size, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), kv_cache(c, size, np.zeros)
+  kv, np_kv = kv_cache(c, size, zeros(rt)), kv_cache(c, size, np.zeros)
   on = lambda row: Tensor.of(rt, [row], "int32")  # a row of ids or places, on the chip
   step, new = jit(lambda ids, places: forward(ids, places, t, c, kv)), ids  # a token at a time, replayed from the third
   print(prompt, end="", flush=True)
