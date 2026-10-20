@@ -391,7 +391,12 @@ def unfused(t):  # the same tree of ops, realized one launch per op
 def test_fusion(chip):
   # a fused chain is one launch, its intermediates never get DRAM, and it is bit for bit the same as running each op on
   # its own: every intermediate is rounded to bf16 on its way to L1 just as it would be on its way to DRAM. Both trees
-  # have ops that read two intermediates, and in the second one an op reads an intermediate made two ops earlier
+  # have ops that read two intermediates, and in the second one an op reads an intermediate made two ops earlier. On one
+  # worker each wait holds a thread back, since only the waits do (each TRISC feeds its thread as fast as it can, and
+  # ttsim runs every instruction the moment it can): the pack TRISC, with the least to push, has each pack queued before
+  # its math is done (SEM_DST); thread 0 reaches the ops that read intermediates before the pack thread has written
+  # them (SEM_L1); and the second tree's math has three ops in a row that read only inputs, so the third waits for the
+  # pack thread to drain a Dst half (SEM_DST)
   for workers in (chip.tensix[1], chip.tensix[-1]):  # one worker cycling through 12 tiles, then a tile per worker
     rt = Runtime(chip, chip.tensix[0], workers)
     a, b, c, d = (Tensor.of(rt, [[bf(random.uniform(-3, 3)) for _ in range(96)] for _ in range(128)]) for _ in range(4))
@@ -433,16 +438,6 @@ def test_assign(chip):
   step = tensor.jit(lambda x: w.assign(w + x))
   for _ in range(4): step(Tensor.of(rt, np.ones((64, 96)).tolist()))
   assert np.allclose(value(w), fresh + 4, rtol=1e-2, atol=0.05), "four updates, two of them replayed"
-
-def test_threads_wait(chip):
-  # each TRISC feeds its thread as fast as it can and ttsim runs every instruction the moment it can, so only the waits
-  # hold a thread back. The pack TRISC, with the least to push, has each pack queued before its math is done (SEM_DST);
-  # thread 0 reaches the ops that read intermediates before the pack thread has written them (SEM_L1); the math thread
-  # gets three ops in a row that read only inputs, so the third waits for the pack thread to drain a Dst half (SEM_DST).
-  # On one worker, so slots and halves are reused
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
-  a, b, c, d = (Tensor.of(rt, [[float((r * 3 + c * k) % 7 - 3) for c in range(64)] for r in range(128)]) for k in (1, 2, 5, 6))
-  assert ((a + b) + ((c - d) + a * b)).tolist() == unfused((a + b) + ((c - d) + a * b)).tolist()
 
 def test_matmul_fusion(chip):
   # matmuls inside elementwise trees, as one kernel: the matmul's result tile is packed into L1 and read from there.
