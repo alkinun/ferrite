@@ -1121,6 +1121,38 @@ def test_torch_frontend(chip):
     want, got = train("cpu"), train("tiny")
     assert np.allclose(got, want, atol=1e-4) and got[-1] < got[0] - 0.2, (got, want)
 
+def test_tinygrad_llm(chip):
+  # tinygrad's own LLM code (tinygrad/llm's Transformer, which runs Llama 3 and Qwen 3) on the FERRITE device: two blocks
+  # in SmolLM's shapes from the same bf16 weights as ferrite's numpy Llama (test/llama.py), against it, a prompt's logits
+  # and then a decode step's from tinygrad's own KV cache (fp16, so on the host: the adapter carries no fp16). Its blocks
+  # are tinygrad functions, precompiled: the adapter inlines them, their own buffers made fresh each call
+  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
+  pytest.importorskip("tinygrad.llm.model")
+  from adapters import tinygrad_ferrite
+  from tinygrad import Tensor as TT, dtypes, nn
+  from tinygrad.helpers import Context
+  from tinygrad.llm.model import Transformer, TransformerConfig
+  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  c, w = smol(np.random.default_rng(37), 2)
+  sd = {"token_embd.weight": w["embed"], "output.weight": w["embed"], "output_norm.weight": w["norm"][0]}
+  for l in range(2):  # tinygrad's Linear has (out, in), as Hugging Face's; q, k and v, and gate and up, apart
+    qkv, gate_up, p = w[f"layers.{l}.qkv_proj"].T, w[f"layers.{l}.gate_up_proj"].T, f"layers.{l}."
+    sd |= {f"blk.{l}.{k}": v for k, v in (("attn_q.weight", qkv[:576]), ("attn_k.weight", qkv[576:768]), ("attn_v.weight", qkv[768:]),
+           ("attn_output.weight", w[p + "o_proj"].T), ("ffn_gate.weight", gate_up[:1536]), ("ffn_up.weight", gate_up[1536:]),
+           ("ffn_down.weight", w[p + "down_proj"].T), ("attn_norm.weight", w[p + "input_layernorm"][0]), ("ffn_norm.weight", w[p + "post_attention_layernorm"][0]))}
+  with Context(DEV="FERRITE"):
+    model = Transformer(TransformerConfig(num_blocks=2, dim=576, hidden_dim=1536, n_heads=9, n_kv_heads=3, norm_eps=c.eps, vocab_size=256,
+                                          head_dim=64, rope_theta=c.theta, rope_dim=64, v_head_dim=64, max_context=64))
+    nn.state.load_state_dict(model, {k: TT(np.ascontiguousarray(v, np.float32)).cast(dtypes.bfloat16) for k, v in sd.items()}, verbose=False)
+    def logits(ids, start):  # Transformer.forward without its sampling
+      x = model.token_embd(TT([ids], dtype=dtypes.int32)).float()
+      for b in model.blk: x = b(x, start)
+      return model.output(model.output_norm(x[:, -1:]))[0, -1].numpy()
+    np_kv = llama.kv_cache(c, 64, np.zeros)
+    for ids, places in (([7, 200, 31, 64, 5], range(5)), ([42], [5])):
+      launches, got, want = rt.launches, logits(ids, places[0]), llama.forward(ids, places, w, c, np_kv)[0]
+      assert rt.launches - launches > 50 and np.abs(got - want).max() < 0.02 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
+
 @pytest.mark.parametrize("n, dtype, size", [(16, "bf16", 0), (40, "bf16", 0), (40, "bfp8", 0), (16, "bf16", 64)])
 def test_gpt2_layer(chip, n, dtype, size):
   # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so attention spans tiles),

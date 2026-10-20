@@ -8,7 +8,7 @@
 #   import adapters.tinygrad_ferrite, then DEV=FERRITE or Tensor(..., device="FERRITE")
 #   TTSIM=/path/to/libttsim.so python3 adapters/tinygrad_ferrite.py script.py [args]   # a tinygrad script, unchanged
 # PyTorch code runs the same way, through tinygrad's own PyTorch frontend (its extra/torch_backend: the "tiny" device).
-import collections, math, os, runpy, sys, types
+import collections, dataclasses, math, os, runpy, sys, types
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import tinygrad, tinygrad.tensor, tinygrad.engine.jit
@@ -419,7 +419,7 @@ class Evaluator:
     worked on on the host, those of the part replaced, so a value read from it before keeps what it had)."""
     chain = []
     while target.op not in (Ops.BUFFER, Ops.ALLOC):
-      assert target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE), f"a store into {target.op}"
+      assert target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE) or target.op is Ops.STAGE and target.arg is None, f"a store into {target.op}"
       chain, target = chain + [target], target.src[0]
     if target.buffer.nbytes == 0: return None
     buf = target.buffer.ensure_allocated()
@@ -427,7 +427,7 @@ class Evaluator:
     if any(u.op in (Ops.SHRINK, Ops.PERMUTE) for u in chain):
       view = View((n,))  # the part, as a view of the buffer's elements
       for u in reversed(chain):
-        if view is None or u.op in (Ops.AFTER, Ops.DETACH): continue
+        if view is None or u.op in (Ops.AFTER, Ops.DETACH, Ops.STAGE): continue  # (a bare STAGE keeps its source's buffer)
         view = view.reshape(tuple(u.shape)) if u.op is Ops.RESHAPE else view.permute(u.arg) if u.op is Ops.PERMUTE else view.shrink(self.marg(u))
       assert view is not None and on_ferrite(target) and isinstance(buf._buf, Holder), "a store into part of a buffer: FERRITE's, a view"
       a = np.frombuffer(contents(buf._buf) or bytes(buf.nbytes), npd).copy()
@@ -481,9 +481,13 @@ class FerriteDevice(Compiled):
   def __init__(self, device): super().__init__(device, FerriteAllocator(self), [], None)
   def synchronize(self, timeout=None): pass  # reading a chip value back waits for what it needs
 
-inline = PatternMatcher([(UPat(Ops.CALL, name="c"), resolve_function)])  # a tinygrad function as its body, storing its outputs
+def inline_call(c):  # a tinygrad function as its body, storing its outputs: a precompiled one too (tinygrad would cache its
+  return resolve_function(c.replace(arg=dataclasses.replace(c.arg, precompile=False)) if c.arg.precompile else c)  # program; ferrite runs the graph)
+inline = PatternMatcher([(UPat(Ops.CALL, name="c"), inline_call)])
 def run(sink):
   sink = graph_rewrite(sink, inline, name="inline calls")
+  if allocs := {u: UOp.new_buffer(u.device, u.max_numel(), u.dtype) for u in sink.toposort() if u.op is Ops.ALLOC}:
+    sink = sink.substitute(allocs)  # an inlined function's own buffers, fresh each call, as tinygrad's schedule makes them
   users = collections.defaultdict(list)
   for u in (order := sink.toposort()):
     for s in u.src: users[s].append(u)
