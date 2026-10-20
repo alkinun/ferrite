@@ -91,16 +91,16 @@ class Tensor:
                               self.rt.back_bus & 0xFFFFFFFF, self.rt.back_bus >> 32, v), units=k, name="readback")
       self.rt.wait()
       tiles += self.rt.back[:k * sent]
-    out = bytearray(n * self.batch * rows * cols)
-    for b, i in ((b, i) for b in range(self.batch) for i in range(self.tiles // self.batch)):
-      r0, c0, base = i // ct * 32, i % ct * 32, b * rows * cols
-      tile = bytes(tiles[(b * (self.tiles // self.batch) + i) * sent:][:sent])
-      if self.dtype in BFP: tile = _bf16s(tile, self.dtype)
-      for face in range(4):
-        c, k = c0 + face % 2 * 16, min(16, cols - c0 - face % 2 * 16)
-        for row, r in enumerate(range(r0 + face // 2 * 16, min(r0 + face // 2 * 16 + 16, rows))):
-          at = faces[face] + row * 16 * n
-          if k > 0: out[n * (base + r * cols + c):n * (base + r * cols + c + k)] = tile[at:at + n * k]
+    if self.dtype in BFP: tiles, sent = b"".join(_bf16s(tiles[i * sent:(i + 1) * sent], self.dtype) for i in range(self.tiles)), 2048
+    words, sw, run, per = memoryview(tiles).cast("Q"), sent // 8, 2 * n, self.tiles // self.batch  # 8-byte words: a tile's, a run's
+    out, row = bytearray(n * self.batch * rows * cols), memoryview(bytearray(32 * n * ct)).cast("Q")  # (a row of a tile band)
+    for b, r in ((b, r) for b in range(self.batch) for r in range(rows)):  # frombytes' copies the other way: a row at a time,
+      first = (b * per + r // 32 * ct) * sw + (r % 16 * 16 * n) // 8  # word q of its runs in the left or right faces of every
+      for half, q in ((half, q) for half in (0, 1) for q in range(run)):  # tile of its band at once
+        start = first + faces[r % 32 // 16 * 2 + half] // 8 + q
+        row[half * run + q::2 * run] = words[start:start + ct * sw:sw]
+      at = n * (b * rows + r) * cols
+      out[at:at + n * cols] = row.cast("B")[:n * cols]
     return bytes(out)
 
   def tolist(self):  # rows of numbers, or a list of those if this is a batch

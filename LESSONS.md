@@ -213,6 +213,10 @@ append a correction.
 3. **Delete before adding.** The simplest correct version first, and the faster one when a measurement says so.
 4. **Keep the documents true.** A stale "next" list or a renamed function in old prose costs the next reader more than
    a missing paragraph. Fix the docs in the same commit as the code.
+5. **Rehearse at the sizes the real run will use.** `tobytes` sliced the rest of its buffer for every tile it laid out,
+   so reading back was quadratic: 0.7 s for 8 MiB, the most any test reads, and 164 s for 64 MiB. Running the bring-up
+   checklist on ttsim-chaos with its 256 MiB step at full size found it. Laid out a row band at a time, a Llama token's
+   logits now cost the host 0.2 ms, not 6.4. (NOTES: "Upload and download")
 
 ## For a chip of our own
 
