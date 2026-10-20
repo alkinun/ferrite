@@ -8,6 +8,7 @@ from ferrite.compiler import from_bf16, to_bf16
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
+from hw import mac
 import benchmark, gpt2, llama, train
 from types import SimpleNamespace
 
@@ -1399,3 +1400,27 @@ def test_llama_model(chip):
     assert np.abs(got - want).max() < 1 and got.argmax() == want.argmax(), (np.abs(got - want).max(), got.argmax(), want.argmax())
     new, places = [int(want.argmax())], [places[-1] + 1]
   assert new == [1962], "a [question]"
+
+def test_mac_model():
+  # the multiply-accumulate unit's model (hw/mac.py: acc + a * b, bf16 by bf16 into fp32, ROADMAP's arithmetic), integers
+  # throughout, against numpy's IEEE fp32 addition with the model's flushes around it (denormals in, the product to
+  # infinity or zero out of fp32's range, denormals out, one NaN): on random bit patterns of every kind, on values close
+  # enough in size that the sum rounds, and on every combination of the values at each edge (zeros, denormals, the
+  # smallest and largest normals, infinities, NaNs, products just inside and outside fp32's range, ties)
+  rng, f32 = np.random.default_rng(29), lambda x: int(np.float32(x).view(np.uint32))
+  edges16 = [0x0000, 0x8000, 0x0001, 0x807F, 0x0080, 0x3F80, 0xBF80, 0x3F81, 0x5F80, 0x5FFF, 0x5F00, 0x2000, 0x1FFF, 0x2080, 0x7F7F, 0x7F80, 0xFF80, 0x7FC0, 0xFF81]
+  edges32 = [0, 0x80000000, 1, 0x807FFFFF, 0x00800000, 0x00C00000, 0x80C00000, f32(1.0), f32(1.0) + 1, f32(-1.0), 0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000, 0xFF800000, NAN := 0x7FC00000, 0x7F800001]
+  edges = np.array([(c, x, y) for c in edges32 for x in edges16 for y in edges16], np.uint32).T
+  near = lambda n, bits, lo, hi: rng.integers(0, 2, n) << (bits - 1) | rng.integers(lo, hi, n) << (bits - 9) | rng.integers(0, 1 << (bits - 9), n)
+  n = 20000
+  acc = np.concatenate([edges[0], rng.integers(0, 2**32, n), near(n, 32, 117, 137)]).astype(np.uint32)
+  a, b = (np.concatenate([e, rng.integers(0, 2**16, n), near(n, 16, 120, 134)]).astype(np.uint32) for e in edges[1:])
+  ftz = lambda x: np.where(np.abs(x) < 2.0**-126, np.copysign(np.float32(0), x), x).astype(np.float32)  # NaN compares False: kept
+  with np.errstate(all="ignore"):
+    p = ftz((a << 16).view(np.float32)).astype(np.float64) * ftz((b << 16).view(np.float32))  # exact in float64
+    p = ftz(np.where(np.abs(p) >= 2.0**128, np.copysign(np.inf, p), p).astype(np.float32))  # in fp32's range, exact
+    want = ftz(ftz(acc.view(np.float32)) + p)
+  want = np.where(np.isnan(want), NAN, want.view(np.uint32))
+  got = np.array([mac.mac(int(c), int(x), int(y)) for c, x, y in zip(acc, a, b)], np.uint32)
+  assert (got == want).all(), [(hex(c), hex(x), hex(y), hex(g), hex(w)) for c, x, y, g, w in zip(acc, a, b, got, want) if g != w][:5]
+  assert mac.mac(f32(1.0), 0x3F80, 0x3380) == f32(1.0) and mac.mac(f32(1.0) + 1, 0x3F80, 0x3380) == f32(1.0) + 2, "ties to even"
