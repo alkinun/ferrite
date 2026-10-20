@@ -1062,6 +1062,46 @@ def test_tinygrad(chip):
   (want, _), (got, calls) = jitted("CPU"), jitted("FERRITE")
   assert np.allclose(got, want, atol=1e-3) and calls == 2, (got, want, calls)
 
+def test_torch_frontend(chip):
+  # PyTorch through tinygrad's own frontend (extra/torch_backend, PyTorch's "tiny" device) with FERRITE as tinygrad's
+  # device: ferrite has no PyTorch adapter of its own. Elementwise ops, a sum, a matmul, softmax, layer norm and a conv2d
+  # against PyTorch on the CPU (the matmul and the conv to the FPU's 2^-11), each on the chip (launches), then an MLP's
+  # three Adam steps against the CPU's losses
+  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
+  pytest.importorskip("tinygrad")
+  torch = pytest.importorskip("torch")
+  from adapters import tinygrad_ferrite
+  from tinygrad.helpers import Context
+  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  with Context(DEV="FERRITE"):  # tinygrad's device for the "tiny" one, read at each op
+    import extra.torch_backend.backend  # registers "tiny" with PyTorch (its C++ part built once, then cached)
+    g = torch.Generator().manual_seed(0)
+    a, b, w = torch.randn(4, 40, generator=g), torch.randn(4, 40, generator=g), torch.randn(40, 24, generator=g)
+    image, kernel, norm = torch.randn(1, 2, 10, 10, generator=g), torch.randn(3, 2, 3, 3, generator=g), torch.nn.LayerNorm(40)
+    cases = [lambda x, y, w: (x * 2 + y).relu() - y.exp() / 4, lambda x, y, w: x.sum(1), lambda x, y, w: x @ w,
+             lambda x, y, w: x.softmax(-1), lambda x, y, w: norm.to(x.device)(x),
+             lambda x, y, w: torch.nn.functional.conv2d(image.to(x.device), kernel.to(x.device))]
+    for n, f in enumerate(cases):
+      want = f(a, b, w).detach()
+      launches, got = rt.launches, f(*(t.to("tiny") for t in (a, b, w))).detach().cpu()
+      assert rt.launches > launches and got.shape == want.shape, n
+      assert (got - want).abs().max() <= 1e-3 * (want.abs().max() + 1), (n, (got - want).abs().max())
+    def train(device):
+      torch.manual_seed(1)
+      model = torch.nn.Sequential(torch.nn.Linear(16, 32), torch.nn.ReLU(), torch.nn.Linear(32, 10)).to(device)
+      opt, g = torch.optim.Adam(model.parameters(), lr=1e-2), torch.Generator().manual_seed(2)
+      x, y = torch.randn(8, 16, generator=g).to(device), torch.randint(0, 10, (8,), generator=g).to(device)
+      losses = []
+      for _ in range(3):
+        opt.zero_grad()
+        loss = torch.nn.functional.cross_entropy(model(x), y)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+      return losses
+    want, got = train("cpu"), train("tiny")
+    assert np.allclose(got, want, atol=1e-4) and got[-1] < got[0] - 0.2, (got, want)
+
 @pytest.mark.parametrize("n, dtype, size", [(16, "bf16", 0), (40, "bf16", 0), (40, "bfp8", 0), (16, "bf16", 64)])
 def test_gpt2_layer(chip, n, dtype, size):
   # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so attention spans tiles),

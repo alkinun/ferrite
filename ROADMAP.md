@@ -31,7 +31,7 @@ Everything so far ran on ttsim. ferrite has never run on silicon; a p150a is ord
   (bfp8; for SmolLM also the MLP's gate and up in bfp4, as Tenstorrent's own models keep them), each token checked
   against the same model in numpy, decode replayed from a recording; a small CNN; a small GPT trained in fp32 with
   Adam, step by step against PyTorch; tinygrad's own scripts on its FERRITE device; PyTorch through tinygrad's torch
-  frontend, checked by hand. The test suite passes: 61 tests, the models and tinygrad included.
+  frontend. The test suite passes: 62 tests, the models, tinygrad and PyTorch included.
 - **Against TT-NN on the same simulator:** 4 to 18 times fewer cycles of control work an op than TT-NN with fast
   dispatch (2 to 3.5 times fewer than with slow dispatch), and 9 to 10 times fewer a SmolLM-135M decode token
   (COMPARE.md). ttsim counts only that control work, not the math or the DRAM, so none of this says yet how fast either

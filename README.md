@@ -80,3 +80,7 @@ is on a real card waits for one; `COMPARE.md` has the numbers and what carries o
 
 `NOTES.md`: how it works, and what is still unknown. `COMPARE.md`: ferrite against TT-NN. `ROADMAP.md`: where it goes,
 from silicon to an inference chip of our own, in five gated stages. `LESSONS.md`: what the work has taught us.
+
+## License
+
+Apache-2.0 (`LICENSE`), as tt-metal's.
