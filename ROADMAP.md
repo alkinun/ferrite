@@ -180,7 +180,7 @@ ferrite runs correctly and fast on a real p150a, and the numbers are public.
 - [ ] The loader decision is written in this file, with both measurements and its reasons.
 - [ ] A LICENSE is in the repository, and PyTorch through tinygrad's torch frontend is an automated test that passes on
       the card.
-- [ ] The multiply-accumulate unit matches a Python model of that arithmetic bit for bit in cocotb, on a million random
+- [x] The multiply-accumulate unit matches a Python model of that arithmetic bit for bit in cocotb, on a million random
       inputs and on zeros, infinities, NaNs and denormals.
 
 **Not yet:** FPGA work, our own architecture, customers.

@@ -34,3 +34,19 @@ def mac(acc, a, b):
   if biased >= 255: return sign << 31 | INF
   if biased <= 0: return sign << 31  # too small for a normal fp32: flushed (exact here, so before or after rounding agree)
   return sign << 31 | biased << 23 | m & 0x7FFFFF
+
+# The cases the model and the hardware are checked on: in bf16, zeros, denormals, the smallest normal, 1 and -1 and 1
+# an ulp up, 2^64 and its neighbours (a product's overflow), 2^-63 and its neighbours (its underflow), the largest
+# finite, infinities and NaNs; in fp32, zeros, denormals, small normals, 1 and its neighbour, -1, the largest finite,
+# infinities and NaNs
+EDGES16 = (0x0000, 0x8000, 0x0001, 0x807F, 0x0080, 0x3F80, 0xBF80, 0x3F81, 0x5F80, 0x5FFF, 0x5F00, 0x2000, 0x1FFF, 0x2080, 0x7F7F,
+           0x7F80, 0xFF80, 0x7FC0, 0xFF81)
+EDGES32 = (0x00000000, 0x80000000, 0x00000001, 0x807FFFFF, 0x00800000, 0x00C00000, 0x80C00000, 0x3F800000, 0x3F800001, 0xBF800000,
+           0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F800001)
+
+def cases(n, rand):
+  """(acc, a, b): every combination of the edge values, then n random ones, half bit patterns of every kind and half
+  values close enough in size that the sum rounds. rand: random.Random(seed).randrange."""
+  yield from ((c, a, b) for c in EDGES32 for a in EDGES16 for b in EDGES16)
+  near = lambda bits, lo, hi: rand(2) << (bits - 1) | (lo + rand(hi - lo)) << (bits - 9) | rand(1 << (bits - 9))
+  for i in range(n): yield (rand(1 << 32), rand(1 << 16), rand(1 << 16)) if i % 2 else (near(32, 117, 137), near(16, 120, 134), near(16, 120, 134))

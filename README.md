@@ -54,6 +54,10 @@ call's launches as ferrite's `jit` does. PyTorch code comes the same way, throug
 
     TTSIM=... PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
 
+The first hardware of our own, in simulation: a multiply-accumulate unit, bf16 by bf16 into fp32, in Verilog
+(`hw/mac.v`), which matches its model (`hw/mac.py`) bit for bit on a million random inputs and every combination of
+the edge values, in cocotb on Verilator (`test_mac_hardware`).
+
 ## Speed
 
 Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 4 to 18
