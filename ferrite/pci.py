@@ -1,6 +1,6 @@
 # The device interface at the PCIe level: config space, BARs, and host memory the device can DMA to.
 # Two backends with the same methods: Sim (ttsim's libttsim.so) and Card (a real card through sysfs).
-import ctypes, gc, mmap, os, time
+import array, ctypes, gc, mmap, os, time
 from ferrite import bh
 
 class Sim:
@@ -58,31 +58,30 @@ class Card:
     _write(f"{self.sys}/enable", "1")
     self.cfg = os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC)
     self.cfg_write(0x04, self.cfg_read(0x04) | 0x6)  # memory decode, and bus mastering so the device can reach host memory
-    self.bars = {}
-    for i in (0, 2, 4):
-      fd = os.open(f"{self.sys}/resource{i}", os.O_RDWR | os.O_SYNC)
-      self.bars[i] = (m := mmap.mmap(fd, os.fstat(fd).st_size), ctypes.addressof(ctypes.c_char.from_buffer(m)))
-      os.close(fd)
-
+    if at := self.capability(0x10):  # PCI Express: reads of host memory as requests of up to 4 KiB (Max Read Request Size),
+      os.pwrite(self.cfg, (self.cfg_read(at + 8) & 0x8FFF | 5 << 12).to_bytes(2, "little"), at + 8)  # as kmd sets them up
+    fd = os.open(f"{self.sys}/resource0", os.O_RDWR | os.O_SYNC)  # BAR0 alone: TLB windows and registers are all ferrite uses
+    self.bars = {0: (m := mmap.mmap(fd, os.fstat(fd).st_size), ctypes.addressof(ctypes.c_char.from_buffer(m)))}  # (BAR4 may not
+    os.close(fd)                                                                                                     # be all there)
+    for i in range(32): self.write(0, bh.TLB_STRIDED + 4 * i, bytes(4))  # TLBs 0-31 multicast to every tile of a rectangle, as kmd
+                                                                          # leaves them, whatever an earlier user set
   def cfg_read(self, off): return int.from_bytes(os.pread(self.cfg, 4, off), "little")
   def cfg_write(self, off, val): os.pwrite(self.cfg, val.to_bytes(4, "little"), off)
+  def capability(self, cap):  # where a PCI capability sits in config space, or 0
+    at = self.cfg_read(0x34) & 0xFC
+    while at and self.cfg_read(at) & 0xFF != cap: at = self.cfg_read(at) >> 8 & 0xFC
+    return at
 
-  # registers want exactly one 32-bit access; bulk data can go as wide as memcpy likes
-  def read(self, bar, off, n):
-    addr = self.bars[bar][1] + off
-    return ctypes.c_uint32.from_address(addr).value.to_bytes(4, "little") if n == 4 else ctypes.string_at(addr, n)
-  def write(self, bar, off, data):
-    addr = self.bars[bar][1] + off
-    if len(data) == 4: ctypes.c_uint32.from_address(addr).value = int.from_bytes(data, "little")
-    else: ctypes.memmove(addr, bytes(data), len(data))
+  def read(self, bar, off, n): return _load(self.bars[bar][1] + off, n)
+  def write(self, bar, off, data): _store(self.bars[bar][1] + off, data)
 
   def alloc(self, size):
     """One 2 MiB hugepage, physically contiguous and locked: (memoryview, bus address). The memoryview holds the page:
     it goes back to the kernel's pool once nothing refers to it (a Runtime's ring and status live as long as it does)."""
     assert size <= 1 << 21, "one hugepage at a time"
-    MAP_HUGETLB, MAP_LOCKED = 0x40000, 0x2000
+    MAP_HUGETLB, MAP_LOCKED, MAP_HUGE_2MB = 0x40000, 0x2000, 21 << 26  # 2 MiB pages whatever the host's default size
     for tries in (1, 0):  # a Runtime dropped in a reference cycle (its numbers' tensors refer to it) holds its page until collected
-      try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED); break
+      try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED | MAP_HUGE_2MB); break
       except OSError:
         if not tries: raise MemoryError("no free 2 MiB hugepage for memory the card can reach: echo 4 > /proc/sys/vm/nr_hugepages") from None
         gc.collect()
@@ -94,6 +93,19 @@ class Card:
 
   def tick(self): pass  # real hardware runs on its own
   def now(self): return time.monotonic()
+
+# A BAR is mapped uncached, where libc's memcpy may copy a byte at a time (rep movsb), each byte a PCIe transaction of its
+# own: so a word at a time, the widest that both the address and the length allow (a register's 4 bytes in one access)
+WORDS = {8: ("Q", ctypes.c_uint64), 4: ("I", ctypes.c_uint32)}
+def _width(addr, n): return next((w for w in WORDS if addr % w == 0 and n % w == 0), None)
+def _load(addr, n):
+  if (w := _width(addr, n)) is None: return ctypes.string_at(addr, n)
+  code, word = WORDS[w]
+  return array.array(code, (word * (n // w)).from_address(addr)).tobytes()
+def _store(addr, data):
+  if (w := _width(addr, len(data))) is None: return ctypes.memmove(addr, bytes(data), len(data))
+  code, word = WORDS[w]
+  (word * (len(data) // w)).from_address(addr)[:] = memoryview(data).cast("B").cast(code)
 
 def _write(path, s):
   with open(path, "w") as f: f.write(s)

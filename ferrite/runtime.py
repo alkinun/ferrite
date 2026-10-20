@@ -1,6 +1,6 @@
 # The runtime: resident firmware on each Tensix tile's BRISC and TRISCs, kernels launched on them without resetting
 # anything, and a command ring in host memory that one tile's BRISC, the dispatcher, reads by itself.
-import collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time
+import atexit, collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time
 from ferrite import bh, pci
 
 # L1 layout, ours to choose. Every tile: firmware at 0, which starts with a jump for each core (BRISC at 0, TRISC i at
@@ -311,6 +311,8 @@ class Runtime:
     ys = [y for y in sorted({y for _, y in self.cores}) if all((x, y) in self.cores for x in xs)]
     assert self.cores[:len(xs) * len(ys)] == [(x, y) for y in ys for x in xs], "whole rows first"
     self.grid = tuple(xs), tuple(ys)
+    chip.halt(*end, start)  # first, and again at exit: a dispatcher still running reads and writes its hugepage after the
+    atexit.register(chip.halt, *end, start)  # process that took it is gone, when the next process may have the same page
     buf, bus = chip.pci.alloc(1 << 21)  # one hugepage: the status, the ring, the times, then tensors read back (tobytes)
     back = 64 + ring + 16 * TIMES
     assert back + 4096 <= 1 << 21, "a ring that leaves no room to read a tile back"
@@ -321,7 +323,6 @@ class Runtime:
     worker, dispatcher = compile_rv32(FIRMWARE), compile_rv32(DISPATCHER)
     assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
     (dx, dy), n = self.dispatcher, len(self.cores)
-    chip.halt(*end, start)
     chip.write(*end, 0, worker, start)
     chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
     for i, (x, y) in enumerate(self.cores):  # mailbox, TRISCs' go and done, SYNC, FLAGS: zero, but for whom to report to and the index

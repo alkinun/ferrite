@@ -9,6 +9,7 @@ RESET_TIMER, RESET_MARKER = ((0x934, 1), (0x930, 0x11)), 1 << 6
 # BAR0 (512 MiB): 202 TLB windows of 2 MiB from offset 0, then registers. BAR4 (32 GiB): 8 TLB windows of 4 GiB.
 TLB_WINDOW, TLB_COUNT = 1 << 21, 201  # TLB 201, the last 2 MiB one, is tt-kmd's; we leave it alone
 TLB_CONFIG = 0x1FC00000  # BAR0 offset of the TLB config registers: 3 dwords per TLB, the 2 MiB ones first
+TLB_STRIDED = 0x1FC009D8  # then a word for each of TLBs 0-31: strided multicast (0: every tile of the rectangle; ISA HostToDeviceTLBs.md)
 # 2 MiB TLB config, a 96-bit little-endian value: field -> (first bit, width). The rest of the fields are in NOTES.md.
 TLB_FIELDS = {"addr": (0, 43), "x_end": (43, 6), "y_end": (49, 6), "x_start": (55, 6), "y_start": (61, 6),
               "mcast": (69, 1), "ordering": (70, 2), "static_vc": (73, 1), "vc_class": (76, 2)}
@@ -36,6 +37,10 @@ ARC_QUEUE_PTRS = (0x0, 0x4, 0x10, 0x14)  # in its header: our request write and 
                                          # read and response write pointers, each counting to 2n so full and empty differ
 # POWER_SETTING with all 15 flags valid and set: max AI clock, GDDR PHY awake, Tensix and L2CPU clocks on
 POWER_ON = 0x21 | 15 << 8 | 0x7FFF << 16
+ASIC_STATE0, AICLK_GO_BUSY = 0xA0, 0x52  # ARC messages: out of the state tt-kmd leaves the chip in when it unbinds (its 0xA3
+                                         # ASIC_STATE3), as its probe does; the AI clock to its busiest, as UMD asks for it
+NIU_CFG_0, NOC_TRANSLATED = 0x1FD04100, 1 << 14  # BAR0: the PCIe tile's NIU config; this bit set, the NoC takes translated
+                                                 # coordinates, which this file's are (UMD and kmd read it too)
 TAG_AICLK, TAG_GDDR_STATUS, TAG_TENSIX_COLS, TAG_GDDR_ENABLED = 14, 22, 34, 36  # telemetry; GDDR_STATUS: 2 bits a bank
 TAG_FIRMWARE = 28  # the firmware bundle's version, a byte each: major, minor, patch, build (umd's FLASH_BUNDLE_VERSION)
 

@@ -1,6 +1,6 @@
 # Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
-import json, math, os, pathlib, random, shutil, struct, subprocess, sys, time, pytest
+import ctypes, json, math, os, pathlib, random, shutil, struct, subprocess, sys, time, pytest
 import numpy as np
 from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
@@ -41,7 +41,16 @@ def test_config_space(chip):
   assert len(set(chip.pci.bars.values())) == 3
 
 def test_arc(chip):
+  # ARC's messages and telemetry. A message sent after a response nobody read (left by a client that died) gets its own
+  # answer: ARC_GET_HARVESTING's is which Tensix columns are off (not 0 on a p150), TEST's is 0
   chip.arc_msg(0x90)  # TEST
+  assert chip.arc_msg(0x57)[0], "a p150 has Tensix columns off"
+  (x, y), entry = bh.ARC, bh.ARC_QUEUE_ENTRY
+  qcb = chip.read32(x, y, bh.ARC_QUEUES)
+  base, n = chip.read32(x, y, qcb), chip.read32(x, y, qcb + 4) & 0xFF
+  resp_r = base + bh.APP_QUEUE * (entry + 2 * n * entry) + bh.ARC_QUEUE_PTRS[1]
+  chip.write32(x, y, resp_r, (chip.read32(x, y, resp_r) - 1) % (2 * n))  # the harvesting answer, as if never read
+  assert chip.arc_msg(0x90)[0] == 0, "TEST's own answer, not the one left in the queue"
   t = chip.telemetry()
   assert len(chip.tensix) == 120 and t[bh.TAG_AICLK] > 0, "a p150 has 12 of 14 Tensix columns working, as ttsim models"
 
@@ -80,6 +89,16 @@ def test_cache_prune(tmp_path, monkeypatch):
   for f in (old, folder): os.utime(f, (0, time.time() - 8 * 86400))
   runtime._prune.__wrapped__()
   assert not old.exists() and new.exists() and folder.exists()
+
+def test_card_copies():
+  # a card's BARs are read and written a word at a time (8 bytes, or 4 where the address and the length allow no more,
+  # a byte only where neither does), since libc's memcpy may go a byte at a time on uncached memory: here on ordinary memory
+  buf = (ctypes.c_char * 256)()
+  for off, n in ((0, 64), (8, 16), (4, 12), (4, 4), (1, 7), (0, 256)):
+    data = random.randbytes(n)
+    pci._store(ctypes.addressof(buf) + off, data)
+    assert pci._load(ctypes.addressof(buf) + off, n) == data == bytes(buf[off:off + n]), (off, n)
+  assert [pci._width(a, n) for a, n in ((0, 64), (4, 12), (1, 7))] == [8, 4, None]
 
 def test_card_wants_root():
   # pci.Card's and pci.reset's first check, which needs no card: without root each says so, rather than failing on a

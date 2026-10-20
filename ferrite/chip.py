@@ -17,11 +17,22 @@ class Chip:
     self.pci, self.tlb, self.target = pci, 0, None  # TLB 0 is the shared window; map hands out the rest
     self.free_tlbs, self.kept = iter(range(1, bh.TLB_COUNT)), {}
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
+    assert int.from_bytes(pci.read(0, bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED, "the NoC is not translating coordinates, which bh's are"
+    self.arc_msg(bh.ASIC_STATE0)  # out of the state tt-kmd leaves the chip in when it lets go of it
     self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
+    self.wait(lambda: self.read32(*bh.ARC, bh.ARC_TELEMETRY[0]), "publish its telemetry", boot)
+    self.arc_msg(bh.AICLK_GO_BUSY)  # and, as UMD does, up to 0.2 s for the AI clock to come within 5% of its busiest, then
+    busy, end = bh.AICLK / 1e6, time.monotonic() + 0.2  # whatever it is (ttsim says 1000 MHz)
+    while abs(self.telemetry().get(bh.TAG_AICLK, 0) - busy) > 0.05 * busy and time.monotonic() < end: self.pci.tick()
     t = self.telemetry()
+    missing = {bh.TAG_AICLK, bh.TAG_GDDR_STATUS, bh.TAG_TENSIX_COLS, bh.TAG_GDDR_ENABLED} - t.keys()
+    assert not missing, f"ARC's telemetry has no tags {sorted(missing)}: firmware older than ferrite knows?"
+    self.aiclk = t[bh.TAG_AICLK]  # MHz, once asked to be busy
     self.tensix = [(x, y) for y in bh.TENSIX_Y for x in bh.TENSIX_X[:t[bh.TAG_TENSIX_COLS].bit_count()]]
     self.banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]  # the DRAM banks firmware enabled
-    self.wait(lambda: all(self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 1 for b in self.banks), "finish GDDR training", 60)
+    training = lambda: [self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 3 for b in self.banks]  # a bank's: 0 still training,
+    self.wait(lambda: 0 not in training(), "finish GDDR training", 300)                         # 1 done, 2 or 3 failed
+    assert not (bad := [b for b, s in zip(self.banks, training()) if s != 1]), f"GDDR banks {bad} failed training (UMD retrains with ARC message 0xB6)"
 
   def map(self, x, y, addr, start=None, tlb=None):
     """Point a TLB at the 2 MiB block holding NoC address (x, y, addr), or for writes at that block in every Tensix of
@@ -75,6 +86,8 @@ class Chip:
     q = base + bh.APP_QUEUE * (entry + 2 * n * entry)
     req_w, resp_r, req_r, resp_w = (q + at for at in bh.ARC_QUEUE_PTRS)
     wptr, rptr = self.read32(x, y, req_w), self.read32(x, y, resp_r)
+    if (left := self.read32(x, y, resp_w)) != rptr: self.write32(x, y, resp_r, rptr := left)  # a response nobody read (a client
+                                                                                               # that died): dropped, as kmd does
     assert (wptr - self.read32(x, y, req_r)) % (2 * n) < n, "ARC message queue full"
     self.write(x, y, q + entry + wptr % n * entry, struct.pack("<8I", header, *payload, *[0] * (7 - len(payload))))
     self.write32(x, y, req_w, (wptr + 1) % (2 * n))

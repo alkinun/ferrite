@@ -92,7 +92,7 @@ def ferrite(folder, prompt, after, top5, book, s):
   chip = Chip(pci.open_device())
   rt, clock, on = Runtime(chip, chip.tensix[0], chip.tensix[-1]), chip.pci.now, lambda row: Tensor.of(rt, [row], "int32")
   firmware = chip.telemetry().get(bh.TAG_FIRMWARE, 0)
-  out = {"versions": {"ferrite": git(ROOT), "firmware": ".".join(str(firmware >> b & 255) for b in (24, 16, 8)), "card": card(isinstance(chip.pci, pci.Sim)),
+  out = {"versions": {"ferrite": git(ROOT), "firmware": ".".join(str(firmware >> b & 255) for b in (24, 16, 8)), "card": card(isinstance(chip.pci, pci.Sim)), "AI clock MHz": chip.aiclk,
                       "host": host(), "lines of code": {d: lines(ROOT, lambda p: p.startswith(d + "/")) for d in ("ferrite", "adapters")}},
          "clock": "ttsim's, not silicon's: a check of the script" if isinstance(chip.pci, pci.Sim) else "the host's"}
 
