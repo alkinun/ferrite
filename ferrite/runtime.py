@@ -330,6 +330,7 @@ class Runtime:
     rect = end[0] | end[1] << 6 | (start[0] | start[1] << 6) << 12  # a multicast's NOC_RET_ADDR_HI
     chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
     chip.write(dx, dy, DONE, bytes(4))
+    chip.write(dx, dy, OUTBOX, bytes(64))  # what a dispatcher before this one left there would read as this one's (wait)
     self.doorbell = chip.map(dx, dy, DISPATCH)  # a TLB of its own, so ringing never has to move a window first
     for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
     chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
