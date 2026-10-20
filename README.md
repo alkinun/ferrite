@@ -29,7 +29,7 @@ need numpy. Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (
     TTSIM=/path/to/libttsim.so python3 -m pytest test        # every step, on the simulator
     TTSIM=/path/to/libttsim.so python3 -m ferrite.bench      # a matmul's speed and DRAM reads
     TTSIM=/path/to/libttsim.so python3 -m ferrite.probe      # launch, DRAM, NoC, Tensix unit and PCIe rates (for the card)
-    python3 test/benchmark.py Llama-3.1-8B-Instruct Llama-3.1-8B-Instruct.refpt   # ROADMAP's B1, B2 and B3, on a card
+    python3 test/benchmark.py ferrite Llama-3.1-8B-Instruct Llama-3.1-8B-Instruct.refpt   # ROADMAP's B1, B2 and B3 (or ttnn)
 
 ## What runs
 

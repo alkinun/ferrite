@@ -8,7 +8,7 @@ from ferrite.compiler import from_bf16, to_bf16
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
-import gpt2, llama, train
+import benchmark, gpt2, llama, train
 from types import SimpleNamespace
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
@@ -1216,9 +1216,9 @@ def test_llama_load(tmp_path):
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   (tmp_path / "config.json").write_text(json.dumps({"hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1, "num_hidden_layers": 1,
                                                     "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "max_position_embeddings": 131072,
-                                                    "rope_scaling": rope, "vocab_size": vocab}))
+                                                    "rope_scaling": rope, "vocab_size": vocab, "intermediate_size": ffn}))
   c, weights = llama.load(str(tmp_path), 64)
-  assert c.places == 64 and c.rope == rope and weights["cos"].bits().shape == (64, 4 * 32)
+  assert c.places == 64 and c.rope == rope and c.ffn == ffn and weights["cos"].bits().shape == (64, 4 * 32)
   q, k, v = (parts[f"model.layers.0.self_attn.{n}_proj.weight"] for n in "qkv")
   assert np.array_equal(weights["layers.0.qkv_proj"].bits(), np.concatenate([q.T, k.T, v.T], 1))
   assert np.array_equal(weights["embed.T"].bits(), parts["lm_head.weight"].T), "its own output layer, not the embedding"
@@ -1280,6 +1280,8 @@ def test_llama_precision(chip):
   c.precision = llama.precision(c, "tt")
   t = llama.upload(rt, {k: llama.Weight(lambda v=v: (np.float32(v).view(np.uint32) >> 16).astype(np.uint16)) for k, v in w.items()}, c.precision)
   assert {k: x.dtype for k, x in t.items() if "proj" in k or k == "embed.T"} == {k: "bfp4" if "gate_up" in k else "bfp8" for k in t if "proj" in k or k == "embed.T"}
+  sizes = SimpleNamespace(**vars(c), vocab=256, places=64, ffn=1536)  # benchmark.weights, from the sizes alone, has them as upload makes them
+  assert {k: (x.rows, x.cols, x.dtype) for k, x in t.items()} == {k: (x.rows, x.cols, x.dtype) for k, x in benchmark.weights(sizes).items()}
   arrays = w | {k: gpt2.values(x) for k, x in t.items() if x.dtype != "bf16"}
   kv, np_kv = llama.kv_cache(c, 32, llama.zeros(rt, "bfp8")), llama.kv_cache(c, 32, np.zeros)  # numpy's rounded as a bfp8 cache's
   assert kv[0].dtype == "bfp8" and np.array_equal(llama.bfp8(w["embed"][:2, :64]), bfp(bf16(w["embed"][:2, :64])))
@@ -1309,15 +1311,11 @@ def test_token_accuracy(chip):
 def test_benchmark_bytes():
   # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token; ROADMAP, Measurement): the bytes a
   # decode token reads, each weight in the format TT's performance precision gives it (llama.weight_format, as upload
-  # casts it). Llama-3.1-8B's shapes give ROADMAP's 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
-  import benchmark
-  c, hd, ffn = SimpleNamespace(dim=4096, heads=32, kv=8, layers=32, vocab=128256), 128, 14336
+  # casts it; benchmark.weights has them from the model's sizes, as test_llama_precision checks). Llama-3.1-8B's sizes
+  # give ROADMAP's 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
+  c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=32, vocab=128256, ffn=14336, places=736)
   c.precision = llama.precision(c, "tt")
-  shapes = {"embed": (c.vocab, c.dim), "embed.T": (c.dim, c.vocab), "norm": (1, c.dim), "cos": (736, 48 * hd), "sin": (736, 48 * hd), "turn": (hd, hd)}
-  for l in range(c.layers):
-    shapes |= {f"layers.{l}.{k}": s for k, s in (("input_layernorm", (1, c.dim)), ("post_attention_layernorm", (1, c.dim)),
-               ("qkv_proj", (c.dim, 48 * hd)), ("o_proj", (c.dim, c.dim)), ("gate_up_proj", (c.dim, 2 * ffn)), ("down_proj", (ffn, c.dim)))}
-  t = {k: SimpleNamespace(rows=r, cols=n, dtype=llama.weight_format(k, c.precision)) for k, (r, n) in shapes.items()}
+  t = benchmark.weights(c)
   assert [t[k].dtype for k in ("layers.0.gate_up_proj", "layers.31.gate_up_proj", "layers.0.down_proj", "embed.T", "embed")] == ["bfp4", "bfp8", "bfp8", "bfp8", "bf16"]
   read = benchmark.bytes_per_token(t, c, 612.5)
   assert round(read / 1e9, 2) == 6.20 and round(41.3 * read / 512e9, 3) == 0.5, read

@@ -152,7 +152,7 @@ def load(folder, places=4096):
   j = json.load(open(os.path.join(folder, "config.json")))
   c = SimpleNamespace(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=j["num_hidden_layers"],
                       eps=j["rms_norm_eps"], theta=j["rope_theta"], places=min(j["max_position_embeddings"], places),
-                      rope=j.get("rope_scaling"), vocab=j["vocab_size"])
+                      rope=j.get("rope_scaling"), vocab=j["vocab_size"], ffn=j["intermediate_size"])
   index = os.path.join(folder, "model.safetensors.index.json")
   files = sorted(set(json.load(open(index))["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
   out = {}
