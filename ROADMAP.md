@@ -10,8 +10,8 @@ as good as CUDA starts out losing, so we build the stack first and the chip afte
 
 - **Prove it on someone else's silicon.** Tenstorrent's Blackhole is open down to its instruction set: its ISA
   documentation and its simulator, ttsim, are public. ferrite drives it with nothing from Tenstorrent at runtime but the
-  card's firmware, in about 3,000 lines of Python. Tenstorrent's own stack spans six layers (tt-kmd, UMD, tt-metal, LLK,
-  TT-NN, the model code), about 1.65 million lines without the model code (COMPARE.md). If ferrite runs an
+  card's firmware, in about 2,300 lines of Python code. Tenstorrent's own stack spans six layers (tt-kmd, UMD, tt-metal,
+  LLK, TT-NN, the model code), about 1.42 million lines of code without its tests, models and docs (COMPARE.md). If ferrite runs an
   8-billion-parameter model on the same card within 1.5 times of that stack's speed (Stage 1's gate), with hundreds of
   times less code, the claim stands: a compiler and a runtime, kept clean, are all an accelerator needs. As George
   Hotz's "Advice to Tenstorrent" puts it, "it's 3 (and only 2 you have to build)".
@@ -145,7 +145,8 @@ ferrite runs correctly and fast on a real p150a, and the numbers are public.
 
 - Before the card arrives: a harsher ttsim (NoC latency, Tensix jitter) to bring out ordering bugs; probes for what
   ttsim cannot measure (launch latency, DRAM GB/s per core, NoC latency, unpack, math and pack rates); a card reset that
-  needs no reboot, and a report of what each core of a hung worker waits on.
+  needs no reboot, and a report of what each core of a hung worker waits on. Done: ttsim-chaos (`test/ttsim-chaos.patch`),
+  `ferrite.probe`, `pci.reset`, `Runtime.report`.
 - Bring the card up with NOTES.md's checklist, in its order. Run TT-NN's Llama-3.1-8B and matmul on the card first: that
   shows the card works and gives the baselines.
 - Run Llama-3.1-8B on ferrite: Llama 3's RoPE scaling, its 128,256-token vocabulary and untied output layer, and 16 GB
@@ -160,19 +161,20 @@ ferrite runs correctly and fast on a real p150a, and the numbers are public.
   B2's block-float formats through the adapter (which carries fp32, bf16 and int32 today), and replay of a decode step
   whose position is a symbolic variable (the adapter runs such a call every time).
 - Turn the hand check of PyTorch through tinygrad's torch frontend into an automated test
-  (`adapters/torch_ferrite.py` is already gone).
-- Add a LICENSE: Apache-2.0, as tt-metal's.
+  (`adapters/torch_ferrite.py` is already gone). Done: `test_torch_frontend`.
+- Add a LICENSE: Apache-2.0, as tt-metal's. Done.
 - Publish B1, B2 and B3 for both stacks, each stack's lines of code beside them, and a script anyone with a p150 can
   rerun.
 - The first hardware design, in simulation: a multiply-accumulate unit in Verilog or Amaranth, tested with Verilator
   and cocotb. bf16 inputs, an fp32 accumulator; each product exact unless it is out of fp32's range (then infinity, or
   zero), each sum rounded to nearest even; denormals in and out flushed to zero; inf x 0 and inf - inf give NaN, and
-  every NaN out is 0x7FC00000.
+  every NaN out is 0x7FC00000. Done: `hw/mac.v`.
 
 **Exit criteria** (fixed 2026-10-20)
 
-- [ ] On the p150a, three runs in a row of `pytest test` (with `GPT2`, `LLAMA` and `TINYGRAD` set, and PyTorch
-      installed) have no failures and no skips but `test_card_wants_root`, which skips as root by design.
+- [ ] On the p150a, three runs in a row of `python3 -m pytest test` (with `GPT2`, `LLAMA` and `TINYGRAD` set, and
+      everything CLAUDE.md lists for the tests installed) have no failures and no skips but `test_card_wants_root`,
+      which skips as root by design.
 - [ ] B2: decode at no less than 41.3 tokens/s (50% of the card's DRAM bandwidth), with top-1 at least 90% and top-5 at
       least 98%.
 - [ ] B1 and B2: ferrite is no more than 1.5 times slower than TT-NN on the same card.
@@ -182,6 +184,10 @@ ferrite runs correctly and fast on a real p150a, and the numbers are public.
       the card.
 - [x] The multiply-accumulate unit matches a Python model of that arithmetic bit for bit in cocotb, on a million random
       inputs and on zeros, infinities, NaNs and denormals.
+
+Amended on 2026-10-20, the day the stage opened: the first criterion names the suite's command as it runs
+(`python3 -m pytest`, so that `ferrite` is importable) and its dependencies by reference, since the multiply-accumulate
+unit's tests brought Verilator, cocotb and Yosys.
 
 **Not yet:** FPGA work, our own architecture, customers.
 

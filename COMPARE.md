@@ -130,8 +130,8 @@ Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.
 the device opens (0.9 s) and each op's kernels the first time (0.6 to 0.8 s). Both cache on disk.
 
 Size, by ROADMAP's measure (code lines as `cloc` counts them, without blank or comment lines, tests, models, docs or
-third-party code; `test/benchmark.py` counts them): ferrite is 1,856 lines of Python (3,112 with its comments and
-docstrings) and its tinygrad adapter 453. tt-metal at 9f98dee9, with TT-NN, LLK and the UMD it pins (9c645d9), is
+third-party code; `test/benchmark.py` counts them): ferrite is 1,856 lines of Python (3,112 lines in all, with its
+comments, docstrings and blank lines) and its tinygrad adapter 453. tt-metal at 9f98dee9, with TT-NN, LLK and the UMD it pins (9c645d9), is
 1,412,977, of which C++ and its headers are 1.24M; tt-kmd at c3befe6, 7,647.
 
 On 2026-10-18 (ferrite at bc715ac) it was the other way round for DRAM: ferrite's matmul read 6.9 times its inputs, its

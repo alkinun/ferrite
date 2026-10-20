@@ -49,7 +49,7 @@ def tensix(unpacks="", maths="", packs="", slots=None):
   them that has work times its loop, to its thread's last instruction, into a[3]."""
   timed = [i for i, body in enumerate((unpacks, maths, packs)) if body][-1]
   loop = lambda i, body: (f"unsigned t0 = CLOCK; for (unsigned i = 0; i < a[2]; i++) {{ {body} }}" +
-                          (f" tensix_idle(); args[3] = CLOCK - t0;" if i == timed else "")) if body else ""
+                          (" tensix_idle(); args[3] = CLOCK - t0;" if i == timed else "")) if body else ""
   return compile_kernel(None, CLOCK + _unpacker(loop(0, unpacks), kernel_config()), CLOCK + _math(slots or {}, loop(1, maths)),
                         CLOCK + _packer(loop(2, packs)))
 

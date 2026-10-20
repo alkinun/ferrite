@@ -128,7 +128,7 @@ def ferrite(folder, prompt, after, top5, book, s):
   for phases in (2, 4):
     seconds = timed(lambda: a.matmul(b, fidelity=phases).realize(), rt.wait, clock, s.runs)
     out[f"B1 matmul {s.n}^3 bf16, {phases} phases"] = {"ms": seconds * 1e3, "TFLOPS": 2 * s.n**3 / seconds / 1e12}
-  del a, b
+  del a, b  # their DRAM back before the model's
   c, w = model(folder, s, len(prompt) + max(s.steps, s.accuracy))
   t = llama.upload(rt, w, c.precision)
   tps = decode(t, c, 1)

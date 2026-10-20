@@ -29,7 +29,7 @@ need numpy. Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (
     TTSIM=/path/to/libttsim.so python3 -m pytest test        # every step, on the simulator
     TTSIM=/path/to/libttsim.so python3 -m ferrite.bench      # a matmul's speed and DRAM reads
     TTSIM=/path/to/libttsim.so python3 -m ferrite.probe      # launch, DRAM, NoC, Tensix unit and PCIe rates (for the card)
-    python3 test/benchmark.py ferrite Llama-3.1-8B-Instruct Llama-3.1-8B-Instruct.refpt   # ROADMAP's B1, B2 and B3 (or ttnn)
+    python3 test/benchmark.py ferrite Llama-3.1-8B-Instruct tt_transformers/tests/reference_outputs/Llama-3.1-8B-Instruct.refpt   # ROADMAP's B1-B3 (or ttnn)
 
 ## What runs
 
@@ -75,9 +75,9 @@ is on a real card waits for one; `COMPARE.md` has the numbers and what carries o
 - `ferrite/runtime.py`: firmware for every core, kernels that stay loaded, and a command ring in host memory that one
   core reads by itself, so a launch costs the host one PCIe write, and a recorded block of launches one too.
 - `ferrite/tensor.py`: lazy tensors of any shape, bf16, fp32, int32, bfp8 or bfp4, with numpy's broadcasting and
-  tinygrad's autograd. A tree of ops becomes one fused kernel; `jit` records a function's launches and replays them.
-- `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs, one per core of a
-  Tensix tile: one moves tiles in and out, and three feed the unpack, math and pack threads.
+  tinygrad's autograd. A tree of ops becomes as few fused kernels as fit; `jit` records a function's launches and replays them.
+- `ferrite/compiler.py`: those kernels, as Tensix instructions from the ISA. Each is four programs for four of a Tensix
+  tile's five cores: BRISC's moves tiles in and out, and one for each TRISC feeds the unpack, math or pack thread.
 - `ferrite/bh.py`: Blackhole's facts as data: addresses, limits, instruction and config encodings.
 - `adapters/tinygrad_ferrite.py`: tinygrad on ferrite, and PyTorch through tinygrad's frontend.
 - `test/`: every step on the simulator (`test_sim.py`), and the models.

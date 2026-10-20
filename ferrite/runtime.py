@@ -90,7 +90,7 @@ def _clang_version(): return subprocess.run(["clang", "--version"], capture_outp
 def _prune(days=7):  # once a process, before its first compile: images unused for a week go (each use touches its file),
   for f in CACHE.glob("*"):  # so what older code compiled does not pile up
     try:
-      if f.stat().st_mtime < time.time() - days * 86400: f.unlink()
+      if f.is_file() and f.stat().st_mtime < time.time() - days * 86400: f.unlink()  # (a folder: test_mac_hardware's build)
     except FileNotFoundError: pass  # another process took it first
 
 def compile_rv32(src):

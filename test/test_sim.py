@@ -80,14 +80,15 @@ def test_dram(chip):
     for port in range(3): assert chip.read(x, y + port, addr, len(d)) == d, f"bank {bank} port {port}"
 
 def test_cache_prune(tmp_path, monkeypatch):
-  # compiled images unused for a week go, once a process, before its first compile; a used one is touched, so it stays
+  # compiled images unused for a week go, once a process, before its first compile; a used one is touched, so it stays,
+  # and a folder (test_mac_hardware's build) is not an image
   import ferrite.runtime as runtime
   monkeypatch.setattr(runtime, "CACHE", tmp_path)
-  old, new = tmp_path / "old", tmp_path / "new"
-  old.write_bytes(b"x"), new.write_bytes(b"y")
-  os.utime(old, (0, time.time() - 8 * 86400))
+  old, new, folder = tmp_path / "old", tmp_path / "new", tmp_path / "folder"
+  old.write_bytes(b"x"), new.write_bytes(b"y"), folder.mkdir()
+  for f in (old, folder): os.utime(f, (0, time.time() - 8 * 86400))
   runtime._prune.__wrapped__()
-  assert not old.exists() and new.exists()
+  assert not old.exists() and new.exists() and folder.exists()
 
 def test_card_wants_root():
   # pci.Card's and pci.reset's first check, which needs no card: without root each says so, rather than failing on a
@@ -143,7 +144,7 @@ void kmain(volatile unsigned *a) {  // a: [index, 1, bank x, bank y, src, dst, n
 }"""), (bx, by, src, dst, n, len(cores), *[x | y << 6 for x, y in cores]))
   rt.wait()
   out = [struct.pack(f"<{n // 4}I", *[(w + i) & 0xFFFFFFFF for w in struct.unpack(f"<{n // 4}I", d)]) for i, d in enumerate(data)]
-  for i, ((x, y), o) in enumerate(zip(cores, out)):
+  for i, o in enumerate(out):
     assert chip.read(bx, by, dst + i * n, n) == o, f"DRAM slice {i}"
     assert chip.read(*cores[(i + 1) % len(cores)], DATA + n, 64) == o[:64], f"L1 of the core after {i}"
 
@@ -1091,6 +1092,7 @@ def test_torch_frontend(chip):
   # three Adam steps against the CPU's losses
   if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
   pytest.importorskip("tinygrad")
+  pytest.importorskip("extra.torch_backend", reason="wants a tinygrad checkout (TINYGRAD=): an installed tinygrad has no extra/")
   torch = pytest.importorskip("torch")
   from adapters import tinygrad_ferrite
   from tinygrad.helpers import Context
@@ -1418,12 +1420,12 @@ def test_mac_model():
   assert (got == want).all(), [(hex(c), hex(x), hex(y), hex(g), hex(w)) for c, x, y, g, w in zip(acc, a, b, got, want) if g != w][:5]
   assert mac.mac(0x3F800000, 0x3F80, 0x3380) == 0x3F800000 and mac.mac(0x3F800001, 0x3F80, 0x3380) == 0x3F800002, "ties to even"
 
-def test_mac_synthesis():
+def test_mac_synthesis(tmp_path):
   # the multiply-accumulate unit synthesizes: Yosys (generic gates) finds no latch, no combinational loop, no undriven or
-  # doubly driven wire in hw/mac.v
+  # doubly driven wire in hw/mac.v (run in a folder of its own: ABC leaves its history file where it runs)
   if not shutil.which("yosys"): pytest.skip("wants Yosys (Arch: pacman -S yosys)")
   hw = pathlib.Path(__file__).parent.parent / "hw"
-  run = subprocess.run(["yosys", "-q", "-p", f"read_verilog {hw / 'mac.v'}; synth -top mac -flatten; check -assert; select -assert-none t:*DLATCH*"], capture_output=True, text=True)
+  run = subprocess.run(["yosys", "-q", "-p", f"read_verilog {hw / 'mac.v'}; synth -top mac -flatten; check -assert; select -assert-none t:*DLATCH*"], capture_output=True, text=True, cwd=tmp_path)
   assert run.returncode == 0, run.stdout + run.stderr
 
 def test_mac_hardware():
