@@ -1297,7 +1297,7 @@ def test_token_accuracy(chip):
   # llama.accuracy, Tenstorrent's token accuracy (ROADMAP, Measurement): a prompt prefilled, then each step fed the
   # reference's token whatever the model picked. Against a reference made the same way from numpy (its five most likely
   # at each place) the chip's picks are numpy's top-1 throughout, and a reference that is wrong at one place costs top-1
-  # exactly that step
+  # exactly that step; in numpy (rt None, the weights as numpy arrays) the picks and scores are the same
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(6)
   c, w = smol(rng, 2)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
@@ -1310,6 +1310,7 @@ def test_token_accuracy(chip):
   top5[3] = top5[3][1:] + top5[3][:1]  # its most likely last: still among the five
   top1, five, picks = llama.accuracy(rt, t, c, prompt, after, top5, 8)
   assert (top1, five) == (7 / 8, 1) and picks[3] == top5[3][-1], (top1, five, picks)
+  assert llama.accuracy(None, w, c, prompt, after, top5, 8) == (top1, five, picks), "in numpy (rt None), the same"
 
 def test_benchmark_bytes():
   # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token; ROADMAP, Measurement): the bytes a

@@ -5,7 +5,8 @@
 # first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
 # starts), a token each a step.
 #   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
-#   ... python3 test/llama.py path/to/model path/to/<model>.refpt [steps] [mode]   # token accuracy, Tenstorrent's way
+#   ... python3 test/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]   # token accuracy, Tenstorrent's way
+# (numpy: the same weight values, as the chip holds them in mode's formats, in numpy with exact products)
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors (or another
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).
 # bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and the rest in bfp8 (numpy then has
@@ -207,12 +208,19 @@ def accuracy(rt, t, c, prompt, after, top5, steps=500):
   """Tenstorrent's token accuracy (simple_text_demo.py's TokenAccuracy) of the model on the chip: the prompt prefilled,
   then each step fed the reference's next token whatever the model predicted (teacher forcing), the steps replayed
   (jit). (top-1, top-5, the model's tokens): the shares of steps whose most likely token is the reference model's most
-  likely, or among its five."""
-  n, on = len(prompt), lambda row: Tensor.of(rt, [row], "int32")
-  kv = kv_cache(c, -(-(n + steps) // 32) * 32, zeros(rt, cache_format(c)))
-  step = jit(lambda ids, places: forward(ids, places, t, c, kv))
-  picks = [int(logits(forward(on(prompt), on(list(range(n))), t, c, kv)).argmax())]
-  for i in range(steps - 1): picks.append(int(logits(step(on([after[i]]), on([n + i]))).argmax()))
+  likely, or among its five. rt None: the model in numpy, t its weights as numpy arrays (arrays: as the chip holds
+  them), with exact products, which tells what the formats cost from what the chip's arithmetic does."""
+  n, size = len(prompt), -(-(len(prompt) + steps) // 32) * 32
+  if rt is None:
+    kv = kv_cache(c, size, np.zeros)
+    first = step = lambda ids, places: forward(ids, places, t, c, kv)[0]
+  else:
+    on, kv = lambda row: Tensor.of(rt, [row], "int32"), kv_cache(c, size, zeros(rt, cache_format(c)))
+    replay = jit(lambda ids, places: forward(ids, places, t, c, kv))
+    first = lambda ids, places: logits(forward(on(ids), on(places), t, c, kv))
+    step = lambda ids, places: logits(replay(on(ids), on(places)))
+  picks = [int(first(prompt, list(range(n))).argmax())]
+  for i in range(steps - 1): picks.append(int(step([after[i]], [n + i]).argmax()))
   return sum(p == f[0] for p, f in zip(picks, top5)) / steps, sum(p in f for p, f in zip(picks, top5)) / steps, picks
 
 def tokenizer(folder):
@@ -243,8 +251,9 @@ def main():
     c.precision = precision(c, mode)
     t = upload(rt, weights, c.precision)
     print(f"weights on the chip in {time.time() - start:.0f}s, {mode}")
-    top1, top5_share, _ = accuracy(rt, t, c, first, after, top5, steps)
-    return print(f"token accuracy over {steps} steps after a {len(first)}-token prompt: top-1 {100 * top1:.1f}%, top-5 {100 * top5_share:.1f}%")
+    on_host = "numpy" in sys.argv[5:]  # the same weight values in numpy, with exact products
+    top1, top5_share, _ = accuracy(None, arrays(weights, t), c, first, after, top5, steps) if on_host else accuracy(rt, t, c, first, after, top5, steps)
+    return print(f"token accuracy over {steps} steps after a {len(first)}-token prompt{' in numpy' if on_host else ''}: top-1 {100 * top1:.1f}%, top-5 {100 * top5_share:.1f}%")
   enc, chip = tokenizer(folder), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   start = time.time()
