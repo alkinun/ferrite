@@ -1269,8 +1269,9 @@ def test_kv_cache(chip):
 def test_llama_precision(chip):
   # TT's performance precision (llama.precision "tt"): each matmul's weights in its format (the MLP's gate and up in bfp4,
   # the rest and the output layer in bfp8) and at its fidelity phases (one for gate and up, two for the rest, attention
-  # two in decode and four in prefill), Llama-3.1-8B's last block's gate and up in bfp8 at two; numpy, given the same
-  # block-float values but exact products, picks the same tokens, its logits within 1% of their span
+  # two in decode and four in prefill), Llama-3.1-8B's last block's gate and up in bfp8 at two, the KV cache in bfp8;
+  # numpy, given the same block-float values (its cache rounded as put rounds, llama.bfp8, numpy's bfp of the same) but
+  # exact products, picks the same tokens, its logits within 1% of their span
   big = SimpleNamespace(layers=32, dim=4096)
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
@@ -1280,7 +1281,8 @@ def test_llama_precision(chip):
   t = llama.upload(rt, {k: llama.Weight(lambda v=v: (np.float32(v).view(np.uint32) >> 16).astype(np.uint16)) for k, v in w.items()}, c.precision)
   assert {k: x.dtype for k, x in t.items() if "proj" in k or k == "embed.T"} == {k: "bfp4" if "gate_up" in k else "bfp8" for k in t if "proj" in k or k == "embed.T"}
   arrays = w | {k: gpt2.values(x) for k, x in t.items() if x.dtype != "bf16"}
-  kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
+  kv, np_kv = llama.kv_cache(c, 32, llama.zeros(rt, "bfp8")), llama.kv_cache(c, 32, np.zeros)  # numpy's rounded as a bfp8 cache's
+  assert kv[0].dtype == "bfp8" and np.array_equal(llama.bfp8(w["embed"][:2, :64]), bfp(bf16(w["embed"][:2, :64])))
   on = lambda row: Tensor.of(rt, [row], "int32")
   for ids, places in (([7, 200, 31], [0, 1, 2]), ([5], [3])):  # the prompt, then a token decoded
     got, want = llama.logits(llama.forward(on(ids), on(places), t, c, kv)), llama.forward(ids, places, arrays, c, np_kv)[0]

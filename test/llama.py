@@ -36,18 +36,31 @@ def precision(c, mode="bf16"):
   mode at tt-metal 9f98dee9 (ROADMAP, "TT's performance precision"): the MLP's gate and up in bfp4 at one phase, the other
   matrices and the output layer in bfp8 at two, attention at two phases in decode and four in prefill; and for
   Llama-3.1-8B (32 blocks 4096 wide) its last block's gate and up in bfp8 at two, as its
-  model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has them."""
+  model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has them; the KV cache (kv, None) in bfp8."""
   tt, fmt = mode == "tt", lambda op: "bfp4" if op == "gate_up" else "bfp8"
   p = {(op, l): (fmt(op), 1 if op == "gate_up" else 2) if tt else (fmt(op) if mode == "bfp4" else mode, 4)
        for l in range(c.layers) for op in ("qkv", "o", "gate_up", "down")}
   if tt and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
   p["head", None] = ("bfp8", 2) if tt else ("bfp8" if mode == "bfp4" else mode, 4)
-  return p | {("attention", "decode"): (None, 2 if tt else 4), ("attention", "prefill"): (None, 4)}
+  return p | {("attention", "decode"): (None, 2 if tt else 4), ("attention", "prefill"): (None, 4), ("kv", None): ("bfp8" if tt else "bf16", None)}
+
+def bfp8(a):  # numpy's model of rows put into a bfp8 KV cache: rounded to bf16, then each run of 16 along a row to its
+  # largest exponent, 7 bits of magnitude below it, half up (as put and cast("bfp8") round)
+  b = np.asarray(a, np.float32).view(np.uint32)
+  bits = (b + 0x7FFF + (b >> 16 & 1)) >> 16
+  s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
+  runs = lambda x: x.reshape(*x.shape[:-1], -1, 16)
+  top = runs(e).max(-1, keepdims=True)
+  shift = np.minimum(top - runs(e), 8)
+  q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
+  return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(np.shape(a))
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
 def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 a head's halves, (-x2, x1) as x @ turn
   return x * cos + (x @ turn) * sin
+
+def cache_format(c): return (getattr(c, "precision", None) or {}).get(("kv", None), ("bf16", None))[0]  # the KV cache's format
 
 def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   """One block, block l: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as
@@ -59,7 +72,8 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c.eps)
   qkv = rope(f.split(f.mm(h, p["qkv_proj"], phases("qkv")), n), f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
-  f.put(cache, rows, qkv[c.heads:, :, :])  # this call's keys and values, at once (v's heads do not turn)
+  kv = qkv[c.heads:, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a bfp8 cache does
+  f.put(cache, rows, bfp8(kv) if isinstance(kv, np.ndarray) and cache_format(c) == "bfp8" else kv)
   k, v = (f.repeat(t, c.heads // c.kv) for t in (cache[:c.kv, :, :], cache[c.kv:, :, :]))  # a head for each query's, in place
   attention = phases("attention", "prefill" if prefill else "decode")
   s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(c.dim // c.heads))
@@ -172,7 +186,8 @@ def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip
 
 def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector
 
-def zeros(rt): return lambda shape: Tensor.frombytes(rt, shape[1], shape[2], bytes(2 * math.prod(shape)), shape[0])  # bf16 0s, for kv_cache
+def zeros(rt, dtype="bf16"):  # zeros of a shape on the chip, in dtype (bfp8: a bfp8 KV cache), for kv_cache
+  return lambda shape: Tensor.frombytes(rt, shape[1], shape[2], bytes(2 * math.prod(shape)), shape[0]).cast(dtype).realize()
 
 def reference(path):
   """Tenstorrent's reference file for a model (tt_transformers' tests/reference_outputs/<model>.refpt, made by its
@@ -191,7 +206,7 @@ def accuracy(rt, t, c, prompt, after, top5, steps=500):
   (jit). (top-1, top-5, the model's tokens): the shares of steps whose most likely token is the reference model's most
   likely, or among its five."""
   n, on = len(prompt), lambda row: Tensor.of(rt, [row], "int32")
-  kv = kv_cache(c, -(-(n + steps) // 32) * 32, zeros(rt))
+  kv = kv_cache(c, -(-(n + steps) // 32) * 32, zeros(rt, cache_format(c)))
   step = jit(lambda ids, places: forward(ids, places, t, c, kv))
   picks = [int(logits(forward(on(prompt), on(list(range(n))), t, c, kv)).argmax())]
   for i in range(steps - 1): picks.append(int(logits(step(on([after[i]]), on([n + i]))).argmax()))
@@ -238,7 +253,7 @@ def main():
   count = sum(x.rows * x.cols for k, x in t.items() if k not in ("embed.T", "cos", "sin", "turn"))
   w = arrays(weights, t) if count < 2e9 else None  # numpy's float32 copy of a bigger one would not fit the host
   print(f"{count / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
-  kv, np_kv = kv_cache(c, size, zeros(rt)), kv_cache(c, size, np.zeros)
+  kv, np_kv = kv_cache(c, size, zeros(rt, cache_format(c))), kv_cache(c, size, np.zeros)
   on = lambda row: Tensor.of(rt, [row], "int32")  # a row of ids or places, on the chip
   step, new = jit(lambda ids, places: forward(ids, places, t, c, kv)), ids  # a token at a time, replayed from the third
   print(prompt, end="", flush=True)
