@@ -116,13 +116,15 @@ def ferrite(folder, prompt, after, top5, book, s):
 
   def prefill(t, c, ids):
     """Seconds to the first token after ids, from them on the host, after a warm-up prefill of them (RoPE's tables
-    uploaded for their places, the cache just big enough)."""
+    uploaded for their places, the cache just big enough), and the chunk the prompt went in (llama.prefill): as many
+    tokens as keep attention's scores within 2 GiB, all of them if they fit."""
     t = t | llama.upload(rt, {k: w for k, w in llama.load(folder, len(ids))[1].items() if k in ("cos", "sin")})
-    kv = llama.kv_cache(c, -(-len(ids) // 32) * 32, llama.zeros(rt, llama.cache_format(c)))
+    size = -(-len(ids) // 32) * 32
+    kv, chunk = llama.kv_cache(c, size, llama.zeros(rt, llama.cache_format(c))), min(len(ids), max(32, (1 << 31) // (2 * c.heads * size) // 32 * 32))
     for _ in range(2):
       start = clock()
-      int(llama.logits(llama.forward(on(ids), on(list(range(len(ids)))), t, c, kv)).argmax())
-    return clock() - start
+      int(llama.logits(llama.prefill(ids, t, c, kv, chunk, on)).argmax())
+    return clock() - start, chunk
 
   rng = np.random.default_rng(0)
   a, b = (Tensor.frombytes(rt, s.n, s.n, (rng.standard_normal((s.n, s.n), np.float32).view(np.uint32) >> 16).astype(np.uint16).tobytes()) for _ in range(2))
@@ -141,7 +143,7 @@ def ferrite(folder, prompt, after, top5, book, s):
   out["B2 token accuracy"] = {"top-1": top1, "top-5": five, "steps": s.accuracy}
   ids = llama.tokenizer(folder).encode(book)
   for n in s.lengths:  # a prompt ferrite cannot run yet is published as such
-    try: out[f"B3 prefill, {n} tokens"] = {"seconds to first token": prefill(t, c, ids[:n])}
+    try: out[f"B3 prefill, {n} tokens"] = dict(zip(("seconds to first token", "chunk"), prefill(t, c, ids[:n])))
     except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run yet": f"{type(e).__name__}: {e}"}
   return out
 

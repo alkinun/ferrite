@@ -118,6 +118,14 @@ def forward(ids, places, w, c, caches, starts=None):
   head = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]
   return f.mm(h if starts is not None else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], head)
 
+def prefill(ids, w, c, caches, chunk, on=lambda row: row):
+  """forward over a prompt from place 0, chunk tokens at a time, as Tenstorrent's prefill takes a long one: each chunk's
+  keys and values go into caches before the next chunk reads them, so attention's scores are a chunk's rows by the
+  cache's places rather than the whole prompt squared. The logits for the token after the prompt. on: a row of ids or
+  places as forward takes it (on ferrite, an int32 tensor)."""
+  for i in range(0, len(ids), chunk): out = forward(on(ids[i:i + chunk]), on(list(range(i, min(i + chunk, len(ids))))), w, c, caches)
+  return out
+
 def kv_cache(c, size, zeros):  # each block's keys' heads then its values', a row for each of size places, made by zeros(shape)
   return [zeros((2 * c.kv, size, c.dim // c.heads)) for _ in range(c.layers)]
 

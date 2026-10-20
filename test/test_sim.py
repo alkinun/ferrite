@@ -1170,13 +1170,13 @@ def test_gpt2_model(chip):
     assert (i or want.argmax() == 407) and err < 2 and want[got.argmax()] >= want.max() - 2 * err, (i, err, got.argmax())
     ids.append(int(want.argmax()))
 
-def smol(rng, layers, vocab=256):  # random weights in SmolLM-135M's shapes (as test/llama.py names them), its config
+def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's shapes (as test/llama.py names them), its config
   c = SimpleNamespace(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)
   shapes = {"input_layernorm": (1, 576, 1), "post_attention_layernorm": (1, 576, 1), "q_proj": (576, 576, 0), "k_proj": (576, 192, 0),
             "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
   w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
   w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
-  return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, 64))))
+  return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, places))))
 
 def test_llama_frequencies():
   # Llama 3.1's RoPE scaling (rope_type llama3: long wavelengths slowed by 8, short ones kept, those between blended):
@@ -1265,6 +1265,23 @@ def test_kv_cache(chip):
     assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (i, np.abs(got - want).max(), np.abs(want).max())
     ids.append(int(want.argmax()))
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
+
+def test_chunked_prefill(chip):
+  # a long prompt a chunk at a time (llama.prefill, as B3's 32,768 tokens must go: attention's scores a chunk by the cache,
+  # not the prompt squared): 70 tokens in chunks of 32, 32 and 6, each chunk's keys and values cached before the next
+  # reads them. In numpy, the logits of the prompt at once; on the chip, numpy's, and then a token decoded from the
+  # cache the chunks filled
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(29)
+  c, w = smol(rng, 2, places=96)
+  t, prompt, on = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, [int(i) for i in rng.integers(0, 256, 70)], lambda row: Tensor.of(rt, [row], "int32")
+  kv, np_kv = llama.kv_cache(c, 96, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 96, np.zeros)
+  want = llama.prefill(prompt, w, c, np_kv, 32)[0]
+  assert np.allclose(want, llama.forward(prompt, range(70), w, c, llama.kv_cache(c, 96, np.zeros))[0], atol=1e-3)
+  got = llama.logits(llama.prefill(prompt, t, c, kv, 32, on))
+  assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), np.abs(got - want).max()
+  nxt = int(want.argmax())
+  got, want = llama.logits(llama.forward(on([nxt]), on([70]), t, c, kv)), llama.forward([nxt], [70], w, c, np_kv)[0]
+  assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), np.abs(got - want).max()
 
 def test_llama_precision(chip):
   # TT's performance precision (llama.precision "tt"): each matmul's weights in its format (the MLP's gate and up in bfp4,
