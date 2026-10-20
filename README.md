@@ -49,8 +49,9 @@ replayed from a recording, its loss and gradients the same as PyTorch's for the 
 
 tinygrad, outside ferrite: its tensor graph runs on ferrite as the FERRITE device, so tinygrad's own scripts run
 unchanged (its `examples/transformer.py` learns two-digit addition to 99.99% on the simulator) and `TinyJit` replays a
-call's launches as ferrite's `jit` does. PyTorch code comes the same way, through tinygrad's own PyTorch frontend
-(`extra/torch_backend` in tinygrad: the `"tiny"` device).
+call's launches as ferrite's `jit` does. So does tinygrad's own LLM code (`tinygrad/llm`'s Transformer), matching
+ferrite's own Llama's logits, though not yet at its speed (NOTES: "tinygrad on ferrite"). PyTorch code comes the same
+way, through tinygrad's own PyTorch frontend (`extra/torch_backend` in tinygrad: the `"tiny"` device).
 
     TTSIM=... PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
 
