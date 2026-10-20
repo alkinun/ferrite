@@ -1324,6 +1324,16 @@ def test_llama_8b_shapes(chip):
     got, want = llama.logits(out), llama.forward(new, places, arrays, c, np_kv)[0]
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.02 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
 
+def test_benchmark_table():
+  # the two stacks' results side by side (benchmark.table), with B1's and B2's gate: TT-NN's speed over ferrite's, at most 1.5
+  ours = {"versions": {"lines of code": {"ferrite": 1}}, "clock": "the host's", "B1 matmul 4096^3 bf16, 2 phases": {"ms": 3.0},
+          "B2 decode, batch 1": {"tokens/s": 40.0}, "B3 prefill, 32768 tokens": {"does not run yet": "MemoryError"}}
+  theirs = {"versions": {"lines of code": {"tt-metal": 2}}, "clock": "the host's", "B1 matmul 4096^3 bf16, 2 phases": {"ms": 1.5},
+            "B2 decode, batch 1": {"tokens/s": 50.0}, "B3 prefill, 32768 tokens": {"seconds to first token": 9.0}}
+  rows = benchmark.table(ours, theirs).splitlines()
+  assert rows[2].endswith("| 2.00 (past 1.5) |") and rows[3].endswith("| 1.25 (within 1.5) |") and rows[4].endswith("|  |"), rows
+  assert all(r.count("|") == 5 for r in rows) and "MemoryError" in rows[4], rows
+
 def test_chunked_prefill(chip):
   # a long prompt a chunk at a time (llama.prefill, as B3's 32,768 tokens must go: attention's scores a chunk by the cache,
   # not the prompt squared): 70 tokens in chunks of 32, 32 and 6, each chunk's keys and values cached before the next

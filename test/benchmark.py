@@ -2,6 +2,7 @@
 # on the same card, with the versions of everything that took part. Prints them and writes them to benchmark-<stack>.json.
 #   python3 test/benchmark.py ferrite path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py ttnn path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
+#   python3 test/benchmark.py table benchmark-ferrite.json benchmark-ttnn.json   # the two side by side, as markdown
 # The folder holds Hugging Face's files for the model; the reference file is tt_transformers'
 # tests/reference_outputs/<model>.refpt. B3's prompts are the start of A Tale of Two Cities, which tt_transformers keeps
 # beside them (tests/tale-of-two-cities.txt.bz2; BOOK=path for another place).
@@ -211,7 +212,23 @@ def ttnn(folder, prompt, after, top5, book, s):
                                           "--max_seq_len", str(2 * n), "--max_generated_tokens", "1", text=tok.decode(ids[:n - 1]))
   return out
 
+def table(ferrite, ttnn):
+  """The two stacks' results side by side, as markdown: each benchmark's numbers, and for B1 and B2 the gate's ratio
+  (ROADMAP: ferrite no more than 1.5 times slower than TT-NN: a time at most 1.5 times, a speed at least two thirds)."""
+  show = lambda v: ", ".join(f"{k} {x:.4g}" if isinstance(x, float) else f"{k} {x}" for k, x in v.items()) if isinstance(v, dict) else str(v)
+  rows = ["| | ferrite | TT-NN | TT-NN's speed over ferrite's |", "|---|---|---|---|"]
+  for key in [k for k in {**ferrite, **ttnn} if k.startswith("B")]:
+    f, t = ferrite.get(key, {}), ttnn.get(key, {})
+    speed = ("ms", -1) if key.startswith("B1") else ("tokens/s", 1) if key == "B2 decode, batch 1" else None  # (a time's ratio inverted)
+    ratio = (t[speed[0]] / f[speed[0]]) ** speed[1] if speed and speed[0] in f and speed[0] in t else None
+    gate = "" if ratio is None else f"{ratio:.2f} ({'within' if ratio <= 1.5 else 'past'} 1.5)"
+    rows.append(f"| {key} | {show(f)} | {show(t)} | {gate} |")
+  for key in ("lines of code", "clock"): rows.append(f"| {key} | {show(ferrite['versions'].get(key) if key != 'clock' else ferrite.get(key))} | "
+                                                    f"{show(ttnn['versions'].get(key) if key != 'clock' else ttnn.get(key))} | |")
+  return "\n".join(rows)
+
 def main():
+  if sys.argv[1] == "table": return print(table(*(json.load(open(p)) for p in sys.argv[2:4])))
   stack, folder, refpt, s = sys.argv[1], sys.argv[2], sys.argv[3], SIZES["--quick" in sys.argv]
   assert stack in ("ferrite", "ttnn"), "the stack to measure: ferrite or ttnn"
   prompt, after, top5 = llama.reference(refpt)
