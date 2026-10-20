@@ -16,7 +16,7 @@ are ticked as tests show them. NOTES.md has the detail of what is built.
 
 Done: a real model generates text on ttsim with nothing from Tenstorrent but the simulator.
 
-## Stage 1: a general compiler, on the simulator
+## Stage 1: a general compiler, on the simulator (done)
 
 Any model and training, from a small set of primitives: every model is built from these, and training is each run
 backwards.
@@ -57,8 +57,8 @@ Done: competitive numbers, and for every gap, a known reason.
 - [x] A tinygrad backend (tinygrad is built on almost the same primitives): `adapters/tinygrad_ferrite.py`, `test_tinygrad`
 - [x] A PyTorch adapter: `adapters/torch_ferrite.py`, `test_torch`
 - [x] Models and training scripts written for those frameworks run unchanged: tinygrad's `examples/transformer.py`
-      trains to 99.99% on ttsim; Hugging Face transformers' SmolLM-135M runs, generates and fine-tunes through the
-      PyTorch adapter (`test_transformers`)
+      trains to 99.99% on ttsim; Hugging Face transformers' own Llama runs, generates and fine-tunes through the
+      PyTorch adapter, and runs SmolLM-135M's real weights (`test_transformers`)
 
 Done: someone else's model trains on a Tenstorrent card through ferrite.
 

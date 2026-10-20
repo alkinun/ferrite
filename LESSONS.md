@@ -60,8 +60,8 @@ append a correction.
    line; run with `-s` to see it.
 2. **Its cycles compare our versions, not silicon.** NoC requests and DRAM answer at once and every Tensix instruction
    runs atomically. So latency hiding (a deeper prefetch) looks slower on ttsim, and some costs are ttsim's own: a
-   kernel whose root is a binary op costs 110 cycles a tile more. Record such results in NOTES for the card to settle.
-   (NOTES: "ttsim's cycles are its model")
+   kernel whose root is a binary op costs about 50 cycles a tile more. Record such results in NOTES for the card to
+   settle. (NOTES: "ttsim's cycles are its model")
 3. **What it does not model, no test can catch.** Instruction cache invalidation, PC snapshots, `mhartid`, the busy
    conditions of `STALLWAIT`, NoC request splitting. The waits only silicon exercises are step 8 of the bring-up plan.
    (NOTES: "What ttsim can and cannot check here")
@@ -81,8 +81,8 @@ append a correction.
    each other instead, and fetches on BRISC's critical path: fetching a layer norm's inputs once took it from 2.6k
    cycles to 0.6k. (NOTES: "How ttsim counts")
 8. **What the simulator does not count, the card will.** ttsim counts the chip's clocks, never the host's: issuing a
-   GPT-2 token took ferrite's Python 10.8 ms (7.3 ms now), where the card should need 0.5 ms. Measure the host as well; replaying a
-   recorded token (`jit`) takes it to 0.1 ms. (NOTES: "The host's part, and replay")
+   GPT-2 token took ferrite's Python 10.8 ms (7.3 ms now), where the card should need 0.5 ms. Measure the host as
+   well; replaying a recorded token (`jit`) takes it to 0.1 ms. (NOTES: "The host's part, and replay")
 9. **A round trip the simulator answers at once is a microsecond on the card.** ttsim answers a read of host memory
    and acknowledges a write to it in no time, so a design that makes a few a launch looks free there: the dispatcher
    read each command's header and then its body and waited for two status writes' acknowledgements, and `tobytes`
@@ -103,10 +103,9 @@ append a correction.
 4. **One padding rule beats special cases.** Padding is zero, except that a dimension of 1 fills its tile. That one
    rule gives broadcasting by tile reuse, lets a matmul sum over a padded K, and every kernel keeps it. Mask with
    stores, not multiplies: inf times 0 is NaN. (NOTES: "Any shape")
-5. **Launch cost dominates small work.** A GPT-2 token went from 2.07M simulated cycles to 117k mostly by launching
-   less and more cheaply: resident kernels, a ring the dispatcher reads by itself, multicast, split K, fewer kernels,
-   a go set up in advance.
-   Faster math was a small part of it.
+5. **Launch cost dominates small work.** A GPT-2 token went from 2.07M simulated cycles to 117k (60k now) mostly by
+   launching less and more cheaply: resident kernels, a ring the dispatcher reads by itself, multicast, split K, fewer
+   kernels, a go set up in advance. Faster math was a small part of it.
 6. **Generate straight-line code.** Kernel setup as straight-line pushes of constants, overlapped across the threads,
    took a one-tile kernel from 790 cycles to 490 against loops over tables in L1. The compiler is Python; the device
    code can be as specialised as we like.
@@ -199,14 +198,13 @@ append a correction.
     casts fused at a kernel's root, 427). (NOTES: "Training")
 31. **Before making a copy faster, ask whether the reader could take the data where it lies.** Grouped-query attention
     stacked 9 query heads into 3 groups and back: two moves and a copy a block, a third of a SmolLM block's cycles. A
-    view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 180k.
-    (NOTES: "A Llama-family model")
-
+    view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 180k
+    (156k now). (NOTES: "A Llama-family model")
 32. **Run the framework's own tests.** tinygrad's `test_ops`, unchanged on the FERRITE device, found what our tests of
     the adapter never reached: an int product labelled int32 where ferrite made it in fp32, bools copied back as the
     bytes they were computed in, a freed buffer handed on with its old contents, a padding mask dropped on an axis of
-    1, zero-size shapes, views at an offset. 266 of its 420 passed, then 339; most of the rest is the FPU's matmul
-    precision. (NOTES: "tinygrad on ferrite")
+    1, zero-size shapes, views at an offset. 266 of its 420 passed, then 339, now 356; most of the rest is the FPU's
+    matmul precision. (NOTES: "tinygrad on ferrite")
 33. **When a tree must be cut, cut where it is shared.** A kernel holds 15 ops, and past that the realizer cut down the
     heaviest branch, which in an RMSNorm over a long residual stream is its sum of squares: the stream was added up in
     two kernels and the norm took three. Computing first the value two of its ops read made it two, and a SmolLM token

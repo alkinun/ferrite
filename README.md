@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2800 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2,900 lines of Python.
 Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
@@ -31,11 +31,11 @@ need numpy. Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (
 
 ## What runs
 
-GPT-2 small and SmolLM-135M (SmolLM2-360M too) with their real weights (Hugging Face's `model.safetensors`), each word
-checked against the same model in numpy; where ferrite picks another, its pick is in brackets (here a near tie, 0.36
-apart in numpy's logits). Both decode with a KV cache, each token replayed from a recording, so a token costs the host
-0.1 ms, and both can keep their weight matrices in bfp8 (add `bfp8`), at about half the bytes (SmolLM's MLP in bfp4 too,
-as Tenstorrent's own code keeps it: add `bfp4`).
+GPT-2 small and SmolLM-135M (SmolLM2-360M and 1.7B too) with their real weights (Hugging Face's `model.safetensors`),
+each word checked against the same model in numpy; where ferrite picks another, its pick is in brackets (here a near
+tie, 0.36 apart in numpy's logits). Both decode with a KV cache, each token replayed from a recording, so a token
+costs the host 0.1 ms, and both can keep their weight matrices in bfp8 (add `bfp8`), at about half the bytes (SmolLM's
+MLP in bfp4 too, as Tenstorrent's own code keeps it: add `bfp4`).
 
     TTSIM=... python3 test/gpt2.py model.safetensors "The meaning of life is" 8
     The meaning of life is not[ferrite: ' to'] the same as the meaning of death
@@ -47,9 +47,9 @@ replayed from a recording, its loss and gradients the same as PyTorch's for the 
 
 Frameworks, outside ferrite: tinygrad's tensor graph runs on it as the FERRITE device, so tinygrad's own scripts run
 unchanged (its `examples/transformer.py` learns two-digit addition to 99.99% on the simulator) and `TinyJit` replays a
-call's launches as ferrite's `jit` does; and PyTorch's, as a
-`FerriteTensor` whose aten ops run on the chip, so eager PyTorch, its autograd and its optimizers do, and Hugging Face
-transformers' models run, generate and fine-tune unchanged.
+call's launches as ferrite's `jit` does. PyTorch runs on it too: a `FerriteTensor`'s aten ops run on the chip, so
+eager PyTorch, its autograd and its optimizers do, and Hugging Face transformers' models run, generate and fine-tune
+unchanged.
 
     TTSIM=... PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
 
@@ -59,13 +59,13 @@ transformers' models run, generate and fine-tune unchanged.
 
 ## Speed
 
-Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 4 to 18 times
-fewer cycles of control work, reading as little DRAM, and runs SmolLM-135M end to end, the same tokens, in 9 to 10
-times fewer cycles a token than Tenstorrent's own LLM code (`tt_transformers`), with a quarter as many launches (5 times
-fewer cycles for 32 users decoding at once), 8 to 11 times fewer for SmolLM2-360M. The simulator times only that control work, not the
-math or the DRAM: by 1.7B parameters a token's weights take longer to read than TT's control work, so there both would
-wait on DRAM and the lead is in how close each gets to the card's bandwidth. How fast either is on a real card waits for
-one; `COMPARE.md` has the numbers and what carries over.
+Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 4 to 18
+times fewer cycles of control work, reading as little DRAM, and runs SmolLM-135M end to end, the same tokens, in 9 to
+10 times fewer cycles a token than Tenstorrent's own LLM code (`tt_transformers`), with a quarter as many launches (5
+times fewer cycles for 32 users decoding at once), 8 to 11 times fewer for SmolLM2-360M. The simulator times only that
+control work, not the math or the DRAM: by 1.7B parameters a token's weights take longer to read than TT's control
+work, so there both would wait on DRAM and the lead is in how close each gets to the card's bandwidth. How fast either
+is on a real card waits for one; `COMPARE.md` has the numbers and what carries over.
 
 ## Code
 

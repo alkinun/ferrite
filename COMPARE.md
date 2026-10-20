@@ -15,7 +15,7 @@ matmuls at full precision (HiFi4) in both; each op is one launch in ferrite and 
 | add 32x32 (one tile: launch cost) | **0.30k** | 5.3k | 0.8k | 1.00x | 1.00x |
 
 ferrite does each op in 4 to 18 times fewer cycles than TT-NN with fast dispatch, which dispatches from cores on the
-chip as ferrite does, and in 2 to 3 times fewer than TT-NN's kernels alone (slow dispatch, where the host does the
+chip as ferrite does, and in 2 to 3.5 times fewer than TT-NN's kernels alone (slow dispatch, where the host does the
 dispatching at no cost here). ferrite reads each input from DRAM about once, TT-NN up to 1.5 times.
 
 ## End to end: SmolLM-135M
@@ -36,11 +36,11 @@ cache, and both write the same tokens, " a question that has been".
 | ... that at a p150's 512 GB/s | 0.53 ms | 0.28 ms | 0.23 ms, 0.33 ms |
 
 ferrite decodes a token in 9 to 10 times fewer simulated cycles than TT's own model code, and prefills in 11 to 12
-times fewer, with a quarter as many launches. TT's two precision modes are within 0.1% of each other here: performance mode
-keeps the MLP's up and gate weights in bfp4 at LoFi and the rest in bfp8 at HiFi2, accuracy mode attention and the KV
-cache in bf16 at HiFi4 and the MLP in bfp8; the output layer is bfp8 in both. ttsim counts the RISC-V work around the
-math, which those settings barely change (ferrite's bfp8 costs it 11%, two reads a tile). TT's operations a token are
-82 for one block and 126 for two (counted untraced), so 44 a block where ferrite has 12.
+times fewer, with a quarter as many launches. TT's two precision modes are within 0.1% of each other here: performance
+mode keeps the MLP's up and gate weights in bfp4 at LoFi and the rest in bfp8 at HiFi2, accuracy mode attention and
+the KV cache in bf16 at HiFi4 and the MLP in bfp8; the output layer is bfp8 in both. ttsim counts the RISC-V work
+around the math, which those settings barely change (ferrite's bfp8 costs it 11%, two reads a tile). TT's operations a
+token are 82 for one block and 126 for two (counted untraced), so 44 a block where ferrite has 11 or 12.
 
 At place 1000 TT's token costs what it does at place 5, and ferrite's 50k more: on ttsim, where tile work is free, a
 longer cache costs TT's attention no more control, while ferrite's grows with it (the attention kernel, one line of 32
@@ -49,9 +49,9 @@ rate ferrite would reach TT's 1.6M near 29,000 places, far past SmolLM's 2,048.
 
 32 users decoding together (all from the same prompt, each at its own places; `llama.forward`'s starts, TT's batch)
 take ferrite 5 times fewer cycles a step than TT, 10.6k a token against 57k. Batching gains TT more: it computes 32
-rows for one user anyway, so 32 users cost it 14% more than one, and ferrite 2.2 times one. Its attention is per user, where ferrite's runs over
-every user's cache, masked: no more tile work, but one line of work a head, 9 lines for 119 workers (NOTES, "A
-Llama-family model").
+rows for one user anyway, so 32 users cost it 14% more than one, and ferrite 2.2 times one. TT's attention is per
+user, where ferrite's runs over every user's cache, masked: no more tile work, but one line of work a head, 9 lines
+for 119 workers (NOTES, "A Llama-family model").
 
 What it could mean on a card: if silicon's RISC-V control work is anything like ttsim's count (in-order cores, about
 an instruction a clock at 1.35 GHz), TT's 1.6M cycles are 1.2 ms of control a token, five times its 0.23 ms of DRAM
@@ -129,7 +129,7 @@ lead is in the work around the math, so it is largest where that work is: small 
 Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.2 s; tt-metal builds its firmware when
 the device opens (0.9 s) and each op's kernels the first time (0.6 to 0.8 s). Both cache on disk.
 
-Size: ferrite is about 2,800 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python, not counting
+Size: ferrite is about 2,900 lines of Python. tt-metal's stack is about 1.65M lines of C++ and Python, not counting
 tests: tt-metal 540k, LLK 111k (44k of it Blackhole's), TT-NN 935k, UMD 56k, tt-kmd 10k.
 
 On 2026-10-18 (ferrite at bc715ac) it was the other way round for DRAM: ferrite's matmul read 6.9 times its inputs, its
@@ -160,7 +160,8 @@ SmolLM-135M through TT's Python API needs `tools` on the path (its `tracy` modul
 TT's tokenizer (which fails on this model: no `<unk>` in its vocabulary), and the prefill warmup off (it runs TT's
 on-device sampling, which uses an SFPU instruction ttsim does not model, `SFPCONFIG` mode 8):
 
-    TTSIM=/path/to/libttsim.so python3 cmp/ferrite_smollm.py bf16 4    # or bfp8; a third argument, 32, for 32 users
+    TTSIM=/path/to/libttsim.so python3 cmp/ferrite_smollm.py bf16 4    # or bfp8 or bfp4; a third argument, 32, for 32 users
+    MODEL=/path/to/SmolLM2-360M ... cmp/ferrite_smollm.py bf16 4    # another model (SmolLM2-1.7B too); HF_MODEL for TT's
     HF_MODEL=/path/to/SmolLM-135M TT_METAL_RUNTIME_ROOT=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so \
       TT_METAL_DISABLE_SFPLOADMACRO=1 LD_LIBRARY_PATH=$PWD/tt-metal/build_Release/lib \
       PYTHONPATH=$PWD/tt-metal:$PWD/tt-metal/ttnn:$PWD/tt-metal/tools python3 cmp/ttnn_smollm.py performance 4    # or accuracy
