@@ -1,6 +1,6 @@
 # Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
-import math, os, random, struct, sys, time, pytest
+import json, math, os, pathlib, random, struct, sys, time, pytest
 import numpy as np
 from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
@@ -1178,6 +1178,54 @@ def smol(rng, layers, vocab=256):  # random weights in SmolLM-135M's shapes (as 
   w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
   w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
   return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, 64))))
+
+def test_llama_frequencies():
+  # Llama 3.1's RoPE scaling (rope_type llama3: long wavelengths slowed by 8, short ones kept, those between blended):
+  # test/llama.py's frequencies are Hugging Face's, in float32 to the bit
+  m, transformers = pytest.importorskip("transformers.modeling_rope_utils"), pytest.importorskip("transformers")
+  rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+  hf = transformers.LlamaConfig(hidden_size=4096, num_attention_heads=32, rope_theta=500000.0, rope_scaling=rope, max_position_embeddings=131072)
+  want = m.ROPE_INIT_FUNCTIONS["llama3"](hf, "cpu")[0].numpy()
+  got = llama.frequencies(SimpleNamespace(dim=4096, heads=32, theta=500000.0, rope=rope))
+  assert got.dtype == np.float32 and np.array_equal(got, want), np.abs(got - want).max()
+  plain = llama.frequencies(SimpleNamespace(dim=4096, heads=32, theta=500000.0))
+  assert plain[0] == got[0] and plain[-1] == 8 * got[-1], "short wavelengths kept, long ones slowed by the factor"
+
+def safetensors(path, tensors):  # {name: (dtype "BF16" or "F32", array of its bits or values)} as a safetensors file
+  header, data = {}, b""
+  for name, (dtype, a) in tensors.items():
+    header[name] = {"dtype": dtype, "shape": list(a.shape), "data_offsets": [len(data), len(data) + a.nbytes]}
+    data += a.tobytes()
+  head = json.dumps(header).encode()
+  pathlib.Path(path).write_bytes(struct.pack("<Q", len(head)) + head + data)
+
+def test_llama_load(tmp_path):
+  # a checkpoint in two files and an index, as Llama-3.1-8B's comes, with an output layer of its own (lm_head) and a
+  # norm in float32: llama.load reads each weight only when asked, transposed for x @ w, q, k and v (and gate and up) side
+  # by side, float32 rounded to bf16 to nearest even, and RoPE's tables for the places asked for, not the model's 131072
+  rng, dim, ffn, vocab = np.random.default_rng(31), 64, 96, 40
+  w = lambda r, c: (rng.standard_normal((r, c)).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
+  parts = {"model.embed_tokens.weight": w(vocab, dim), "lm_head.weight": w(vocab, dim), "model.norm.weight": w(1, dim)[0],
+           **{f"model.layers.0.self_attn.{n}_proj.weight": w(r, dim) for n, r in (("q", dim), ("k", 32), ("v", 32), ("o", dim))},
+           **{f"model.layers.0.mlp.{n}_proj.weight": w(r, cl) for n, r, cl in (("gate", ffn, dim), ("up", ffn, dim), ("down", dim, ffn))}}
+  norms = {f"model.layers.0.{n}.weight": rng.standard_normal(dim).astype(np.float32) for n in ("input_layernorm", "post_attention_layernorm")}
+  safetensors(tmp_path / "model-00001-of-00002.safetensors", {k: ("BF16", v) for k, v in list(parts.items())[:5]} | {k: ("F32", v) for k, v in norms.items()})
+  safetensors(tmp_path / "model-00002-of-00002.safetensors", {k: ("BF16", v) for k, v in list(parts.items())[5:]})
+  (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: f"model-0000{1 + (i >= 5)}-of-00002.safetensors"
+                                                                                   for i, k in enumerate(list(parts) + list(norms))}}))
+  rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+  (tmp_path / "config.json").write_text(json.dumps({"hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1, "num_hidden_layers": 1,
+                                                    "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "max_position_embeddings": 131072,
+                                                    "rope_scaling": rope, "vocab_size": vocab}))
+  c, weights = llama.load(str(tmp_path), 64)
+  assert c.places == 64 and c.rope == rope and weights["cos"].bits().shape == (64, 4 * 32)
+  q, k, v = (parts[f"model.layers.0.self_attn.{n}_proj.weight"] for n in "qkv")
+  assert np.array_equal(weights["layers.0.qkv_proj"].bits(), np.concatenate([q.T, k.T, v.T], 1))
+  assert np.array_equal(weights["embed.T"].bits(), parts["lm_head.weight"].T), "its own output layer, not the embedding"
+  bits = norms["model.layers.0.input_layernorm.weight"].view(np.uint32)
+  assert np.array_equal(weights["layers.0.input_layernorm"].bits()[0], ((bits + 0x7FFF + (bits >> 16 & 1)) >> 16).astype(np.uint16))
+  out = llama.forward([3, 7], [0, 1], llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros))
+  assert out.shape == (1, vocab) and np.isfinite(out).all()
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_llama_layer(chip, n):
