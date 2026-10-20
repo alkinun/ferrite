@@ -112,8 +112,7 @@ class Weight:
 
 def fuse(w):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls
   cat = lambda xs: np.ascontiguousarray(np.concatenate(xs, 1))
-  join = lambda *xs: (Weight(lambda: cat([x.bits() for x in xs])) if isinstance(xs[0], Weight) else
-                      tuple(map(join, *xs)) if isinstance(xs[0], tuple) else cat(xs))
+  join = lambda *xs: Weight(lambda: cat([x.bits() for x in xs])) if isinstance(xs[0], Weight) else cat(xs)
   for pre in {k[:k.index(".", 7) + 1] for k in w if k.startswith("layers.")}:
     w[pre + "qkv_proj"] = join(*(w.pop(pre + n) for n in ("q_proj", "k_proj", "v_proj")))
     w[pre + "gate_up_proj"] = join(w.pop(pre + "gate_proj"), w.pop(pre + "up_proj"))
@@ -124,7 +123,7 @@ def forward(ids, places, w, c, caches, starts=None):
   block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids and places are
   rows: lists for numpy, int32 tensors for ferrite. starts: several sequences decoding together (a batch of users), their
   caches side by side, each token's sequence starting at its start's row and each token seeing only its own sequence;
-  then the logits are every token's, the next token of each (rows: numpy arrays for numpy)."""
+  then the logits are every token's, the next token of each (on the chip only)."""
   f = fns(w["embed"])
   x, rows = f.rows(w["embed"], ids), places if starts is None else places + starts
   rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(rows, caches[0].shape[-2], starts)
@@ -262,22 +261,22 @@ def main():
   c, weights = load(folder, size)
   c.precision = precision(c, mode)
   t = upload(rt, weights, c.precision)
-  count = sum(x.rows * x.cols for k, x in t.items() if k not in ("embed.T", "cos", "sin", "turn"))
+  count = sum(x.rows * x.cols for k, x in t.items() if k not in ("cos", "sin", "turn"))  # (a tied output layer twice)
   w = arrays(weights, t) if count < 2e9 else None  # numpy's float32 copy of a bigger one would not fit the host
-  print(f"{count / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
-  kv, np_kv = kv_cache(c, size, zeros(rt, cache_format(c))), kv_cache(c, size, np.zeros)
+  print(f"{count / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s" + ("" if w else ", too many to check in numpy"))
+  kv, np_kv = kv_cache(c, size, zeros(rt, cache_format(c))), w and kv_cache(c, size, np.zeros)
   on = lambda row: Tensor.of(rt, [row], "int32")  # a row of ids or places, on the chip
   step, new = jit(lambda ids, places: forward(ids, places, t, c, kv)), ids  # a token at a time, replayed from the third
   print(prompt, end="", flush=True)
   for i in range(steps):  # the prompt at once, then a token at a time, each seeing the keys and values cached so far
     start, places = time.time(), list(range(len(ids) - len(new), len(ids)))
     got = logits(forward(on(new), on(places), t, c, kv) if i == 0 else step(on(new), on(places)))
-    want = forward(new, places, w, c, np_kv)[0] if w else got
+    want = forward(new, places, w, c, np_kv)[0] if w else got  # unchecked: ferrite's own
     agree += int(got.argmax()) == int(want.argmax())
     new = [int(want.argmax())]  # numpy's pick, so that one near tie does not send the two down different paths
     ids += new
     print(enc.decode(new) + ("" if got.argmax() == want.argmax() else f"[ferrite: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
-    print(f" ({time.time() - start:.0f}s, logits within {np.abs(got - want).max():.2f})", end="", file=sys.stderr, flush=True)
-  print(f"\nferrite picked the same token as numpy {agree} times out of {steps}")
+    print(f" ({time.time() - start:.0f}s" + (f", logits within {np.abs(got - want).max():.2f})" if w else ")"), end="", file=sys.stderr, flush=True)
+  print(f"\nferrite picked the same token as numpy {agree} times out of {steps}" if w else "")
 
 if __name__ == "__main__": main()

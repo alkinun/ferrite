@@ -171,8 +171,8 @@ def test_queue(chip):
   for x, y in rt.cores: assert chip.read32(x, y, DATA) == sum(range(100))
 
 def test_probe(chip):
-  # ferrite.probe's kernels all run and report, at small sizes (on ttsim the numbers say nothing about silicon): each
-  # DRAM probe read what it says it read, counted by the workers' NIUs
+  # ferrite.probe's kernels all run and report, at small sizes (on ttsim the numbers say nothing about silicon), and the
+  # workers' NIUs count at least the reads the DRAM probes say they made (the other probes read too)
   from ferrite import probe
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in chip.tensix)
   before = reads()
@@ -512,7 +512,9 @@ def test_sfpu(chip):
   # word, while recip's and relu's are replayed
   u = [[bf(random.uniform(-3, 3)) for _ in range(64)] for _ in range(64)]
   w = [[bf(random.choice((-1, 1)) * random.uniform(0.5, 2)) for _ in range(64)] for _ in range(64)]
-  got = (Tensor.of(rt, u).exp().relu() + Tensor.of(rt, w).reciprocal()).tolist()
+  tu, tw = Tensor.of(rt, u), Tensor.of(rt, w)
+  launches, got = rt.launches, (tu.exp().relu() + tw.reciprocal()).tolist()
+  assert kernels(rt, launches) == 1, "one kernel"
   for g, ru, rw in zip(got, u, w):
     for gv, uv, wv in zip(g, ru, rw):
       e, r = exp(uv), recip(wv)
@@ -616,7 +618,9 @@ def test_reduce_axes(chip):
     close((tx - tx.max(1)).exp() / (tx - tx.max(1)).exp().sum(1), e / e.sum(1, keepdims=True), 0.02)
     launches, got = rt.launches, tx.sum() * (1 / x.size)
     assert abs(got.tolist()[0][0] - x.mean()) <= 2**-7 * abs(x.mean()) and kernels(rt, launches) == 3, "an axis a launch"
+    launches = rt.launches
     close(tx.sum(0) * tx[1] - 1.0, x.sum(0) * x[1] - 1, 2**-6)  # the batch sum, a view and a number in one kernel
+    assert kernels(rt, launches) == 1, "fused" 
     y = bf16(rng.uniform(-2, 2, (2, 45, 200)))  # reductions of another length than the result along the axis: first, alone
     ty = Tensor.of(rt, y.tolist())
     close(tx[0:1, :, :].max(1) * ty[:, :, :70] + 1.0, x[0:1].max(1, keepdims=True) * y[:, :, :70] + 1, 2**-6)
@@ -1140,9 +1144,10 @@ def test_gpt2_layer(chip, n, dtype, size):
   # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so attention spans tiles),
   # against the same code (test/gpt2.py) in numpy, float64, with the same weights: bf16, or the matrices cast to bfp8 on
   # the chip (numpy then has them as the chip does); with size, its keys and values put into a KV cache of that many
-  # places, attention reading all of them, the empty ones masked. Weights as GPT-2 initialises them; the attention is
-  # causal and not uniform (scores of a few units). Every intermediate is bf16 here, so the block's change to x (up to
-  # ~2) must match to within 3% of its size
+  # places, attention reading all of them, the empty ones masked. Matrices as GPT-2 initialises them (normal, 0.02 wide),
+  # biases and norms about 0 and 1 but 0.1 wide, so that they count; the attention is causal and not uniform (scores of
+  # a few units). Every intermediate is bf16 here, so the block's change to x (up to ~2) must match to within 3% of its
+  # size
   rt, rng, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 768
   shapes = {"ln_1.weight": (1, d, 1), "ln_1.bias": (1, d, 0), "attn.c_attn.weight": (d, 3 * d, 0), "attn.c_attn.bias": (1, 3 * d, 0),
             "attn.c_proj.weight": (d, d, 0), "attn.c_proj.bias": (1, d, 0), "ln_2.weight": (1, d, 1), "ln_2.bias": (1, d, 0),
@@ -1213,26 +1218,28 @@ def safetensors(path, tensors):  # {name: (dtype "BF16" or "F32", array of its b
 
 def test_llama_load(tmp_path):
   # a checkpoint in two files and an index, as Llama-3.1-8B's comes, with an output layer of its own (lm_head) and a
-  # norm in float32: llama.load reads each weight only when asked, transposed for x @ w, q, k and v (and gate and up) side
-  # by side, float32 rounded to bf16 to nearest even, and RoPE's tables for the places asked for, not the model's 131072
+  # norm in float32: llama.load gives each weight as a Weight, read only when asked, transposed for x @ w, q, k and v (and
+  # gate and up) side by side, float32 rounded to bf16 to nearest even, and RoPE's tables for the places asked for, not
+  # the model's 131072
   rng, dim, ffn, vocab = np.random.default_rng(31), 64, 96, 40
   w = lambda r, c: (rng.standard_normal((r, c)).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
   parts = {"model.embed_tokens.weight": w(vocab, dim), "lm_head.weight": w(vocab, dim), "model.norm.weight": w(1, dim)[0],
            **{f"model.layers.0.self_attn.{n}_proj.weight": w(r, dim) for n, r in (("q", dim), ("k", 32), ("v", 32), ("o", dim))},
            **{f"model.layers.0.mlp.{n}_proj.weight": w(r, cl) for n, r, cl in (("gate", ffn, dim), ("up", ffn, dim), ("down", dim, ffn))}}
   norms = {f"model.layers.0.{n}.weight": rng.standard_normal(dim).astype(np.float32) for n in ("input_layernorm", "post_attention_layernorm")}
-  safetensors(tmp_path / "model-00001-of-00002.safetensors", {k: ("BF16", v) for k, v in list(parts.items())[:5]} | {k: ("F32", v) for k, v in norms.items()})
-  safetensors(tmp_path / "model-00002-of-00002.safetensors", {k: ("BF16", v) for k, v in list(parts.items())[5:]})
-  (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: f"model-0000{1 + (i >= 5)}-of-00002.safetensors"
-                                                                                   for i, k in enumerate(list(parts) + list(norms))}}))
+  files = [{k: ("BF16", v) for k, v in list(parts.items())[:5]} | {k: ("F32", v) for k, v in norms.items()}, {k: ("BF16", v) for k, v in list(parts.items())[5:]}]
+  for i, file in enumerate(files): safetensors(tmp_path / f"model-0000{i + 1}-of-00002.safetensors", file)
+  (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: f"model-0000{i + 1}-of-00002.safetensors" for i, file in enumerate(files) for k in file}}))
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   (tmp_path / "config.json").write_text(json.dumps({"hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1, "num_hidden_layers": 1,
                                                     "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "max_position_embeddings": 131072,
                                                     "rope_scaling": rope, "vocab_size": vocab, "intermediate_size": ffn}))
   c, weights = llama.load(str(tmp_path), 64)
+  assert all(isinstance(x, llama.Weight) for x in weights.values())
   assert c.places == 64 and c.rope == rope and c.ffn == ffn and weights["cos"].bits().shape == (64, 4 * 32)
-  q, k, v = (parts[f"model.layers.0.self_attn.{n}_proj.weight"] for n in "qkv")
+  q, k, v, gate, up = (parts[f"model.layers.0.{n}_proj.weight"] for n in ("self_attn.q", "self_attn.k", "self_attn.v", "mlp.gate", "mlp.up"))
   assert np.array_equal(weights["layers.0.qkv_proj"].bits(), np.concatenate([q.T, k.T, v.T], 1))
+  assert np.array_equal(weights["layers.0.gate_up_proj"].bits(), np.concatenate([gate.T, up.T], 1))
   assert np.array_equal(weights["embed.T"].bits(), parts["lm_head.weight"].T), "its own output layer, not the embedding"
   bits = norms["model.layers.0.input_layernorm.weight"].view(np.uint32)
   assert np.array_equal(weights["layers.0.input_layernorm"].bits()[0], ((bits + 0x7FFF + (bits >> 16 & 1)) >> 16).astype(np.uint16))
@@ -1287,6 +1294,7 @@ def test_llama_precision(chip):
   big = SimpleNamespace(layers=32, dim=4096)
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
+  assert [llama.precision(big, "tt")[k] for k in (("attention", "decode"), ("attention", "prefill"), ("kv", None))] == [(None, 2), (None, 4), ("bfp8", None)]
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(5)
   c, w = smol(rng, 2)
   c.precision = llama.precision(c, "tt")

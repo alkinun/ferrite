@@ -85,8 +85,8 @@ class Value:
   def whole(self): return self.view.contiguous() and math.prod(self.shape) == math.prod(self.t.shape)  # its tensor, all of it, as it lies
 
 def merge(view, groups):
-  """(size, stride, lo, hi) for each group of view's axes taken as one, or None if a group's strides do not line up
-  (or it masks more than one axis)."""
+  """(size, stride, lo, hi) for each group of view's axes taken as one, or None if a group's strides do not line up, or
+  if its mask does not either (on more than one axis, or on one beside another longer than 1)."""
   out = []
   for g in groups:
     axes, size = [k for k in g if view.shape[k] > 1], math.prod(view.shape[k] for k in g)
@@ -307,7 +307,7 @@ class Evaluator:
     m = p.src[0] if p.op is Ops.PERMUTE else p
     if m.op is not Ops.MUL or not all(dtypes.is_float(s.dtype) and s.dtype in DTYPES for s in m.src): return None
     lift = lambda s, v: to_chip(v, s.dtype) if isinstance(v, Tensor) and constant(v) is None else v  # a weight still on the host goes up
-    a, b = (spread_to(lift(s, self.read(s, self.values.get(s))), m.shape) for s in m.src)
+    a, b = (spread_to(lift(s, self.read(self.values.get(s))), m.shape) for s in m.src)
     if not (isinstance(a, Value) and isinstance(b, Value)) or a.view.mask or b.view.mask: return None
     shape, summed = m.shape, list(order[:u.arg[1]])
     full = lambda v, k: shape[k] == 1 or v.view.strides[k] != 0
@@ -361,14 +361,14 @@ class Evaluator:
     if u.op is not Ops.REDUCE: srcs = [self.force(s) if v is DEFER else v for s, v in zip(u.src, srcs)]  # a sum may make a matmul of them
     if u.op is Ops.CONST: return u.arg
     if u.op is Ops.STACK and all(isinstance(v, (bool, int, float)) for v in srcs): return tuple(srcs)  # a shape; else values, stacked on the host
-    if u.op in (Ops.BUFFER, Ops.ALLOC): return self.read(u, u)  # as it is before any STORE in this graph
-    if u.op is Ops.COPY and on_ferrite(u) and isinstance(v := self.read(u.src[0], srcs[0]), Tensor) and u.dtype in DTYPES and v.ndim:
+    if u.op in (Ops.BUFFER, Ops.ALLOC): return self.read(u)  # as it is before any STORE in this graph
+    if u.op is Ops.COPY and on_ferrite(u) and isinstance(v := self.read(srcs[0]), Tensor) and u.dtype in DTYPES and v.ndim:
       return to_chip(v, u.dtype)
-    if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return self.read(u.src[0], srcs[0])
+    if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return self.read(srcs[0])
     if u.op is Ops.AFTER: return self.now(u.src[0])
-    if u.op is Ops.STORE: return self.store(u.src[0], self.read(u.src[1], srcs[1]))
+    if u.op is Ops.STORE: return self.store(u.src[0], self.read(srcs[1]))
     if u.op is Ops.SINK: return None
-    x = [self.read(s, v) for s, v in zip(u.src, srcs)]
+    x = [self.read(v) for v in srcs]
     if u.op is Ops.RESHAPE and u.src[0].op is Ops.BUFFER and on_ferrite(u.src[0]) and (v := self.lay_out(u, x[0])) is not None: return v
     if u.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.PAD):  # (symbolic shapes on the host)
       return self.movement(u, x[0]) if isinstance(x[0], Value) and all(isinstance(d, int) for d in u.shape) else self.on_host(u, x)
@@ -393,13 +393,14 @@ class Evaluator:
     return Value(h.value.t, View(u.shape), u.dtype)
 
   def now(self, x):  # x (a buffer, or a view of one) as the buffers hold it now, after the STOREs so far
-    if x.op in (Ops.BUFFER, Ops.ALLOC): return self.read(x, x)
+    if x.op in (Ops.BUFFER, Ops.ALLOC): return self.read(x)
     if x.op is Ops.AFTER: return self.now(x.src[0])
     v = self.now(x.src[0])
     return self.movement(x, v) if isinstance(v, Value) else self.on_host(x, [v] + [self.values.get(s) for s in x.src[1:]])
 
-  def read(self, s, v):
-    """The value of source s: a buffer's contents as they are now (a FERRITE one's chip value or bytes, another device's bytes)."""
+  def read(self, v):
+    """A source's value v, or if it is a buffer, its contents as they are now (a FERRITE one's chip value or bytes,
+    another device's bytes)."""
     if not (isinstance(v, UOp) and v.op in (Ops.BUFFER, Ops.ALLOC)): return v
     buf = v.buffer
     if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")

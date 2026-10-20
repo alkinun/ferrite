@@ -36,9 +36,9 @@ def mac(acc, a, b):
   return sign << 31 | biased << 23 | m & 0x7FFFFF
 
 # The cases the model and the hardware are checked on: in bf16, zeros, denormals, the smallest normal, 1 and -1 and 1
-# an ulp up, 2^64 and its neighbours (a product's overflow), 2^-63 and its neighbours (its underflow), the largest
-# finite, infinities and NaNs; in fp32, zeros, denormals, small normals, 1 and its neighbour, -1, the largest finite,
-# infinities and NaNs
+# an ulp up, 2^63, 2^64 and the largest bf16 below 2^65 (products just inside and outside fp32's range at the top),
+# 2^-63, the bf16 below it and 2^-62 (the same at the bottom), the largest finite, infinities and NaNs; in fp32, zeros,
+# denormals, small normals, 1 and its neighbour, -1, the largest finite, infinities and NaNs
 EDGES16 = (0x0000, 0x8000, 0x0001, 0x807F, 0x0080, 0x3F80, 0xBF80, 0x3F81, 0x5F80, 0x5FFF, 0x5F00, 0x2000, 0x1FFF, 0x2080, 0x7F7F,
            0x7F80, 0xFF80, 0x7FC0, 0xFF81)
 EDGES32 = (0x00000000, 0x80000000, 0x00000001, 0x807FFFFF, 0x00800000, 0x00C00000, 0x80C00000, 0x3F800000, 0x3F800001, 0xBF800000,

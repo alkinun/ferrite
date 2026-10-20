@@ -37,6 +37,7 @@ def cross_entropy(logits, onehot):  # the mean over positions of -log p(target),
   return (logits.log_softmax() * onehot).sum() * (-1 / logits.rows)
 
 B1, B2, EPS = 0.9, 0.999, 1e-8  # Adam's, as PyTorch has them
+LR = 3e-3
 def adam(params, state, lr, bias2):
   """PyTorch's Adam, written the same way: lr is the step's lr / (1 - B1^step) and bias2 its 1 / sqrt(1 - B2^step),
   each a 1 x 1 tensor, so a recorded step (jit) takes them as inputs."""
@@ -46,24 +47,24 @@ def adam(params, state, lr, bias2):
     v.assign(v * B2 + g * g * (1 - B2))
     p.assign(p - m * lr / (v.sqrt() * bias2 + EPS))
 
-def train(rt, steps, c=None, lr=3e-3, log=None, data=None):
+def train(rt, steps, log=None, data=None):
   """steps of training on ferrite, and PyTorch beside it. Each step, PyTorch takes ferrite's weights as they are and
   computes the same loss and gradients; and PyTorch also trains by itself, from the same first weights on the same text.
-  The two runs part, though each step is right: Adam's first step moves every weight by lr times the sign of its
-  gradient, so a weight whose gradient is below the matmul's 2^-11 moves either way, and the runs go on from there.
+  The two runs part, though each step is right: Adam's first step moves every weight by LR times the sign of its
+  gradient, so a weight whose gradient is below the matmul's error (about 2^-12) moves either way, and the runs go on from there.
   Returns, each step: ferrite's loss, PyTorch's on the same weights, the gradients' worst error (relative to each
   weight's largest), and PyTorch's own run's loss. data: the text (README and LESSONS unless given)."""
   import torch
   data = data or text()
   chars = sorted(set(data))
-  c = c or SimpleNamespace(ctx=64, dim=64, heads=2, layers=2)
+  c = SimpleNamespace(ctx=64, dim=64, heads=2, layers=2)
   c.vocab, ids, rng = len(chars), np.array([chars.index(ch) for ch in data]), np.random.default_rng(1)
   w = init(c)
   mask = np.triu(np.full((c.ctx, c.ctx), -1e9, np.float32), 1)
   tw = {k: Tensor.of(rt, a.tolist(), "fp32").requires_grad_() for k, a in w.items()}
   state = {id(t): [Tensor.full(rt, t.rows, t.cols, 0.0, "fp32") for _ in range(2)] for t in tw.values()}
   pw = {k: torch.tensor(a, requires_grad=True) for k, a in w.items()}
-  opt = torch.optim.Adam(pw.values(), lr=lr)
+  opt = torch.optim.Adam(pw.values(), lr=LR)
   tmask, pmask, losses = Tensor.of(rt, mask.tolist(), "fp32"), torch.tensor(mask), []
   @tensor.jit  # recorded on its second call and replayed from then on: the host only copies the inputs in
   def train_step(x, onehot, step_lr, bias2):  # the loss, each gradient into .grad, and Adam's update
@@ -78,7 +79,7 @@ def train(rt, steps, c=None, lr=3e-3, log=None, data=None):
     x, y = ids[at:at + c.ctx].tolist(), ids[at + 1:at + c.ctx + 1].tolist()
     same = {k: torch.tensor(array(t), requires_grad=True) for k, t in tw.items()}  # PyTorch on ferrite's weights, as they are
     loss = train_step(Tensor.of(rt, [x], "int32"), Tensor.of(rt, np.eye(c.vocab, dtype=np.float32)[y].tolist(), "fp32"),
-                      Tensor.full(rt, 1, 1, lr / (1 - B1**step), "fp32"), Tensor.full(rt, 1, 1, 1 / math.sqrt(1 - B2**step), "fp32"))
+                      Tensor.full(rt, 1, 1, LR / (1 - B1**step), "fp32"), Tensor.full(rt, 1, 1, 1 / math.sqrt(1 - B2**step), "fp32"))
     want = torch.nn.functional.cross_entropy(forward(x, same, pmask, c), torch.tensor(y))
     want.backward()
     grads = max(float(np.abs(array(t.grad) - same[k].grad.numpy()).max() / np.abs(same[k].grad.numpy()).max()) for k, t in tw.items())

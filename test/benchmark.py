@@ -11,7 +11,7 @@
 # counts tt-kmd's lines of code too. On ttsim (TTSIM set for ferrite, TT_METAL_SIMULATOR for TT-NN) the times are its
 # clock, not silicon's, and --quick shrinks every size and the model to two blocks: only a check of the script. TT's
 # script does not run on ttsim (its prefill warm-up uses an SFPU mode ttsim lacks), so there only TT-NN's B1 does.
-import bz2, glob, json, os, platform, re, statistics, subprocess, sys, tempfile, time
+import bz2, glob, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -27,12 +27,14 @@ def git(folder):  # a checkout's commit, and whether it has changes
   return run("rev-parse", "--short", "HEAD") + (" with changes" if run("status", "--porcelain", "--untracked-files=no") else "")
 
 def lines(folder, keep):  # code lines as cloc counts them, in the files git tracks there (and in its submodules) that keep keeps
+  if not shutil.which("cloc"): return "not counted: cloc is not installed"
   files = subprocess.run(["git", "-C", folder, "ls-files", "--recurse-submodules"], capture_output=True, text=True).stdout.splitlines()
   with tempfile.NamedTemporaryFile("w") as f:
     f.write("\n".join(os.path.join(folder, p) for p in files if keep(p)))
     f.flush()
-    try: return json.loads(subprocess.run(["cloc", "--json", "--quiet", f"--list-file={f.name}"], capture_output=True, text=True).stdout)["SUM"]["code"]
-    except (OSError, ValueError, KeyError): return "not counted: cloc is not installed"
+    out = subprocess.run(["cloc", "--json", "--quiet", f"--list-file={f.name}"], capture_output=True, text=True).stdout
+  try: return json.loads(out)["SUM"]["code"]
+  except (ValueError, KeyError): return f"not counted: cloc found no code in {folder}"
 
 def tenstorrent(path):  # Tenstorrent's code as ROADMAP counts it: no tests, models, docs (Markdown included), CI or editor
   parts = path.split("/")  # settings (dot folders), or third-party code but the UMD tt-metal pins
