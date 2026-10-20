@@ -213,7 +213,7 @@ append a correction.
 
 ## For a chip of our own
 
-What Blackhole made hard to program, so that a design for simple software can design it away (ROADMAP, stage 6).
+What Blackhole made hard to program, so that a design for simple software can design it away (ROADMAP, Stage 3).
 
 - **Coherence, or no caches at all.** Three kinds of manual synchronization (the L0 data cache, settling L1, the
   instruction cache) are the commonest source of subtle bugs here.

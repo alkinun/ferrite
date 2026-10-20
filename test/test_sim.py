@@ -956,7 +956,7 @@ def test_mnist_mlp(chip):
   assert clear.sum() >= 8 and (logits.argmax(1) == want.argmax(1))[clear].all()
 
 def test_mnist_cnn(chip):
-  # stage 1's CNN: MNIST-shaped images through a 3x3 convolution (1 -> 8 channels, padded) and relu, a 2x2 max pool, a
+  # a small CNN: MNIST-shaped images through a 3x3 convolution (1 -> 8 channels, padded) and relu, a 2x2 max pool, a
   # 3x3 convolution (8 -> 16) and relu, a pool, and 784 -> 10, against numpy in float64; random weights, as above. Each
   # convolution is one matmul by the stacked patches, each of whose 9 taps is one move
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3)
@@ -976,7 +976,7 @@ def test_mnist_cnn(chip):
     assert np.allclose(logits, want, rtol=0.02, atol=0.02), np.abs(logits - want).max()
 
 def test_train(chip):
-  # stage 1's training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning to count
+  # training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning to count
   # in fp32 with Adam (test/train.py learns README and LESSONS, which change with every edit: once, a new text put one
   # gradient past the bound). Every step's loss and gradients against PyTorch's on the same weights (to 1e-3, and 2e-3
   # of the largest: the matmul's 2^-11, compounded), the step recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1
@@ -987,7 +987,7 @@ def test_train(chip):
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
 def test_tinygrad(chip):
-  # stage 4: tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
+  # tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
   # ferrite runs it: elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad
   # writes one (a broadcast multiply, summed), softmax, a tinygrad function (inlined); integers and bools, a view of part
   # of a buffer, stores into parts of one, and tensors with nothing in them; then an MLP trained with Adam for three
@@ -1090,7 +1090,7 @@ def test_gpt2_layer(chip, n, dtype, size):
 
 @pytest.mark.skipif("GPT2" not in os.environ, reason="GPT2=/path/to/model.safetensors (Hugging Face openai-community/gpt2) runs it")
 def test_gpt2_model(chip):
-  # stage 0's finish line: GPT-2 small's real weights, all 12 blocks, the embeddings (gathered on the chip) and the output layer
+  # the whole model: GPT-2 small's real weights, all 12 blocks, the embeddings (gathered on the chip) and the output layer
   # (the token embedding transposed on the chip). After "The meaning of life is", then after each of three more tokens
   # (a token at a time from the KV cache, the last a replay), the next token's 50257 logits against the same model in
   # numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and a pick numpy rates as good: first
