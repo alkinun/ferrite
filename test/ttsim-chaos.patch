@@ -1,0 +1,220 @@
+diff --git a/src/libttsim.cpp b/src/libttsim.cpp
+index 42fe3c4..ceba2de 100644
+--- a/src/libttsim.cpp
++++ b/src/libttsim.cpp
+@@ -18,6 +18,7 @@ extern "C" API_EXPORT void libttsim_init() {
+     TTSIM_VERIFY(!s_ttsim_running, ConfigurationError, "sim is already running");
+     ttsim_init();
+     pcie_init();
++    chaos_init();
+     s_ttsim_running = true;
+ }
+ 
+@@ -126,13 +127,14 @@ static void clock_current_chip() {
+         for (;;) {
+             for (uint32_t rv32_mask = p_tile->rv32_cores_active; rv32_mask; rv32_mask &= rv32_mask - 1) {
+                 uint32_t rv32_index = __builtin_ctz(rv32_mask);
+-                rv32_step(&p_tile->rv32[rv32_index]);
++                if (!chaos_skip_rv32()) rv32_step(&p_tile->rv32[rv32_index]);
+             }
+             [[maybe_unused]] bool any_tensix = false;
+             for (uint32_t tensix_id = 0; tensix_id < std::size(p_tile->tensix); tensix_id++) {
+                 TensixState *p_tensix = &p_tile->tensix[tensix_id];
+                 for (uint32_t pipe_mask = p_tensix->inst_pipes_active; pipe_mask; pipe_mask &= pipe_mask - 1) {
+                     uint32_t pipe = __builtin_ctz(pipe_mask);
++                    if (chaos_skip_tensix()) continue; // ttsim-chaos: this pipe waits a turn
+                     uint32_t inst_rd_ptr = p_tensix->inst_rd_ptr[pipe];
+                     if (inst_rd_ptr != p_tensix->inst_wr_ptr[pipe]) {
+                         uint32_t inst = p_tensix->inst[pipe][inst_rd_ptr];
+@@ -175,6 +177,7 @@ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
+ #else
+         clock_current_chip();
+ #endif
++        chaos_tick();
+         g_clock++; // single global timebase, advanced once per clock across all chips
+     }
+ #if NUM_CHIPS > 1
+diff --git a/src/sim.h b/src/sim.h
+index 37259db..e0a979c 100644
+--- a/src/sim.h
++++ b/src/sim.h
+@@ -578,6 +578,11 @@ void libttsim_pci_dma_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size)
+ void ttsim_init();
+ void ttsim_exit();
+ void ttsim_select_chip(uint32_t chip_id);
++// ttsim-chaos (tile.cpp; ../CHAOS.md): off unless TTSIM_CHAOS_* is set
++void chaos_init();
++void chaos_tick();
++bool chaos_skip_tensix();
++bool chaos_skip_rv32();
+ bool ttsim_rv32_get_core_active(char tile_type, uint32_t tile_id, uint32_t rv32_id);
+ void ttsim_rv32_set_core_active(char tile_type, uint32_t tile_id, uint32_t rv32_id, bool active);
+ void ttsim_heartbeat();
+diff --git a/src/tile.cpp b/src/tile.cpp
+index 4d19315..0a1135a 100644
+--- a/src/tile.cpp
++++ b/src/tile.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ // Per-tile infrastructure: tile init, NOC routing, TDMA, Ethernet, DRAM, debug/config registers.
++#include <map>
++#include <tuple>
+ #include "sim.h"
+ #include "topology.h"
+ #include "eth_fw_blob.h" // generated
+@@ -24,6 +26,97 @@ static inline auto get_tile(uint32_t tile_id) {
+     }
+ }
+ 
++
++// ---- ttsim-chaos: perturbations ttsim leaves out, off unless TTSIM_CHAOS_* is set (see ../CHAOS.md) ----
++// A Tensix tile's NoC request is not carried out when issued but a random number of clocks later (TTSIM_CHAOS_NOC=lo,hi):
++// until then a read or an acknowledged write counts in NIU_MST_REQS_OUTSTANDING_ID and a write in
++// NIU_MST_WRITE_REQS_OUTGOING_ID, its source is read and its data lands only then, and acknowledgements and read
++// responses are counted only then. Requests on a static VC between the same two places keep their order (the NoC's
++// guarantee); requests on dynamic VCs may overtake each other. The request's registers are kept as they were at issue.
++struct ChaosRequest {
++    uint64_t seq;
++    uint32_t chip_id, tile_id, noc_instance, cmd_buf;
++    uint32_t regs[10]; // targ lo, mid, hi, ret lo, mid, hi, packet tag, ctrl, at_len_be, at_data
++};
++static struct {
++    uint32_t noc_lo = 0, noc_hi = 0, tensix_stall = 0, rv32_skip = 0; // clocks; per million
++    bool noc = false, replaying = false;
++    uint64_t rng = 0x9E3779B97F4A7C15ull, seq = 0;
++    std::map<std::pair<uint64_t, uint64_t>, ChaosRequest> pending; // by (due clock, issue order)
++    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> last_due; // static VC order
++    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, uint32_t> outgoing; // (chip, tile, noc, txn id)
++} s_chaos;
++
++static uint64_t chaos_rand() {
++    uint64_t x = s_chaos.rng;
++    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
++    return s_chaos.rng = x;
++}
++
++void chaos_init() {
++    const char *seed = getenv("TTSIM_CHAOS_SEED"), *noc = getenv("TTSIM_CHAOS_NOC");
++    const char *tensix = getenv("TTSIM_CHAOS_TENSIX"), *rv32 = getenv("TTSIM_CHAOS_RISCV");
++    if (seed) s_chaos.rng = strtoull(seed, nullptr, 0) * 0x9E3779B97F4A7C15ull + 1;
++    if (noc) {
++        TTSIM_VERIFY(sscanf(noc, "%u,%u", &s_chaos.noc_lo, &s_chaos.noc_hi) == 2 && s_chaos.noc_lo <= s_chaos.noc_hi, ConfigurationError,
++            "TTSIM_CHAOS_NOC=%s: want lo,hi clocks", noc);
++        s_chaos.noc = true;
++    }
++    if (tensix) s_chaos.tensix_stall = uint32_t(atof(tensix) * 1e6);
++    if (rv32) s_chaos.rv32_skip = uint32_t(atof(rv32) * 1e6);
++    if (noc || tensix || rv32) {
++        fprintf(stderr, "ttsim-chaos: NoC requests %u..%u clocks late, Tensix pipes stall %.4f, RISC-V steps skipped %.4f, seed %s\n",
++            s_chaos.noc_lo, s_chaos.noc_hi, s_chaos.tensix_stall / 1e6, s_chaos.rv32_skip / 1e6, seed ? seed : "default");
++    }
++}
++
++bool chaos_skip_tensix() { return s_chaos.tensix_stall && chaos_rand() % 1000000 < s_chaos.tensix_stall; }
++bool chaos_skip_rv32() { return s_chaos.rv32_skip && chaos_rand() % 1000000 < s_chaos.rv32_skip; }
++
++static uint32_t chaos_outgoing(char tile_type, uint32_t tile_id, uint32_t noc_instance, uint32_t txn_id) {
++    if (tile_type != 'T') return 0;
++    auto it = s_chaos.outgoing.find({g_current_chip_id, tile_id, noc_instance, txn_id});
++    return it == s_chaos.outgoing.end() ? 0 : it->second;
++}
++
++// what a request is, from its NOC_CTRL (as noc_cmd_ctrl tells them apart): whether it writes, whether it is acknowledged
++// (a read always is), and whether it is an atomic (which neither counter tracks here)
++static void chaos_kind(uint32_t ctrl, bool *write, bool *counted) {
++    bool multicast = bits<5,5>(ctrl), atomic = !multicast && bits<0,0>(ctrl);
++    *write = multicast || (!atomic && (bits<3,3>(ctrl) || bits<1,1>(ctrl)));
++    *counted = !atomic && (!*write || bits<4,4>(ctrl));
++}
++
++template<char tile_type>
++static uint32_t *chaos_reg(uint32_t tile_id, uint32_t n, uint32_t b, uint32_t i) {
++    auto *p_tile = get_tile<tile_type>(tile_id);
++    uint32_t *regs[] = {&p_tile->noc_targ_addr_lo[n][b], &p_tile->noc_targ_addr_mid[n][b], &p_tile->noc_targ_addr_hi[n][b],
++                        &p_tile->noc_ret_addr_lo[n][b], &p_tile->noc_ret_addr_mid[n][b], &p_tile->noc_ret_addr_hi[n][b],
++                        &p_tile->noc_packet_tag[n][b], &p_tile->noc_ctrl[n][b], &p_tile->noc_at_len_be[n][b], &p_tile->noc_at_data[n][b]};
++    return regs[i];
++}
++
++// a Tensix tile's request, kept for later instead of carried out now (false: carry it out now)
++template<char tile_type>
++static bool chaos_defer(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
++    if (tile_type != 'T' || !s_chaos.noc || s_chaos.replaying) return false;
++    ChaosRequest r = {s_chaos.seq++, g_current_chip_id, tile_id, noc_instance, cmd_buf, {}};
++    for (uint32_t i = 0; i < 10; i++) r.regs[i] = *chaos_reg<tile_type>(tile_id, noc_instance, cmd_buf, i);
++    uint32_t ctrl = r.regs[7], txn_id = bits<13,10>(r.regs[6]);
++    bool write, counted;
++    chaos_kind(ctrl, &write, &counted);
++    if (counted) get_tile<tile_type>(tile_id)->niu_mst_reqs_outstanding[noc_instance][txn_id]++;
++    if (write) s_chaos.outgoing[{r.chip_id, tile_id, noc_instance, txn_id}]++;
++    uint64_t due = g_clock + s_chaos.noc_lo + chaos_rand() % (s_chaos.noc_hi - s_chaos.noc_lo + 1);
++    if (bits<7,7>(ctrl)) { // a static VC: after whatever went before it from here to there on that VC
++        uint64_t &last = s_chaos.last_due[{r.chip_id, tile_id, noc_instance, r.regs[2], r.regs[5], bits<15,14>(ctrl)}];
++        due = std::max(due, last);
++        last = due;
++    }
++    s_chaos.pending.emplace(std::make_pair(due, r.seq), r);
++    return true;
++}
++
+ static constexpr uint32_t logical_harvesting_mask(uint32_t chip_id) {
+     TTSIM_ASSERT(chip_id < NUM_CHIPS);
+ #if TT_ARCH_VERSION == 0
+@@ -1386,7 +1479,8 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+         case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(13):
+         case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(14):
+         case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(15):
+-            return 0; // NIU_MST_WRITE_REQS_OUTGOING_ID would be incremented and decremented by the same amount for write transactions
++            // NIU_MST_WRITE_REQS_OUTGOING_ID would be incremented and decremented by the same amount for write transactions
++            return chaos_outgoing(tile_type, tile_id, noc_instance, (offset - NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(0)) >> 2);
+         default:
+             return base_noc_regs_rd32(&p_tile->base, tile_type, tile_id, noc_instance, offset);
+     }
+@@ -1394,6 +1488,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+ 
+ template<char tile_type>
+ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
++    if (chaos_defer<tile_type>(tile_id, noc_instance, cmd_buf)) return;
+     auto *p_tile = get_tile<tile_type>(tile_id);
+     uint32_t noc_at_len_be = p_tile->noc_at_len_be[noc_instance][cmd_buf];
+     uint32_t txn_id = bits<13,10>(p_tile->noc_packet_tag[noc_instance][cmd_buf]);
+@@ -1617,6 +1712,38 @@ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_b
+     }
+ }
+ 
++// ttsim-chaos: a request whose time has come, carried out with its registers as they were at issue (put back after),
++// then its own counts undone (a multicast's own request count, which noc_cmd_ctrl adds too, among them)
++template<char tile_type>
++static void chaos_replay(const ChaosRequest &r) {
++    uint32_t saved[10];
++    for (uint32_t i = 0; i < 10; i++) {
++        uint32_t *reg = chaos_reg<tile_type>(r.tile_id, r.noc_instance, r.cmd_buf, i);
++        saved[i] = *reg;
++        *reg = r.regs[i];
++    }
++    s_chaos.replaying = true;
++    noc_cmd_ctrl<tile_type>(r.tile_id, r.noc_instance, r.cmd_buf);
++    s_chaos.replaying = false;
++    for (uint32_t i = 0; i < 10; i++) *chaos_reg<tile_type>(r.tile_id, r.noc_instance, r.cmd_buf, i) = saved[i];
++    uint32_t txn_id = bits<13,10>(r.regs[6]);
++    bool write, counted;
++    chaos_kind(r.regs[7], &write, &counted);
++    if (counted) get_tile<tile_type>(r.tile_id)->niu_mst_reqs_outstanding[r.noc_instance][txn_id]--;
++    if (write) s_chaos.outgoing[{r.chip_id, r.tile_id, r.noc_instance, txn_id}]--;
++}
++
++void chaos_tick() {
++    while (!s_chaos.pending.empty() && s_chaos.pending.begin()->first.first <= g_clock) {
++        ChaosRequest r = s_chaos.pending.begin()->second;
++        s_chaos.pending.erase(s_chaos.pending.begin());
++        uint32_t saved_chip_id = g_current_chip_id;
++        ttsim_select_chip(r.chip_id);
++        chaos_replay<'T'>(r);
++        ttsim_select_chip(saved_chip_id);
++    }
++}
++
+ template<char tile_type>
+ static void noc_regs_wr32(uint32_t tile_id, uint32_t noc_instance, uint32_t offset, uint32_t data) {
+     auto *p_tile = get_tile<tile_type>(tile_id);

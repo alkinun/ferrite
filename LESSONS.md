@@ -62,9 +62,11 @@ append a correction.
    runs atomically. So latency hiding (a deeper prefetch) looks slower on ttsim, and some costs are ttsim's own: a
    kernel whose root is a binary op costs about 50 cycles a tile more. Record such results in NOTES for the card to
    settle. (NOTES: "ttsim's cycles are its model")
-3. **What it does not model, no test can catch.** Instruction cache invalidation, PC snapshots, `mhartid`, the busy
-   conditions of `STALLWAIT`, NoC request splitting. The waits only silicon exercises are step 8 of the bring-up plan.
-   (NOTES: "What ttsim can and cannot check here")
+3. **What it does not model, no test can catch, so model it.** NoC latency was the first: ttsim answers at once, and a
+   missing wait for a read passes every test there; ttsim-chaos delays requests and jitters the cores, and fails at once
+   on one (removed on purpose: none was missing). Still unmodelled: instruction cache invalidation, PC snapshots,
+   `mhartid`, the busy conditions of `STALLWAIT`, NoC request splitting; the waits only silicon exercises are step 8 of
+   the bring-up plan. (NOTES: "What ttsim can and cannot check here", "ttsim-chaos")
 4. **Break things on purpose.** Removing each wait in turn and running the tests showed which ones ttsim enforces and
    which it lets through. That list is worth more than a passing run.
 5. **When the docs and ttsim disagree, ask which chip each describes.** Some Blackhole ISA pages are Wormhole's copied
