@@ -1306,6 +1306,22 @@ def test_token_accuracy(chip):
   top1, five, picks = llama.accuracy(rt, t, c, prompt, after, top5, 8)
   assert (top1, five) == (7 / 8, 1) and picks[3] == top5[3][-1], (top1, five, picks)
 
+def test_benchmark_bytes():
+  # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token; ROADMAP, Measurement): the bytes a
+  # decode token reads, each weight in the format TT's performance precision gives it (llama.weight_format, as upload
+  # casts it). Llama-3.1-8B's shapes give ROADMAP's 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
+  import benchmark
+  c, hd, ffn = SimpleNamespace(dim=4096, heads=32, kv=8, layers=32, vocab=128256), 128, 14336
+  c.precision = llama.precision(c, "tt")
+  shapes = {"embed": (c.vocab, c.dim), "embed.T": (c.dim, c.vocab), "norm": (1, c.dim), "cos": (736, 48 * hd), "sin": (736, 48 * hd), "turn": (hd, hd)}
+  for l in range(c.layers):
+    shapes |= {f"layers.{l}.{k}": s for k, s in (("input_layernorm", (1, c.dim)), ("post_attention_layernorm", (1, c.dim)),
+               ("qkv_proj", (c.dim, 48 * hd)), ("o_proj", (c.dim, c.dim)), ("gate_up_proj", (c.dim, 2 * ffn)), ("down_proj", (ffn, c.dim)))}
+  t = {k: SimpleNamespace(rows=r, cols=n, dtype=llama.weight_format(k, c.precision)) for k, (r, n) in shapes.items()}
+  assert [t[k].dtype for k in ("layers.0.gate_up_proj", "layers.31.gate_up_proj", "layers.0.down_proj", "embed.T", "embed")] == ["bfp4", "bfp8", "bfp8", "bfp8", "bf16"]
+  read = benchmark.bytes_per_token(t, c, 612.5)
+  assert round(read / 1e9, 2) == 6.20 and round(41.3 * read / 512e9, 3) == 0.5, read
+
 def test_put(chip):
   # rows into a tensor at places read on the chip (gather's inverse), against numpy: 70 rows (three tiles of places) of a
   # batch of 3, into 200 places (seven tile rows), scattered and out of order, one place twice (the later row stays),

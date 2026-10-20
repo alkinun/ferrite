@@ -35,6 +35,7 @@ ARC_QUEUE_PTRS = (0x0, 0x4, 0x10, 0x14)  # in its header: our request write and 
 # POWER_SETTING with all 15 flags valid and set: max AI clock, GDDR PHY awake, Tensix and L2CPU clocks on
 POWER_ON = 0x21 | 15 << 8 | 0x7FFF << 16
 TAG_AICLK, TAG_GDDR_STATUS, TAG_TENSIX_COLS, TAG_GDDR_ENABLED = 14, 22, 34, 36  # telemetry; GDDR_STATUS: 2 bits a bank
+TAG_FIRMWARE = 28  # the firmware bundle's version, a byte each: major, minor, patch, build (umd's FLASH_BUNDLE_VERSION)
 
 # Tensix tile, at the same addresses over the NoC and from its own cores
 L1_SIZE = 1536 * 1024

@@ -90,7 +90,9 @@ What the words and numbers in the exit criteria mean.
   first replay of a recorded step: TT-NN's first, which compiles and captures its trace (Tenstorrent's script leaves
   it out too), and ferrite's first two, which run and record (`jit`).
 - **Prefill speed.** Batch 1. Time to first token: the wall time from a prompt's token ids on the host to its first
-  generated token.
+  generated token, after a warm-up prefill of the same length, which compiles (Tenstorrent's script does the same, and
+  reports its warm-up apart, as compile time). A prompt of n tokens is the first n of A Tale of Two Cities as
+  tt_transformers keeps it (`tests/tale-of-two-cities.txt.bz2`), in the model's tokenizer.
 - **TT's performance precision.** Each weight matrix and the KV cache in the format, and each matmul at the number of
   fidelity phases, that tt_transformers' performance mode gives it at the pinned tt-metal commit. At 9f98dee9 that is,
   for Llama-3.1-8B: the MLP's gate and up projections in bfp4, multiplied at one phase (LoFi), except in the last of

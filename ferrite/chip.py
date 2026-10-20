@@ -101,6 +101,7 @@ if __name__ == "__main__":  # what a card says about itself: the first thing to 
   chip = Chip(dev, 300 if sys.argv[1:] == ["reset"] else 2)
   t = chip.telemetry()
   banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]
-  print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware up, Tensix powered; AI clock {t.get(bh.TAG_AICLK, 0)} MHz; "
+  fw = ".".join(str(t.get(bh.TAG_FIRMWARE, 0) >> s & 255) for s in (24, 16, 8))
+  print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware {fw} up, Tensix powered; AI clock {t.get(bh.TAG_AICLK, 0)} MHz; "
         f"{len(chip.tensix)} Tensix in {len(chip.tensix) // len(bh.TENSIX_Y)} columns; DRAM banks {banks} trained")
   print("telemetry:", " ".join(f"{tag}={value:#x}" for tag, value in sorted(t.items())))

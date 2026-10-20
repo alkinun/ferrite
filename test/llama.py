@@ -171,14 +171,17 @@ def load(folder, places=4096):
   for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: (a.view(np.uint32) >> 16).astype(np.uint16))
   return c, fuse(out)
 
-def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a time, the matrices a matmul reads as its
-  # B (the blocks' and the output layer) cast on the chip to the format prec (precision's) gives them, bf16 without one
+def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks' and the
+  # output layer) in the one prec (precision's) gives them, the rest, and all without prec, bf16
+  key = ("head", None) if name == "embed.T" else (name.split(".")[2].removesuffix("_proj"), int(name.split(".")[1])) if name.endswith("_proj") else None
+  return prec[key][0] if prec and key else "bf16"
+
+def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a time, each cast on the chip to its format
   t = {}
   for name, w in weights.items():
     bits = w.bits()
     x = t[name] = Tensor.frombytes(rt, *bits.shape, bits.tobytes())
-    key = ("head", None) if name == "embed.T" else (name.split(".")[2].removesuffix("_proj"), int(name.split(".")[1])) if name.endswith("_proj") else None
-    if prec and key: t[name] = x.cast(prec[key][0]).realize()
+    if (f := weight_format(name, prec)) != "bf16": t[name] = x.cast(f).realize()
   return t
 
 def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip (upload), those not in bf16 as the chip has them
