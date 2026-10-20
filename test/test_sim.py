@@ -362,8 +362,9 @@ def test_matmul_multicast(chip):
   # worker (gy, gx) computes one block, each worker of a grid row reads its share of the block row's rows of A and
   # multicasts it along the row, each of a grid column its share of each column of B down it. Of one row (a token's):
   # each worker a block of columns, A's row read by the first grid row and multicast to all, from 2 workers to 96. Odd
-  # edges; a K so long that B's three buffers nearly fill the slots below 256; B read transposed (four quarter-tile
-  # reads a tile); and an epilogue fused after, bit for bit the same as unfused
+  # edges; a K so long that B's three buffers nearly fill the slots below 256; B read transposed (a tile a read: the
+  # unpacker transposes each face, the math walks the faces transposed); and an epilogue fused after, bit for bit the
+  # same as unfused
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   rng = np.random.default_rng(3)
@@ -372,7 +373,7 @@ def test_matmul_multicast(chip):
     tb = Tensor.of(rt, b.T.tolist()).T if bt else Tensor.of(rt, b.tolist())
     y, before = Tensor.of(rt, a.tolist()) @ tb, reads()
     y.realize(), rt.wait()
-    tiles = -(-m // 32) * (k // 32) + (4 if bt else 1) * (k // 32) * -(-n // 32)
+    tiles = -(-m // 32) * (k // 32) + (k // 32) * -(-n // 32)
     assert reads() - before == tiles, (m, k, n, reads() - before, tiles)
     assert np.all(np.abs(value(y)[0] - a @ b) <= 2**-8 * (np.abs(a) @ np.abs(b))), (m, k, n)
   x, w, d, bias = (Tensor.of(rt, bf16(rng.uniform(-1, 1, shape)).tolist()) for shape in ((96, 64), (64, 200), (96, 200), (1, 200)))

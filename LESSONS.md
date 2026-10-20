@@ -32,8 +32,9 @@ append a correction.
    word. With a TRISC per thread, a stalled feeder holds up only its own thread, and push order stopped mattering.
    (NOTES: "No push order to get right")
 8. **The tile is ours, not the hardware's.** The ISA has no tile. The four-face layout is what `MVMUL` wants, and it
-   shapes everything else: a transpose is a face swap in the fetch plus a per-face transpose in the unpacker, and a
-   column of a tile is one lane of eight SFPU loads. (NOTES: "Tile layout")
+   shapes everything else: a transpose is a per-face transpose in the unpacker plus the faces walked in transposed
+   order by the math (or swapped in the fetch), and a column of a tile is one lane of eight SFPU loads. (NOTES: "Tile
+   layout", "Transpose")
 9. **Precision lives in the details.** A bf16 product is exact only after all four fidelity phases. `ELWADD` aligns
    mantissas at 11 bits with round half up, the packer rounds half up, uploads round to nearest even. Bit-exact tests
    (small integers, a diagonal of full mantissas, A @ I) pin the layout and the phases where a tolerance would pass a

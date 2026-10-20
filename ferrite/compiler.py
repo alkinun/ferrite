@@ -155,16 +155,21 @@ def pack(row, slot, *done):  # 64 Dst rows from row into an L1 slot, then free t
          [ins("SEMPOST", sem_sel=d) for d in done]
 TAKE_L1 = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)]
 
-def matmul_phase():
+def matmul_phase(transposed=False):
   """One fidelity phase of Dst += A @ B on a pair of tiles, A in SrcB and B in SrcA: MVMUL does
   Dst[8x16] += SrcB[8x16] @ SrcA[16x16]. Output face (i, j) adds A face (i, k) times B face (k, j) for k = 0, 1, in two
   MVMULs of 8 rows (h). In the order below SrcA steps by (16, -16, 16, -16, ...) faces and SrcB by (0, 8, 0, 8, ...)
   rows, so four address modes (4-7) cover it, and the last one wraps both back to row 0 (counters wrap at 64) and
-  moves on to the next fidelity phase."""
+  moves on to the next fidelity phase.
+  transposed: B came in as it lies, each face transposed by unpacker 0 (haloize), so B^T's face (k, j) is SrcA's face
+  2j + k: SrcA steps by 32 for the next j or h, by -16 for the next k and by 16 for the next i, five modes where four
+  did (TRANSPOSED: slots 4-6 and 2 rewritten around the matmul's steps), and no read is split to move faces about."""
   phase = []
   for i, k, h, j in [(i, k, h, j) for i in (0, 1) for k in (0, 1) for h in (0, 1) for j in (0, 1)]:
     last = (i, k, h, j) == (1, 1, 1, 1)
-    phase.append(ins("MVMUL", dst=32 * i + 16 * j + 8 * h, addr_mode=4 + (0 if j == 0 else 1 if h == 0 else 3 if last else 2)))
+    mode = 4 + (0 if j == 0 else 1 if h == 0 else 3 if last else 2)
+    if transposed and mode == 6 and k == 1: mode = 2  # the next i, where the next k is 6
+    phase.append(ins("MVMUL", dst=32 * i + 16 * j + 8 * h, addr_mode=mode))
   return phase
 
 def to_bf16(x):
@@ -383,13 +388,13 @@ def mask_rows(kind, m, d=0):
   return p + [CC_OFF]
 MASK = {1: mask_rows, 2: mask_columns}  # the padding past the last tile along an axis
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
-MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
+MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
 def allocate(names):
   """{run: replay index} for the math thread: SFPU bodies (32 replays a tile, longest first), then matmul and mul
   phases (4). What does not fit is pushed word by word."""
   slots, at = {}, 0
-  for name in sorted(names, key=lambda n: (n in ("mm", "mul"), -len(MATH_RUNS[n]), n)):  # by name last: the same kernel in every process
+  for name in sorted(names, key=lambda n: (n in ("mm", "mmT", "mul"), -len(MATH_RUNS[n]), n)):  # by name last: the same kernel in every process
     if at + len(MATH_RUNS[name]) <= 32: slots[name], at = at, at + len(MATH_RUNS[name])
   return slots
 def run(slots, name, count=None):  # the first count words of a run: one REPLAY if it was recorded, else the words
@@ -402,12 +407,18 @@ def release(word): return word | 3 << 22  # the same ELW*/MVMUL with clear_dvali
 def phased(slots, name, phases):  # a run of MATH_RUNS, once each fidelity phase, the last word releasing both Src banks
   words = MATH_RUNS[name]
   return [ins("SETRWC", bit_mask=0b1111)] + run(slots, name) * (phases - 1) + run(slots, name, len(words) - 1) + [release(words[-1])]
-def matmul(slots, phases=4):
+# A transposed B's walk (matmul_phase): (SrcA step, SrcB step) of the slots it rewrites, and what they hold otherwise
+TRANSPOSED = {4: (32, 0), 5: (32, 8), 6: (48, 8), 2: (16, 8)}
+def walk(transposed):  # the math thread's address modes set for a transposed B's steps, or back
+  return [ins("SETC16", setc16_reg=bh.ADDR_MOD_AB + m, setc16_value=a | b << 8)
+          for m, (a, b) in ((m, TRANSPOSED[m] if transposed else ADDR_MODES[m][0]) for m in sorted(TRANSPOSED))]
+
+def matmul(slots, phases=4, transposed=False):
   """One matmul step: its first `phases` fidelity phases (SETRWC starts each step at phase 0). A phase multiplies 7 of
   A's 8 significand bits (SrcB) or its last one by 5 of B's (SrcA) or its last 3 (ISA SrcASrcB.md): phase 0 is A's top 7
   by B's top 5, 1 the same by B's last 3, 2 A's last bit by B's top 5, 3 the last by the last. So four make the whole
   product, three leave out under 2^-11 of it, two drop A's last bit (truncating, 2^-7 at most), one keeps 5 bits of B."""
-  return phased(slots, "mm", phases)
+  return phased(slots, "mmT" if transposed else "mm", phases)
 
 def elementwise(op, slots, dst=0):
   """Math for one tile of SrcA op SrcB at Dst row dst: 8 rows of 16 per instruction, address mode 0 steps 8 rows.
@@ -535,7 +546,7 @@ static void step(unsigned how, unsigned b, unsigned b_tile, unsigned b_slot, uns
   unsigned s = steps % {DEPTH};
   reached(stream_done[s]);  // the step that last used slot s has been unpacked
   tagged(s + 1);
-  if (b_slot != KEPT) {{ if (how == 1) flipped(b, b_tile, b_slot); else if (how == 2) getb(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}
+  if (b_slot != KEPT) {{ if (how == 2) getb(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}  // a transposed B as it lies
   if (a_slot != KEPT) get(a, a_tile, a_slot);
   (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU has counted the reads before thread 0 hears of them
   stream_done[s] = ++events;
@@ -747,7 +758,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   sfpu_name = lambda op: ops_of.get(op["kind"], op["kind"] if dtype != "int32" else None)  # a binary op's program
   sfpu_op = lambda op: op["kind"] in BINARY or (dst and op.get("y", "zero") != "zero")
   assert dtype != "int32" or all(sfpu_name(op) for op in ops if sfpu_op(op)), "an int32 kernel adds, subtracts, compares and picks"
-  slots = allocate({"mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul" and not dst} |
+  slots = allocate({"mmT" if op["how"] == 1 else "mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul" and not dst} |
                    {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE} |
                    {sfpu_name(op) for op in ops if sfpu_op(op)})
   frame, matmuls = inputs + len(ops), [j for j, op in enumerate(ops) if op["kind"] == "matmul"]
@@ -898,7 +909,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
           get_a = (f"for (unsigned e = {a0}; e < {a1}; e++) "
                    f"{{ unsigned i_ = i0 + e / {kt}, m = e % {kt}; get(a[{x}], {a_tile}, {rows_at[q]} + e); }} "
                    f"share(SLOT({rows_at[q]} + {a0}), ({a1} - {a0}) * {tile_bytes(dtype)}, row_rect[{gy}], {gx_n - 1}, {gx}, 1);")
-          get_b = f"for (unsigned m = {b0}; m < {b1}; m++) {('get', 'flipped', 'getb')[how]}(a[{y}], {b_tile}, {buf} + m); "
+          get_b = f"for (unsigned m = {b0}; m < {b1}; m++) {('get', 'get', 'getb')[how]}(a[{y}], {b_tile}, {buf} + m); "
           share_b = lambda l1, n: f"share({l1}, ({b1} - {b0}) * {n}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, jj + 1);"
           if how == 2:  # in region jj % 3 of B8: the share's exponents, then its values
             region = f"{B8} + jj % 3 * {kt * tile_bytes(wt)}"
@@ -938,9 +949,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
                       f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
           c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ "
                       f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
-        c[M].append(f"{cond}{{ {tt(math_begin(True))} "
-                    f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases']))} }} "
-                    f"{tt(sfpu(op['posts'], slots))} {math_end(j)} h ^= {DST_HALF}; }}")
+        c[M].append(f"{cond}{{ {tt(math_begin(True) + walk(True) * bt)} "  # a transposed B's walk, then the modes back
+                    f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases'], bt))} }} "
+                    f"{tt(walk(False) * bt + sfpu(op['posts'], slots))} {math_end(j)} h ^= {DST_HALF}; }}")
         continue
       drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
       x, y = slot(op["x"]), slot(op["y"])
