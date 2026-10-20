@@ -4,7 +4,6 @@ import json, math, os, pathlib, random, shutil, struct, subprocess, sys, time, p
 import numpy as np
 from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
-from ferrite.compiler import from_bf16, to_bf16
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
@@ -13,19 +12,7 @@ import benchmark, gpt2, llama, train
 from types import SimpleNamespace
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
-  b = np.asarray(a, np.float32).view(np.uint32)
-  return ((b + (0x8000 if packer else 0x7FFF + (b >> 16 & 1))) & 0xFFFF0000).view(np.float32).astype(np.float64)
-
-def bfp(a, dtype="bfp8"):  # numpy's bfp8 of bf16 values, as the packer makes it: each run of 16 in a row shares its
-  bits = np.asarray(a, np.float32).view(np.uint32) >> 16  # largest exponent, each value keeps 7 bits of magnitude below it,
-  # rounded half up (bfp4, as bfp4_kernel makes it: 3 bits, to the nearest)
-  s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
-  runs = lambda x: x.reshape(x.shape[0], -1, 16)
-  top = runs(e).max(2, keepdims=True)
-  shift = np.minimum(top - runs(e), 8)  # 8 and more leave 0
-  q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
-  if dtype == "bfp4": q = np.where(shift < 4, np.minimum((runs(m) + (16 << shift)) >> (shift + 5), 7), 0) << 4  # nearest 3 bits
-  return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(a.shape)
+  return gpt2.bf16_floats(gpt2.bf16_bits(a, packer)).astype(np.float64)
 
 def kernels(rt, since):  # launches after launch number `since`, not counting the reads back (tobytes is one)
   return sum(rt.names[n % TIMES] != "readback" for n in range(since + 1, rt.launches + 1))
@@ -35,8 +22,8 @@ def close(t, want, tol):  # a tensor's values within tol (relative, and absolute
   assert got.shape == want.shape and np.allclose(got, want, rtol=tol, atol=tol), f"off by up to {np.abs(got - want).max()}"
 
 def value(t): return np.array(t.tolist()).reshape(t.shape)  # a tensor as numpy, in its shape
-def bf(v): return from_bf16(to_bf16(v))  # a float rounded to bf16, as uploads round
-def packed(v): return from_bf16((struct.unpack("<I", struct.pack("<f", v))[0] + 0x8000) >> 16)  # rounded half up, as the packer does
+def bf(v): return float(bf16(v))  # a float rounded to bf16, as uploads round
+def packed(v): return float(bf16(v, True))  # rounded half up, as the packer does
 def gelu(a): return 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))  # GPT-2's, in numpy
 
 def conv(x, w, padding=0):  # numpy's convolution of x (channels, height, width) by w (out, in, k * k), tap by tap
@@ -354,7 +341,7 @@ def test_bfp(chip, dtype):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   rng = np.random.default_rng(5)
   a = bf16(rng.normal(0, 1, (64, 96)) * np.exp(rng.normal(0, 2, (64, 96))))
-  assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast(dtype))[0], bfp(a, dtype))
+  assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast(dtype))[0], gpt2.bfp(a, dtype))
   on = lambda *shape: Tensor.of(rt, rng.normal(0, 1, shape).tolist())
   for b, m, k, n in ((1, 64, 9000, 40), (1, 1, 768, 2304), (1, 100, 256, 200), (2, 100, 256, 96), (1, 32, 2048, 64)):
     x, w = on(b, m, k), on(b, k, n).cast(dtype)
@@ -1241,8 +1228,7 @@ def test_llama_load(tmp_path):
   assert np.array_equal(weights["layers.0.qkv_proj"].bits(), np.concatenate([q.T, k.T, v.T], 1))
   assert np.array_equal(weights["layers.0.gate_up_proj"].bits(), np.concatenate([gate.T, up.T], 1))
   assert np.array_equal(weights["embed.T"].bits(), parts["lm_head.weight"].T), "its own output layer, not the embedding"
-  bits = norms["model.layers.0.input_layernorm.weight"].view(np.uint32)
-  assert np.array_equal(weights["layers.0.input_layernorm"].bits()[0], ((bits + 0x7FFF + (bits >> 16 & 1)) >> 16).astype(np.uint16))
+  assert np.array_equal(weights["layers.0.input_layernorm"].bits()[0], gpt2.bf16_bits(norms["model.layers.0.input_layernorm.weight"]))
   out = llama.forward([3, 7], [0, 1], llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros))
   assert out.shape == (1, vocab) and np.isfinite(out).all()
 
@@ -1256,7 +1242,7 @@ def test_llama_layer(chip, n):
   c, w = smol(rng, 1)
   p = {k.removeprefix("layers.0."): v for k, v in w.items() if k.startswith("layers.0.")}
   x, (cos, sin, turn) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, n)
-  mask = np.triu(np.full((n, n), -1e9, np.float32), 1)
+  mask = gpt2.mask(range(n), n)
   on = lambda a: Tensor.of(rt, a.tolist())
   cache, np_cache = on(np.zeros((6, n, 64))), np.zeros((6, n, 64))
   places = Tensor.of(rt, [list(range(n))], "int32")
@@ -1289,7 +1275,7 @@ def test_llama_precision(chip):
   # TT's performance precision (llama.precision "tt"): each matmul's weights in its format (the MLP's gate and up in bfp4,
   # the rest and the output layer in bfp8) and at its fidelity phases (one for gate and up, two for the rest, attention
   # two in decode and four in prefill), Llama-3.1-8B's last block's gate and up in bfp8 at two, the KV cache in bfp8;
-  # numpy, given the same block-float values (its cache rounded as put rounds, llama.bfp8, numpy's bfp of the same) but
+  # numpy, given the same block-float values (its cache rounded as put rounds, gpt2.bfp) but
   # exact products, picks the same tokens, its logits within 1% of their span
   big = SimpleNamespace(layers=32, dim=4096)
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
@@ -1304,7 +1290,7 @@ def test_llama_precision(chip):
   assert {k: (x.rows, x.cols, x.dtype) for k, x in t.items()} == {k: (x.rows, x.cols, x.dtype) for k, x in benchmark.weights(sizes).items()}
   arrays = w | {k: gpt2.values(x) for k, x in t.items() if x.dtype != "bf16"}
   kv, np_kv = llama.kv_cache(c, 32, llama.zeros(rt, "bfp8")), llama.kv_cache(c, 32, np.zeros)  # numpy's rounded as a bfp8 cache's
-  assert kv[0].dtype == "bfp8" and np.array_equal(llama.bfp8(w["embed"][:2, :64]), bfp(bf16(w["embed"][:2, :64])))
+  assert kv[0].dtype == "bfp8"
   on = lambda row: Tensor.of(rt, [row], "int32")
   for ids, places in (([7, 200, 31], [0, 1, 2]), ([5], [3])):  # the prompt, then a token decoded
     got, want = llama.logits(llama.forward(on(ids), on(places), t, c, kv)), llama.forward(ids, places, arrays, c, np_kv)[0]
@@ -1371,7 +1357,7 @@ def test_bfp8_cache(chip):
   for places in ([5], [33, 34, 70], list(range(32, 64)), [0, 95]):
     x = bf16(rng.normal(0, 2, (4, len(places), 64)) * 10.0 ** rng.integers(-3, 3, (4, len(places), 1)))
     cache.put(Tensor.of(rt, [places], "int32"), Tensor.of(rt, x.tolist()))
-    want[:, places] = np.stack([bfp(m) for m in x])
+    want[:, places] = gpt2.bfp(x)
     assert np.array_equal(value(cache), want), places
   same = Tensor.of(rt, want.tolist())  # the same values in bf16
   q, s = (Tensor.of(rt, bf16(rng.normal(0, 1, shape)).tolist()) for shape in ((4, 5, 64), (4, 5, 96)))

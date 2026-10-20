@@ -13,6 +13,37 @@ from ferrite.tensor import Tensor, jit
 
 HEADS = 12
 
+def bf16_bits(a, packer=False):  # numpy values as bf16 bits: rounded to nearest even as uploads round, or half up as the packer does
+  b = np.asarray(a, np.float32).view(np.uint32)
+  return ((b + (0x8000 if packer else 0x7FFF + (b >> 16 & 1))) >> 16).astype(np.uint16)
+def bf16_floats(bits): return (np.asarray(bits).astype(np.uint32) << 16).view(np.float32)  # bf16 bits as float32 values
+
+def bfp(a, dtype="bfp8"):
+  """numpy's model of a block float as the chip makes it (cast, or put into a bfp8 KV cache), as values: rounded to
+  bf16, then each run of 16 along a row to its largest exponent, 7 bits of magnitude below it rounded half up (bfp4: 3
+  bits, to the nearest)."""
+  bits = bf16_bits(a).astype(np.uint32)
+  s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
+  runs = lambda x: x.reshape(*x.shape[:-1], -1, 16)
+  top = runs(e).max(-1, keepdims=True)
+  shift = np.minimum(top - runs(e), 8)  # 8 and more leave 0
+  q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
+  if dtype == "bfp4": q = np.where(shift < 4, np.minimum((runs(m) + (16 << shift)) >> (shift + 5), 7), 0) << 4  # nearest 3 bits
+  return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(np.shape(a))
+
+def safetensors(path):  # a safetensors file: its JSON header (each tensor's dtype, shape and byte range) and its data, mapped
+  with open(path, "rb") as f:
+    size = struct.unpack("<Q", f.read(8))[0]
+    header = json.loads(f.read(size))
+  return header, np.memmap(path, np.uint8, "r", offset=8 + size)
+
+def tensor_bits(data, t, transpose=False):  # one tensor of a safetensors file as bf16 bits (fp32 rounded to nearest even), a vector as one row
+  raw = data[t["data_offsets"][0]:t["data_offsets"][1]]
+  if t["dtype"] == "F32": bits = bf16_bits(raw.view(np.float32))
+  else: assert t["dtype"] == "BF16", t["dtype"]; bits = raw.view(np.uint16)
+  bits = bits.reshape(t["shape"] if len(t["shape"]) == 2 else (1, -1))
+  return np.ascontiguousarray(bits.T) if transpose else bits
+
 def fns(x):  # what numpy and ferrite spell differently
   if isinstance(x, np.ndarray):
     split = lambda a, n: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2)
@@ -76,19 +107,12 @@ def mask(places, size, starts=None):
 def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # each block's, by zeros(shape)
 
 def load(path):
-  """{name: (bf16 bits, the same as float32)} from a safetensors file: 8 bytes of header size, a JSON header naming each
-  tensor's dtype, shape and byte range, then the data. Vectors become one-row matrices."""
-  with open(path, "rb") as f:
-    size = struct.unpack("<Q", f.read(8))[0]
-    header = json.loads(f.read(size))
-  data, out = np.memmap(path, np.uint8, "r", offset=8 + size), {}
-  for name, t in header.items():
-    if name == "__metadata__" or name.endswith(".attn.bias") or name.endswith(".attn.masked_bias"): continue  # causal masks
-    assert t["dtype"] == "F32"
-    bits = data[t["data_offsets"][0]:t["data_offsets"][1]].view(np.uint32).reshape(t["shape"] if len(t["shape"]) == 2 else (1, -1))
-    bits = ((bits + 0x7FFF + (bits >> 16 & 1)) >> 16).astype(np.uint16)  # to bf16, nearest even
-    out[name] = (bits, (bits.astype(np.uint32) << 16).view(np.float32))
-  return out
+  """{name: (bf16 bits, the same as float32)} from a safetensors file (8 bytes of header size, a JSON header naming each
+  tensor's dtype, shape and byte range, then the data), vectors as one-row matrices."""
+  header, data = safetensors(path)
+  bits = {name: tensor_bits(data, t) for name, t in header.items()  # but the attention's causal masks
+          if name != "__metadata__" and not name.endswith((".attn.bias", ".attn.masked_bias"))}
+  return {name: (b, bf16_floats(b)) for name, b in bits.items()}
 
 def upload(rt, weights, dtype="bf16"):  # the weights as ferrite Tensors, the output layer's transposed on the chip, and
   # the matrices a matmul reads as its B (the blocks' and the output layer) cast to dtype there
@@ -100,8 +124,9 @@ def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip
   w = {name: values for name, (_, values) in weights.items()} | {"wte.T": weights["wte.weight"][1].T}
   return w | {k: values(x) for k, x in (t or {}).items() if x.dtype != "bf16"}
 
-def values(x):  # a ferrite matrix as numpy float32 (bf16 bits, or bfp8's as bf16)
-  return (np.frombuffer(x.tobytes(), np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(x.rows, x.cols)
+def values(x):  # a ferrite matrix as numpy float32: fp32 as it is, bf16's bits, a block float's as bf16
+  raw = x.tobytes()
+  return (np.frombuffer(raw, np.float32) if x.dtype == "fp32" else bf16_floats(np.frombuffer(raw, np.uint16))).reshape(x.rows, x.cols)
 
 def logits(ids, w):  # the logits for the token after ids, in numpy, as a vector
   return forward(ids, w, mask(range(len(ids)), len(ids)))[0]

@@ -11,23 +11,18 @@
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).
 # bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and the rest in bfp8 (numpy then has
 # them as the chip does), tt: TT's performance precision, formats and fidelity phases both (precision). A model too big to check in numpy on the host (over 2 billion weights) is generated unchecked.
-import functools, json, math, os, struct, sys, time
+import functools, json, math, os, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ferrite.tensor import Tensor, jit
 import gpt2
 
-def fns(x):  # what numpy and ferrite spell differently
+def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llama adds
   if isinstance(x, np.ndarray):
-    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], split=lambda a, n: a.reshape(a.shape[-2], n, -1).transpose(1, 0, 2),
-                           merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
-                           softmax=lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True),
-                           mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), silu=lambda a: a / (1 + np.exp(-a)),
-                           put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b), repeat=lambda a, n: np.repeat(a, n, 0),
-                           mm=lambda a, b, phases: a @ b)
-  return SimpleNamespace(rows=Tensor.gather, split=Tensor.split, merge=Tensor.merge, t=lambda a: a.T, softmax=Tensor.softmax,
-                         mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, put=Tensor.put, repeat=Tensor.repeat_interleave,
+    return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a),
+                           silu=lambda a: a / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0), mm=lambda a, b, phases: a @ b)
+  return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, repeat=Tensor.repeat_interleave,
                          mm=lambda a, b, phases: a.matmul(b, fidelity=phases))  # numpy's products are exact at any phases
 
 def precision(c, mode="bf16"):
@@ -44,17 +39,6 @@ def precision(c, mode="bf16"):
   if tt and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
   p["head", None] = ("bfp8", 2) if tt else ("bfp8" if mode == "bfp4" else mode, 4)
   return p | {("attention", "decode"): (None, 2 if tt else 4), ("attention", "prefill"): (None, 4), ("kv", None): ("bfp8" if tt else "bf16", None)}
-
-def bfp8(a):  # numpy's model of rows put into a bfp8 KV cache: rounded to bf16, then each run of 16 along a row to its
-  # largest exponent, 7 bits of magnitude below it, half up (as put and cast("bfp8") round)
-  b = np.asarray(a, np.float32).view(np.uint32)
-  bits = (b + 0x7FFF + (b >> 16 & 1)) >> 16
-  s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
-  runs = lambda x: x.reshape(*x.shape[:-1], -1, 16)
-  top = runs(e).max(-1, keepdims=True)
-  shift = np.minimum(top - runs(e), 8)
-  q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
-  return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(np.shape(a))
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
@@ -74,7 +58,7 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   h = rms(x, p["input_layernorm"], c.eps)
   qkv = rope(f.split(f.mm(h, p["qkv_proj"], phases("qkv")), n), f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
   kv = qkv[c.heads:, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a bfp8 cache does
-  f.put(cache, rows, bfp8(kv) if isinstance(kv, np.ndarray) and cache_format(c) == "bfp8" else kv)
+  f.put(cache, rows, gpt2.bfp(kv) if isinstance(kv, np.ndarray) and cache_format(c) == "bfp8" else kv)
   k, v = (f.repeat(t, c.heads // c.kv) for t in (cache[:c.kv, :, :], cache[c.kv:, :, :]))  # a head for each query's, in place
   attention = phases("attention", "prefill" if prefill else "decode")
   s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(c.dim // c.heads))
@@ -98,7 +82,7 @@ def rotary(c, n):  # cos and sin for places 0 to n - 1, as Hugging Face's (angle
   # for each of q's, k's and v's heads (v's 1 and 0: they do not turn, so one kernel turns them all), and turn:
   hd, inv = c.dim // c.heads, frequencies(c)  # x @ turn is (-x2, x1), each of its entries one of x's, so exact
   angles = np.arange(n, dtype=np.float32)[:, None] * inv[None]
-  bf16 = lambda a: ((a.astype(np.float32).view(np.uint32) + 0x7FFF + (a.astype(np.float32).view(np.uint32) >> 16 & 1)) & 0xFFFF0000).view(np.float32)
+  bf16 = lambda a: gpt2.bf16_floats(gpt2.bf16_bits(a))
   turn = np.zeros((hd, hd), np.float32)
   turn[np.arange(hd // 2) + hd // 2, np.arange(hd // 2)], turn[np.arange(hd // 2), np.arange(hd // 2) + hd // 2] = -1, 1
   heads = lambda t, v: np.concatenate([t] * (c.heads + c.kv) + [np.full_like(t, v)] * c.kv, 1)
@@ -108,7 +92,7 @@ class Weight:
   """A weight read from the checkpoint only when it is wanted, so the host never holds more of a big model at once than
   a matrix or two: bits() gives its bf16 bits as x @ w takes them, values() the same as float32."""
   def __init__(self, bits): self.bits = bits
-  def values(self): return (self.bits().astype(np.uint32) << 16).view(np.float32)
+  def values(self): return gpt2.bf16_floats(self.bits())
 
 def fuse(w):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls
   cat = lambda xs: np.ascontiguousarray(np.concatenate(xs, 1))
@@ -137,13 +121,6 @@ def forward(ids, places, w, c, caches, starts=None):
 def kv_cache(c, size, zeros):  # each block's keys' heads then its values', a row for each of size places, made by zeros(shape)
   return [zeros((2 * c.kv, size, c.dim // c.heads)) for _ in range(c.layers)]
 
-def _bits(data, t, transpose):  # one tensor of a safetensors file, as bf16 bits (fp32 rounded, to nearest even)
-  raw = data[t["data_offsets"][0]:t["data_offsets"][1]]
-  if t["dtype"] == "F32": bits = raw.view(np.uint32); bits = ((bits + 0x7FFF + (bits >> 16 & 1)) >> 16).astype(np.uint16)
-  else: assert t["dtype"] == "BF16", t["dtype"]; bits = raw.view(np.uint16)
-  bits = bits.reshape(t["shape"] if len(t["shape"]) == 2 else (1, -1))
-  return np.ascontiguousarray(bits.T) if transpose else bits
-
 def load(folder, places=4096):
   """The config, and {name: Weight} from model.safetensors, or from the files model.safetensors.index.json names (each 8
   bytes of header size, a JSON header naming each tensor's dtype, shape and byte range, then the data), named without
@@ -157,18 +134,14 @@ def load(folder, places=4096):
   files = sorted(set(json.load(open(index))["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
   out = {}
   for file in files:
-    path = os.path.join(folder, file)
-    with open(path, "rb") as fh:
-      size = struct.unpack("<Q", fh.read(8))[0]
-      header = json.loads(fh.read(size))
-    data = np.memmap(path, np.uint8, "r", offset=8 + size)
+    header, data = gpt2.safetensors(os.path.join(folder, file))
     for name, t in header.items():
       if name == "__metadata__": continue
       name = name.removeprefix("model.").replace("self_attn.", "").replace("mlp.", "").removesuffix(".weight")
-      out[name] = Weight(functools.partial(_bits, data, t, name.endswith("_proj") or name == "lm_head"))
+      out[name] = Weight(functools.partial(gpt2.tensor_bits, data, t, name.endswith("_proj") or name == "lm_head"))
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = out.pop("lm_head", None) or Weight(lambda e=out["embed"]: np.ascontiguousarray(e.bits().T))  # tied, or its own
-  for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: (a.view(np.uint32) >> 16).astype(np.uint16))
+  for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: gpt2.bf16_bits(a))
   return c, fuse(out)
 
 def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks' and the

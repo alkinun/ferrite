@@ -60,7 +60,7 @@ def train(rt, steps, log=None, data=None):
   c = SimpleNamespace(ctx=64, dim=64, heads=2, layers=2)
   c.vocab, ids, rng = len(chars), np.array([chars.index(ch) for ch in data]), np.random.default_rng(1)
   w = init(c)
-  mask = np.triu(np.full((c.ctx, c.ctx), -1e9, np.float32), 1)
+  mask = gpt2.mask(range(c.ctx), c.ctx)
   tw = {k: Tensor.of(rt, a.tolist(), "fp32").requires_grad_() for k, a in w.items()}
   state = {id(t): [Tensor.full(rt, t.rows, t.cols, 0.0, "fp32") for _ in range(2)] for t in tw.values()}
   pw = {k: torch.tensor(a, requires_grad=True) for k, a in w.items()}
@@ -77,12 +77,12 @@ def train(rt, steps, log=None, data=None):
     start = time.time()
     at = int(rng.integers(0, len(ids) - c.ctx - 1))
     x, y = ids[at:at + c.ctx].tolist(), ids[at + 1:at + c.ctx + 1].tolist()
-    same = {k: torch.tensor(array(t), requires_grad=True) for k, t in tw.items()}  # PyTorch on ferrite's weights, as they are
+    same = {k: torch.tensor(gpt2.values(t), requires_grad=True) for k, t in tw.items()}  # PyTorch on ferrite's weights, as they are
     loss = train_step(Tensor.of(rt, [x], "int32"), Tensor.of(rt, np.eye(c.vocab, dtype=np.float32)[y].tolist(), "fp32"),
                       Tensor.full(rt, 1, 1, LR / (1 - B1**step), "fp32"), Tensor.full(rt, 1, 1, 1 / math.sqrt(1 - B2**step), "fp32"))
     want = torch.nn.functional.cross_entropy(forward(x, same, pmask, c), torch.tensor(y))
     want.backward()
-    grads = max(float(np.abs(array(t.grad) - same[k].grad.numpy()).max() / np.abs(same[k].grad.numpy()).max()) for k, t in tw.items())
+    grads = max(float(np.abs(gpt2.values(t.grad) - same[k].grad.numpy()).max() / np.abs(same[k].grad.numpy()).max()) for k, t in tw.items())
     opt.zero_grad()
     own = torch.nn.functional.cross_entropy(forward(x, pw, pmask, c), torch.tensor(y))
     own.backward()
@@ -92,7 +92,6 @@ def train(rt, steps, log=None, data=None):
                 f"{own.item():.4f} on its own ({time.time() - start:.1f}s)")
   return losses
 
-def array(t): return np.frombuffer(t.tobytes(), np.float32).reshape(t.rows, t.cols)  # an fp32 matrix, as numpy
 
 def main():
   from ferrite import pci
