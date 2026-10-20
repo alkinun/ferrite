@@ -55,25 +55,30 @@ def wrap(t, shape, dtype): return FerriteTensor(Value(t, View(tuple(shape)), dty
 def view(x, v): return FerriteTensor(Value(x.v.t, v, x.dtype))
 def chip(x): return hasattr(x, "eq")  # a ferrite tensor, not a number
 
+def promoted(args):  # the dtype PyTorch gives an elementwise op of one or two tensors and numbers
+  stand = [torch.empty((1,) * min(a.dim(), 1), dtype=a.dtype) if isinstance(a, torch.Tensor) else a for a in args]
+  return torch.result_type(*stand) if len(stand) == 2 else stand[0].dtype
+def as_dtype(t, dtype):  # a ferrite tensor in the dtype that holds torch's dtype (ferrite multiplies int32 in fp32, say)
+  return t.cast(DTYPES[dtype]) if DTYPES[dtype] and t.dtype != DTYPES[dtype] else t
+
 def ew(f, args, dtype=None):
   """An elementwise op on FerriteTensors and numbers (a plain tensor goes up first, a 0-d one is a number), numpy's
-  broadcasting: f of ferrite tensors, folded alike, or numbers."""
+  broadcasting: f of ferrite tensors, folded alike, or numbers; the result in dtype, PyTorch's unless said."""
   num = lambda a: a.item() if a.dim() == 0 else ferrite(a).v
   vals = [a.v if isinstance(a, FerriteTensor) else num(a) if isinstance(a, torch.Tensor) else a for a in args]
   shape = tuple(torch.broadcast_shapes(*[v.shape for v in vals if isinstance(v, Value)]))
   vals = [broadcast(v, shape) if isinstance(v, Value) else v for v in vals]
-  groups, dtype = common_groups(shape, vals), dtype or next(v.dtype for v in vals if isinstance(v, Value))
-  out = f(*[operand(v, shape, groups) if isinstance(v, Value) else v for v in vals])
-  if DTYPES[dtype] == "int32" and out.dtype == "fp32": out = out.cast("int32")  # ferrite multiplies int32 in fp32
+  groups, dtype = common_groups(shape, vals), dtype or promoted(args)
+  out = as_dtype(f(*[operand(v, shape, groups) if isinstance(v, Value) else v for v in vals]), dtype)
   return FerriteTensor(Value(spread(out, shape, groups), View(shape), dtype))
 
 def dims(d, n):  # torch's dim argument as a list of axes
   return list(range(n)) if d is None or d == [] else [k % n for k in ([d] if isinstance(d, int) else d)]
 
-def reduction(op, x, dim=None, keepdim=False):
-  axes = dims(dim, x.dim())
+def reduction(op, x, dim=None, keepdim=False, dtype=None):  # a sum of integers or bools is int64, as PyTorch has it
+  axes, dtype = dims(dim, x.dim()), dtype or (x.dtype if op == "max" or x.is_floating_point() else torch.int64)
   shape = [1 if k in axes else n for k, n in enumerate(x.shape)] if keepdim else [n for k, n in enumerate(x.shape) if k not in axes]
-  return wrap(reduce(x.v, axes, op), shape, x.dtype)
+  return wrap(as_dtype(reduce(x.v, axes, op), dtype), shape, dtype)
 
 def reshape(x, shape):
   shape = list(shape)
@@ -109,7 +114,7 @@ def cat(xs, dim=0):  # tinygrad's way: each padded with zeros into its place, an
 
 def pad(x, widths, value=0):  # torch's (before, after) pairs from the last axis back: zeros outside by the view, then value there
   w = [(0, 0)] * (x.dim() - len(widths) // 2) + [tuple(widths[i:i + 2]) for i in range(len(widths) - 2, -1, -2)]
-  if min(min(w)) < 0: return on_cpu(aten.constant_pad_nd.default, (x, widths, value), {})  # a crop as well
+  if min(map(min, w)) < 0: return on_cpu(aten.constant_pad_nd.default, (x, widths, value), {})  # a crop as well
   out, ones = view(x, x.v.view.pad(w)), constant(x, 1)
   return ew(lambda p, m: p - m * value + value, [out, view(ones, ones.v.view.pad(w))]) if value else out
 
@@ -222,7 +227,7 @@ OPS = {  # aten op -> what it is on FerriteTensors (their in-place versions come
   aten.rsqrt: unary(lambda p: p.rsqrt()), aten.reciprocal: unary(lambda p: p.reciprocal()), aten.sin: unary(lambda p: p.sin()),
   aten.cos: unary(lambda p: p.cos()), aten.relu: unary(lambda p: p.relu()), aten.sigmoid: unary(lambda p: p.sigmoid()),
   aten.erf: unary(erf), aten.abs: unary(lambda p: p.maximum(-p)), aten.mean: mean, aten.var: variance,
-  aten.sum: lambda a, dim=None, keepdim=False, dtype=None: reduction("sum", a, dim, keepdim),
+  aten.sum: lambda a, dim=None, keepdim=False, dtype=None: reduction("sum", a, dim, keepdim, dtype),
   aten.amax: lambda a, dim=None, keepdim=False: reduction("max", a, dim, keepdim),
   aten.mm: matmul, aten.bmm: matmul, aten.cat: cat,
   aten.view: reshape, aten._unsafe_view: reshape, aten.reshape: reshape, aten.expand: expand, aten.transpose: transpose,
@@ -250,8 +255,9 @@ OPS = {  # aten op -> what it is on FerriteTensors (their in-place versions come
 
 PRIMS = {prims.view_of: lambda a: FerriteTensor(a.v),
          prims.pow: lambda a, e: ew(POWERS[e], [a]) if e in POWERS else on_cpu(prims.pow.default, (a, e), {}),
-         prims.sum: lambda a, dims, output_dtype=None: reduction("sum", a, dims), prims.var: lambda a, dims, correction=1, output_dtype=None:
-         variance(a, dims, correction), prims.broadcast_in_dim: broadcast_in_dim, prims.convert_element_type: lambda a, dtype: to_copy(a, dtype)}
+         prims.sum: lambda a, dims, output_dtype=None: reduction("sum", a, dims, False, output_dtype),
+         prims.var: lambda a, dims, correction=1, output_dtype=None: variance(a, dims, correction),
+         prims.broadcast_in_dim: broadcast_in_dim, prims.convert_element_type: lambda a, dtype: to_copy(a, dtype)}
 
 def dispatch(func, args, kwargs):
   """func on ferrite: its own version, or the in-place one made from it (the result kept, and computed now, so a training
@@ -271,7 +277,7 @@ def dispatch(func, args, kwargs):
 
 def keep(t, x):  # x into the FerriteTensor t, in place: its whole shape, computed now
   x = x if isinstance(x, FerriteTensor) else ferrite(x)
-  t.v = Value(materialize(broadcast(x.v, tuple(t.shape))).realize(), View(tuple(t.shape)), t.dtype)
+  t.v = Value(as_dtype(materialize(broadcast(x.v, tuple(t.shape))), t.dtype).realize(), View(tuple(t.shape)), t.dtype)
   return t
 
 def on_cpu(func, args, kwargs):

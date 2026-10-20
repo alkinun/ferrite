@@ -333,8 +333,9 @@ def test_bfp(chip, dtype):
   for b, m, k, n in ((1, 64, 9000, 40), (1, 1, 768, 2304), (1, 100, 256, 200), (2, 100, 256, 96), (1, 32, 2048, 64)):
     x, w = on(b, m, k), on(b, k, n).cast(dtype)
     assert (x @ w).tolist() == (x @ Tensor.of(rt, w.tolist())).tolist(), (b, m, k, n)
-  x, w, v, bias = on(64, 192), on(192, 96).cast(dtype), on(192, 96), on(1, 96)  # K too short to split: one kernel
-  assert (x @ w + x @ v + bias).relu().tolist() == (x @ Tensor.of(rt, w.tolist()) + x @ v + bias).relu().tolist()
+  x, w, v, bias = on(64, 192), on(192, 96).cast(dtype).realize(), on(192, 96), on(1, 96)  # K too short to split: one kernel
+  launches, y = rt.launches, (x @ w + x @ v + bias).relu().realize()
+  assert rt.launches == launches + 1 and y.tolist() == (x @ Tensor.of(rt, w.tolist()) + x @ v + bias).relu().tolist()
 
 def test_matmul_multicast(chip):
   # with a grid of workers (Runtime.grid), a matmul reads each input tile from DRAM once. Of more than one row of tiles:
@@ -811,7 +812,7 @@ def test_int32(chip):
 def test_autograd(chip):
   # every op's backward against numpy: the loss sum(f(inputs) * w), w random so every element of the gradient differs,
   # and its gradient by central differences in float64. fp32 tensors, odd shapes, broadcasting; matmuls to the FPU's
-  # 2^-12, the rest to fp32's rounding. Then a bf16 leaf (its gradient comes back through the cast), a tensor read twice
+  # 2^-11, the rest to fp32's rounding. Then a bf16 leaf (its gradient comes back through the cast), a tensor read twice
   # (gradients add), and .grad adding up over two backward passes
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(11)
   softmax = lambda a, ax: np.exp(a - a.max(ax, keepdims=True)) / np.exp(a - a.max(ax, keepdims=True)).sum(ax, keepdims=True)
@@ -888,7 +889,7 @@ def test_fuzz(chip, monkeypatch):
   realize = Tensor.realize
   def checked_realize(t):
     if t.op in (None, "T", "move"): return realize(t)  # data movement is test_movement's
-    tensor._fit(t)  # too big for one kernel: its parts first, as realize does, each checked too
+    tensor._fit(t)  # the parts realize computes first (a long matmul, a shared value, a tree too big), each checked too
     inputs = []
     e, _ = tensor._tree(t, inputs)
     xs = [value(u) for u in inputs]
@@ -928,7 +929,8 @@ def test_fuzz(chip, monkeypatch):
       bb = b if rng.random() < 0.5 else 1
       return (leaf((b, r, k)) @ (leaf((bb, c, k)).T if rng.random() < 0.3 else leaf((bb, k, c)))) * (1 / k)  # B read transposed, or not
     return leaf(shape)
-  for n in range(int(os.environ.get("FUZZ", 30))):  # sizes past 4 tiles make part-blocks of batched matmuls (unbatched ones share by multicast); every other tree is fp32
+  for n in range(int(os.environ.get("FUZZ", 30))):  # every other tree fp32; sizes past 4 tiles make part-blocks of batched
+    # matmuls (unbatched ones share by multicast)
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
     dtype = ("bf16", "fp32")[n % 2]
     gen(shape, 4).realize()
@@ -976,8 +978,8 @@ def test_mnist_cnn(chip):
 def test_train(chip):
   # stage 1's training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning to count
   # in fp32 with Adam (test/train.py learns README and LESSONS, which change with every edit: once, a new text put one
-  # gradient past the bound). Every step's loss and gradients against PyTorch's on the same weights, to the matmul's
-  # 2^-11, the step recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1
+  # gradient past the bound). Every step's loss and gradients against PyTorch's on the same weights (to 1e-3, and 2e-3
+  # of the largest: the matmul's 2^-11, compounded), the step recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1
   # together, so a replay sends them in parts); the loss falling; and the first step the same as PyTorch's own
   pytest.importorskip("torch")
   losses = train.train(Runtime(chip, chip.tensix[0], chip.tensix[-1]), 5, data=" ".join(map(str, range(3000))))
@@ -996,8 +998,9 @@ def tinygrad(chip):  # tinygrad with ferrite as its FERRITE device, on this proc
 def test_tinygrad(tinygrad):
   # stage 4's first step: tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
   # ferrite runs it: elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad
-  # writes one (a broadcast multiply, summed), softmax, a tinygrad function (inlined); then an MLP trained with Adam for
-  # three steps, and a layer for five under TinyJit, replayed. All against tinygrad on its own CPU device, and on the chip
+  # writes one (a broadcast multiply, summed), softmax, a tinygrad function (inlined); integers and bools, a view of part
+  # of a buffer, stores into parts of one, and tensors with nothing in them; then an MLP trained with Adam for three
+  # steps, and a layer for five under TinyJit, replayed. All against tinygrad on its own CPU device, and on the chip
   # (launches), not the host
   from tinygrad import Tensor, TinyJit, dtypes, function, nn
   from tinygrad.helpers import Context
@@ -1013,11 +1016,13 @@ def test_tinygrad(tinygrad):
     launches, got = rt.launches, f(*(Tensor(v, device="FERRITE") for v in (a, b, w))).numpy()
     assert rt.launches > launches and got.shape == want.shape, n
     assert np.abs(got - want).max() <= 1e-3 * (np.abs(want).max() + 1), (n, np.abs(got - want).max())  # a matmul to the FPU's 2^-11
-  Tensor.ones(2, device="FERRITE").contiguous().realize().tolist()  # a buffer freed, then one of its size: nothing of it left
-  assert Tensor.ones((), dtype=dtypes.int64, device="FERRITE").contiguous().item() == 1
+  Tensor.ones(2, device="FERRITE").contiguous().realize().tolist()  # 8 bytes, freed: the next buffer of 8 bytes (this
+  assert Tensor.ones((), dtype=dtypes.int64, device="FERRITE").contiguous().item() == 1  # int64) has nothing of it
   ints = Tensor([[1, -8, 1], [32, 1, 6]], dtype=dtypes.int32, device="FERRITE")  # products come back int32, bitwise and on the host
   assert (ints * ints).tolist() == [[1, 64, 1], [1024, 1, 36]] and (ints & 12).tolist() == [[0, 8, 0], [0, 0, 4]]
   assert ints.argmax(1).tolist() == [0, 0]
+  made = Tensor([3, 3], dtype=dtypes.int64, device="FERRITE").cast(dtypes.bfloat16)  # bf16 made on the host: up as values
+  assert (made * Tensor([1.0, 2.0], dtype=dtypes.bfloat16, device="FERRITE")).tolist() == [3.0, 6.0]
   assert (Tensor(a, device="FERRITE") > 0).any(1).tolist() == (a > 0).any(1).tolist()  # bools read back a byte each
   assert (Tensor(np.arange(8, dtype=np.float32), device="FERRITE")[:4] * 2).tolist() == [0, 2, 4, 6]  # a view of part of a tensor
   assert (ints.T @ ints).tolist() == (np.array(ints.tolist()).T @ np.array(ints.tolist())).tolist()  # summed in fp32, no FPU
@@ -1084,6 +1089,10 @@ def test_torch(chip, monkeypatch):
   for n, f in enumerate(cases):
     want, got = f(a, b, w), f(tf.ferrite(a), tf.ferrite(b), tf.ferrite(w)).cpu()
     assert (got - want).abs().max() <= 1e-3 * (want.abs().max() + 1), (n, (got - want).abs().max())
+  i, h = tf.ferrite(torch.tensor([[1, -2], [3, 4]])), tf.ferrite(a.bfloat16())  # dtypes as PyTorch makes them
+  assert torch.equal((i + 0.5).cpu(), torch.tensor([[1.5, -1.5], [3.5, 4.5]])) and (i > 0).sum().cpu().dtype is torch.int64
+  assert (h + tf.ferrite(a)).cpu().dtype is torch.float32 and torch.equal(torch.full_like(h, 1.5).cpu(), torch.full_like(a.bfloat16(), 1.5))
+  assert torch.equal(F.pad(tf.ferrite(torch.tensor([float("inf"), 1.0])), (1, 1)).cpu(), torch.tensor([0, float("inf"), 1, 0]))  # no NaN
   def train(model, x, y, loss, steps, on_chip):
     torch.manual_seed(17)
     model, x, y = model(), x(), y()
@@ -1107,8 +1116,8 @@ def test_transformers(chip, monkeypatch):
   # stage 4: someone else's model, unchanged. Hugging Face transformers' own Llama (SmolLM's architecture: RMSNorm, RoPE,
   # grouped-query attention, SwiGLU, tied embeddings), small and with random weights, through the PyTorch adapter: its
   # logits, greedy generate with its KV cache, and three Adam steps, against PyTorch on the CPU from the same weights
-  # (at a learning rate of 1e-2, Adam makes gradients that nearly cancel full steps of either sign, and fp32 matmuls as
-  # bf16x3 drift 0.01 apart in two steps), with nothing on the CPU but generate's integer bitwise and. With LLAMA set,
+  # (at a learning rate of 1e-3: at 1e-2, Adam turns gradients that nearly cancel into full steps of either sign, and
+  # fp32 matmuls as bf16x3 drift 0.01 apart in two steps), with nothing on the CPU but generate's integer bitwise and. With LLAMA set,
   # SmolLM-135M's real weights too, all 30 blocks (85 s on ttsim)
   transformers = pytest.importorskip("transformers")
   import torch
@@ -1139,7 +1148,7 @@ def test_transformers(chip, monkeypatch):
   if "LLAMA" in os.environ:
     with torch.no_grad():
       smol = lambda: transformers.AutoModelForCausalLM.from_pretrained(os.environ["LLAMA"], torch_dtype=torch.float32)
-      ids = torch.tensor([[504, 3172, 282, 1029, 314]])  # "The meaning of life is"
+      ids = torch.tensor([[504, 2455, 282, 1029, 314]])  # "The meaning of life is"
       want, got = smol()(ids).logits, tf.ferrite(smol())(tf.ferrite(ids)).logits.cpu()
       assert (got - want).abs().max() < 0.1 and got[0, -1].argmax() == want[0, -1].argmax(), (got - want).abs().max()
   assert set(fell_back) <= {"aten.bitwise_and.Tensor"}, fell_back

@@ -144,7 +144,7 @@ def main():
   c, weights = load(folder)
   t = upload(rt, weights, dtype)
   w = arrays(weights, t)
-  print(f"{sum(bits.size for k, (bits, _) in weights.items() if k != 'embed.T') / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
+  print(f"{sum(bits.size for k, (bits, _) in weights.items() if k not in ('embed.T', 'cos', 'sin', 'turn')) / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
   ids, agree = enc.encode(prompt), 0
   size = -(-(len(ids) + steps) // 32) * 32  # a row for each place the generation reaches, in whole tiles
   kv, np_kv = kv_cache(c, size, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), kv_cache(c, size, np.zeros)

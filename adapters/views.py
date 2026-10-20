@@ -33,8 +33,8 @@ class View:
   def permute(self, order):
     return View([self.shape[k] for k in order], [self.strides[k] for k in order], self.offset, self.mask and [self.mask[k] for k in order])
   def expand(self, shape):
-    return View(shape, [0 if n != m else s for s, n, m in zip(self.strides, self.shape, shape)], self.offset,
-                self.mask and [(0, m if w[0] < w[1] else 0) if n != m else w for w, n, m in zip(self.mask, self.shape, shape)])  # padding stays padding
+    mask = self.mask and [(0, m if w[0] < w[1] else 0) if n != m else w for w, n, m in zip(self.mask, self.shape, shape)]  # padding
+    return View(shape, [0 if n != m else s for s, n, m in zip(self.strides, self.shape, shape)], self.offset, mask)  # stays padding
   def shrink(self, ranges):
     mask = self.mask and [(max(lo - a, 0), min(hi - a, b - a)) for (lo, hi), (a, b) in zip(self.mask, ranges)]
     return View([b - a for a, b in ranges], self.strides, self.offset + sum(a * s for (a, _), s in zip(ranges, self.strides)), mask)
@@ -136,12 +136,16 @@ def download(v):  # a chip value as numpy, in its shape (bf16 as its bits)
   if view.mask is not None:
     for k, (lo, hi) in enumerate(view.mask):
       keep = (np.arange(view.shape[k]) >= lo) & (np.arange(view.shape[k]) < hi)
-      out = out * keep.reshape([-1 if j == k else 1 for j in range(len(view.shape))])
+      out = np.where(keep.reshape([-1 if j == k else 1 for j in range(len(view.shape))]), out, out.dtype.type(0))  # (inf * 0 is NaN)
   return out
 
 def upload(a, dtype=None, shape3=None):
-  """numpy a (bf16 as its bits) onto the chip as ferrite dtype (by default fp32, or int32 for integers), shape3 or folded."""
+  """numpy a onto the chip as ferrite dtype (by default fp32, or int32 for integers), shape3 or folded. For bf16, a is
+  its bits (uint16) or values (floats, rounded to nearest even)."""
   dtype = dtype or ("int32" if a.dtype.kind in "iub" else "fp32")
+  if dtype == "bf16" and a.dtype.kind == "f":
+    b = np.asarray(a, np.float32).view(np.uint32).astype(np.uint64)
+    a = ((b + 0x7FFF + (b >> 16 & 1)) >> 16).astype(np.uint16)
   shape3 = shape3 or fold(a.shape)
   return tensor.Tensor.frombytes(runtime(), *shape3[1:], np.ascontiguousarray(a, NP[dtype]).tobytes(), shape3[0], dtype)
 

@@ -15,7 +15,7 @@ HEADS = 12
 
 def fns(x):  # what numpy and ferrite spell differently
   if isinstance(x, np.ndarray):
-    split = lambda a, n, axis=1: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2) if axis else a.reshape(n, -1, a.shape[1])
+    split = lambda a, n: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2)
     softmax = lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True)
     layernorm = lambda a: (a - a.mean(-1, keepdims=True)) / np.sqrt(a.var(-1, keepdims=True) + 1e-5)
     return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split, softmax=softmax, layernorm=layernorm,
@@ -37,8 +37,8 @@ def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 def layer(x, p, mask, heads=HEADS, cache=None, places=None):
   """One transformer block: attention then MLP, each after a layer norm and added back. p: the block's weights by their
   names in the file, less "h.<layer>."; mask: 0 where a token may look, -1e9 where it may not (see mask); cache: this
-  block's keys and values, its heads' then theirs (kv_cache), a row for every place: this call's are put at places,
-  both in one put, and attention reads all of them."""
+  block's keys and values (kv_cache: the keys' heads, then the values'), a row for every place: this call's are put at
+  places, both in one put, and attention reads all of them."""
   f = fns(x)
   d = f.width(x)
   hd = d // heads
@@ -104,10 +104,8 @@ def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip
 def values(x):  # a ferrite matrix as numpy float32 (bf16 bits, or bfp8's as bf16)
   return (np.frombuffer(x.tobytes(), np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(x.rows, x.cols)
 
-def logits(ids, w, rt=None):
-  """The logits for the token after ids, as a numpy vector: on the chip if rt is given (w: from upload), else in numpy."""
-  if rt is None: return forward(ids, w, mask(range(len(ids)), len(ids)))[0]
-  return values(forward(ids, w, Tensor.of(rt, mask(range(len(ids)), len(ids)).tolist())))[0]
+def logits(ids, w):  # the logits for the token after ids, in numpy, as a vector
+  return forward(ids, w, mask(range(len(ids)), len(ids)))[0]
 
 def main():
   import tiktoken

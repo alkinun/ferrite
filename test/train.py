@@ -102,7 +102,8 @@ def main():
   mean = lambda i, part: sum(step[i] for step in part) / len(part)
   print(f"every step: loss within {max(abs(f - p) for f, p, _, _ in losses):.0e} of PyTorch's on the same weights, gradients within "
         f"{max(g for _, _, g, _ in losses):.0e}")
-  print(f"mean loss over 50 steps: {mean(0, losses[:50]):.2f} -> {mean(0, losses[-50:]):.2f}, PyTorch on its own "
-        f"{mean(3, losses[:50]):.2f} -> {mean(3, losses[-50:]):.2f}")
+  n = min(50, len(losses) // 2) or 1  # the first n steps' mean loss against the last n's
+  print(f"mean loss of the first and last {n} steps: {mean(0, losses[:n]):.2f} -> {mean(0, losses[-n:]):.2f}, PyTorch on its own "
+        f"{mean(3, losses[:n]):.2f} -> {mean(3, losses[-n:]):.2f}")
 
 if __name__ == "__main__": main()
