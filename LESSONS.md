@@ -217,6 +217,13 @@ append a correction.
    so reading back was quadratic: 0.7 s for 8 MiB, the most any test reads, and 164 s for 64 MiB. Running the bring-up
    checklist on ttsim-chaos with its 256 MiB step at full size found it. Laid out a row band at a time, a Llama token's
    logits now cost the host 0.2 ms, not 6.4. (NOTES: "Upload and download")
+6. **Have what passes read by someone looking for faults.** Read-only audits of code that passed every test found three
+   bugs no test reached: each `Runtime` took a TLB it never gave back (the 201st would have failed), indexing a repeat
+   of heads read the wrong matrices, and the compile cache's pruning would have crashed on a folder a week later. A
+   review of the card path against tt-kmd and UMD found what no ISA page asks for: the chip left in ASIC state 3 when
+   kmd lets go, a busy clock to ask for, BARs that libc's memcpy may copy a byte at a time. A test checks what its
+   writer thought of; a reader hunting for faults finds the rest. (NOTES: "What tt-kmd does that a userspace driver
+   must do instead")
 
 ## For a chip of our own
 
