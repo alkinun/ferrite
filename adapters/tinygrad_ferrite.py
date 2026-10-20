@@ -83,6 +83,12 @@ class Value:
   @property
   def shape(self): return self.view.shape
   def whole(self): return self.view.contiguous() and math.prod(self.shape) == math.prod(self.t.shape)  # its tensor, all of it, as it lies
+  def covers(self): return not self.view.mask and math.prod(n for n, s in zip(self.shape, self.view.strides) if s) == math.prod(self.t.shape)  # all of it, in any order
+
+def uncast(v):  # a bf16 tensor cast to fp32 for a matmul, as the bf16: ferrite multiplies fp32 by bf16 exactly (no lo part
+  if isinstance(v, Value) and v.t.op == "cast" and v.t.dtype == "fp32" and v.t.srcs[0].dtype == "bf16":  # for it), and reads its
+    return Value(v.t.srcs[0], v.view, dtypes.bfloat16)  # transpose in place: the cast never runs
+  return v
 
 def merge(view, groups):
   """(size, stride, lo, hi) for each group of view's axes taken as one, or None if a group's strides do not line up, or
@@ -290,7 +296,9 @@ class Evaluator:
       c, x, y = (self.operand(s, shape, groups) for s in srcs)
       if not chip(c): return None
       return whole(c.where(x, y))
-    if u.op is Ops.CAST:
+    if u.op is Ops.CAST:  # of a view of all of a tensor (a weight transposed): the tensor cast, the view kept, so a matmul
+      if isinstance(v := srcs[0], Value) and v.covers() and DTYPES.get(u.dtype):  # can read the cast's source in place
+        return Value(v.t.cast(DTYPES[u.dtype]), v.view, u.dtype)
       x = self.operand(srcs[0], shape, groups)
       if not chip(x): return None
       return whole(x.ne(0) if u.dtype is dtypes.bool else x.cast(DTYPES[u.dtype]))
@@ -307,7 +315,7 @@ class Evaluator:
     m = p.src[0] if p.op is Ops.PERMUTE else p
     if m.op is not Ops.MUL or not all(dtypes.is_float(s.dtype) and s.dtype in DTYPES for s in m.src): return None
     lift = lambda s, v: to_chip(v, s.dtype) if isinstance(v, Tensor) and constant(v) is None else v  # a weight still on the host goes up
-    a, b = (spread_to(lift(s, self.read(self.values.get(s))), m.shape) for s in m.src)
+    a, b = (uncast(spread_to(lift(s, self.read(self.values.get(s))), m.shape)) for s in m.src)
     if not (isinstance(a, Value) and isinstance(b, Value)) or a.view.mask or b.view.mask: return None
     shape, summed = m.shape, list(order[:u.arg[1]])
     full = lambda v, k: shape[k] == 1 or v.view.strides[k] != 0
@@ -322,7 +330,7 @@ class Evaluator:
     runs = lambda *sizes: [list(range(sum(sizes[:i]), sum(sizes[:i + 1]))) for i in range(3)]  # consecutive axes in groups of these sizes
     A = materialize(Value(a.t, pick(a, batch + rows + summed), a.dtype), runs(nb, nr, nk))
     B = materialize(Value(b.t, pick(b, batch + summed + cols), b.dtype), runs(len(batch), nk, len(cols)))
-    out = A @ B
+    out = A.matmul(B, DTYPES[u.dtype])  # (as u's dtype: an fp32 product of bf16s that were cast up stays fp32)
     made = batch + rows + cols  # the result's axes as made, and as u wants them (free's order)
     return Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)
 
