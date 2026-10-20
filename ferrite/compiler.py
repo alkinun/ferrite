@@ -203,12 +203,12 @@ EXP_P = [1.0, 1.0, 0.49999991, 0.16666421, 0.041668355, 0.008374773, 0.001382954
 LOG2_Q = [1.442695, -0.72134733, 0.4809106, -0.36070517, 0.2879189, -0.23891294, 0.21565668, -0.20746617, 0.12623915]  # 1.3e-7
 SIN_P = [1.0, -0.16666658, 0.0083330506, -0.00019809045, 2.6051646e-06]  # sin(r) / r in r^2, r in [-pi/2, pi/2], 1.4e-7
 
-def exp(base2):
+def exp(base2, nan=False):
   """2^x, or e^x: n = round(t), t = x log2(e) (adding and taking away 1.5 2^23 rounds to an integer, whose bits it
   leaves in the sum's low ones), r = (x - n) ln 2, or for e^x x - n ln 2 in two parts (Cody-Waite: n times 0.693359375 is
   exact), e^r by a polynomial, times 2^floor(n/2) and 2^ceil(n/2), each built from its exponent bits: the multiplies
   overflow to inf, or flush to 0, exactly where the result does. x is first held to where |t| <= 150, which sends a
-  NaN to an end, so a NaN is put back at the end (x again from Dst)."""
+  NaN to an end; nan (an fp32 kernel's: in bf16 a NaN is inf before the SFPU sees it) puts it back (x again from Dst)."""
   (lim, t), ln2 = (150.0, 0) if base2 else (104.0, 5), math.log(2)
   return (sfp_const(1, ln2) if base2 else sfp_const(1, 1 / ln2) + sfp_const(2, 0.693359375) + sfp_const(3, ln2 - 0.693359375),
           [sfp_load(), sfp_bf16(4, -lim), ins("SFPSWAP", vd=4, vc=0, mod1=1), sfp_bf16(4, lim), ins("SFPSWAP", vd=0, vc=4, mod1=1),  # x within +-lim
@@ -218,7 +218,16 @@ def exp(base2):
            *poly(4, 5, EXP_P, 7), ins("SFPSHFT", vd=0, vc=6, mod1=7, imm12=-1 & 0xFFF), ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=1),
            ins("SFPSHFT", vd=6, mod1=3, imm12=-1 & 0xFFF),  # LReg 0, 6: floor(n/2), ceil(n/2), then each 2^ that, by its bits
            *[w for r in (0, 6) for w in (ins("SFPIADD", vd=r, vc=r, mod1=5, imm12=127), ins("SFPSHFT", vd=r, mod1=1, imm12=23), mul(4, 4, r))],
-           sfp_load(0), FLAGS_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), FLAGS_OFF, sfp_store(4)])
+           *([sfp_load(0), FLAGS_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), FLAGS_OFF] if nan else []), sfp_store(4)])
+
+def recip(nan=False):
+  """1/x: SFPARECIP's 7-bit estimate, then two Newton steps y += y * (1 - x * y). Only where x is a normal number: 0 and
+  denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate, and
+  with nan (fp32's) a NaN's (0) is NaN again."""
+  return ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent
+               FLAGS_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
+               mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1),
+               *([FLAGS_RESET, *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0)] if nan else []), FLAGS_OFF, sfp_store(1)])
 
 def log(scale):
   """log2(x) scale: x = 2^e m with m in [sqrt(1/2), sqrt(2)) (from [1, 2), halved and e one more where above sqrt 2), so
@@ -252,13 +261,7 @@ SFPU = {
   # max(x, 0): SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc; a pick, stored raw for int32
   "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, RAW)]),
   "exp": exp(False), "exp2": exp(True), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
-  # 1/x: SFPARECIP's 7-bit estimate, then two Newton steps y += y * (1 - x * y). Only where x is a normal number:
-  # 0 and denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate,
-  # and a NaN's (0) is NaN again
-  "recip": ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent
-                 FLAGS_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
-                 mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), FLAGS_RESET,
-                 *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0), FLAGS_OFF, sfp_store(1)]),
+  "fexp": exp(False, True), "fexp2": exp(True, True), "recip": recip(), "frecip": recip(True),
   # sqrt(x) = x / sqrt(x): 1/sqrt(x) by the bit trick (0x5F3759DF - bits / 2, within 3.5%) and three Newton steps
   # y *= 1.5 - x/2 y^2 (two leave 5e-6, 80 ulps), then times x (x + 0 first, so -0 is 0), within 3 ulps. 0, inf and NaN
   # give themselves, a negative number NaN
@@ -275,14 +278,19 @@ SFPU = {
 # that an inf in the one not picked does not make a NaN, as c * x would.
 def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
 BINARY = {"max", "cmplt", "cmpne", "keep", "drop"}
-FP32 = {"add": "fadd", "sub": "fsub", "mul": "fmul"}  # in an fp32 kernel the SFPU does these too, one rounding each, as fp32 does
+# In an fp32 kernel the SFPU does add, sub and mul too, one rounding each, as fp32 does, and NaN goes as IEEE has it
+# through exp, the reciprocal and comparisons, which bf16's take no time for: a bf16 NaN is inf before the SFPU sees it
+FP32 = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip", "cmplt": "fcmplt", "cmpne": "fcmpne"}
 INT32 = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne", "keep": "keep", "drop": "drop"}  # what int32 does itself
 CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # SFPU programs of a cast
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
-  "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 2, 4, True), *nans(1, 3, 4, True), ins("SFPOR", vd=2, vc=3),
+  "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
+                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "fcmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 2, 4, True), *nans(1, 3, 4, True), ins("SFPOR", vd=2, vc=3),
                        ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPNOT", vd=2, vc=2), ins("SFPAND", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 3, 4, True), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
+  "fcmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 3, 4, True), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
                        ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPOR", vd=1, vc=3), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
   "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
@@ -693,7 +701,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
     elif e[0] == "cast" or e[0] in SFPU and e[0] not in BINARY:  # a unary op, or the root's cast (packed as out, after an
       x = visit(e[1])                                              # SFPU program between floats and ints, if need be)
-      posts = ([CASTS[dtype, out]] if (dtype, out) in CASTS else []) if e[0] == "cast" else [e[0]]
+      posts = ([CASTS[dtype, out]] if (dtype, out) in CASTS else []) if e[0] == "cast" else [FP32.get(e[0], e[0]) if dtype == "fp32" else e[0]]
       if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below (a bf16 one rounded first,
         ops[x[1]]["posts"] += ["ftob"] * (e[0] == "cast" and dtype == "bf16") + posts  # as its own pack would round it)
         refs[e] = x
