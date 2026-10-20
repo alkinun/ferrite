@@ -10,7 +10,7 @@ as good as CUDA starts out losing, so we build the stack first and the chip afte
 
 - **Prove it on someone else's silicon.** Tenstorrent's Blackhole is open down to its instruction set: its ISA
   documentation and its simulator, ttsim, are public. ferrite drives it with nothing from Tenstorrent at runtime but the
-  card's firmware, in about 2,900 lines of Python. Tenstorrent's own stack spans six layers (tt-kmd, UMD, tt-metal, LLK,
+  card's firmware, in about 3,000 lines of Python. Tenstorrent's own stack spans six layers (tt-kmd, UMD, tt-metal, LLK,
   TT-NN, the model code), about 1.65 million lines without the model code (COMPARE.md). If ferrite runs an
   8-billion-parameter model on the same card within 1.5 times of that stack's speed (Stage 1's gate), with hundreds of
   times less code, the claim stands: a compiler and a runtime, kept clean, are all an accelerator needs. As George
@@ -31,7 +31,7 @@ Everything so far ran on ttsim. ferrite has never run on silicon; a p150a is ord
   (bfp8; for SmolLM also the MLP's gate and up in bfp4, as Tenstorrent's own models keep them), each token checked
   against the same model in numpy, decode replayed from a recording; a small CNN; a small GPT trained in fp32 with
   Adam, step by step against PyTorch; tinygrad's own scripts on its FERRITE device; PyTorch through tinygrad's torch
-  frontend. The test suite passes: 62 tests, the models, tinygrad and PyTorch included.
+  frontend. The test suite passes: 63 tests, the models, tinygrad and PyTorch included.
 - **Against TT-NN on the same simulator:** 4 to 18 times fewer cycles of control work an op than TT-NN with fast
   dispatch (2 to 3.5 times fewer than with slow dispatch), and 9 to 10 times fewer a SmolLM-135M decode token
   (COMPARE.md). ttsim counts only that control work, not the math or the DRAM, so none of this says yet how fast either

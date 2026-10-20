@@ -29,7 +29,7 @@ Nothing from Tenstorrent runs at runtime except the firmware on the card: no tt-
 - `ferrite/runtime.py`: device C compiled with clang and lld (cached in `~/.cache/ferrite`, for a week unused), firmware for the workers and the dispatcher, kernels loaded once and kept until their room is full, the command ring in host memory (a launch, or a recorded block of them, is one PCIe write), DRAM, waiting, and each launch's time on the chip's clock (`profile`).
 - `ferrite/compiler.py`: Tensix instructions from the ISA. A fused kernel is four programs (BRISC moves tiles; each TRISC feeds one Tensix thread: unpack, math or pack): elementwise ops and SFPU programs, matmuls (blocks, tiles shared between workers by multicast, reads in flight, bfp8 and bfp4 weights), reductions along any axis in passes, movement, `gather` and `put`.
 - `ferrite/tensor.py`: `Tensor`: lazy, any shape, bf16, fp32, int32, bfp8 or bfp4, numpy's broadcasting, views, tinygrad's ops and autograd. Realizing turns a tree of ops into as few kernels as fit; `jit` records a function's launches and replays them.
-- `ferrite/hello.py`: fib(n) on every worker, the one-command demo. `ferrite/bench.py`: a matmul's speed and DRAM reads (ROADMAP, Stage 1).
+- `ferrite/hello.py`: fib(n) on every worker, the one-command demo. `ferrite/bench.py`: a matmul's speed and DRAM reads (ROADMAP, Stage 1). `ferrite/probe.py`: the numbers ttsim cannot give (launch cost, DRAM GB/s by reads in flight, NoC latency, MVMUL, unpack, pack and SFPU rates, PCIe), for the card's first day.
 - `adapters/tinygrad_ferrite.py`: tinygrad on ferrite, outside it: the FERRITE device (tinygrad's tensors of any rank as views of ferrite's), and a runner for tinygrad's scripts unchanged. PyTorch runs through tinygrad's own frontend (`extra/torch_backend` in tinygrad), not an adapter of ours.
 - `test/test_sim.py`: every step, on ttsim (or on a card when `TTSIM` is not set). `test/gpt2.py`, `test/llama.py`: GPT-2 small and SmolLM-135M, written once for ferrite Tensors and numpy, generating from the real weights, checked against numpy step by step. `test/train.py`: a small GPT trained on ferrite in fp32 with Adam, checked against PyTorch.
 - `NOTES.md`: how ferrite works, and what is still unknown. `LESSONS.md`: what the work has taught us; add to it as we go, and keep it short and true. `ROADMAP.md`: the five gated stages from here to a chip of our own. `COMPARE.md`: ferrite against TT-NN.
@@ -42,6 +42,7 @@ Needs clang and lld on PATH, and ttsim's `libttsim.so` built for Blackhole (outs
     TTSIM=/path/to/libttsim.so python3 -m ferrite.hello
     TTSIM=/path/to/libttsim.so python3 -m pytest test
     TTSIM=/path/to/libttsim.so python3 -m ferrite.bench
+    TTSIM=/path/to/libttsim.so python3 -m ferrite.probe
     TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "The meaning of life is" 8
     TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "The meaning of life is" 6
     TTSIM=/path/to/libttsim.so python3 test/train.py 300

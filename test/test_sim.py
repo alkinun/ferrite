@@ -164,6 +164,18 @@ def test_queue(chip):
   rt.wait()
   for x, y in rt.cores: assert chip.read32(x, y, DATA) == sum(range(100))
 
+def test_probe(chip):
+  # ferrite.probe's kernels all run and report, at small sizes (on ttsim the numbers say nothing about silicon): each
+  # DRAM probe read what it says it read, counted by the workers' NIUs
+  from ferrite import probe
+  reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in chip.tensix)
+  before = reads()
+  rows = probe.probe(chip, n=4, rounds=2, upload=1 << 16)
+  names = [what for what, *_ in rows]
+  assert len(names) == len(set(names)) == 24 and all(value > 0 for _, value, *_ in rows), rows
+  workers = len(chip.tensix) - 1
+  assert reads() - before >= sum(2 * d * (1 + workers) for d in (1, 2, 4, 8)), "the DRAM probes' reads"
+
 def test_profile(chip):
   # each launch's [go, last report] on the dispatcher's wall clock lands in host memory, and Runtime.profile adds them
   # up by name: three kernels, queued back to back four times, take about the time the host saw (the rest is between

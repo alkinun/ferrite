@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 2,900 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 3,000 lines of Python.
 Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
@@ -28,6 +28,7 @@ need numpy. Without `TTSIM`, ferrite looks for a real Blackhole on the PCI bus (
     TTSIM=/path/to/libttsim.so python3 -m ferrite.hello      # every worker computes fib(30); one more dispatches
     TTSIM=/path/to/libttsim.so python3 -m pytest test        # every step, on the simulator
     TTSIM=/path/to/libttsim.so python3 -m ferrite.bench      # a matmul's speed and DRAM reads
+    TTSIM=/path/to/libttsim.so python3 -m ferrite.probe      # launch, DRAM, NoC, Tensix unit and PCIe rates (for the card)
 
 ## What runs
 
