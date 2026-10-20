@@ -1,6 +1,6 @@
 # Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
-import json, math, os, pathlib, random, shutil, struct, sys, time, pytest
+import json, math, os, pathlib, random, shutil, struct, subprocess, sys, time, pytest
 import numpy as np
 from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
@@ -1417,6 +1417,14 @@ def test_mac_model():
   got = np.array([mac.mac(int(c), int(x), int(y)) for c, x, y in zip(acc, a, b)], np.uint32)
   assert (got == want).all(), [(hex(c), hex(x), hex(y), hex(g), hex(w)) for c, x, y, g, w in zip(acc, a, b, got, want) if g != w][:5]
   assert mac.mac(0x3F800000, 0x3F80, 0x3380) == 0x3F800000 and mac.mac(0x3F800001, 0x3F80, 0x3380) == 0x3F800002, "ties to even"
+
+def test_mac_synthesis():
+  # the multiply-accumulate unit synthesizes: Yosys (generic gates) finds no latch, no combinational loop, no undriven or
+  # doubly driven wire in hw/mac.v
+  if not shutil.which("yosys"): pytest.skip("wants Yosys (Arch: pacman -S yosys)")
+  hw = pathlib.Path(__file__).parent.parent / "hw"
+  run = subprocess.run(["yosys", "-q", "-p", f"read_verilog {hw / 'mac.v'}; synth -top mac -flatten; check -assert; select -assert-none t:*DLATCH*"], capture_output=True, text=True)
+  assert run.returncode == 0, run.stdout + run.stderr
 
 def test_mac_hardware():
   # the multiply-accumulate unit in Verilog (hw/mac.v) against its model, bit for bit, in cocotb on Verilator
