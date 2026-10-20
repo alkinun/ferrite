@@ -12,7 +12,8 @@ from ferrite import bh, pci
 # tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The dispatcher: its
 # config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an outbox [go, kernel,
 # arguments, workers] [rptr, launches done] (and at +32 a launch's [go, last report] times), the count of the workers'
-# reports, and staging for one command, both above the kernels (loading a kernel writes the dispatcher's tile too).
+# reports, and STAGING for up to STAGE bytes of commands, both above the kernels (loading a kernel writes the
+# dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_COUNTS = 8  # SYNC's words that start each launch at 0 (a kernel writes the rest before reading them)
@@ -91,12 +92,12 @@ def _prune(days=7):  # once a process, before its first compile: images unused f
       if f.stat().st_mtime < time.time() - days * 86400: f.unlink()
     except FileNotFoundError: pass  # another process took it first
 
-def compile_rv32(src, base=0):
-  """C source, after DEVICE, to a flat rv32 image linked at base: `.start` first, else `kmain`, then the rest. The code
+def compile_rv32(src):
+  """C source, after DEVICE, to a flat rv32 image linked at 0: `.start` first, else `kmain`, then the rest. The code
   reaches its own functions and data by PC-relative addresses (medany, no linker relaxation, no jump tables), so the
-  image runs wherever it is put; base only matters to firmware, which is put at 0. Images are kept in CACHE, named by
-  a hash of the compiler's version, its flags, the link script and the source, until a week goes by unused (_prune)."""
-  link = (f"SECTIONS {{ .text {base:#x} : {{ *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
+  image runs wherever it is put (firmware is put at 0). Images are kept in CACHE, named by a hash of the compiler's
+  version, its flags, the link script and the source, until a week goes by unused (_prune)."""
+  link = ("SECTIONS { .text 0 : { *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
           ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one section: .bss is zeros in the image
   cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
   if cached.exists():
@@ -133,7 +134,7 @@ def compile_kernel(*programs):
   for src in programs + (None,) * (4 - len(programs)):
     entry.append(16 + len(image) if src else 0)
     if src:
-      program = compile_rv32(KENTRY + src, entry[-1])
+      program = compile_rv32(KENTRY + src)
       image += program.ljust(-(-len(program) // 16) * 16, b"\0")
   return struct.pack("<4I", *entry) + image
 
@@ -146,7 +147,7 @@ def start(brisc, trisc0, trisc1, trisc2):  # firmware's first words: BRISC start
 # cores (the kernel may sit where another was), and tells the TRISCs to go; each core runs its program from the
 # kernel's header, and a TRISC then waits for its Tensix thread to finish everything it pushed. Once all four are done
 # BRISC reports: it notes the launch in its own mailbox (for the host, should one hang) and adds 1 to the dispatcher's
-# count with a NoC atomic, posted (its old value lands in the scratch word).
+# count with a NoC atomic increment, posted: nothing comes back, and no counter moves at either end.
 FIRMWARE = f"""
 #define MAILBOX ((volatile unsigned *){MAILBOX:#x})
 #define TRISCS ((volatile unsigned *){TRISCS:#x})
@@ -236,8 +237,8 @@ void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0, me = noc_me();
   unsigned ready = 0, ready_n = 0, ready_end = 0;  // a launch whose arguments and go are in place (0: none)
-  unsigned running = 0, running_end = 0, reports = 0, began = 0;  // the launch the workers are on; the count once it
-                                                                  // is done; when its go went
+  unsigned running = 0, running_end = 0, reports = 0, began = 0;  // the launch the workers are on, the ring pointer
+                                                                  // past it, the reports once it is done, its go's time
   unsigned long long times = ring + size;  // launch n's [go, last report] at times + n % TIMES * 16
   unsigned staged = 0, first = 0;  // the ring's bytes [first, staged) are in STAGING
   NIU1(TARG_LO) = {OUTBOX:#x}; NIU1(TARG_MID) = 0; NIU1(TARG_HI) = noc_me(); NIU1(RET_LO) = {MAILBOX:#x}; NIU1(RET_MID) = 0;
@@ -288,10 +289,10 @@ void loop(void) {{
 class Runtime:
   """A rectangle of Tensix from start to end: its last tile dispatches, the rest are workers running kernels from
   compile_kernel. A kernel is loaded into every worker once and stays (load), until the room for kernels is full and
-  they all go (evict). Launches go into a ring in host memory
-  that the dispatcher reads by itself, so a launch costs the host one PCIe write, the doorbell. The dispatcher runs one
-  launch at a time and writes [ring read pointer, launches done] back into host memory, where wait() and the ring's
-  flow control look. A new Runtime takes over its rectangle's cores: one that overlaps it stops working."""
+  they all go (evict). Launches go into a ring in host memory that the dispatcher reads by itself, so a launch costs the
+  host one PCIe write, the doorbell. The dispatcher runs one launch at a time and writes [ring read pointer, launches
+  done] back into host memory, where wait() and the ring's flow control look. A new Runtime takes over its rectangle's
+  cores: one that overlaps it stops working."""
   def __init__(self, chip, start, end, ring=1 << 20):
     assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
@@ -373,7 +374,6 @@ class Runtime:
     body = struct.pack(f"<{2 + len(args)}I", units or n, 0, *args)
     assert len(body) <= ARGS_SIZE, f"{len(body)} bytes of arguments, room for {ARGS_SIZE}"
     length = -(-(16 + len(body)) // 64) * 64
-    assert length <= STAGE, f"a {length}-byte command does not fit"
     return struct.pack("<4I", length, kernel, len(body), n) + body.ljust(length - 16, b"\0"), n
 
   def send(self, cmds, launches):
@@ -455,7 +455,8 @@ class Runtime:
     dispatcher which launch it is on and the workers which have not finished it. Then frees what was waiting for them."""
     try: self.until(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
     except TimeoutError as e:
-      current = self.chip.read32(*self.dispatcher, OUTBOX)
+      current = (self.chip.read32(*self.dispatcher, OUTBOX + 20) + 1) % 2**32  # after the last it saw finish (OUT[5])
+      if current == (self.launches + 1) % 2**32: raise TimeoutError(f"{e}: all done, but the status never reached the host") from None
       n = next((n for launch, n in self.workers if launch % 2**32 == current), 0)
       stuck = [c for c in self.cores[:n] if self.chip.read32(*c, MAILBOX + 16) != current]
       pcs = lambda c: " ".join(f"{self.chip.read32(*c, bh.PC_SNAPSHOT + 4 * i):#x}" for i in range(5))  # where its cores sit

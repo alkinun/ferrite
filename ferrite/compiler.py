@@ -50,10 +50,10 @@ FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32, "int32": bh.INT32, "bfp8": bh.BFP8, 
 def kernel_config(dtype="bf16", out="bf16", transposing=False):
   """A kernel's backend config. Unpackers read one whole tile each (1024 datums): bf16 into a SrcA/SrcB bank; fp32
   straight into Dst (unpacker 0 in context 1, where the 32-bit Dst row is channel 1's Y). Z picks the slot (the Z stride
-  is one tile). The FPU writes Dst in fp32. The packer reads 4 Dst rows per PACR (its Dst row stride is in bytes of out, or of fp32 for a block float)
-  and writes them as out (fp32 to bf16 rounds); its channel 1 Y picks the slot (that Y stride is one tile of out). Base
-  addresses are in 16-byte units, minus 1, and unpacker 0's rows are biased by 4 (64 datums). transposing: unpacker 0
-  transposes each 16x16 face into SrcA."""
+  is one tile). The FPU writes Dst in fp32. The packer reads 4 Dst rows per PACR (its Dst row stride is in bytes of
+  out, or of fp32 for a block float) and writes them as out (fp32 to bf16 rounds); its channel 1 Y picks the slot (that
+  Y stride is one tile of out). Base addresses are in 16-byte units, minus 1, and unpacker 0's rows are biased by 4 (64
+  datums). transposing: unpacker 0 transposes each 16x16 face into SrcA."""
   base, fmt, pack = slot_base(dtype) // 16 - 1, FORMAT[dtype], FORMAT[out]
   late = bh.FP32 if out in BFP else pack  # the packer's own format: a block float from fp32 rounds each value once, from bfp8 twice
   return config(Dstacc=late, Fp32_enabled=1, Zero_Flag_disabled_src=0, Read_32b_data=1, Edge_mask=0xFFFF, pack_reads_per_xy_plane=16,
@@ -73,8 +73,9 @@ ADDR_MODES = {0: ((8, 8), (8, 0)), 1: ((0, 0), (0, 1)), 2: ((0, 0), (0, 0)), 3: 
               4: ((16, 0), (0, 0)), 5: ((48, 8), (0, 0)), 6: ((16, 8), (0, 0)), 7: ((16, 8), (0, 1))}
 def thread(dst=False):  # a thread's config, written since reset values are undocumented; dst: it unpacks into Dst
   return [ins("SETC16", setc16_reg=r, setc16_value=v) for r, v in
-          ({r: 0 for r in bh.THREAD_CFG.values()} | {bh.ADDR_MOD_PACK: 4} | {bh.ADDR_MOD_BIAS + m: 0 for m in range(8)} |  # the packer's
-           {bh.ADDR_MOD_AB + m: a | b << 8 for m, ((a, b), _) in ADDR_MODES.items()} |    # mode 0 moves on 4 Dst rows a PACR
+          ({r: 0 for r in bh.THREAD_CFG.values()} | {bh.ADDR_MOD_BIAS + m: 0 for m in range(8)} |
+           {bh.ADDR_MOD_PACK: 4} |  # the packer's mode 0 moves on 4 Dst rows a PACR
+           {bh.ADDR_MOD_AB + m: a | b << 8 for m, ((a, b), _) in ADDR_MODES.items()} |
            {bh.ADDR_MOD_DST + m: d | f << bh.FIDELITY_INCR for m, (_, (d, f)) in ADDR_MODES.items()} |
            ({bh.THREAD_CFG["UNPACK_MISC"]: 1} if dst else {bh.THREAD_CFG["SRCA_SET"]: bh.SRCA_SET_BY_ADDR})).items()]
 
@@ -185,10 +186,10 @@ def mad(d, a, b, c, neg=0): return ins("SFPMAD", vd=d, va=a, vb=b, vc=c, mod1=ne
 def mul(d, a, b): return ins("SFPMUL", vd=d, va=a, vb=b, vc=9)
 CONSTS = bh.LREG_CONSTS  # constant LRegs
 ZERO, ONE, MINUS_ONE = CONSTS[0.0], CONSTS[1.0], CONSTS[-1.0]
-FLAGS_ON, FLAGS_RESET, FLAGS_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags
+CC_ON, CC_ALL, CC_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags: on, all set, off
 NAN, INF = 0x7FC00000, 0x7F800000
 def nans(x, t, inf, mask=False):  # LReg t where LReg x is NaN: |x| past inf's bits (LReg inf holds them) in SFPGT's
-  # order, as all ones (mask) or as lane flags, for an SFPMOV to give those lanes NaN (between FLAGS_ON and FLAGS_OFF)
+  # order, as all ones (mask) or as lane flags, for an SFPMOV to give those lanes NaN (between CC_ON and CC_OFF)
   return [*sfp_bits(inf, INF), ins("SFPABS", vd=t, vc=x, mod1=1), ins("SFPGT", vd=t, vc=inf, mod1=8 if mask else 1)]
 def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # flags on: keep the lanes where integer LReg e >= n
 def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n (LReg t is overwritten)
@@ -218,16 +219,16 @@ def exp(base2, nan=False):
            *poly(4, 5, EXP_P, 7), ins("SFPSHFT", vd=0, vc=6, mod1=7, imm12=-1 & 0xFFF), ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=1),
            ins("SFPSHFT", vd=6, mod1=3, imm12=-1 & 0xFFF),  # LReg 0, 6: floor(n/2), ceil(n/2), then each 2^ that, by its bits
            *[w for r in (0, 6) for w in (ins("SFPIADD", vd=r, vc=r, mod1=5, imm12=127), ins("SFPSHFT", vd=r, mod1=1, imm12=23), mul(4, 4, r))],
-           *([sfp_load(0), FLAGS_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), FLAGS_OFF] if nan else []), sfp_store(4)])
+           *([sfp_load(0), CC_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), CC_OFF] if nan else []), sfp_store(4)])
 
 def recip(nan=False):
   """1/x: SFPARECIP's 7-bit estimate, then two Newton steps y += y * (1 - x * y). Only where x is a normal number: 0 and
   denormals (estimate inf) and inf (estimate 0) would turn into 0 * inf = NaN, so those lanes keep the estimate, and
   with nan (fp32's) a NaN's (0) is NaN again."""
   return ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent
-               FLAGS_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
+               CC_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
                mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1),
-               *([FLAGS_RESET, *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0)] if nan else []), FLAGS_OFF, sfp_store(1)])
+               *([CC_ALL, *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0)] if nan else []), CC_OFF, sfp_store(1)])
 
 def log(scale):
   """log2(x) scale: x = 2^e m with m in [sqrt(1/2), sqrt(2)) (from [1, 2), halved and e one more where above sqrt 2), so
@@ -235,11 +236,11 @@ def log(scale):
   NaN give themselves, a negative number NaN, zero (and a denormal, flushed) -inf."""
   return (sfp_const(5, math.sqrt(2)) + (sfp_const(7, scale) if scale != 1 else []),
           [sfp_load(), ins("SFPEXEXP", vd=1, vc=0, mod1=1), ins("SFPSETEXP", vd=2, vc=0, mod1=1, imm12=127),  # LReg 1: e, biased; 2: m
-           FLAGS_ON, ins("SFPGT", vd=2, vc=5, mod1=1), ins("SFPSETEXP", vd=2, vc=2, mod1=1, imm12=126), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=1),
-           FLAGS_OFF, ins("SFPCAST", vd=1, vc=1), sfp_bf16(6, -127.0), mad(1, 1, ONE, 6), mad(2, 2, ONE, MINUS_ONE),
+           CC_ON, ins("SFPGT", vd=2, vc=5, mod1=1), ins("SFPSETEXP", vd=2, vc=2, mod1=1, imm12=126), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=1),
+           CC_OFF, ins("SFPCAST", vd=1, vc=1), sfp_bf16(6, -127.0), mad(1, 1, ONE, 6), mad(2, 2, ONE, MINUS_ONE),
            *poly(3, 2, LOG2_Q, 6), mad(3, 3, 2, 1), *([mul(3, 3, 7)] if scale != 1 else []),
-           ins("SFPEXEXP", vd=1, vc=0, mod1=1), FLAGS_ON, at_least(1, 255, 4), ins("SFPMOV", vd=3, vc=0), FLAGS_RESET,
-           ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), FLAGS_RESET, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), FLAGS_OFF, sfp_store(3)])
+           ins("SFPEXEXP", vd=1, vc=0, mod1=1), CC_ON, at_least(1, 255, 4), ins("SFPMOV", vd=3, vc=0), CC_ALL,
+           ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), CC_ALL, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), CC_OFF, sfp_store(3)])
 
 def sin(phase):
   """sin(x + pi phase): k = round(x / pi + phase), r = x - k pi in two parts (Cody-Waite: k times 3.140625 is exact, and
@@ -254,8 +255,8 @@ def sin(phase):
            *(sfp_const(3, hi) + [mad(6, 6, ONE, 3)] if phase else []), *sfp_const(3, math.pi - 3.140625), mad(6, 4, 3, 6, neg=1),
            *(sfp_const(3, math.pi / 2 - hi) + [mad(6, 6, ONE, 3)] if phase else []),  # LReg 6: r
            ins("SFPSHFT", vd=5, mod1=1, imm12=31), ins("SFPEXEXP", vd=0, vc=0, mod1=1), mul(7, 6, 6), *poly(4, 7, SIN_P, 3), mul(4, 4, 6),
-           ins("SFPXOR", vd=4, vc=5), FLAGS_ON, at_least(0, 127 + 24, 5), ins("SFPMOV", vd=4, vc=ZERO), FLAGS_RESET, at_least(0, 255, 5),
-           *sfp_bits(4, NAN), FLAGS_OFF, sfp_store(4)])
+           ins("SFPXOR", vd=4, vc=5), CC_ON, at_least(0, 127 + 24, 5), ins("SFPMOV", vd=4, vc=ZERO), CC_ALL, at_least(0, 255, 5),
+           *sfp_bits(4, NAN), CC_OFF, sfp_store(4)])
 
 SFPU = {
   # max(x, 0): SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc; a pick, stored raw for int32
@@ -269,8 +270,8 @@ SFPU = {
            [sfp_load(), mad(0, 0, ONE, ZERO), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF),  # LReg 1 = bits of x >> 1
             ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +  # LReg 1 = magic - LReg 1 as integers; LReg 5 = x/2
            [w for _ in range(3) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, neg=1), mul(1, 1, 6))] +
-           [mul(1, 1, 0), ins("SFPEXEXP", vd=6, vc=0, mod1=1), FLAGS_ON, at_least(6, 255, 5), ins("SFPMOV", vd=1, vc=0), FLAGS_RESET,
-            below(6, 1, 5), ins("SFPMOV", vd=1, vc=0), FLAGS_RESET, ins("SFPSETCC", vc=0), *sfp_bits(1, NAN), FLAGS_OFF, sfp_store(1)]),
+           [mul(1, 1, 0), ins("SFPEXEXP", vd=6, vc=0, mod1=1), CC_ON, at_least(6, 255, 5), ins("SFPMOV", vd=1, vc=0), CC_ALL,
+            below(6, 1, 5), ins("SFPMOV", vd=1, vc=0), CC_ALL, ins("SFPSETCC", vc=0), *sfp_bits(1, NAN), CC_OFF, sfp_store(1)]),
 }
 # Binary ops on the SFPU: x and y each added to zero into Dst (x at the op's Dst half, y 128 rows on), loaded into LRegs
 # 0 and 1, the result stored over x. Comparisons give 1.0 or 0 (all ones or 0 from SFPGT, and 1.0's bits), after x + 0
@@ -280,8 +281,9 @@ def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
 BINARY = {"max", "cmplt", "cmpne", "keep", "drop"}
 # In an fp32 kernel the SFPU does add, sub and mul too, one rounding each, as fp32 does, and NaN goes as IEEE has it
 # through exp, the reciprocal and comparisons, which bf16's take no time for: a bf16 NaN is inf before the SFPU sees it
-FP32 = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip", "cmplt": "fcmplt", "cmpne": "fcmpne"}
-INT32 = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne", "keep": "keep", "drop": "drop"}  # what int32 does itself
+FP32_OPS = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip", "cmplt": "fcmplt",
+            "cmpne": "fcmpne"}
+INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne", "keep": "keep", "drop": "drop"}  # what int32 does itself
 CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # SFPU programs of a cast
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
@@ -289,9 +291,11 @@ SFPU |= {
   "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
                        ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
   "fcmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 2, 4, True), *nans(1, 3, 4, True), ins("SFPOR", vd=2, vc=3),
-                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPNOT", vd=2, vc=2), ins("SFPAND", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "fcmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 3, 4, True), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
-                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPOR", vd=1, vc=3), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPNOT", vd=2, vc=2), ins("SFPAND", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE),
+                       sfp_store(1))),
+  "fcmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 3, 4, True), ins("SFPMOV", vd=2, vc=0),
+                       ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPOR", vd=1, vc=3),
+                       ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
   "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
                       ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
@@ -311,8 +315,8 @@ SFPU |= {
   # by shifting its mantissa (hidden bit in) by its exponent - 23: 0 where the exponent is negative, negated if negative
   "itof": ([], [sfp_load(), ins("SFPCAST", vd=0, vc=0, mod1=3), ins("SFPCAST", vd=0, vc=0), sfp_store(0)]),
   "ftoi": ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0), ins("SFPEXMAN", vd=2, vc=0), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=-23 & 0xFFF),
-                ins("SFPSHFT", vd=2, vc=1), FLAGS_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), FLAGS_RESET, ins("SFPSETCC", vc=0),
-                ins("SFPIADD", vd=2, vc=ZERO, mod1=6), FLAGS_OFF, sfp_store(2, RAW)]),
+                ins("SFPSHFT", vd=2, vc=1), CC_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), CC_ALL, ins("SFPSETCC", vc=0),
+                ins("SFPIADD", vd=2, vc=ZERO, mod1=6), CC_OFF, sfp_store(2, RAW)]),
   # an fp32 value rounded to bf16 as the packer rounds it (half up: the bits plus 2^15, the low 16 cleared), still fp32
   "ftob": ([ins("SFPLOADI", vd=2, mod0=2, imm16=0x8000), *sfp_bits(3, 0xFFFF0000)],
            [sfp_load(), ins("SFPIADD", vd=0, vc=2, mod1=4), ins("SFPAND", vd=0, vc=3), sfp_store(0, RAW)]),
@@ -365,18 +369,18 @@ def mask_columns(kind, n, d=0):
   p += sfp_bits(7, 14) + [ins("SFPAND", vd=7, vc=15)]
   for base, right, odd in [(b, r, o) for b in (0, 4, 8, 12, 32, 36, 40, 44) for r in (0, 1) for o in (0, 1)]:
     t = max(0, min(8, -(-(n - 16 * right - odd) // 2)))  # the first lane (of 8) at column n or more
-    if t < 8: p += [FLAGS_ON, at_least(7, 2 * t, 6),  # lanes t+
+    if t < 8: p += [CC_ON, at_least(7, 2 * t, 6),  # lanes t+
                     ins("SFPSTORE", vd=identity, mod0=3, addr_mode=2, imm10=d + base + 16 * right + 2 * odd)]  # right faces: 16 rows on
-  return p + [FLAGS_OFF]
+  return p + [CC_OFF]
 def mask_rows(kind, m, d=0):
   """Rows m and on of the tile at Dst row d to the identity, past a tensor's last row. A store covers 4 rows, lane l in
   row l // 8 of them, and LReg 15 holds 2l, so LReg 15 - 16k >= 0 picks the rows from k on."""
   p, identity = masking(kind)
   for r in range(0, 32, 4):  # tile rows r..r+3: Dst rows (r // 16) * 32 + r % 16 on, left face, and 16 more, right face
     k = max(0, m - r)
-    if k < 4: p += [w for o in (0, 2, 16, 18) for w in (FLAGS_ON, at_least(15, 16 * k, 6),
+    if k < 4: p += [w for o in (0, 2, 16, 18) for w in (CC_ON, at_least(15, 16 * k, 6),
                                                      ins("SFPSTORE", vd=identity, mod0=3, addr_mode=2, imm10=d + r // 16 * 32 + r % 16 + o))]
-  return p + [FLAGS_OFF]
+  return p + [CC_OFF]
 MASK = {1: mask_rows, 2: mask_columns}  # the padding past the last tile along an axis
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
@@ -464,11 +468,11 @@ def shared_k(rt, grid, added=0):  # the longest K, in tiles, of a matmul of rt t
   inputs, ops = 2 + added, 1 + added  # whose tiles the grid's workers share by multicast (mc): A's rows and B's three
   return (UNPACKABLE - FRAMES - 2 * (inputs + ops) - ops) // (-(-rt // min(len(grid[1]), rt)) + 3)  # buffers past the frames
 
-# SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word written by
-# one of them: FETCHED, how many frames BRISC has fetched into L1; ISSUED, how many matmul steps it has issued the reads
-# of; UNPACKED, how many frames and steps thread 0 has unpacked, from TRISC0; READY, set by TRISC0 once the backend
-# config and semaphores are set up; PACKED, how many results the pack thread has packed, from TRISC2, with where each
-# goes in RING (four entries [slot, tile]); SENT, how many of those BRISC has sent home.
+# SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word
+# written by one of them: FETCHED, how many frames BRISC has fetched into L1; ISSUED, how many matmul steps it has
+# issued the reads of; UNPACKED, how many frames and steps thread 0 has unpacked, from TRISC0; READY, set by TRISC0
+# once the backend config and semaphores are set up; PACKED, how many results the pack thread has packed, from TRISC2,
+# with where each goes in RING (four entries [slot, tile]); SENT, how many of those BRISC has sent home.
 SYNC_WORDS = f"""
 enum {{ FETCHED, UNPACKED, READY, PACKED, SENT, ISSUED, RING = 8 }};
 #define SYNC ((volatile unsigned *){SYNC:#x})
@@ -616,7 +620,7 @@ def _math(slots, body, dst=False):  # TRISC1; dst: it unpacks into Dst itself, s
 static unsigned needed;
 static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  // until BRISC has fetched the next tiles
 {KMAIN}
-  {tt(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + [FLAGS_OFF])} {_pushes(math_runs(slots))}
+  {tt(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + [CC_OFF])} {_pushes(math_runs(slots))}
   while (!peek(READY)) {{}}  // the backend config and the semaphores
   unsigned tiles = 0, h = 0;  // h: the Dst half the next op gets, by its first row
 {body}
@@ -643,14 +647,14 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
 
 def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub, mul and the binary SFPU ops, (op, x) for the
-  unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, ("matmul", a, b[, phases]) where a is an input and b an
-  input, ("T", input), read transposed, or ("bfp8", input) or ("bfp4", input), a block-float input (unpacker 0 makes it
-  bf16 on its way into SrcA), run at `phases` fidelity phases (4 unless said), and plain numbers for inputs. shapes: each input's (batch,
-  rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others (broadcasting). dtype: what the
-  inputs are and the kernel computes in; out: what its root is written as (a cast, or a matmul written as fp32: the
-  packer is switched to it for the root's pack); grid: the workers as Runtime.grid has them, for a matmul to share its
-  tiles between them; reps: each input's repeat (Tensor.repeat_interleave: its matrix b is the one stored at b // rep),
-  1 unless said.
+  unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, and ("matmul", a, b[, phases]) at `phases` fidelity
+  phases (4 unless said), where a is an input and b an input, ("T", input) for one read transposed, or ("bfp8", input)
+  or ("bfp4", input) for a block float (unpacker 0 makes it bf16 on its way into SrcA); an input is a number, its place
+  in shapes. shapes: each input's (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the
+  others (broadcasting). dtype: what the inputs are and the kernel computes in; out: what its root is written as (a
+  cast, or a matmul written as fp32: the packer is switched to it for the root's pack); grid: the workers as
+  Runtime.grid has them, for a matmul to share its tiles between them; reps: each input's repeat
+  (Tensor.repeat_interleave: its matrix b is the one stored at b // rep), 1 unless said.
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
@@ -673,8 +677,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   lines of it in L1, but reads inputs from DRAM once: one read in more than one pass keeps its line of tiles in L1 from
   the first, while they fit. Values one tile long along the axis (reductions, ops on them, inputs of 1 there) are
   worked out once per line, in the first tile of the pass that needs them, into slots of their own.
-  Two frames of slots alternate between tiles: inputs, then one slot per op. Every intermediate is rounded to bf16 on
-  its way to L1, exactly as if each op ran on its own; in-place SFPU ops see the fp32 result.
+  Two frames of slots alternate between tiles: inputs, then one slot per op. Every intermediate goes to L1 in the
+  kernel's dtype (bf16 rounded), exactly as if each op ran on its own; in-place SFPU ops see Dst's result unrounded.
   The four programs run the same loops over units, passes and tiles, each doing its own part of every tile."""
   uses, seen_exprs = {}, set()
   def count(e):  # how many ops read each subexpression
@@ -686,7 +690,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   count(expr)
   out, dst = out or dtype, dtype != "bf16"  # dst: the math thread fills Dst itself and the SFPU does the math
   ext = lambda s, ax: s[ax] if ax == 0 else -(-s[ax] // 32)  # a shape's extent along an axis: matrices, or tiles
-  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also how, kt, phases); refs: expr -> input number or ("op", j)
+  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also how, wt, kt, phases); refs: expr -> input number or ("op", j)
   size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (batch, rows, columns)
   def visit(e):
     if isinstance(e, int): return e
@@ -701,9 +705,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
     elif e[0] == "cast" or e[0] in SFPU and e[0] not in BINARY:  # a unary op, or the root's cast (packed as out, after an
       x = visit(e[1])                                              # SFPU program between floats and ints, if need be)
-      posts = ([CASTS[dtype, out]] if (dtype, out) in CASTS else []) if e[0] == "cast" else [FP32.get(e[0], e[0]) if dtype == "fp32" else e[0]]
-      if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below (a bf16 one rounded first,
-        ops[x[1]]["posts"] += ["ftob"] * (e[0] == "cast" and dtype == "bf16") + posts  # as its own pack would round it)
+      posts = ([CASTS[dtype, out]] if (dtype, out) in CASTS else []) if e[0] == "cast" else [FP32_OPS.get(e[0], e[0]) if dtype == "fp32" else e[0]]
+      if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below (a bf16 cast rounds it
+        ops[x[1]]["posts"] += ["ftob"] * (e[0] == "cast" and dtype == "bf16") + posts  # first, as its own pack would)
         refs[e] = x
         return x
       op = dict(kind="add", x=x, y="zero", shape=size(x), posts=posts)  # operand + 0 into Dst, then the SFPU
@@ -739,7 +743,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     if op["kind"] in COMBINE: sweep[j] = max(deps, default=0); ready[j] = sweep[j] + 1
     else: ready[j] = max(deps, default=0)
   last = sweep[root] if root in sweep else ready[root]
-  sfpu_name = lambda op: {"fp32": FP32.get(op["kind"], op["kind"]), "int32": INT32.get(op["kind"])}.get(dtype, op["kind"])  # a binary op's program
+  ops_of = {"fp32": FP32_OPS, "int32": INT32_OPS}.get(dtype, {})
+  sfpu_name = lambda op: ops_of.get(op["kind"], op["kind"] if dtype != "int32" else None)  # a binary op's program
   sfpu_op = lambda op: op["kind"] in BINARY or (dst and op.get("y", "zero") != "zero")
   assert dtype != "int32" or all(sfpu_name(op) for op in ops if sfpu_op(op)), "an int32 kernel adds, subtracts, compares and picks"
   slots = allocate({"mm" for op in ops if op["kind"] == "matmul"} | {"mul" for op in ops if op["kind"] == "mul" and not dst} |
@@ -1029,32 +1034,32 @@ def gather_kernel(dtype):
   the tensor's tiles. A NoC read from DRAM must keep its address's low 6 bits, so each run comes in as the 64-byte
   block holding it and is copied into place from there. One row fills its tile: it comes in once and is doubled up
   inside L1 by NoC copies from the tile to itself."""
-  t, face, run = tile_bytes(dtype), tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a tile, a face, a face's row
+  tb, fb, run = tile_bytes(dtype), tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a tile, a face, a face's row
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
-#define BLOCK {DATA + t:#x}
-#define IDS {DATA + t + 64:#x}
+#define BLOCK {DATA + tb:#x}
+#define IDS {DATA + tb + 64:#x}
 {_rows(dtype)}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // index r of this tile's 32, in row 0
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] == 1 ? 1 : 32, it = a[9] + i;  // it: the indices' tile
     noc_get(BANK(it), a[8] + it / 8 * 4096, IDS, 4096);
-    copy({ZEROS:#x}, SLOT, {t});  // the rows past the end stay zero
+    copy({ZEROS:#x}, SLOT, {tb});  // the rows past the end stay zero
     noc_wait();
     for (unsigned r = 0; r < rows; r++) {{
       unsigned row = i * 32 + r;
       for (unsigned face = r / 16 * 2; face < r / 16 * 2 + 2; face++) {{
-        volatile unsigned *to = (volatile unsigned *)(SLOT + face * {face} + r % 16 * {run});
+        volatile unsigned *to = (volatile unsigned *)(SLOT + face * {fb} + r % 16 * {run});
         if (row >= a[7]) continue;
-        unsigned n = id(r), from = n / 32 * a[4] + j + a[5], at = (n % 32 / 16 * 2 + face % 2) * {face} + n % 16 * {run};
-        noc_get(BANK(from), a[3] + from / 8 * {t} + at / 64 * 64, BLOCK, 64);
+        unsigned n = id(r), from = n / 32 * a[4] + j + a[5], at = (n % 32 / 16 * 2 + face % 2) * {fb} + n % 16 * {run};
+        noc_get(BANK(from), a[3] + from / 8 * {tb} + at / 64 * 64, BLOCK, 64);
         noc_wait();
         for (unsigned k = 0; k < {run // 4}; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
       }}
     }}
     if (rows == 1) row_down(SLOT);
-    noc_write(SLOT, BANK(t), a[2] + t / 8 * {t}, {t});
+    noc_write(SLOT, BANK(t), a[2] + t / 8 * {tb}, {tb});
     noc_wait();
   }}
 }}""")
@@ -1113,14 +1118,14 @@ def readback_kernel(dtype):
 {BANKS}
 void kmain(volatile unsigned *a) {{
   unsigned long long host = a[10] | (unsigned long long)a[11] << 32;
-  unsigned v = a[12], slot = {f"v * 32 * {item}" if item else n};  // the rows sent, and their bytes
+  unsigned v = a[12], sent = {f"v * 32 * {item}" if item else n};  // the rows sent, and their bytes
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned k = a[0] + u, t = a[2] + k, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b / a[9] * a[4] + i * a[5] + j + a[6];
     unsigned l1 = {DATA:#x} + u % 2 * {n};
-    unsigned long long to = host + (unsigned long long)k * slot;
+    unsigned long long to = host + (unsigned long long)k * sent;
     noc_get(BANK(from), a[3] + from / 8 * {n}, l1, {n});
     noc_wait();  // and the writes out of this buffer two tiles ago are done
-    if (slot == {n}) noc_write(l1, {bh.PCIE[0]}, {bh.PCIE[1]}, to, {n});
+    if (sent == {n}) noc_write(l1, {bh.PCIE[0]}, {bh.PCIE[1]}, to, {n});
     else for (unsigned f = 0; f < 4; f++) {{  // faces 0 and 1 hold rows 0-15, 2 and 3 rows 16-31
       unsigned r = f < 2 ? (v < 16 ? v : 16) : (v > 16 ? v - 16 : 0);
       if (r) noc_write(l1 + f * {256 * item}, {bh.PCIE[0]}, {bh.PCIE[1]}, to, r * {16 * item});
@@ -1197,7 +1202,7 @@ MOVE_SLOTS = 127  # x's tiles cached in L1 by a move, by tile number mod a prime
 def move_kernel(dtype):
   """A tensor moved around: reshape, permute, expand, pad, slice. args [first unit, units, out, x's address, tile
   strides for batch and row, tile offset, x's rows and columns, the result's rows and columns, then the map: an offset
-  and strides for batch, row and column, and each axis's bounds lo and hi]. Element (b, r, c) of the result, inside
+  and strides for batch, row and column, then the bounds: lo for batch, row and column, then hi]. Element (b, r, c) of the result, inside
   the bounds, is element offset + b sb + r sr + c sc of x, counted in row-major order; outside them, 0.
   BRISC alone: a NoC read cannot put 2 bytes just anywhere, so x's tiles come whole into a cache in L1 as they are
   needed. A result tile inside the bounds that is one of x's tiles as it is (a pad, slice or cat on tile boundaries)
