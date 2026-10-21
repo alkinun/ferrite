@@ -389,13 +389,12 @@ class Tensor:
       return _bf16x3(a, b)._track("matmul", (self, x), a, b).cast(dtype)
     assert self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch)), f"{self.shape} @ {x.shape}"
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
-    kt, tiles = self.cols // 32, -(-self.rows // 32) * -(-x.cols // 32)
-    s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and self.cols % (32 * s) == 0 and kt // s >= 4 and
-             s * tiles <= len(self.rt.cores)], default=1)
-    if s > 1:  # too few result tiles to keep the workers busy (a token's MLP): K cut in s, a batch, and the parts summed
-      parts = self.split(s).matmul(x.split(s, 0), dtype, fidelity)
-      return sum((parts[i] for i in range(1, s)), parts[0])
     k, rt = -(-self.cols // 32), -(-self.rows // 32)
+    s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and rt == 1 and self.cols % (32 * s) == 0 and k // s >= 4
+             and s * -(-x.cols // 32) <= len(self.rt.cores)], default=1)
+    if s > 1:  # one row of tiles, too few to keep the workers busy (a token's MLP): K cut in s, a batch, and the parts
+      parts = self.split(s).matmul(x.split(s, 0), dtype, fidelity)  # summed. Not more rows: a batch of those would read
+      return sum((parts[i] for i in range(1, s)), parts[0])           # its own tiles, where one matrix's blocks share them
     if self.batch == x.batch == 1 and rt > 1 and k > shared_k(rt, self.rt.grid):  # K too long for the workers to share the
       most = shared_k(rt, self.rt.grid, 1)                                         # tiles: in parts that fit, each added onto
       per, out = 32 * -(-k // -(-k // most)), None                                 # the parts before as it is made
