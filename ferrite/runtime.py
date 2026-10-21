@@ -90,7 +90,7 @@ def _clang_version(): return subprocess.run(["clang", "--version"], capture_outp
 def _prune(days=7):  # once a process, before its first compile: images unused for a week go (each use touches its file),
   for f in CACHE.glob("*"):  # so what older code compiled does not pile up
     try:
-      if f.is_file() and f.stat().st_mtime < time.time() - days * 86400: f.unlink()  # (a folder: test_mac_hardware's build)
+      if f.is_file() and f.stat().st_mtime < time.time() - days * 86400: f.unlink()  # (a folder: an older checkout's tests built one here)
     except FileNotFoundError: pass  # another process took it first
 
 def compile_rv32(src):
@@ -395,7 +395,7 @@ class Runtime:
       self.launches += 1
       self.names[self.launches % TIMES] = name
       self.workers.append((self.launches, n))
-    self.chip.pci.write(0, self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
+    self.chip.pci.write(self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
 
   def profile(self, since):
     """The launches after launch number `since` by name, once they are done: [(name, launches, cycles)], most cycles

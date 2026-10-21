@@ -17,7 +17,7 @@ class Chip:
     self.pci, self.tlb, self.target = pci, 0, None  # TLB 0 is the shared window; map hands out the rest
     self.free_tlbs, self.kept = iter(range(1, bh.TLB_COUNT)), {}
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
-    assert int.from_bytes(pci.read(0, bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED, "the NoC is not translating coordinates, which bh's are"
+    assert int.from_bytes(pci.read(bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED, "the NoC is not translating coordinates, which bh's are"
     self.arc_msg(bh.ASIC_STATE0)  # out of the state tt-kmd leaves the chip in when it lets go of it
     self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_TELEMETRY[0]), "publish its telemetry", boot)
@@ -47,7 +47,7 @@ class Chip:
       tlb = self.kept[x, y, base, start]
     mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
     cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast)
-    for i in range(3): self.pci.write(0, bh.TLB_CONFIG + 12 * tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
+    for i in range(3): self.pci.write(bh.TLB_CONFIG + 12 * tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
     return tlb * bh.TLB_WINDOW + addr - base
 
   def window(self, x, y, addr, start=None):  # the shared TLB, moved only when an access needs another block
@@ -62,12 +62,12 @@ class Chip:
       yield self.window(x, y, addr, start), size
       addr, n = addr + size, n - size
 
-  def read(self, x, y, addr, n): return b"".join(self.pci.read(0, off, size) for off, size in self.chunks(x, y, addr, n))
+  def read(self, x, y, addr, n): return b"".join(self.pci.read(off, size) for off, size in self.chunks(x, y, addr, n))
   def write(self, x, y, addr, data, start=None):
     """Write data at NoC address (x, y, addr); with start, to every Tensix in the rectangle from start to (x, y)."""
     done = 0
     for off, size in self.chunks(x, y, addr, len(data), start):
-      self.pci.write(0, off, data[done:done + size])
+      self.pci.write(off, data[done:done + size])
       done += size
   def read32(self, x, y, addr): return int.from_bytes(self.read(x, y, addr, 4), "little")
   def write32(self, x, y, addr, val, start=None): self.write(x, y, addr, val.to_bytes(4, "little"), start)
@@ -78,7 +78,7 @@ class Chip:
       if time.monotonic() > deadline: raise TimeoutError(f"chip did not {what} within {timeout}s")
       self.pci.tick()
 
-  def arc_msg(self, header, *payload, timeout=1.0):
+  def arc_msg(self, header):
     """Send ARC one message (the low byte of header is its code) and return the 8-word response."""
     (x, y), entry = bh.ARC, bh.ARC_QUEUE_ENTRY
     qcb = self.read32(x, y, bh.ARC_QUEUES)
@@ -89,10 +89,10 @@ class Chip:
     if (left := self.read32(x, y, resp_w)) != rptr: self.write32(x, y, resp_r, rptr := left)  # a response nobody read (a client
                                                                                                # that died): dropped, as kmd does
     assert (wptr - self.read32(x, y, req_r)) % (2 * n) < n, "ARC message queue full"
-    self.write(x, y, q + entry + wptr % n * entry, struct.pack("<8I", header, *payload, *[0] * (7 - len(payload))))
+    self.write(x, y, q + entry + wptr % n * entry, struct.pack("<8I", header, *[0] * 7))
     self.write32(x, y, req_w, (wptr + 1) % (2 * n))
     self.write32(x, y, *bh.ARC_IRQ)
-    self.wait(lambda: self.read32(x, y, resp_w) != rptr, f"answer ARC message {header & 0xFF:#x}", timeout)
+    self.wait(lambda: self.read32(x, y, resp_w) != rptr, f"answer ARC message {header & 0xFF:#x}", 1.0)
     resp = struct.unpack("<8I", self.read(x, y, q + entry * (1 + n + rptr % n), entry))
     self.write32(x, y, resp_r, (rptr + 1) % (2 * n))
     assert resp[0] & 0xFF < bh.ARC_FAILED, f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}"

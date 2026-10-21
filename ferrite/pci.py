@@ -1,10 +1,10 @@
-# The device interface at the PCIe level: config space, BARs, and host memory the device can DMA to.
+# The device interface at the PCIe level: config space, BAR0, and host memory the device can DMA to.
 # Two backends with the same methods: Sim (ttsim's libttsim.so) and Card (a real card through sysfs).
 import array, ctypes, gc, mmap, os, time
 from ferrite import bh
 
 class Sim:
-  """libttsim.so: a virtual Blackhole driven by forwarding config and BAR accesses. One per process."""
+  """libttsim.so: a virtual Blackhole driven by forwarding config and BAR0 accesses. One per process."""
   def __init__(self, path):
     self.lib = lib = ctypes.CDLL(path)
     lib.libttsim_pci_config_rd32.restype = ctypes.c_uint32
@@ -18,17 +18,17 @@ class Sim:
                 cb(lambda bus, p, n: ctypes.memmove(self.host(bus, n), p, n)))
     lib.libttsim_set_pci_dma_mem_callbacks(*self.cbs)
     lib.libttsim_init()
-    self.bars = {i: self.cfg_read(0x10 + 4 * i) & ~0xF | self.cfg_read(0x14 + 4 * i) << 32 for i in (0, 2, 4)}
+    self.bar0 = self.cfg_read(0x10) & ~0xF | self.cfg_read(0x14) << 32  # TLB windows and registers: all ferrite uses
     self.dma, self.clocks = [], 0  # (bus address, size, host address, buffer); chip cycles run so far
 
   def cfg_read(self, off): return self.lib.libttsim_pci_config_rd32(0, off)
   def cfg_write(self, off, val): self.lib.libttsim_pci_config_wr32(0, off, val)
 
-  def read(self, bar, off, n):
+  def read(self, off, n):
     buf = ctypes.create_string_buffer(n)
-    self.lib.libttsim_pci_mem_rd_bytes(self.bars[bar] + off, buf, n)
+    self.lib.libttsim_pci_mem_rd_bytes(self.bar0 + off, buf, n)
     return buf.raw
-  def write(self, bar, off, data): self.lib.libttsim_pci_mem_wr_bytes(self.bars[bar] + off, bytes(data), len(data))
+  def write(self, off, data): self.lib.libttsim_pci_mem_wr_bytes(self.bar0 + off, bytes(data), len(data))
 
   def alloc(self, size):
     """Host memory the device can reach: (memoryview, bus address). Sim bus addresses are made up: one per 4 GiB."""
@@ -47,7 +47,7 @@ class Sim:
   def now(self): return self.clocks / bh.AICLK  # seconds of chip time, by ttsim's clock, which is not silicon's timing
 
 class Card:
-  """A real card from userspace: config space and BARs through sysfs, DMA memory from locked hugepages.
+  """A real card from userspace: config space and BAR0 through sysfs, DMA memory from locked hugepages.
   Needs root, the kernel driver unbound, and the IOMMU off or in passthrough (bus address == physical address)."""
   def __init__(self, bdf):
     if os.geteuid() != 0: raise PermissionError("a card wants root: its config space, its BARs, and physical addresses for DMA")
@@ -61,9 +61,10 @@ class Card:
     if at := self.capability(0x10):  # PCI Express: reads of host memory as requests of up to 4 KiB (Max Read Request Size),
       os.pwrite(self.cfg, (self.cfg_read(at + 8) & 0x8FFF | 5 << 12).to_bytes(2, "little"), at + 8)  # as kmd sets them up
     fd = os.open(f"{self.sys}/resource0", os.O_RDWR | os.O_SYNC)  # BAR0 alone: TLB windows and registers are all ferrite uses
-    self.bars = {0: (m := mmap.mmap(fd, os.fstat(fd).st_size), ctypes.addressof(ctypes.c_char.from_buffer(m)))}  # (BAR4 may not
-    os.close(fd)                                                                                                     # be all there)
-    for i in range(32): self.write(0, bh.TLB_STRIDED + 4 * i, bytes(4))  # TLBs 0-31 multicast to every tile of a rectangle, as kmd
+    self.map = mmap.mmap(fd, os.fstat(fd).st_size)  # (BAR4 may not be all there)
+    self.bar0 = ctypes.addressof(ctypes.c_char.from_buffer(self.map))
+    os.close(fd)
+    for i in range(32): self.write(bh.TLB_STRIDED + 4 * i, bytes(4))  # TLBs 0-31 multicast to every tile of a rectangle, as kmd
                                                                           # leaves them, whatever an earlier user set
   def cfg_read(self, off): return int.from_bytes(os.pread(self.cfg, 4, off), "little")
   def cfg_write(self, off, val): os.pwrite(self.cfg, val.to_bytes(4, "little"), off)
@@ -72,8 +73,8 @@ class Card:
     while at and self.cfg_read(at) & 0xFF != cap: at = self.cfg_read(at) >> 8 & 0xFC
     return at
 
-  def read(self, bar, off, n): return _load(self.bars[bar][1] + off, n)
-  def write(self, bar, off, data): _store(self.bars[bar][1] + off, data)
+  def read(self, off, n): return _load(self.bar0 + off, n)
+  def write(self, off, data): _store(self.bar0 + off, data)
 
   def alloc(self, size):
     """One 2 MiB hugepage, physically contiguous and locked: (memoryview, bus address). The memoryview holds the page:

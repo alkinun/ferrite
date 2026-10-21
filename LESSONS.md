@@ -1,7 +1,7 @@
 # Lessons
 
 What building ferrite has taught us: the surprises, the mistakes, and the rules we now work by. NOTES.md holds the
-facts and where each comes from; this file holds what they mean for the next piece of work, and for a chip of our own.
+facts and where each comes from; this file holds what they mean for the next piece of work, and for Tenstorrent's chips.
 
 Add a lesson when something cost real time or changed how we work. Keep it to a few sentences and name the evidence: a
 test, a measurement, a NOTES section. When a lesson turns out wrong or incomplete, rewrite it in place rather than
@@ -225,9 +225,9 @@ append a correction.
    writer thought of; a reader hunting for faults finds the rest. (NOTES: "What tt-kmd does that a userspace driver
    must do instead")
 
-## For a chip of our own
+## For Tenstorrent's next chips
 
-What Blackhole made hard to program, so that a design for simple software can design it away (ROADMAP, Stage 3).
+What Blackhole made hard to program, for Tenstorrent to design away in the chips after it.
 
 - **Coherence, or no caches at all.** Three kinds of manual synchronization (the L0 data cache, settling L1, the
   instruction cache) are the commonest source of subtle bugs here.

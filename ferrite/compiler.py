@@ -124,7 +124,7 @@ def reconfigure(**fields):  # unpacker 0's config fields rewritten from thread 0
             for b in range(first // 8, (first + width + 7) // 8)]
   return ([ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_UNPACK0)] + writes +
           [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)])
-def repack(old, new):  # the packer's config from old to new (kernel_configs), from the pack thread: the bytes that
+def repack(old, new):  # the packer's config from old to new (kernel_config's), from the pack thread: the bytes that
   # differ, written once the packer is idle, and its next pack held until they are
   writes = [ins(f"RMWCIB{b}", cfg_reg_addr=w, data=new[w] >> 8 * b & 255, mask=255) for w in sorted(new) for b in range(4)
             if (old[w] ^ new[w]) >> 8 * b & 255]

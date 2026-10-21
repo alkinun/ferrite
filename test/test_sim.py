@@ -1,13 +1,12 @@
 # Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
-import ctypes, json, math, os, pathlib, random, shutil, struct, subprocess, sys, time, pytest
+import ctypes, json, math, os, pathlib, random, struct, sys, time, pytest
 import numpy as np
 from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
-from hw import mac
 import benchmark, gpt2, llama, train
 from types import SimpleNamespace
 
@@ -38,7 +37,7 @@ def chip(): return Chip(pci.open_device())  # one per process: libttsim can only
 def test_config_space(chip):
   assert chip.pci.cfg_read(0x00) == bh.VENDOR | bh.DEVICE << 16
   assert chip.pci.cfg_read(0x04) & 0x2, "memory decode is off"
-  assert len(set(chip.pci.bars.values())) == 3
+  assert chip.pci.cfg_read(0x10) & ~0xF | chip.pci.cfg_read(0x14) << 32, "BAR0 has no address"
 
 def test_arc(chip):
   # ARC's messages and telemetry. A message sent after a response nobody read (left by a client that died) gets its own
@@ -71,7 +70,7 @@ def test_l1(chip):
   for (x, y), d in data.items(): assert chip.read(x, y, addr, len(d)) == d, f"Tensix {x},{y}"
   (x, y), d = next(iter(data.items()))
   at = chip.map(x, y, addr)
-  assert chip.map(x, y, addr) == at and chip.pci.read(0, at, 64) == d[:64]
+  assert chip.map(x, y, addr) == at and chip.pci.read(at, 64) == d[:64]
 
 def test_dram(chip):
   addr, data = bh.TLB_WINDOW - 2048, [random.randbytes(4096) for _ in bh.DRAM]  # straddles two 2 MiB windows
@@ -81,7 +80,7 @@ def test_dram(chip):
 
 def test_cache_prune(tmp_path, monkeypatch):
   # compiled images unused for a week go, once a process, before its first compile; a used one is touched, so it stays,
-  # and a folder (test_mac_hardware's build) is not an image
+  # and a folder (an older checkout's tests built one here) is not an image
   import ferrite.runtime as runtime
   monkeypatch.setattr(runtime, "CACHE", tmp_path)
   old, new, folder = tmp_path / "old", tmp_path / "new", tmp_path / "folder"
@@ -1505,41 +1504,3 @@ def test_llama_model(chip):
     assert np.abs(got - want).max() < 1 and got.argmax() == want.argmax(), (np.abs(got - want).max(), got.argmax(), want.argmax())
     new, places = [int(want.argmax())], [places[-1] + 1]
   assert new == [1962], "a [question]"
-
-def test_mac_model():
-  # the multiply-accumulate unit's model (hw/mac.py: acc + a * b, bf16 by bf16 into fp32, ROADMAP's arithmetic), integers
-  # throughout, against numpy's IEEE fp32 addition with the model's flushes around it (denormals in, the product to
-  # infinity or zero out of fp32's range, denormals out, one NaN), on mac.cases: every combination of the edge values
-  # (zeros, denormals, the smallest and largest normals, infinities, NaNs, products just inside and outside fp32's
-  # range), and random ones of every kind and close enough in size that the sum rounds; and on ties
-  acc, a, b = np.array(list(mac.cases(40000, random.Random(29).randrange)), np.uint32).T
-  ftz = lambda x: np.where(np.abs(x) < 2.0**-126, np.copysign(np.float32(0), x), x).astype(np.float32)  # NaN compares False: kept
-  with np.errstate(all="ignore"):
-    p = ftz((a << 16).view(np.float32)).astype(np.float64) * ftz((b << 16).view(np.float32))  # exact in float64
-    p = ftz(np.where(np.abs(p) >= 2.0**128, np.copysign(np.inf, p), p).astype(np.float32))  # in fp32's range, exact
-    want = ftz(ftz(acc.view(np.float32)) + p)
-  want = np.where(np.isnan(want), mac.NAN, want.view(np.uint32))
-  got = np.array([mac.mac(int(c), int(x), int(y)) for c, x, y in zip(acc, a, b)], np.uint32)
-  assert (got == want).all(), [(hex(c), hex(x), hex(y), hex(g), hex(w)) for c, x, y, g, w in zip(acc, a, b, got, want) if g != w][:5]
-  assert mac.mac(0x3F800000, 0x3F80, 0x3380) == 0x3F800000 and mac.mac(0x3F800001, 0x3F80, 0x3380) == 0x3F800002, "ties to even"
-
-def test_mac_synthesis(tmp_path):
-  # the multiply-accumulate unit synthesizes: Yosys (generic gates) finds no latch, no combinational loop, no undriven or
-  # doubly driven wire in hw/mac.v (run in a folder of its own: ABC leaves its history file where it runs)
-  if not shutil.which("yosys"): pytest.skip("wants Yosys (Arch: pacman -S yosys)")
-  hw = pathlib.Path(__file__).parent.parent / "hw"
-  run = subprocess.run(["yosys", "-q", "-p", f"read_verilog {hw / 'mac.v'}; synth -top mac -flatten; check -assert; select -assert-none t:*DLATCH*"], capture_output=True, text=True, cwd=tmp_path)
-  assert run.returncode == 0, run.stdout + run.stderr
-
-def test_mac_hardware():
-  # the multiply-accumulate unit in Verilog (hw/mac.v) against its model, bit for bit, in cocotb on Verilator
-  # (hw/mac_tb.py): its arithmetic on every combination of the edge values and a million random cases (ROADMAP's exit
-  # criterion), then its accumulator on a stream of loads, steps and idle clocks. Built with every Verilator warning on
-  runner = pytest.importorskip("cocotb_tools.runner")
-  if not shutil.which("verilator"): pytest.skip("wants Verilator (Arch: pacman -S verilator)")
-  hw, build = pathlib.Path(__file__).parent.parent / "hw", pathlib.Path.home() / ".cache/ferrite/mac"
-  if str(hw) not in sys.path: sys.path.append(str(hw))  # the simulator's Python imports mac_tb from where this one finds it
-  sim = runner.get_runner("verilator")
-  sim.build(sources=[hw / "mac.v"], hdl_toplevel="mac", build_dir=build, build_args=["-Wall", "-Wno-DECLFILENAME"])
-  results = sim.test(test_module="mac_tb", hdl_toplevel="mac", build_dir=build)
-  assert runner.get_results(results) == (2, 0), "a test of hw/mac_tb.py failed: its log is above (pytest -s)"

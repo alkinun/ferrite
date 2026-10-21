@@ -1,6 +1,6 @@
 # ferrite
 
-The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 3,000 lines of Python.
+The whole software stack for Tenstorrent's Blackhole, from PCIe up to a tensor compiler, in about 1,900 lines of Python code.
 Nothing from Tenstorrent runs but the card's own firmware: no kernel driver, no tt-umd, no tt-metal, no LLK. ferrite
 talks to the card through its PCIe BARs from userspace, loads its own firmware onto every Tensix core, and compiles
 tensor expressions straight to Tensix instructions, written from the ISA documentation.
@@ -55,10 +55,6 @@ way, through tinygrad's own PyTorch frontend (`extra/torch_backend` in tinygrad:
 
     TTSIM=... PYTHONPATH=tinygrad python3 adapters/tinygrad_ferrite.py tinygrad/examples/transformer.py
 
-The first hardware of our own, in simulation: a multiply-accumulate unit, bf16 by bf16 into fp32, in Verilog
-(`hw/mac.v`), which matches its model (`hw/mac.py`) bit for bit on a million random inputs and every combination of
-the edge values, in cocotb on Verilator (`test_mac_hardware`).
-
 ## Speed
 
 Against Tenstorrent's own stack (tt-metal with TT-NN) on the same simulator: ferrite does the same ops in 4 to 18
@@ -86,7 +82,7 @@ is on a real card waits for one; `COMPARE.md` has the numbers and what carries o
 ## Docs
 
 `NOTES.md`: how it works, and what is still unknown. `COMPARE.md`: ferrite against TT-NN. `ROADMAP.md`: where it goes,
-from silicon to an inference chip of our own, in five gated stages. `LESSONS.md`: what the work has taught us.
+from one card to machines of linked cards, in four gated stages. `LESSONS.md`: what the work has taught us.
 
 ## License
 
