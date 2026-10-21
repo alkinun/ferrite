@@ -41,17 +41,18 @@ def test_config_space(chip):
 
 def test_arc(chip):
   # ARC's messages and telemetry. A message sent after a response nobody read (left by a client that died) gets its own
-  # answer: ARC_GET_HARVESTING's is which Tensix columns are off (not 0 on a p150), TEST's is 0
+  # answer, not the one left: here TEST's, its slot marked as if ARC had written something else there
   chip.arc_msg(0x90)  # TEST
-  assert chip.arc_msg(0x57)[0], "a p150 has Tensix columns off"
   (x, y), entry = bh.ARC, bh.ARC_QUEUE_ENTRY
   qcb = chip.read32(x, y, bh.ARC_QUEUES)
   base, n = chip.read32(x, y, qcb), chip.read32(x, y, qcb + 4) & 0xFF
-  resp_r = base + bh.APP_QUEUE * (entry + 2 * n * entry) + bh.ARC_QUEUE_PTRS[1]
-  chip.write32(x, y, resp_r, (chip.read32(x, y, resp_r) - 1) % (2 * n))  # the harvesting answer, as if never read
-  assert chip.arc_msg(0x90)[0] == 0, "TEST's own answer, not the one left in the queue"
+  q = base + bh.APP_QUEUE * (entry + 2 * n * entry)
+  rptr = (chip.read32(x, y, q + bh.ARC_QUEUE_PTRS[1]) - 1) % (2 * n)
+  chip.write32(x, y, q + entry * (1 + n + rptr % n), 0xABCD0000)
+  chip.write32(x, y, q + bh.ARC_QUEUE_PTRS[1], rptr)  # its answer, as if never read
+  assert chip.arc_msg(0x90)[0] != 0xABCD0000, "TEST's own answer, not the one left in the queue"
   t = chip.telemetry()
-  assert len(chip.tensix) == 120 and t[bh.TAG_AICLK] > 0, "a p150 has 12 of 14 Tensix columns working, as ttsim models"
+  assert len(chip.tensix) in (120, 140) and t[bh.TAG_AICLK] > 0, "14 Tensix columns, 2 harvested from firmware 19.5"
 
 def test_dma(chip):
   # the PCIe tile forwards NoC addresses below 2**58 to the host as bus addresses: point the TLB there and the
@@ -114,7 +115,7 @@ def test_every_core(chip):
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { a[0] = noc_me(); }"))
   rt.wait()
-  assert len(rt.cores) == len(chip.tensix) - 1 == 119  # and one dispatcher
+  assert len(rt.cores) == len(chip.tensix) - 1  # and one dispatcher
   for x, y in rt.cores: assert chip.read32(x, y, rt.args()) == x | y << 6
 
 def test_relaunch_without_reset(chip):

@@ -33,7 +33,7 @@ Firmware turns on **coordinate translation** at boot (`NIU_CFG_0` bit 14) and pr
 
 | Translated (x, y) | What |
 |---|---|
-| x 1..7, 10..14, y 2..11 | Tensix, 120 on a p150 (x 15, 16 are its 2 harvested columns: firmware 19.5+ harvests 2 on every p150, umd `CHANGELOG`, `cluster_descriptor.cpp`) |
+| x 1..7, 10..14, y 2..11 | Tensix, 120 on a p150 (x 15, 16 are its 2 harvested columns: firmware 19.5+ harvests 2 on every p150, umd `CHANGELOG`, `cluster_descriptor.cpp`; before 19.5 all 140 run) |
 | x 17..18, y 12..23 | DRAM: bank b at (17 + b//4, 12 + 3*(b%4) + port), port 0..2, all three ports reach the same 4 GiB |
 | (19, 24) | the PCIe tile connected to the host |
 | x 20..31, y 25 | Ethernet |
