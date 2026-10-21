@@ -95,6 +95,10 @@ append a correction.
    read DRAM over the BARs a few bytes a round trip (a token's logits were 3 MB). Price each PCIe round trip from the
    ISA and the bus: the dispatcher now reads all the host has written in one read and posts its status, and results
    come back by the chip's own writes into host memory. (NOTES: "The dispatcher", "Waiting")
+10. **A rare failure is a knob turned too gently.** One run in twenty of the suite under ttsim-chaos stopped on a
+    semaphore posted while full, and the same seed would not do it again. Turning the one perturbation that mattered up
+    to nine Tensix stalls in ten made the first matmul whose steps stay in L1 fail every time: a test for the fix, and
+    its proof. Sweep wide, then turn up what failed. (NOTES: "ttsim-chaos")
 
 ## The compiler and runtime
 
