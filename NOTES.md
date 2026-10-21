@@ -262,7 +262,7 @@ Handoffs:
 - **Unpack to math**: SrcA and SrcB have two banks each, and the hardware does the rest (`UNPACR` waits for a bank the FPU has released, the FPU for one the unpacker has filled).
 - **Math to pack**: SEM_DST counts results in Dst waiting to be packed (max 2, one per half). Math waits while both halves are full, pack while none is.
 - **Pack to unpack** (fused chains): an intermediate is packed into L1 and unpacked by a later op. Pack posts SEM_L1 for each; before an op that reads an intermediate, unpack takes one for every op packed since it last looked (`drain`). Packs happen in op order, so that covers whichever earlier op it reads (a plain count would not: the op might read an older intermediate than the one just posted).
-- **Between BRISC and the TRISCs**: words in `SYNC`, each written by one core and read with a `fence` first (the L0 data cache never sees another core's writes). BRISC cannot read semaphores, so TRISC0 and TRISC2 relay theirs: they read SEM_UNPACKED or SEM_PACKED (TRISCs see the semaphores at `0xFFE8_0020 + 4i`), take one with a store of 1, and bump a count in `SYNC`.
+- **Between BRISC and the TRISCs**: words in `SYNC`, each written by one core and read with a `fence` first (the L0 data cache never sees another core's writes). BRISC cannot read semaphores, so TRISC0 and TRISC2 relay theirs: they read SEM_UNPACKED or SEM_PACKED (TRISCs see the semaphores at `0xFFE8_0020 + 4i`), take one with a store of 1, and bump a count in `SYNC`. A semaphore holds 15, and a post onto a full one breaks the contract, so neither TRISC pushes a 16th report before it has relayed one: TRISC2's results wait for their slot to go home (two at most), and TRISC0's frames for BRISC's fetches (two ahead) and its steps for `landed`, which counts the reports out, since a step kept in L1 waits for nothing else.
 
 | word | written by | means |
 |---|---|---|
@@ -309,7 +309,7 @@ A result goes home as soon as it is packed, and the only waits between the cores
 - A multicast leaves the NIU's outstanding count wrong (up once, down once a recipient), so BRISC waits for everything else first and clears the count after, as the dispatcher does.
 - When A's rows and three buffers do not fit below slot 256, `Tensor.matmul` cuts K into parts that do (`compiler.shared_k`), each part's matmul adding the sum of those before as its epilogue (rounded to bf16 between parts, as split K's are below).
 
-The benchmark, 512x768 @ 768x3072, reads 1.00 times its inputs in 1.5k ttsim cycles; 512x3072 @ 3072x768 (GPT-2's MLP down, in parts) 1.2 times.
+The benchmark, 512x768 @ 768x3072, reads 1.00 times its inputs in 1.6k ttsim cycles; 512x3072 @ 3072x768 (GPT-2's MLP down, in parts) 1.2 times.
 
 **A token's row, shared** (`bcast`, `test_matmul_multicast`). A matmul of one row of tiles (a token, or a few) gives each grid worker a block of the result's columns, and the first grid row reads A's tiles in shares and multicasts them to every worker, flagging each share as above; B, whose tiles no two workers share, streams in behind one wait for A. A batch (K split in parts) gives each matrix whole grid rows of its own, its blocks padded out to them, and its first row shares its part of A. So a token reads its activations once, not once a worker (`ferrite.bench 1 768 3072`: 1.0 times its inputs where it was 2.0).
 
@@ -515,7 +515,7 @@ Each is one launch, matching float64 to about 2% (softmax) and 0.05 + 2% (layer 
 - `TTSIM_CHAOS_SEED=n`: the random generator's seed.
 - `TTSIM_CHAOS_UNHARVESTED=1`: a p150 of 140 Tensix, none harvested, as its firmware runs it before 19.5 (ttsim models the 120 of 19.5 on). It found the split K that read 2 to 3 times a matmul's inputs ("Split K").
 
-The suite passes under each: NoC delays of 1-20, 0-100 and 0-400 clocks; Tensix 0.3; RISC-V 0.3; NoC 0-200 with Tensix and RISC-V at 0.3 and at 0.5; the models, tinygrad and PyTorch with NoC 0-200 and both at 0.3; and unharvested, alone and with NoC 0-200 and both at 0.3. It catches what ttsim cannot: without BRISC's wait for a frame's reads (`ready`'s `noc_wait`) or thread 0's wait for a matmul step's reads (`landed`), ttsim passes and ttsim-chaos fails at once. (The firmware's wait for a kernel's writes before it reports is belt and braces: every kernel waits for its own writes' acknowledgements first, and nothing fails without it.) Still not modelled: the busy conditions `STALLWAIT` and `SEMWAIT` wait on (the units still finish at once), so the waits listed above stay silicon's to check.
+The suite passes under each: NoC delays of 1-20, 0-100 and 0-400 clocks; Tensix 0.3; RISC-V 0.3; NoC 0-200 with Tensix and RISC-V at 0.3 and at 0.5; the models, tinygrad and PyTorch with NoC 0-200 and both at 0.3; and unharvested, alone and with NoC 0-200 and both at 0.3. It catches what ttsim cannot: without BRISC's wait for a frame's reads (`ready`'s `noc_wait`) or thread 0's wait for a matmul step's reads (`landed`), ttsim passes and ttsim-chaos fails at once. Run over twenty seeds, it found TRISC0 pushing a matmul's steps kept in L1 more than 15 reports ahead of thread 0, whose next post landed on a full SEM_UNPACKED: one run in twenty at Tensix and RISC-V 0.5, and every run with the Tensix stalled nine turns in ten (`TTSIM_CHAOS_TENSIX=0.9`), under which the suite now passes ("Between BRISC and the TRISCs"). (The firmware's wait for a kernel's writes before it reports is belt and braces: every kernel waits for its own writes' acknowledgements first, and nothing fails without it.) Still not modelled: the busy conditions `STALLWAIT` and `SEMWAIT` wait on (the units still finish at once), so the waits listed above stay silicon's to check.
 
 **How ttsim counts** (`libttsim.cpp`, `clock_current_chip`). In one clock, each tile steps its RISC-V cores once and runs one Tensix instruction from each pipe that can go, and does it again for as long as any pipe ran one. So a Tensix instruction that is queued costs nothing, whether pushed, replayed or expanded from a MOP (all of which put it in the FIFO at once); clocks go by only while every pipe of a tile is empty or stalled, one RISC-V instruction a clock. A kernel's cycles on ttsim are the RISC-V instructions on its critical path while the Tensix waits: polling, handshakes, NoC requests. So:
 
@@ -543,7 +543,8 @@ The suite passes under each: NoC delays of 1-20, 0-100 and 0-400 clocks; Tensix 
 | attention's kᵀ kept across softmax's passes | | | 55k | |
 | a KV cache, so a token replays (its puts and mask) | | | 60k | 140 |
 | each tile's code written once (a bfp8 token's matmul 1.5k to 0.77k) | | | | |
-| now | 1.5k | 1.0x | 60k | 140 |
+| TRISC0 at most 15 reports ahead of thread 0 (a race ttsim-chaos found) | 1.6k | | 61k | |
+| now | 1.6k | 1.0x | 61k | 140 |
 
 A token's DRAM reads went from 222.8k tiles to 136.7k with a token's A shared and attention's kᵀ kept (its weights are 120.6k). On ttsim queued Tensix instructions cost nothing, so what is left is the RISC-V work between them; on silicon the MVMULs and DRAM will count, and the host's part ("The host's part, and replay").
 

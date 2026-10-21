@@ -614,7 +614,9 @@ static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relaye
 static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next frame
 static unsigned landed(void) {{  // until the next matmul step's tiles are in: BRISC has issued its reads, and those (its
   unsigned z = stepped++ % {DEPTH};  // transaction id's) have landed. Its stream slot
-  do relay(); while (peek(ISSUED) < stepped);  // relaying at least once a step, as SEM_UNPACKED holds 15
+  // and no more than the 15 reports SEM_UNPACKED holds are pushed but not relayed: a step kept in L1 waits for no
+  // fetch, so thread 0 could fall further behind, and a post onto a full semaphore breaks the contract
+  do relay(); while (peek(ISSUED) < stepped || needed + stepped - relayed > 15);
   while (NIU(OUTSTANDING + 4 + 4 * z)) relay();
   return z;
 }}
