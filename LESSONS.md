@@ -166,15 +166,16 @@ append a correction.
     CPU. Then a tinygrad script ran on tinygrad's own default device, because the device was chosen in the environment
     after tinygrad had read it. Count launches in a test, and make a fallback show itself. (NOTES: "tinygrad on
     ferrite")
-23. **The primitives map; the layouts are the work.** tinygrad's ops are ferrite's almost one for one, and matched on the
-    first try. A transformer step's time went into where data lies: views that did not fold into three axes went
+23. **The primitives map; the layouts are the work.** tinygrad's ops are ferrite's almost one for one, and matched on
+    the first try. A transformer step's time went into where data lies: views that did not fold into three axes went
     through the host, short axes padded every tile, flat weights and transposes were moved where they could be read in
     place, and a product was made whole before its sum. 52 s a step went to 25 by layout alone. (NOTES: "tinygrad on
     ferrite")
 24. **Copy what is already together.** The move kernel found each datum on its own, though most moves are whole tiles (a
     pad on tile boundaries), tiles transposed (an fp32 `.T`) or runs along a row or down a column. Copying those as they
     are took a training step's moves from 450k cycles to 28k, and tinygrad's transformer step from 6.1M to 2.9M. Which
-    way to sweep mattered as much: attention's heads run 6 datums along a row and 32 down a column. (NOTES: "Movement at any granularity")
+    way to sweep mattered as much: attention's heads run 6 datums along a row and 32 down a column. (NOTES: "Movement at
+    any granularity")
 25. **Work out a cost's floor before trying to lower it.** The benchmark's matmul read its inputs 6.9 times over, and
     bigger blocks looked like the fix; but 96 workers making 16 result tiles each from 4 rows and 4 columns is already
     the fewest reads a worker can make alone, so only sharing between workers could go lower. Multicast took it to 1.0,

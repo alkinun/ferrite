@@ -1395,7 +1395,7 @@ def test_llama_precision(chip):
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.01 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
 
 def test_token_accuracy(chip):
-  # llama.accuracy, Tenstorrent's token accuracy (ROADMAP, Measurement): a prompt prefilled, then each step fed the
+  # llama.accuracy, Tenstorrent's token accuracy (COMPARE, Measurement): a prompt prefilled, then each step fed the
   # reference's token whatever the model picked. Against a reference made the same way from numpy (its five most likely
   # at each place) the chip's picks are numpy's top-1 throughout, and a reference that is wrong at one place costs top-1
   # exactly that step; in numpy (rt None, the weights as numpy arrays) the picks and scores are the same
@@ -1414,10 +1414,10 @@ def test_token_accuracy(chip):
   assert llama.accuracy(None, w, c, prompt, after, top5, 8) == (top1, five, picks), "in numpy (rt None), the same"
 
 def test_benchmark_bytes():
-  # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token; ROADMAP, Measurement): the bytes a
+  # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token; COMPARE, Measurement): the bytes a
   # decode token reads, each weight in the format TT's performance precision gives it (llama.weight_format, as upload
   # casts it; benchmark.weights has them from the model's sizes, as test_llama_precision checks). Llama-3.1-8B's sizes
-  # give ROADMAP's 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
+  # give COMPARE's 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
   c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=32, vocab=128256, ffn=14336, places=736)
   c.precision = llama.precision(c, "tt")
   t = benchmark.weights(c)

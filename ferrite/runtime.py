@@ -105,7 +105,7 @@ def compile_rv32(src):
     os.utime(cached)
     return cached.read_bytes()
   _prune()
-  if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld (Arch: pacman -S lld)")
+  if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld")
   with tempfile.TemporaryDirectory() as d:
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
     out = pathlib.Path(d, "prog.bin")

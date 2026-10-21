@@ -129,30 +129,88 @@ lead is in the work around the math, so it is largest where that work is: small 
 Compiling (host seconds): ferrite builds a kernel with clang and lld in about 0.2 s; tt-metal builds its firmware when
 the device opens (0.9 s) and each op's kernels the first time (0.6 to 0.8 s). Both cache on disk.
 
-Size, by ROADMAP's measure (code lines as `cloc` counts them, without blank or comment lines, tests, models, docs or
-third-party code; `test/benchmark.py` counts them): ferrite is 1,891 lines of Python (3,156 lines in all, with its
-comments, docstrings and blank lines) and its tinygrad adapter 464. tt-metal at 9f98dee9, with TT-NN, LLK and the UMD it pins (9c645d9), is
+Size, in code lines as `cloc` counts them (without blank or comment lines, tests, models, docs or third-party code;
+`test/benchmark.py` counts them): ferrite is 1,891 lines of Python (3,156 lines in all, with its comments, docstrings
+and blank lines) and its tinygrad adapter 464. tt-metal at 9f98dee9, with TT-NN, LLK and the UMD it pins (9c645d9), is
 1,412,977, of which C++ and its headers are 1.24M; tt-kmd at c3befe6, 7,647.
 
 On 2026-10-18 (ferrite at bc715ac) it was the other way round for DRAM: ferrite's matmul read 6.9 times its inputs, its
 softmax 3 and its layer norm 6, and the matmul took 17.0k cycles. Sharing tiles between workers by multicast and keeping
 a line's inputs in L1 between passes closed that (NOTES, "Tiles shared between workers", "Lines in passes").
 
+## On a card
+
+Three benchmarks set the two stacks side by side on a p150 (Tenstorrent's Blackhole card, the p150a actively cooled or
+the p150b passive), run by `test/benchmark.py`:
+
+- **B1, matmul:** (4096 x 4096) @ (4096 x 4096) in bf16, at two fidelity phases (HiFi2, what tt_transformers uses for
+  most of its matmuls) and at four.
+- **B2, decode:** `meta-llama/Llama-3.1-8B-Instruct` at TT's performance precision: tokens/s, effective DRAM bandwidth
+  and token accuracy, for one user and for 32 at once.
+- **B3, long-context prefill:** time to first token for B2's model, with prompts of 4,096 and 32,768 tokens.
+
+### Measurement
+
+- **Versions.** Every number records the commits of ferrite and tt-metal (and so the UMD it pins), the versions of
+  tt-kmd, the card's firmware, tinygrad and PyTorch where they take part, and the host's CPU, OS and kernel. TT-NN's
+  numbers are measured on the same card with Tenstorrent's own scripts (tt_transformers' `simple_text_demo.py` for
+  models), never taken from Tenstorrent's tables.
+- **Decode speed.** Batch 1, unless a benchmark says otherwise. The prompt is the first 512 tokens of the model's
+  reference file (below); then 200 tokens are generated greedily, end-of-sequence ignored. tokens/s is the steps after
+  each stack's warm-up over their wall time on the host's clock. The warm-up is the steps before the first replay of a
+  recorded step: TT-NN's first, which compiles and captures its trace, and ferrite's first two, which run and record.
+- **Prefill speed.** Batch 1. Time to first token: the wall time from a prompt's token ids on the host to its first
+  generated token, after a warm-up prefill of the same length, which compiles. A prompt of n tokens is the first n of A
+  Tale of Two Cities as tt_transformers keeps it (`tests/tale-of-two-cities.txt.bz2`), in the model's tokenizer.
+- **TT's performance precision.** Each weight matrix and the KV cache in the format, and each matmul at the number of
+  fidelity phases, that tt_transformers' performance mode gives it at the pinned tt-metal commit. At 9f98dee9 that is,
+  for Llama-3.1-8B: the MLP's gate and up projections in bfp4 at one phase (LoFi), except in the last of its 32 blocks,
+  which keeps them in bfp8 at two (HiFi2); the other weight matrices and the KV cache in bfp8 at two phases; attention
+  itself at two phases in decode and four in prefill.
+- **Effective DRAM bandwidth.** The bytes a decode token reads at the benchmark's formats, times the measured tokens/s,
+  over the card's 512 GB/s. Weights count at their stored size (per 1,024 values: bf16 2,048 bytes, bfp8 1,088, bfp4
+  576), the token embedding only for the row gathered, the KV cache at the decode's mean context (612.5 tokens for a
+  512-token prompt and 200 steps). For Llama-3.1-8B at TT's performance precision that is about 6.20 GB a token, so
+  half the bandwidth is 41.3 tokens/s.
+- **Token accuracy.** Tenstorrent's method (`simple_text_demo.py`, its `ci-token-matching` run). The reference file
+  (`tests/reference_outputs/<model>.refpt` in tt_transformers) holds 1,024 tokens of text and, for each, the Hugging
+  Face model's five most likely next tokens. The prompt is its first 512 tokens; then, for 500 steps, the stack is fed
+  the file's next token whatever it predicted. A step counts for top-1 when the stack's most likely token is the
+  reference model's most likely, and for top-5 when it is among the reference model's five most likely. A model
+  without a reference file gets one from Tenstorrent's own script (`tests/generate_reference_hf.py`), with the model's
+  own configuration (without the script's YaRN override for Qwen models, which the served model does not use).
+- **Matmul time.** bf16 inputs and result in DRAM, sums in fp32, each stack in its own tile layout, both at the same
+  number of fidelity phases. The median of 5 measurements, each 20 back-to-back runs after 3 warm-up runs, timed from
+  the first launch to the last result. TT-NN's side is `ttnn.matmul` called as its documentation calls it, with the
+  fidelity and fp32 accumulation set in its compute kernel config.
+- **No more than 1.5 times slower.** A time at most 1.5 times TT-NN's; a speed at least two thirds of TT-NN's.
+- **Lines of code.** Code lines as `cloc` counts them (no blank or comment lines). ferrite: `ferrite/` and `adapters/`,
+  each given. Tenstorrent: tt-metal (with TT-NN, LLK and the UMD it pins) and tt-kmd, at the recorded versions, without
+  tests, models, docs or other third-party code.
+
+Tenstorrent's side, at tt-metal 9f98dee9:
+[model_targets.yaml](https://github.com/tenstorrent/tt-metal/blob/9f98dee9/models/model_targets.yaml) (Llama-3.1-8B on a
+P150: 42.0 tokens/s a user at batch 32; top-1 90%, top-5 98%),
+[model_config.py](https://github.com/tenstorrent/tt-metal/blob/9f98dee9/models/tt_transformers/tt/model_config.py) and
+[performance_decoder_config.json](https://github.com/tenstorrent/tt-metal/blob/9f98dee9/models/tt_transformers/model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json)
+(the performance mode's formats and fidelities), and
+[simple_text_demo.py](https://github.com/tenstorrent/tt-metal/blob/9f98dee9/models/tt_transformers/demo/simple_text_demo.py)
+(how speed and token accuracy are measured).
+
 ## Reproducing
 
-tt-metal on Arch Linux needed `hwloc` and `libc++` (pacman), SFPI 7.88.0's Debian tarball (there is none for Arch;
-its sha256 checks), and three local fixes for clang and libc++ 22: `#include <cstdlib>` in the bundled fmt's
-`format.h`, a `const` dropped from a map key in `tt_metal/fabric/mesh_graph.cpp`, and the system `ar` and `ranlib`
-for CMake. Then, from `~/Desktop/tt`, with a toolchain file for the system's clang 22 and libc++:
+tt-metal, built from source with clang and libc++ 22, needs `hwloc`, SFPI 7.88.0, and three local fixes:
+`#include <cstdlib>` in the bundled fmt's `format.h`, a `const` dropped from a map key in
+`tt_metal/fabric/mesh_graph.cpp`, and the system's `ar` and `ranlib` for CMake. With a toolchain file for that clang:
 
     cmake -S tt-metal -B tt-metal/build_Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=clang22-libcxx.cmake \
       -DENABLE_DISTRIBUTED=OFF -DBUILD_PROGRAMMING_EXAMPLES=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF
     ninja -C tt-metal/build_Release install
 
-The shim (`sim/shim.c`, built to `sim/libttsim.so` beside a copy of `blackhole_140_arch.yaml` as `soc_descriptor.yaml`)
-and the measurement programs (`cmp/ttnn_ops.cpp`, `cmp/ferrite_ops.py`, and for SmolLM `cmp/ttnn_smollm.py`,
-`cmp/ferrite_smollm.py`) are in `~/Desktop/tt`, outside this repository. Run them one at a time: the shim counts clocks
-in one file in `/dev/shm`, so two runs at once each count both.
+Both stacks run on the same ttsim through a shim (`sim/libttsim.so`, with a copy of `blackhole_140_arch.yaml` beside it
+as `soc_descriptor.yaml`) that counts clocks in one file in `/dev/shm`, so runs go one at a time: two at once each count
+both. The shim and the measurement programs (`cmp/ttnn_ops.cpp`, `cmp/ferrite_ops.py`, and for SmolLM
+`cmp/ttnn_smollm.py`, `cmp/ferrite_smollm.py`) are kept outside this repository.
 
     TTSIM=/path/to/libttsim.so python3 cmp/ferrite_ops.py
     TT_METAL_RUNTIME_ROOT=$PWD/tt-metal TT_METAL_SIMULATOR=$PWD/sim/libttsim.so TT_METAL_DISABLE_SFPLOADMACRO=1 cmp/build/ttnn_ops

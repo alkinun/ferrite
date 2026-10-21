@@ -29,7 +29,7 @@ def precision(c, mode="bf16"):
   """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
   block, head (block None), and attention, whose B is the cache (block "decode" or "prefill", format None). bf16, bfp8, or
   bfp4 (the MLP's gate and up in bfp4, the rest in bfp8): four phases, exact products. tt: tt_transformers' performance
-  mode at tt-metal 9f98dee9 (ROADMAP, "TT's performance precision"): the MLP's gate and up in bfp4 at one phase, the other
+  mode at tt-metal 9f98dee9 (COMPARE, "TT's performance precision"): the MLP's gate and up in bfp4 at one phase, the other
   matrices and the output layer in bfp8 at two, attention at two phases in decode and four in prefill; and for
   Llama-3.1-8B (32 blocks 4096 wide) its last block's gate and up in bfp8 at two, as its
   model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has them; the KV cache (kv, None) in bfp8."""
