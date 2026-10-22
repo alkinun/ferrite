@@ -58,7 +58,9 @@ code on the Ethernet tiles (`Tensor.to`).
 
 Serving: `models/serve.py` is an OpenAI-compatible server (`/v1/completions`, `/v1/chat/completions`, whole or streamed)
 for these models, from a folder or a Hugging Face model id; a thinking model's reasoning (Qwen3's) comes apart from its
-answer, and Qwen3.6's tool calls come back as OpenAI's `tool_calls`. Requests decode together, each in a slot of one KV
+answer, and Qwen3.6's tool calls come back as OpenAI's `tool_calls`; tool_choice and answers to a JSON schema
+(response_format) are kept to as each token is drawn, and usage counts the prompt tokens a slot or a saved session
+already held, as OpenRouter bills cached tokens. Requests decode together, each in a slot of one KV
 cache (and of Gated DeltaNet's states), every step one replayed call for all of them, and a prompt goes to the slot
 that already holds the longest start of it, or takes a session saved on the host, so a shared prefix (an agent's
 conversation so far) is not prefilled again. Qwen3.6 drafts with its multi-token prediction layer, a token and its
