@@ -14,11 +14,12 @@ import gpt2, llama
 class Request:
   """A prompt's tokens and how to go on from them: greedy at temperature 0, else sampled from the softmax at that
   temperature with its least likely tokens past top_p left out, until a token in eos, a stop string or max_tokens.
-  Each piece of new text goes into out as soon as no stop string could still begin in it, then None; finish says why."""
+  Each piece of new text goes into out as soon as no stop string could still begin in it, then None; finish says why.
+  One whose client has gone (gone) ends at its next token, or takes no slot."""
   def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None):
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
     self.stop, self.eos, self.rng = [stop] if isinstance(stop, str) else list(stop or ()), set(eos), np.random.default_rng(seed)
-    self.made, self.said, self.out, self.finish = [], "", queue.Queue(), None
+    self.made, self.said, self.out, self.finish, self.gone = [], "", queue.Queue(), None, False
 
   def pick(self, logits):
     if self.temperature == 0: return int(logits.argmax())
@@ -28,6 +29,7 @@ class Request:
     return int(self.rng.choice(keep, p=p[keep] / p[keep].sum()))
 
   def take(self, logits, room):  # the next token from its logits (room: whether its slot has a place for one more): done?
+    if self.gone: self.finish = "gone"; self.out.put(None); return True
     token = self.pick(logits)
     if token not in self.eos: self.made.append(token)
     text = self.tok.decode(self.made)
@@ -59,6 +61,7 @@ class Engine:
   def on(self, row): return Tensor.of(self.rt, [row], "int32")
 
   def admit(self, r):  # into the free slot holding the longest start of its prompt (its last token runs again for its logits)
+    if r.gone: return
     shared = lambda u: next((i for i, (a, b) in enumerate(zip(self.held[u], r.ids)) if a != b), min(len(self.held[u]), len(r.ids)))
     u = max((u for u, b in enumerate(self.busy) if b is None), key=lambda u: (shared(u), -self.used[u]))
     self.used[u] = max(self.used) + 1
@@ -127,10 +130,13 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
         send = lambda body: (self.wfile.write(f"data: {json.dumps(body)}\n\n".encode()), self.wfile.flush())
         head["object"] += ".chunk" if is_chat else ""
-        if is_chat: send(head | {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-        while (text := r.out.get(timeout=wait)) is not None: send(head | {"choices": [piece(text, None)]})
-        send(head | {"choices": [piece("", r.finish)]})
-        return self.wfile.write(b"data: [DONE]\n\n")
+        try:
+          if is_chat: send(head | {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+          while (text := r.out.get(timeout=wait)) is not None: send(head | {"choices": [piece(text, None)]})
+          send(head | {"choices": [piece("", r.finish)]})
+          return self.wfile.write(b"data: [DONE]\n\n")
+        except (OSError, queue.Empty): r.gone = True  # the client went, or no text came: its slot is let go
+        return
       try: text = "".join(iter(lambda: r.out.get(timeout=wait), None))
       except queue.Empty: return self.reply(504, {"error": {"message": f"no text in {wait}s: the chip hangs"}})
       if r.finish == "error": return self.reply(500, {"error": {"message": "the engine stopped"}})

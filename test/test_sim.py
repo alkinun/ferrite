@@ -1521,10 +1521,10 @@ def test_serve(chip, tmp_path):
   # longest ago) decode together, then the last two again alone, the last first (the slot used longer ago holds the
   # other), each in the slot that holds it already, so a token of each is prefilled and the rest come from the cache:
   # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
-  # reaches (on any other it would spoil what its slot holds). A request ends at a stop string,
-  # without its text, or at an end-of-sequence token, and says no text in which a stop string might yet begin. Over
-  # HTTP, /v1/completions whole and streamed give the engine's text, and /v1/models the model; chat messages go into
-  # ChatML's or Llama 3's template
+  # reaches (on any other it would spoil what its slot holds). A request ends at a stop string (without its text), at
+  # an end-of-sequence token, or when its client has gone, and says no text in which a stop string might yet begin.
+  # Over HTTP, /v1/completions whole and streamed give the engine's text, and /v1/models the model; chat messages go
+  # into ChatML's or Llama 3's template
   import threading, urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -1553,6 +1553,9 @@ def test_serve(chip, tmp_path):
   assert r.take(np.eye(256)[99], True) and said() == [None] and (r.said, r.finish) == ("a", "stop")
   r = serve.Request(tok, [], 9, 0, eos=[0])
   assert not r.take(np.eye(256)[97], True) and r.take(np.eye(256)[0], True) and (r.made, r.said, r.finish) == ([97], "a", "stop")
+  r = serve.Request(tok, [], 9, 0)
+  r.gone = True  # its client went
+  assert r.take(np.eye(256)[97], True) and (r.made, r.finish, r.out.get_nowait()) == ([], "gone", None)
   http = serve.server(engine, "smol", port=0)
   threading.Thread(target=http.serve_forever, daemon=True).start()
   url = f"http://127.0.0.1:{http.server_address[1]}/v1"
