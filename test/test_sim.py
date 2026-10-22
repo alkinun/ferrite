@@ -1409,7 +1409,9 @@ def test_qwen3_moe(chip, tmp_path):
   # by fuse) weighted by their probabilities among all (norm_topk_prob off, transformers' default), RMSNorms on each
   # head of q and k, heads whose width the config gives (4 of 32 in a model 64 wide), and an output layer of its own.
   # Hugging Face's own model (transformers, float32, random bf16 weights) is the reference: numpy's logits within 0.5%
-  # of its at every place (0.12%), the chip's within 2% (1%) and picking the same tokens
+  # of its at every place (0.12%), the chip's within 2% (1%) and picking the same tokens. In TT's performance precision
+  # the experts take their block's MLP formats and phases, and the chip is within 1% of the span of numpy's given the
+  # same block floats (0.8%)
   torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
   torch.manual_seed(0)
   config = transformers.Qwen3MoeConfig(hidden_size=64, intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=2, num_attention_heads=4,
@@ -1427,6 +1429,12 @@ def test_qwen3_moe(chip, tmp_path):
   on = lambda row: Tensor.of(rt, [row], "int32")
   got = gpt2.values(llama.forward(on(ids), on(list(range(8))), llama.upload(rt, weights), c, llama.kv_cache(c, 32, llama.zeros(rt)), every=True))
   assert rel(got) < 0.02 and np.array_equal(got.argmax(-1), want.argmax(-1)), rel(got)
+  c.precision = llama.precision(c, "tt")  # the experts' gate and up in bfp4 at one phase, their down in bfp8 at two
+  t = llama.upload(rt, weights, c.precision)
+  assert (t["layers.1.experts.gate_up"].dtype, t["layers.1.experts.down"].dtype, t["layers.1.router"].dtype) == ("bfp4", "bfp8", "bf16")
+  got = gpt2.values(llama.forward(on(ids), on(list(range(8))), t, c, llama.kv_cache(c, 32, llama.zeros(rt, "bfp8")), every=True))
+  want = llama.forward(ids, list(range(8)), llama.arrays(weights, c.precision), c, llama.kv_cache(c, 32, np.zeros), every=True)
+  assert np.array_equal(got.argmax(-1), want.argmax(-1)) and np.abs(got - want).max() < 0.01 * np.ptp(want), np.abs(got - want).max() / np.ptp(want)
 
 @pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
 def test_llama_8b_shapes(chip):

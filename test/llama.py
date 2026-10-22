@@ -73,22 +73,22 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(head(c)))
   x = x + f.mm(f.merge(f.mm(f.softmax(s + mask), v, attention)), p["o_proj"], phases("o"))
   h = rms(x, p["post_attention_layernorm"], c.eps)
-  if "router" in p: return x + moe(h, p, c)
+  if "router" in p: return x + moe(h, p, c, phases)
   gate_up, m = f.mm(h, p["gate_up_proj"], phases("gate_up")), p["down_proj"].shape[-2]
   return x + f.mm(f.silu(gate_up[:, :m]) * gate_up[:, m:], p["down_proj"], phases("down"))
 
-def moe(h, p, c):
+def moe(h, p, c, phases=lambda op: None):
   """A mixture of experts in the MLP's place (Qwen3's, Mixtral's): each token's router logits, its c.k best experts
   (topk, on the chip), their SwiGLUs by matmuls that pick each one's weights where they lie (a batch entry a token and
   expert: the token's row by its expert's matrix), weighted by the softmax of their logits (which Qwen3's top-k
   probabilities, renormalized, are too) and summed. p: router (dim x experts), experts.gate_up and experts.down (a
-  batch of the experts' matrices)."""
+  batch of the experts' matrices); phases(op): the fidelity phases of the experts' gate_up and down."""
   f, n, k, m, norm = fns(h), h.shape[-2], c.k, p["experts.down"].shape[-2], getattr(c, "norm_topk", True)
   logits = f.mm(h, p["router"], None)  # (without norm_topk_prob, the chosen experts' probabilities among all, as they are)
   values, ids = f.topk(logits if norm else f.softmax(logits), k)
   x = h.reshape(n, 1, h.shape[-1])
-  gate_up = f.pick(f.repeat(x, k) if n > 1 else x, p["experts.gate_up"], ids, None)
-  y = f.pick(f.silu(gate_up[:, :, :m]) * gate_up[:, :, m:], p["experts.down"], ids, None)
+  gate_up = f.pick(f.repeat(x, k) if n > 1 else x, p["experts.gate_up"], ids, phases("gate_up"))
+  y = f.pick(f.silu(gate_up[:, :, :m]) * gate_up[:, :, m:], p["experts.down"], ids, phases("down"))
   return (y * (f.softmax(values) if norm else values).reshape(n * k, 1, 1)).reshape(n, k, y.shape[-1]).sum(1).reshape(n, y.shape[-1])
 
 def frequencies(c):  # RoPE's, a head's half of them, in fp32 as Hugging Face computes them; with Llama 3's scaling
@@ -192,9 +192,10 @@ def load(folder, places=4096):
   for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: gpt2.bf16_bits(a))
   return c, fuse(out)
 
-def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks' and the
-  # output layer) in the one prec (precision's) gives them, the rest, and all without prec, bf16
-  key = ("head", None) if name == "embed.T" else (name.split(".")[2].removesuffix("_proj"), int(name.split(".")[1])) if name.endswith("_proj") else None
+def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks', their
+  # experts' as their MLP's, and the output layer) in the one prec (precision's) gives them, the rest, and all without prec, bf16
+  op = name.split(".")[-1].removesuffix("_proj")
+  key = ("head", None) if name == "embed.T" else (op, int(name.split(".")[1])) if name.endswith("_proj") or ".experts." in name else None
   return prec[key][0] if prec and key else "bf16"
 
 def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a time, each cast on the chip to its format
@@ -217,7 +218,8 @@ def arrays(weights, prec=None):
   up and not kept, so numpy holds no more of a model than the block it is running, whatever the model's size."""
   def made(name, w):
     v, f = w.values(), weight_format(name, prec)
-    return v if f == "bf16" else np.concatenate([gpt2.bfp(v[i:i + 1024], f).astype(np.float32) for i in range(0, len(v), 1024)])
+    rows = v.reshape(-1, v.shape[-1])  # (a batch of experts' too)
+    return v if f == "bf16" else np.concatenate([gpt2.bfp(rows[i:i + 1024], f).astype(np.float32) for i in range(0, len(rows), 1024)]).reshape(v.shape)
   return Made({name: functools.partial(made, name, w) for name, w in weights.items()})
 
 def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector
