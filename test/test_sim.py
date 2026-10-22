@@ -1357,23 +1357,35 @@ def test_kv_cache(chip):
     ids.append(int(want.argmax()))
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
+def test_topk(chip):
+  # Tensor.topk, one kernel of BRISC's: each row's k largest and their columns as numpy's stable argsort has them (the
+  # first of equals first, -0 equal to 0), for one row (its results' tiles full of copies of it, as a broadcast reads
+  # them), a k of 1 (copies across), rows past one tile, a batch, columns not a multiple of 32 and 256 of them; and of a
+  # matmul's softmax not yet computed, which the kernels of its max and of its columns once rounded apart (an index of 8
+  # in 8 columns, when topk was passes of max)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(37)
+  for batch, rows, cols, k in ((1, 1, 128, 8), (1, 3, 16, 4), (1, 40, 40, 1), (2, 33, 256, 32)):
+    x = rng.normal(0, 2, (batch, rows, cols))
+    x[0, -1, :3], x[0, -1, 3:] = [-0.0, 0.0, -0.0], -np.abs(x[0, -1, 3:]) - 1  # -0 and 0, equal and the largest
+    x[0, 0, 9] = x[0, 0, 3] = x[0, 0].max()  # a tie
+    x = bf16(x)
+    values, ids = Tensor.of(rt, x.tolist()).topk(k)
+    want = np.argsort(-x, -1, kind="stable")[..., :k]
+    assert np.array_equal(value(ids), want) and np.array_equal(value(values), np.take_along_axis(x, want, -1)), (batch, rows, cols, k)
+    wide = Tensor.of(rt, np.ones((batch, 32 if rows == 1 else rows, 32 if k == 1 else k)).tolist())  # a dimension of 1 broadcast, from its copies
+    assert np.array_equal(value(values * wide), np.broadcast_to(value(values), wide.shape)), (rows, k)
+  logits = Tensor.of(rt, rng.normal(0, 1, (32, 64)).tolist()).matmul(Tensor.of(rt, rng.normal(0, 0.05, (64, 8)).tolist()))
+  probs = logits.softmax()
+  values, ids = probs.topk(2)
+  got, p = value(ids)[0], value(probs)[0]  # the indices first: probs read first would be computed on its own
+  assert np.array_equal(got, np.argsort(-p, -1, kind="stable")[:, :2]) and np.array_equal(value(values)[0], -np.sort(-p, -1)[:, :2])
+
 def test_moe(chip):
-  # a mixture of experts in the MLP's place (llama.moe): Tensor.topk picks each row's largest the way numpy's stable
-  # argsort does (first of ties), of a matmul's softmax not yet computed too (which the kernels of its max and of its
-  # columns rounded apart, an index of 8 in 8 columns); a token's router logits choose its k experts on the chip,
-  # matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen logits
-  # and summed, as numpy does for one token and for three; and a two-block model of them decodes from a replay
+  # a mixture of experts in the MLP's place (llama.moe): a token's router logits choose its k experts on the chip
+  # (topk), matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen
+  # logits and summed, as numpy does for one token and for three; and a two-block model of them decodes from a replay
   # (tensor.jit) bit for bit as it does op by op, so a replayed step reads whatever experts its token chose, and near numpy
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
-  x = bf16(rng.normal(0, 2, (3, 16)))
-  x[1, 9] = x[1, 3] = x[1].max()  # a tie: the first column first
-  values, indices = Tensor.of(rt, x.tolist()).topk(4)
-  assert np.array_equal(value(indices)[0], np.argsort(-x, -1, kind="stable")[:, :4]) and np.array_equal(value(values)[0], -np.sort(-x, -1)[:, :4])
-  logits = Tensor.of(rt, rng.normal(0, 1, (32, 64)).tolist()).matmul(Tensor.of(rt, rng.normal(0, 0.05, (64, 8)).tolist()))
-  probs = logits.softmax()  # lazy: computed in the kernel of its max, some rows' came out an ulp from their own
-  values, indices = probs.topk(2)
-  got, p = value(indices)[0], value(probs)[0]  # the indices first: probs read first would be computed on its own
-  assert np.array_equal(got, np.argsort(-p, -1, kind="stable")[:, :2]) and np.array_equal(value(values)[0], -np.sort(-p, -1)[:, :2])
   experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
   c, w = SimpleNamespace(dim=64, k=4), experts(64, 16, 64)

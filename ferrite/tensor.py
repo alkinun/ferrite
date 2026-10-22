@@ -5,7 +5,7 @@
 import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
-from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, move_kernel, put_kernel, readback_kernel, transpose_kernel
+from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -361,20 +361,15 @@ class Tensor:
     s = self.sum(axis)
     return s * (math.prod(s.shape) / math.prod(self.shape))
   def topk(self, k):
-    """tinygrad's along each row, largest first: (values, int32 indices), from k passes of the row's max, the first
-    column that holds it (a minimum, as the max of negatives), and that column left out of the next (columns as bf16, so
-    at most 256: a mixture of experts' router). The rows are computed once first: two kernels may round a value not yet
-    computed differently (a matmul's softmax, in the kernel of its max, came out an ulp from its own), and then no
-    column holds the max."""
-    assert self.cols <= 256, "columns numbered in bf16"
-    cols, x, out = Tensor.of(self.rt, [list(range(self.cols))]), self.realize(), []
-    for _ in range(k):
-      m = x.max(2)
-      i = -(x.eq(m).where(-cols, -self.cols)).max(2)
-      out.append((m, i))
-      x = cols.eq(i).where(-3e38, x)
-    values, indices = zip(*out)
-    return values[0].cat(*values[1:], axis=2), indices[0].cat(*indices[1:], axis=2).cast("int32")
+    """tinygrad's along each row, largest first: (values, int32 indices), the first column of equals first (numpy's
+    stable argsort's order), by one kernel of BRISC's alone (topk_kernel): a mixture of experts' router, of at most 256
+    columns and k of at most 32. Exact, so a value its kernels would round apart is compared as stored; no gradient."""
+    assert self.dtype == "bf16" and self.cols <= 256 and k <= min(self.cols, 32), "a bf16 row of at most 256, k of at most 32"
+    x = _plain(self.realize())
+    values, ids = Tensor(self.rt, x.rows, k, batch=x.batch), Tensor(self.rt, x.rows, k, batch=x.batch, dtype="int32")
+    values.addr, ids.addr = values._alloc(), ids._alloc()
+    return values._run(_cached(("topk", k, x.cols), lambda: topk_kernel(k, x.cols)), values.addr, ids.addr, *x._where(), x.rows,
+                       units=x.batch * -(-x.rows // 32), name="topk"), ids
   def softmax(self, axis=-1):  # max first, so exp stays in range
     e = (self - self.max(axis)).exp()
     return e / e.sum(axis)

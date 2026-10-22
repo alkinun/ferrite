@@ -1157,6 +1157,54 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+def topk_kernel(k, cols):
+  """Each row's k largest of its cols (at most 256) and their columns, the first of equals first, args [first unit,
+  units, the values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows].
+  BRISC alone, a unit one tile row of x: its tiles come in, and each row is scanned k times, a column left out once
+  picked. bf16 compares as an integer once its sign orders it (negatives flipped, -0 as 0). The values' tile (bf16) and
+  the indices' (int32) are written whole: zeros past the rows and the k columns, but a dimension of 1 fills its tile
+  with copies, as every tensor's does."""
+  ct = -(-cols // 32)
+  return compile_kernel(f"""
+#define X {DATA:#x}
+#define VALUES {DATA + ct * 2048:#x}
+#define IDS {DATA + (ct + 1) * 2048:#x}
+{BANKS}
+static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
+static unsigned key(unsigned v) {{ return v == 0x8000 ? 0x8000 : v & 0x8000 ? 0xFFFF & ~v : v | 0x8000; }}  // bf16's order
+void kmain(volatile unsigned *a) {{
+  unsigned short *x = (unsigned short *)X;
+  volatile unsigned short *values = (volatile unsigned short *)VALUES;
+  volatile unsigned *ids = (volatile unsigned *)IDS;
+  unsigned rows = a[8], tr = (rows + 31) / 32;
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned t = a[0] + u, first = t / tr * a[5] + t % tr * a[6] + a[7];  // x's tile row t % tr of matrix t / tr
+    for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, 2048), X + j * 2048, 2048);
+    for (unsigned i = 0; i < 1024; i++) values[i] = 0, ids[i] = 0;
+    noc_wait();
+    unsigned n = rows == 1 ? 1 : rows - t % tr * 32 < 32 ? rows - t % tr * 32 : 32;  // x's rows in this tile row
+    for (unsigned r = 0; r < n; r++) {{
+      unsigned taken[{ct}];
+      for (unsigned j = 0; j < {ct}; j++) taken[j] = 0;
+      for (unsigned j = 0; j < {k}; j++) {{
+        unsigned best = {cols}, top = 0;
+        for (unsigned c = 0; c < {cols}; c++) {{
+          unsigned v = key(x[c / 32 * 1024 + at(r, c % 32)]);
+          if (!(taken[c / 32] >> c % 32 & 1) && (best == {cols} || v > top)) best = c, top = v;
+        }}
+        taken[best / 32] |= 1u << best % 32;
+        values[at(r, j)] = x[best / 32 * 1024 + at(r, best % 32)], ids[at(r, j)] = best;
+      }}
+    }}
+    for (unsigned r = 0; r < 32; r++)  // one row of x fills the tile with copies of its row, k of 1 with copies of its column
+      for (unsigned c = 0; c < 32; c++)
+        if ((rows == 1 && r) || ({k} == 1 && c)) {{ unsigned from = at(rows == 1 ? 0 : r, {k} == 1 ? 0 : c); values[at(r, c)] = values[from], ids[at(r, c)] = ids[from]; }}
+    noc_write(VALUES, BANK(t), AT(a[2], t, 2048), 2048);
+    noc_write(IDS, BANK(t), AT(a[3], t, 4096), 4096);
+    noc_wait();
+  }}
+}}""")
+
 def readback_kernel(dtype):
   """A tensor's tiles into host memory (Runtime.back) for tobytes, since a read of DRAM over the BARs waits on PCIe for
   each load: args [first unit, units, the first tile, the tensor's address, tile strides for batch and row, tile offset,
