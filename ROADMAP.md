@@ -120,6 +120,9 @@ first (NOTES, "Bring-up on a p150").
 - [x] **Structured outputs**: answers to a JSON schema (response_format) as a shape, its prefix parsed as it comes; no
   start of one leads nowhere, and whitespace and numbers are bounded, which a shape's model would otherwise run on in
   (NOTES, "Serving").
+- [ ] **Less control a Gated DeltaNet block**: on ttsim each token of a step adds 26k cycles to a block, most of it
+  moves of its slot's heads into batch entries and out (and the conv's pads), 5.9 ms of an eight-user step's 32.5
+  if the card's cores count as ttsim's (NOTES, "The cost model").
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the

@@ -20,6 +20,9 @@ LAUNCHES = {"attention": 12, "experts": 18, "deltanet": 27, "deltanet verify": 6
 # for several slots: an attention block's (with its norms), a mixture of experts' more, a Gated DeltaNet block's (and one
 # taking a token and a draft at once), the rest (the embedding's gather, the step's masks, the final norm and the output
 # layer), the multi-token prediction layer's call. Counted on ttsim at Qwen3.6's shapes, four slots (cmp/qwen36/launches.py).
+CONTROL = {"deltanet": (20400, 26400), "attention": (17900, 11100), "rest": (3500, 1200)}  # a decode step's RISC-V work as ttsim
+# counts it, in cycles: a Gated DeltaNet block's (with its experts), an attention block's (with its experts), the rest's,
+# so many and so many more a token (cmp/qwen36/control.py at Qwen3.6's shapes, one slot and eight: its moves, most of it)
 WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 banks of 4 GiB, a GiB of it for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # its 512 GB/s, and the share of it a decode step reaches (a guess)
@@ -67,8 +70,9 @@ def session(c, use, speculative=False):
 
 def step(c, s, use, card, users, speculative=False, cards=1):
   """A decode step for `users` sessions at once, a token each, or a token and a draft each then the next drafts (two
-  calls): the bytes it reads, its flops, launches and seconds (waiting on DRAM or on the matmuls, whichever is longer,
-  then on the launches), and tokens/s a user."""
+  calls): the bytes it reads, its flops, launches, control and seconds (waiting on DRAM or on the matmuls, whichever is
+  longer, then on the launches or the kernels' own RISC-V work, if the card's counts as ttsim's does, whichever is
+  more: the small kernels that do it read little), and tokens/s a user."""
   n, one, d = users * (1 + speculative), session(c, use, speculative), c.dim
   touched = lambda tokens: c.experts * (1 - (1 - c.k / c.experts) ** tokens) if c.experts else 0  # a block's experts some token picks
   reads = s.every + s.moe * touched(n) * s.expert + n * one.kv + users * one.state * (1.5 if speculative else 1)  # states read and written, twice
@@ -77,12 +81,14 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   linear = sum(llama.linear(c, l) for l in range(c.layers))
   launches = (c.layers - linear) * LAUNCHES["attention"] + linear * LAUNCHES["deltanet verify" if speculative else "deltanet"]
   launches += s.moe * LAUNCHES["experts"] + LAUNCHES["rest"]
+  cycles = lambda kind, blocks: blocks * (CONTROL[kind][0] + CONTROL[kind][1] * n)
+  control = (cycles("attention", c.layers - linear) + cycles("deltanet", linear) + cycles("rest", 1)) / bh.AICLK
   if speculative:  # the drafting call: the layer over two places a user, and the output layer again
     reads += s.draft + c.mtp * touched(2 * users) * s.expert + c.vocab * d * BYTES["bfp8"] + 2 * users * one.draft
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)
     launches += LAUNCHES["draft"]
-  seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + launches * card["launch"]
-  return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, flops=flops, rate=(1 + use["accept"] if speculative else 1) / seconds)
+  seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + max(launches * card["launch"], control)
+  return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, control=control, flops=flops, rate=(1 + use["accept"] if speculative else 1) / seconds)
 
 def hourly(card): return (card["price"] + card["host"]) / (card["years"] * 8766) + (card["watts"] + card["host_watts"]) / 1000 * card["kwh"]
 
@@ -105,11 +111,11 @@ def report(folder, mode="bf16", **keys):
     out.append(f"  a session of {use['context']} tokens: {one.kv / 1e9:.2f} GB of KV cache rows ({one.kv / use['context'] / 1e3:.1f} KB a token, {use['kv']})"
                + (f" and {one.state / 1e6:.0f} MB of Gated DeltaNet states" if one.state else "") + f": {most} on the card{'s' * (cards > 1)}")
     out.append(f"  decode, {'a token and a draft' if speculative else 'a token'} a user a step" + (f", {use['accept']:.0%} of drafts taken" if speculative else "") + ":")
-    out.append("     users   reads, GB   step, ms   launches   tokens/s a user   a card   $ a million out" + ("   drafts to take, to pay" if speculative else ""))
+    out.append("     users   reads, GB   step, ms   launches   control, ms   tokens/s a user   a card   $ a million out" + ("   drafts to take, to pay" if speculative else ""))
     for users in [u for u in (1, 2, 4, 8, 16, 32, 64, 128) if u <= most]:
       t = step(c, s, use, card, users, speculative, cards)
       pays = f"{step(c, s, use, card, users, True, cards).seconds / step(c, s, use, card, users, False, cards).seconds - 1:23.0%}" if speculative else ""
-      out.append(f"  {users:8d} {t.reads / 1e9:11.2f} {t.seconds * 1e3:10.1f} {t.launches:10d} {t.rate:17.1f} {users * t.rate:8.0f} "
+      out.append(f"  {users:8d} {t.reads / 1e9:11.2f} {t.seconds * 1e3:10.1f} {t.launches:10d} {t.control * 1e3:13.1f} {t.rate:17.1f} {users * t.rate:8.0f} "
                  f"{hour / (users * t.rate * 3600) * 1e6:17.3f}{pays}")
   prompt = 2 * s.values + sum(2 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))  # half the context, on average
   fill = card["tflops"] / card["phases"] * cards / prompt
