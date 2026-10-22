@@ -159,11 +159,14 @@ def weight_format(name, prec):  # a weight's format on the chip: the matrices a 
   return prec[key][0] if prec and key else "bf16"
 
 def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a time, each cast on the chip to its format
-  t = {}
-  for name, w in weights.items():
+  t = {}                                # and waited for, so the next weight's bf16 copy goes where this one's was: a model
+  for name, w in weights.items():       # takes the DRAM its formats need and one matrix more, not all its bf16 besides
     bits = w.bits()
     x = t[name] = Tensor.frombytes(rt, *bits.shape, bits.tobytes())
-    if (f := weight_format(name, prec)) != "bf16": t[name] = x.cast(f).realize()
+    if (f := weight_format(name, prec)) != "bf16":
+      t[name] = x.cast(f).realize()
+      del x
+      rt.wait(3600)  # a big matrix's cast is one launch, minutes long on ttsim
   return t
 
 class Made(dict):  # name -> what makes its value: made at each lookup and not kept

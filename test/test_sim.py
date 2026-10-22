@@ -1324,7 +1324,7 @@ def test_llama_8b_shapes(chip):
   # one block in Llama-3.1-8B's shapes (4096 wide, 32 query heads sharing 8 KV heads, an MLP of 14336, Llama 3's RoPE
   # scaling), random weights, at TT's performance precision: B2's matmuls, casts and attention at their real sizes (the
   # logits over a vocabulary of 2048), a 64-token prompt and two decode steps against numpy. On ttsim the upload's casts
-  # (the MLP's 4096 x 28672 to bfp4 is 114,688 tiles) take minutes, past Runtime.wait's default
+  # take minutes (the MLP's 4096 x 28672 to bfp4 is 114,688 tiles), which llama.upload waits for
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(8)
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=1, eps=1e-5, theta=500000.0, rope=rope, vocab=2048, ffn=14336, places=96)
@@ -1335,7 +1335,6 @@ def test_llama_8b_shapes(chip):
   w |= {"embed.T": np.ascontiguousarray(w["embed"].T)} | {k: gpt2.bf16_bits(a) for k, a in zip(("cos", "sin", "turn"), llama.rotary(c, c.places))}
   weights, c.precision = {k: llama.Weight(lambda v=v: v) for k, v in w.items()}, llama.precision(c, "tt")
   t = llama.upload(rt, weights, c.precision)
-  rt.wait(3600)
   arrays, on = llama.arrays(weights, c.precision), lambda row: Tensor.of(rt, [row], "int32")
   kv, np_kv = llama.kv_cache(c, 96, llama.zeros(rt, "bfp8")), llama.kv_cache(c, 96, np.zeros)
   prompt = [int(i) for i in rng.integers(0, 2048, 64)]
@@ -1377,7 +1376,8 @@ def test_llama_precision(chip):
   # the rest and the output layer in bfp8) and at its fidelity phases (one for gate and up, two for the rest, attention
   # two in decode and four in prefill), Llama-3.1-8B's last block's gate and up in bfp8 at two, the KV cache in bfp8;
   # numpy, given the same block-float values (llama.arrays rounds the weights, and layer the cache, as the chip does:
-  # gpt2.bfp) but exact products, picks the same tokens, its logits within 1% of their span
+  # gpt2.bfp) but exact products, picks the same tokens, its logits within 1% of their span. upload leaves no more DRAM
+  # behind than one bf16 matrix: each cast is waited for, so the next weight's bf16 copy goes where this one's was
   big = SimpleNamespace(layers=32, dim=4096)
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
@@ -1387,6 +1387,9 @@ def test_llama_precision(chip):
   c.precision = llama.precision(c, "tt")
   weights = {k: llama.Weight(lambda v=v: (np.float32(v).view(np.uint32) >> 16).astype(np.uint16)) for k, v in w.items()}
   t = llama.upload(rt, weights, c.precision)
+  rt.wait()  # what upload freed goes back
+  reached, held = max(a + n for a, n in rt.used.items()), sum(rt.used.values())  # DRAM a bank
+  assert reached - held <= -(-max(x.tiles for x in t.values()) // 8) * 2048, "a cast weight's bf16 DRAM is used again"
   assert {k: x.dtype for k, x in t.items() if "proj" in k or k == "embed.T"} == {k: "bfp4" if "gate_up" in k else "bfp8" for k in t if "proj" in k or k == "embed.T"}
   sizes = SimpleNamespace(**vars(c), vocab=256, places=64, ffn=1536)  # benchmark.weights, from the sizes alone, has them as upload makes them
   assert {k: (x.rows, x.cols, x.dtype) for k, x in t.items()} == {k: (x.rows, x.cols, x.dtype) for k, x in benchmark.weights(sizes).items()}
