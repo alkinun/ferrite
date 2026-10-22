@@ -6,7 +6,7 @@ import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
 from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
-from ferrite.compiler import transpose_kernel
+from ferrite.compiler import LINK_L1, LINK_TILES, link_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -386,6 +386,20 @@ class Tensor:
     order._run(_cached(("group", rows, k, n), lambda: group_kernel(rows, k, n)), order.addr, tiles.addr, places.addr, x.addr, x.stride, x.offset,
                units=1, name="group")
     return order, tiles, places
+  def to(self, rt, ch, back):
+    """This tensor in DRAM of another chip's (rt's), copied across the Ethernet link at this chip's channel ch, whose other
+    end is that chip's channel back (Chip.links): a worker on each chip (link_kernel), the sender's tiles a chunk at a
+    time through its Ethernet tile's L1 into the receiver's, a flag after each, a credit back. Waits for what both chips
+    have queued first: each end's flag and credit start at 0."""
+    x = self.realize()
+    if x.owner is not None or x.rep > 1 or x.offset: x = (x + 0).realize()  # a view: a whole tensor of its own first
+    out = Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype)
+    out.addr = out._alloc()
+    x.rt.wait(), rt.wait()
+    for chip, end in ((x.rt.chip, ch), (rt.chip, back)): chip.write(*bh.ETH[end], LINK_L1 + 2 * LINK_TILES * tile_bytes(x.dtype), bytes(48))
+    out._run(_cached(("link", False, x.dtype), lambda: link_kernel(False, x.dtype)), out.addr, out.tiles, *bh.ETH[back], units=1, name="link in")
+    x._run(_cached(("link", True, x.dtype), lambda: link_kernel(True, x.dtype)), x.addr, x.tiles, *bh.ETH[ch], units=1, name="link out")
+    return out
   def softmax(self, axis=-1):  # max first, so exp stays in range
     e = (self - self.max(axis)).exp()
     return e / e.sum(axis)

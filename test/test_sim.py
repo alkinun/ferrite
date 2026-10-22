@@ -1528,9 +1528,8 @@ from ferrite.chip import Chip
 from ferrite.runtime import Runtime
 from ferrite.tensor import Tensor
 chips = [Chip(pci.open_device(n)) for n in range(2)]
-for n, chip in enumerate(chips):
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
-  assert (Tensor.of(rt, [[1.0, 2.0]]) * (n + 2)).tolist() == [[n + 2.0, 2 * n + 4.0]], n
+rts = [Runtime(chip, chip.tensix[0], chip.tensix[-1]) for chip in chips]
+for n, rt in enumerate(rts): assert (Tensor.of(rt, [[1.0, 2.0]]) * (n + 2)).tolist() == [[n + 2.0, 2 * n + 4.0]], n
 (a, links_a), (b, links_b) = (chip.links() for chip in chips)
 assert a != b and len(links_a) == len(links_b) == 2, (a, links_a, b, links_b)
 assert all(peer == b and links_b[back] == (a, ch) for ch, (peer, back) in links_a.items()), (links_a, links_b)
@@ -1543,6 +1542,12 @@ for src, dst, links in ((chips[0], chips[1], links_a), (chips[1], chips[0], link
     src.send(ch, 0x20000 + len(data), 0x40000 + len(data), 16)
     src.wait(lambda: dst.read(*bh.ETH[back], 0x40000 + len(data), 16) == flag, "deliver the flag", 2.0)
     assert dst.read(*bh.ETH[back], 0x40000, len(data)) == data, ch
+import random
+x = [[[random.uniform(-4, 4) for _ in range(100)] for _ in range(70)] for _ in range(2)]
+t = Tensor.of(rts[0], x)  # 24 tiles: 6 chunks through the 2 slots, so the credits count
+for ch, (_, back) in links_a.items():
+  y = t.to(rts[1], ch, back)
+  assert y.rt is rts[1] and y.tolist() == t.tolist() and (y * 2).to(rts[0], back, ch).tolist() == (t * 2).tolist(), ch
 print("ok")
 """
 
@@ -1550,8 +1555,9 @@ print("ok")
 def test_two_chips():
   # two chips in one process, ttsim's two-chip build (a P300's two Blackholes, two Ethernet links between them; its own
   # process, since one process has one libttsim): a runtime on each computes, Chip.links finds both links up on both
-  # chips and pairs them (each side's peer the other's ASIC id and channel), and Chip.send moves data across each link
-  # both ways, from one Ethernet tile's L1 into the other's, a flag sent after it landing after it
+  # chips and pairs them (each side's peer the other's ASIC id and channel), Chip.send moves data across each link
+  # both ways, from one Ethernet tile's L1 into the other's, a flag sent after it landing after it, and Tensor.to copies
+  # a tensor from one chip's DRAM into the other's across each link and back, kernels on both chips driving the links
   import subprocess
   run = subprocess.run([sys.executable, "-c", TWO_CHIPS], env=os.environ | {"TTSIM": os.environ["TTSIM2"]}, capture_output=True, text=True,
                        timeout=600, cwd=pathlib.Path(__file__).parent.parent)

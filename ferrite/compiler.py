@@ -1258,6 +1258,52 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+LINK_L1, LINK_TILES = 0x20000, 4  # where a copy across an Ethernet link keeps its two slots in each end's tile, of so many tiles
+
+def link_kernel(send, dtype):
+  """One end of a copy across an Ethernet link (Tensor.to), args [first unit, units, the tensor's address, its tiles, this
+  chip's Ethernet tile's x and y]. BRISC alone, on one worker. The sender reads the tensor LINK_TILES tiles at a time,
+  writes each chunk into a slot (two take turns) in its Ethernet tile's L1, and has the tile's TX queue write it, then a
+  flag (the chunk's number + 1), into the same places in the peer's: the link delivers in order, so the chunk is there
+  when its flag is. The receiver waits for each flag, writes the chunk into its tensor and sends back a credit (chunks
+  done), which the sender waits for before it fills a slot again. A word of another tile's (the queue's registers, a
+  flag, the credit) is read and written over the NoC, from a place in L1 with the same low 4 bits, as the NoC wants."""
+  tb, q = tile_bytes(dtype), lambda name: f"{bh.ETH_TXQ0 + bh.ETH_TXQ[name]:#x}"
+  slot = LINK_TILES * tb
+  body = f"""
+    while (c >= 2 && peek(CREDIT) < c - 1) {{}}  // slot s is free once chunk c - 2 is done
+    for (unsigned i = 0; i < n; i++) noc_get(BANK(t + i), AT(a[2], t + i, {tb}), BUF + i * {tb}, {tb});
+    noc_wait();
+    noc_write(BUF, ex, ey, SLOT(s), n * {tb}), noc_wait();
+    link_write(SLOT(s), n * {tb});
+    poke(FLAG(s), c + 1), link_write(FLAG(s), 16);""" if send else f"""
+    while (peek(FLAG(s)) != c + 1) {{}}  // the chunk is here once its flag is
+    noc_get(ex, ey, SLOT(s), BUF, n * {tb}), noc_wait();
+    for (unsigned i = 0; i < n; i++) noc_write(BUF + i * {tb}, BANK(t + i), AT(a[2], t + i, {tb}), {tb});
+    noc_wait();
+    poke(CREDIT, c + 1), link_write(CREDIT, 16);"""
+  return compile_kernel(f"""
+#define BUF {DATA:#x}
+#define WORD {DATA + slot:#x}
+#define SLOT(s) ({LINK_L1:#x} + (s) * {slot})
+#define FLAG(s) ({LINK_L1 + 2 * slot:#x} + 16 * (s))
+#define CREDIT {LINK_L1 + 2 * slot + 32:#x}
+{BANKS}
+static unsigned ex, ey;  // this end's Ethernet tile
+static unsigned peek(unsigned addr) {{ unsigned at = WORD + (addr & 15); noc_get(ex, ey, addr, at, 4); noc_wait(); return *(volatile unsigned *)at; }}
+static void poke(unsigned addr, unsigned v) {{ unsigned at = WORD + 16 + (addr & 15); *(volatile unsigned *)at = v; noc_write(at, ex, ey, addr, 4); noc_wait(); }}
+static void link_write(unsigned at, unsigned n) {{  // n bytes of the tile's L1 at `at` into the peer's, by TX queue 0
+  do peek({q("CMD")}); while (peek({q("STATUS")}) & {bh.ETH_BUSY:#x});  // busy read after another register (BH-55)
+  poke({q("START")}, at), poke({q("SIZE")}, n), poke({q("DEST")}, at), poke({q("CMD")}, {bh.ETH_TT_L1_WRITE});
+}}
+void kmain(volatile unsigned *a) {{
+  if (!a[1]) return;
+  ex = a[4], ey = a[5];
+  for (unsigned c = 0, t = 0; t < a[3]; c++, t += {LINK_TILES}) {{
+    unsigned n = a[3] - t < {LINK_TILES} ? a[3] - t : {LINK_TILES}, s = c % 2;{body}
+  }}
+}}""")
+
 def readback_kernel(dtype):
   """A tensor's tiles into host memory (Runtime.back) for tobytes, since a read of DRAM over the BARs waits on PCIe for
   each load: args [first unit, units, the first tile, the tensor's address, tile strides for batch and row, tile offset,
