@@ -231,6 +231,11 @@ append a correction.
     dropped Qwen2's biases or gpt-oss's would have matched its random model exactly. Drawn at random too, each one a
     family adds (biases, sinks, the q and k norms, a window, YaRN) moves numpy past the test's bound when it is left
     out, and that was checked one at a time. (`test_hf_families`)
+36. **Read the vendor's smallest sample before its framework.** tt-metal reaches the Ethernet links through firmware of
+    its own on the Ethernet tiles and a fabric of routers; the ISA documentation's `ethdump`, one C file, runs beside
+    Tenstorrent's Ethernet firmware from userspace and writes the TX queue's registers from the host. Those registers
+    answer over the NoC, so a Tensix kernel drives the link too, and a tensor crosses chips with no code on the Ethernet
+    tiles at all. (`test_two_chips`)
 
 ## Working method
 
