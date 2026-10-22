@@ -1,6 +1,6 @@
 # Every step, one test each, on ttsim (TTSIM=/path/to/libttsim.so python3 -m pytest test) or, without TTSIM, on the
 # first Blackhole on the PCI bus (as root; NOTES.md, "Bring-up").
-import ctypes, json, math, os, pathlib, random, struct, sys, time, unicodedata, pytest
+import ctypes, json, math, os, pathlib, random, struct, sys, threading, time, unicodedata, pytest
 import numpy as np
 from ferrite import bh, compiler, pci, tensor
 from ferrite.chip import Chip
@@ -1247,6 +1247,32 @@ def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's 
   w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
   return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, places))), c)
 
+def near(got, want):  # each row's pick numpy's best, or one the chip's bf16 logits cannot tell from it (0.5% of the span apart)
+  return all(w.max() - w[g.argmax()] <= 0.005 * np.ptp(w) for g, w in zip(got, want))
+
+def qwen35(rng, vocab=256, places=64):
+  """A small Qwen3.5-MoE at random, its weights under Hugging Face's names as llama.load reads them (Weights: bf16 bits,
+  linear ones as x @ w) and fused as load fuses them, and its config: three Gated DeltaNet blocks, then a gated
+  attention block (4 heads of 64 sharing 2 key and value heads, a quarter of each turning), each with 8 experts of
+  64 and a shared one: every token takes all 8, weighted by the router, so that no near tie of experts decides a test.
+  Its embedding is small next to what the blocks add (losing the Gated DeltaNet states moves its logits 100%)."""
+  c = SimpleNamespace(dim=128, heads=4, kv=2, head_dim=64, layers=4, eps=1e-6, theta=1e7, partial=0.25, gated=True, centered=True, conv=4,
+                      kh=2, vh=4, kd=32, vd=32, k=8, norm_topk=True, layer_types=["linear_attention"] * 3 + ["full_attention"])
+  bits = lambda *shape, mean=0.0, sd=0.05: llama.Weight(lambda a=gpt2.bf16_bits(rng.normal(mean, sd, shape)): a)
+  w = {"embed": bits(vocab, 128, sd=0.3), "embed.T": bits(128, vocab), "norm": bits(1, 128, sd=0.3)}  # its own output layer
+  for l in range(c.layers):
+    pre = f"layers.{l}."
+    w |= {pre + "input_layernorm": bits(1, 128, sd=0.3), pre + "post_attention_layernorm": bits(1, 128, sd=0.3), pre + "gate": bits(8, 128),
+          pre + "experts.gate_up_proj": bits(8, 128, 128), pre + "experts.down_proj": bits(8, 128, 64), pre + "shared_expert.gate_proj": bits(128, 64),
+          pre + "shared_expert.up_proj": bits(128, 64), pre + "shared_expert.down_proj": bits(64, 128), pre + "shared_expert_gate": bits(1, 128)}
+    if l < 3: w |= {pre + "in_proj_qkv": bits(128, 256), pre + "in_proj_z": bits(128, 128), pre + "in_proj_b": bits(128, 4), pre + "in_proj_a": bits(128, 4),
+                    pre + "conv1d": bits(256, 1, 4, sd=0.3), pre + "A_log": bits(1, 4, sd=0.5), pre + "dt_bias": bits(1, 4, mean=1.0, sd=0.2),
+                    pre + "norm": bits(1, 32, mean=1.0, sd=0.2), pre + "out_proj": bits(128, 128)}
+    else: w |= {pre + "q_proj": bits(128, 512), pre + "k_proj": bits(128, 128), pre + "v_proj": bits(128, 128), pre + "o_proj": bits(256, 128),
+                pre + "q_norm": bits(1, 64, sd=0.3), pre + "k_norm": bits(1, 64, sd=0.3)}
+  w |= {k: llama.Weight(lambda a=a: gpt2.bf16_bits(a)) for k, a in zip(("cos", "sin", "turn"), llama.rotary(c, places))}
+  return c, llama.fuse(w, c)
+
 def test_llama_frequencies():
   # Llama 3.1's RoPE scaling (rope_type llama3: long wavelengths slowed by 8, short ones kept, those between blended):
   # models/llama.py's frequencies are Hugging Face's, in float32 to the bit
@@ -1549,9 +1575,45 @@ def test_qwen3_5_moe(chip, tmp_path, monkeypatch):
   got = gpt2.values(llama.forward(on(ids), on(list(range(100))), t, c, ckv, every=True))
   step = tensor.jit(lambda ids, places: llama.forward(ids, places, t, c, ckv))
   got_steps = [llama.logits(step(on([s]), on([100 + i]))) for i, s in enumerate(steps)]
-  ties = lambda got, want: all(w.max() - w[g.argmax()] <= 0.005 * np.ptp(w) for g, w in zip(got, want))  # its best, or one the chip's
-  assert rel(got, numpy) < 0.03 and ties(got, numpy), rel(got, numpy)                                      # bf16 logits cannot tell from it
-  assert rel(got_steps, numpy_steps) < 0.03 and ties(got_steps, numpy_steps), rel(got_steps, numpy_steps)
+  assert rel(got, numpy) < 0.03 and near(got, numpy), rel(got, numpy)
+  assert rel(got_steps, numpy_steps) < 0.03 and near(got_steps, numpy_steps), rel(got_steps, numpy_steps)
+
+def test_qwen3_5_sequences(chip):
+  # Qwen3.5's blocks for several sequences at once (qwen35), as a server's slots: each prompt prefilled into its own
+  # (its KV rows from row 32 u, its Gated DeltaNet states batch entry u, in place: llama.states), then decode steps of a
+  # token of each, one call for all, replayed, a free slot among them on its last row whose states stay as they were
+  # (live 0). Against each sequence alone in numpy, within 3% (0.8%) and picking its tokens (near); and llama.delta in numpy for a
+  # token of each of three sequences at once is each alone's
+  rng = np.random.default_rng(29)
+  c, weights = qwen35(rng)
+  w, size, prompts = llama.arrays(weights), 32, {0: [7, 200, 31], 2: [5, 64, 9, 9, 9]}
+  p = {k.removeprefix("layers.0."): w[k] for k in w if k.startswith("layers.0.")}
+  h, alone = rng.normal(0, 1, (3, 128)), [llama.kv_cache(c, size, np.zeros) for _ in range(3)]
+  for s in alone: s[0][1][:] = rng.normal(0, 0.1, s[0][1].shape)  # each sequence some state of its own
+  many = llama.kv_cache(c, 3 * size, np.zeros, 3)
+  for u in range(3): many[0][1][4 * u:4 * u + 4] = alone[u][0][1]
+  together = llama.delta(h, p, c, many[0], lambda op: None, np.array([[1.0, 0.0, 1.0]]))
+  for u in (0, 2): assert np.allclose(together[u], llama.delta(h[u:u + 1], p, c, alone[u][0], lambda op: None)[0], atol=1e-5)
+  assert np.array_equal(many[0][1][4:8], alone[1][0][1]), "a free slot's state as it was"
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  t, kv, np_kv = llama.upload(rt, weights), llama.kv_cache(c, 3 * size, llama.zeros(rt), 3), {u: llama.kv_cache(c, size, np.zeros) for u in prompts}
+  on, ids = lambda row, d="int32": Tensor.of(rt, [row], d), {u: list(s) for u, s in prompts.items()}
+  rel = lambda got, want: np.abs(got - want).max() / np.abs(want).max()
+  for u, s in prompts.items():
+    got = gpt2.values(llama.forward(on(s), on(list(range(len(s)))), t, c, llama.states(c, kv, u), on([size * u] * len(s))))[len(s) - 1]
+    want = llama.forward(s, list(range(len(s))), w, c, np_kv[u])[0]
+    assert rel(got, want) < 0.03 and near([got], [want]), (u, rel(got, want))
+    ids[u].append(int(want.argmax()))
+  step = tensor.jit(lambda ids, places, starts, live: llama.forward(ids, places, t, c, kv, starts, live=live))
+  for i in range(4):
+    places = [len(ids[u]) - 1 if u in ids else size - 1 for u in range(3)]
+    got = gpt2.values(step(on([ids[u][-1] if u in ids else 0 for u in range(3)]), on(places), on([size * u for u in range(3)]), on([1.0, 0.0, 1.0], "fp32")))
+    for u in prompts:
+      want = llama.forward(ids[u][-1:], [places[u]], w, c, np_kv[u])[0]
+      assert rel(got[u], want) < 0.03 and near([got[u]], [want]), (i, u, rel(got[u], want))
+      ids[u].append(int(want.argmax()))
+  free = llama.states(c, kv, 1)
+  assert not any(np.any(np.frombuffer(s.tobytes(), np.float32)) for l in range(3) for s in free[l]), "the free slot's states stay 0"
 
 def test_mxfp4(tmp_path):
   # gpt-oss's checkpoints keep the experts in MXFP4 (a tensor's _blocks of 4-bit values and its _scales): llama.mxfp4
@@ -1821,6 +1883,12 @@ def test_batched_decode(chip):
       assert np.abs(got[u] - want).max() < 0.03 * np.abs(want).max(), (i, u, np.abs(got[u] - want).max())
       s.append(int(want.argmax()))
 
+def bytes_tokenizer(folder):  # a byte-level vocabulary of the 256 bytes, as tokenizer.json in folder
+  bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+  chars = map(chr, bs + [256 + i for i in range(256 - len(bs))])
+  (folder / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {ch: b for ch, b in zip(chars, bs + [b for b in range(256) if b not in bs])}}, "added_tokens": []}))
+  return llama.Tokenizer(str(folder))
+
 def test_serve(chip, tmp_path):
   # models/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
   # longest ago) decode together, numpy's greedy tokens for each, then the last two again alone, the last first (the slot used longer ago holds the
@@ -1832,15 +1900,12 @@ def test_serve(chip, tmp_path):
   # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
   # template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and streamed, or not
   # at all when it is told not to think
-  import threading, urllib.request
+  import urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
   w = {k: bf16(v * 10) if k.endswith("_proj") else v for k, v in w.items()}  # sharp attention, so every cached row counts
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
-  bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # a byte-level vocabulary of the 256 bytes
-  chars = map(chr, bs + [256 + i for i in range(256 - len(bs))])
-  (tmp_path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {ch: b for ch, b in zip(chars, bs + [b for b in range(256) if b not in bs])}}, "added_tokens": []}))
-  tok = llama.Tokenizer(str(tmp_path))
+  tok = bytes_tokenizer(tmp_path)
   engine = serve.Engine(rt, t, c, tok, slots=2, places=64, chunk=16)
   threading.Thread(target=engine.run, daemon=True).start()
   def done(r):
@@ -1918,6 +1983,85 @@ def test_serve(chip, tmp_path):
   assert serve.answer("<|channel|>analysis<|message|>Greet.<|end|><|start|>assistant<|channel|>final<|message|>Hello!") == ("Greet.", "Hello!")
   assert serve.answer("<|channel|>analysis<|message|>Gree") == ("Gree", "") and serve.answer("<|channel|>final<|message|>Hi") == ("", "Hi")
   assert serve.answer("<|channel|>") == serve.answer("<|channel|>analysis") == ("", ""), "a channel's name, a token at a time, is neither"
+
+def test_serve_sessions(chip, tmp_path):
+  # models/serve.py's engine for a model of Gated DeltaNet blocks (qwen35): three greedy requests on two slots (a free
+  # slot's and a prefilling one's states left as they are by the others' steps, a slot whose states are past where a
+  # prompt parts from them taken from the start again), each token's logits within 3% of numpy's for its prompt and the
+  # tokens it took before, and picked as numpy would (near). Then an agent's next turns, once other requests hold both
+  # slots: one whose prompt is the first's prompt and answer and more goes on from the session saved on the host when
+  # the first ended, its new tokens alone prefilled; one that parts from the first after its prompt goes on from the
+  # session saved when that prompt was in; each the same against numpy from nothing
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
+  c, weights = qwen35(rng)
+  w, tok = llama.arrays(weights), bytes_tokenizer(tmp_path)
+  engine = serve.Engine(rt, llama.upload(rt, weights), c, tok, slots=2, places=64, chunk=16)
+  threading.Thread(target=engine.run, daemon=True).start()
+  class Kept(serve.Request):  # the logits each of its tokens came from
+    def take(self, logits, room): self.logits = getattr(self, "logits", []) + [logits]; return super().take(logits, room)
+  def check(r):  # against numpy over its prompt and the tokens it took
+    while r.out.get(timeout=600) is not None: pass
+    ids = r.ids + r.made
+    want = llama.forward(ids, list(range(len(ids))), w, c, llama.kv_cache(c, 64, np.zeros), every=True)[len(r.ids) - 1:][:len(r.logits)]
+    worst = max(np.abs(g - v).max() / np.abs(v).max() for g, v in zip(r.logits, want))
+    assert worst < 0.03 and near(r.logits, want), worst
+  prompts = [[7, 200, 31, 64, 5], [5, 64], list(range(40, 60))]  # the last longer than a chunk
+  together = [Kept(tok, p, 6, 0) for p in prompts]
+  for r in together: engine.waiting.put(r)
+  for r in together: check(r)
+  first = together[0]
+  for turn, saved in ((first.ids + first.made + [9, 8], first.ids + first.made[:-1]), (first.ids + [1, 2, 3], first.ids)):
+    before, r = engine.prefilled, Kept(tok, turn, 4, 0)
+    engine.waiting.put(r)
+    check(r)
+    assert engine.prefilled - before == len(turn) - len(saved), engine.prefilled - before
+
+def test_chat_tools(tmp_path):
+  # Qwen3.5's and Qwen3.6's chat template (serve.qwen), with tools: the strings Qwen3.6's own chat_template.jinja makes
+  # (through transformers' apply_chat_template) for a conversation with tools, a tool call and its result, and without
+  # tools, thinking and not. An answer's tool calls in its XML come out OpenAI's way (serve.calls: a value as its tool's
+  # schema types it), and go back into the template as they came. Over HTTP, an answer (a stand-in engine's) with a
+  # tool call gives its reasoning, its text before the call and the call, finish_reason tool_calls; streamed, the text
+  # stops where the call begins and the call comes after it
+  import queue, urllib.request
+  qwen = "<|im_start|> <think> <tool_call>\n<function="  # (what in a template says it is Qwen3.5's)
+  tools = [{"type": "function", "function": {"name": "read", "description": "A file's text", "parameters": {"type": "object",
+            "properties": {"path": {"type": "string"}, "lines": {"type": "integer"}}, "required": ["path"]}}}]
+  call = {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": {"path": "a.txt", "lines": 2}}}
+  messages = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "What is in a.txt?"},
+              {"role": "assistant", "content": "", "reasoning_content": "I should read it.", "tool_calls": [call]}, {"role": "tool", "tool_call_id": "call_1", "content": "hello"}]
+  want = ("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n" + json.dumps(tools[0]) + "\n</tools>" + serve.CALLING +
+          "\n\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is in a.txt?<|im_end|>\n<|im_start|>assistant\n<think>\nI should read it.\n</think>\n\n<tool_call>\n"
+          "<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n"
+          "<tool_response>\nhello\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n")
+  assert serve.chat(qwen, messages, tools=tools) == want
+  assert serve.chat(qwen, messages[:2]) == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is in a.txt?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  assert serve.chat(qwen, messages[:2], False).endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "not thinking: its reasoning given, empty"
+  said = "I should read it.\n</think>\n\nLet me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>\n</function>\n</tool_call>"
+  text, made = serve.calls(serve.answer(said)[1], tools)
+  assert text == "Let me look." and [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in made] == [("read", {"path": "a.txt", "lines": 2})]
+  again = messages[:2] + [{"role": "assistant", "content": text, "reasoning_content": "I should read it.", "tool_calls": made}]
+  assert "Let me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>" in serve.chat(qwen, again + messages[3:], tools=tools)
+  class Stand:  # an engine that answers every request with `said`, a few characters at a time
+    tok, places, waiting = bytes_tokenizer(tmp_path), 4096, queue.Queue()
+    def run(self):
+      while r := self.waiting.get():
+        for i in range(0, len(said), 7): r.out.put(said[i:i + 7])
+        r.finish = "stop"
+        r.out.put(None)
+  stand = Stand()
+  threading.Thread(target=stand.run, daemon=True).start()
+  http = serve.server(stand, "qwen", qwen, port=0)
+  threading.Thread(target=http.serve_forever, daemon=True).start()
+  ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/chat/completions", json.dumps(body).encode(),
+                                                                   {"Content-Type": "application/json"}), timeout=60)
+  reply = json.load(ask({"messages": messages[:2], "tools": tools}))["choices"][0]
+  assert reply["finish_reason"] == "tool_calls" and reply["message"]["content"] == "Let me look." and reply["message"]["reasoning_content"] == "I should read it."
+  assert json.loads(reply["message"]["tool_calls"][0]["function"]["arguments"]) == {"path": "a.txt", "lines": 2}
+  events = [json.loads(line[6:])["choices"][0] for line in ask({"messages": messages[:2], "tools": tools, "stream": True}).read().decode().split("\n\n") if line.startswith("data: {")]
+  assert "".join(e["delta"].get("content", "") for e in events).strip() == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
+  assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
+  http.shutdown()
 
 def test_fetch(tmp_path, monkeypatch):
   # serve.fetch: a model id's files from Hugging Face's resolve URLs (a local server in its place, by HF_ENDPOINT), the

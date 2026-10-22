@@ -26,7 +26,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), topk=topk,
                            silu=lambda a: a / (1 + np.exp(-a)), sigmoid=lambda a: 1 / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0),
                            mm=lambda a, b, phases: a @ b, experts=numpy_experts, where=np.where, minimum=np.minimum, maximum=np.maximum,
-                           sink_softmax=sink_softmax, exp=np.exp, log=np.log, float=lambda a: a, bf16=lambda a: a, now=lambda a: a,
+                           sink_softmax=sink_softmax, exp=np.exp, log=np.log, float=lambda a: a, bf16=lambda a: a, now=lambda a: a, swap=lambda a: a.transpose(1, 0, 2),
                            cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None], assign=lambda a, b: a.__setitem__(..., b),
                            tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)))
   sink_softmax = lambda a, sink: (e := (a - (m := a.max(2).maximum(sink))).exp()) / (e.sum(2) + (sink - m).exp())  # one more logit, left out
@@ -35,6 +35,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                          experts=chip_experts, where=lambda cond, a, b: cond.where(a, b), minimum=Tensor.minimum, maximum=Tensor.maximum,  # products
                          sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, float=Tensor.float, bf16=Tensor.bfloat16,  # are exact
                          now=Tensor.realize, cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0),  # at any phases
+                         swap=lambda a: a.permute(1, 0, 2),
                          assign=Tensor.assign, tri=lambda n, lower=False: triangle(x.rt, n, lower))
 
 @functools.cache
@@ -68,17 +69,17 @@ def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 a
 
 def cache_format(c): return (getattr(c, "precision", None) or {}).get(("kv", None), ("bf16", None))[0]  # the KV cache's format
 
-def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
+def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None):
   """One block, block l: attention (or Gated DeltaNet, where its weights have a conv: delta) then a SwiGLU MLP (or a
   mixture of experts: moe), each after an RMSNorm and added back. p: the block's weights (as x @ w, so the Hugging Face
   ones transposed, q, k and v's side by side, and gate and up's; and what other families add: Qwen2's qkv_bias, Qwen3's
   qk_norm and qk_on, gpt-oss's sinks and o_proj.bias), c: the config (its precision, if it has one, says each matmul's
   fidelity phases), rotary: (cos, sin, turn), the tables' rows for this call's places; cache: this block's keys' heads
-  then its values', each with a row for every place, this call's written at its rows (or Gated DeltaNet's state);
-  mask: -1e9 where a token must not look (gpt2.mask); prefill: a prompt's tokens at once, not decode's."""
+  then its values', each with a row for every place, this call's written at its rows (or Gated DeltaNet's states);
+  mask: -1e9 where a token must not look (gpt2.mask); prefill: a prompt's tokens at once, not decode's; live: delta's."""
   phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c)
-  x = x + (delta(h, p, c, cache, phases) if "conv" in p else attention(h, p, c, rotary, mask, cache, rows, phases, prefill))
+  x = x + (delta(h, p, c, cache, phases, live) if "conv" in p else attention(h, p, c, rotary, mask, cache, rows, phases, prefill))
   h = rms(x, p["post_attention_layernorm"], c)
   return x + (moe(h, p, c, phases) if "router" in p else mlp(h, p, phases))
 
@@ -102,31 +103,37 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill):  # a block's
   o = f.mm(o, p["o_proj"], phases("o"))
   return o + p["o_proj.bias"] if "o_proj.bias" in p else o
 
-def delta(h, p, c, state, phases):
-  """Gated DeltaNet (Qwen3.5's linear attention) over this call's tokens, the next of one sequence. state: [the conv's
-  last c.conv - 1 inputs, S], both updated in place; S is each value head's memory (a key's width by a value's), which
-  a token decays by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T k)^T, and reads
-  with its query. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay (-exp(A_log)),
-  dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it), a chunk of at most 64 tokens at a
-  time (chunk); a decode step is a chunk of one."""
+def delta(h, p, c, state, phases, live=None):
+  """Gated DeltaNet (Qwen3.5's linear attention) over this call's tokens: one sequence's next ones, or the next token
+  of each of several (a decode step of a batch, whose live row, 1 or 0 for each, says which are a sequence's: the
+  others leave their states as they were). state: [the conv's last c.conv - 1 inputs, S] of each sequence (one batch
+  entry, and c.vh of them), updated in place; S is each value head's memory (a key's width by a value's), which a token
+  decays by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T k)^T, and reads with its
+  query. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay (-exp(A_log)), dt_bias, norm
+  and o_proj. After the conv, in fp32 (as transformers computes it), a chunk of at most 64 tokens at a time (chunk); a
+  decode step is a chunk of one."""
   f, (past, S) = fns(h), state
-  n, qk, vw = h.shape[-2], c.kh * c.kd, c.vh * c.vd
+  n, seqs, qk, vw = h.shape[-2], past.shape[0], c.kh * c.kd, c.vh * c.vd
+  m, width = n // seqs, 2 * qk + vw  # each sequence's tokens; the conv's channels
   x = f.mm(h, p["qkv_proj"], phases("qkv"))
-  rows = f.now(f.cat(past[0], x[:, :2 * qk + vw]))  # the conv's inputs: the last ones, then this call's, computed before
-  y = f.silu(sum(rows[j:j + n, :] * p["conv"][j] for j in range(c.conv)))  # the past ones are written over
-  f.assign(past, rows[n:, :])
+  rows = f.now(f.cat(past, x[:, :width].reshape(seqs, m, width)))  # each sequence's conv inputs: the last ones, then this
+  y = f.silu(sum(rows[:, j:j + m, :] * p["conv"][j] for j in range(c.conv)).reshape(n, width))  # call's, computed before
+  keep = lambda old, new: new if live is None else old + live.reshape(seqs, 1, 1) * (new - old)  # the last are written over
+  f.assign(past, keep(past, rows[:, m:, :]))
   unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # each head's query and key to length 1
   q, k = (f.repeat(unit(f.split(y[:, a:a + qk], c.kh)), c.vh // c.kh) for a in (0, qk))  # a key head for each value head's
-  q, v, zba = q * c.kd ** -0.5, f.split(y[:, 2 * qk:], c.vh), x[:, 2 * qk + vw:]
+  q, v, zba = q * c.kd ** -0.5, f.split(y[:, 2 * qk:], c.vh), x[:, width:]
   z, b, a = zba[:, :vw], zba[:, vw:vw + c.vh], f.float(zba[:, vw + c.vh:]) + p["dt_bias"]
   g = f.heads(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))))  # softplus, each head's as a column
-  beta, out = f.heads(f.sigmoid(b)), []
-  for s in range(0, n, 64):
-    part = lambda t: t[:, s:s + 64, :]
+  apart = lambda t: t if seqs == 1 else f.swap(t).reshape(seqs * c.vh, 1, t.shape[-1])  # a token of each sequence: each
+  beta, out = f.heads(f.sigmoid(b)), []                                                  # sequence's heads, a batch entry each
+  for s in range(0, m, 64):
+    part = lambda t: apart(t)[:, s:s + 64, :]
     o, S2 = chunk(*map(part, (q, k, v, beta, g)), S)
     out.append(f.now(o))  # read from S before S is written over
-    f.assign(S, S2)
+    f.assign(S, S2 if live is None else S + f.repeat(live.reshape(seqs, 1, 1), c.vh) * (S2 - S))
   o = out[0] if len(out) == 1 else f.cat(*out)
+  o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, c.vd))  # each head's tokens again
   o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(z, c.vh))  # each head RMS-normed and gated by z
   return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"))
 
@@ -299,13 +306,14 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
     w[pre + "experts.gate_up"], w[pre + "experts.down"] = stack([join(g, u) for g, u in zip(gates, ups)]), stack(expert("down_proj"))
   return w
 
-def forward(ids, places, w, c, caches, starts=None, every=False):
+def forward(ids, places, w, c, caches, starts=None, every=False, live=None):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (a
   block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids and places are
   rows: lists for numpy, int32 tensors for ferrite. starts: several sequences decoding together (a batch of users), their
   caches side by side, each token's sequence starting at its start's row and each token seeing only its own sequence;
   then the logits are every token's, the next token of each (on the chip only). every: every token's logits, not only
-  the last's. w is looked up a block at a time (arrays makes numpy's weights as they are looked up)."""
+  the last's. w is looked up a block at a time (arrays makes numpy's weights as they are looked up). live: with starts,
+  for Gated DeltaNet's states, which tokens are a sequence's and which only hold a free slot's place (delta)."""
   f = fns(w["norm"])
   x, rows = f.rows(w["embed"], ids), places if starts is None else places + starts
   size = next(k.shape[-2] for k in caches if not isinstance(k, list))  # an attention block's cache's places
@@ -315,7 +323,7 @@ def forward(ids, places, w, c, caches, starts=None, every=False):
   prefill = starts is None and x.shape[-2] > 1
   for l in range(c.layers):
     p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
-    x = layer(x, p, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill)
+    x = layer(x, p, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill, live)
   h = rms(x, w["norm"], c)
   phases = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]  # the output layer's
   return f.mm(h if starts is not None or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases)
@@ -328,12 +336,18 @@ def prefill(ids, w, c, caches, chunk, on=lambda row: row):
   for i in range(0, len(ids), chunk): out = forward(on(ids[i:i + chunk]), on(list(range(i, min(i + chunk, len(ids))))), w, c, caches)
   return out
 
-def kv_cache(c, size, zeros):  # each block's keys' heads then its values', a row for each of size places, made by zeros(shape);
-  # a Gated DeltaNet block's state instead, [its conv's last inputs, S] (delta), in float32 (zeros(shape, "float32"))
+def kv_cache(c, size, zeros, sequences=1):  # each block's keys' heads then its values', a row for each of size places, made by
+  # zeros(shape); a Gated DeltaNet block's states instead, [its conv's last inputs, S] (delta) for each of sequences, in
+  # float32 (zeros(shape, "float32"))
   def block(l):
-    if (getattr(c, "layer_types", None) or [None] * c.layers)[l] != "linear_attention": return zeros((2 * c.kv, size, head(c)))
-    return [zeros((1, c.conv - 1, 2 * c.kh * c.kd + c.vh * c.vd), "float32"), zeros((c.vh, c.kd, c.vd), "float32")]
+    if not linear(c, l): return zeros((2 * c.kv, size, head(c)))
+    return [zeros((sequences, c.conv - 1, 2 * c.kh * c.kd + c.vh * c.vd), "float32"), zeros((sequences * c.vh, c.kd, c.vd), "float32")]
   return [block(l) for l in range(c.layers)]
+
+def linear(c, l): return (getattr(c, "layer_types", None) or [None] * c.layers)[l] == "linear_attention"  # a Gated DeltaNet block?
+
+def states(c, caches, u):  # caches made for several sequences as sequence u's alone: its Gated DeltaNet states, in place
+  return [[kv[0][u:u + 1, :, :], kv[1][u * c.vh:(u + 1) * c.vh, :, :]] if linear(c, l) else kv for l, kv in enumerate(caches)]
 
 def read_json(path):
   with open(path, encoding="utf-8") as f: return json.load(f)

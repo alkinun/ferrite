@@ -88,9 +88,9 @@ first (NOTES, "Bring-up on a p150").
   chunks, a decode step a chunk of one), gated attention with partial RoPE, its experts with the shared one; real
   blocks within 0.22% of transformers in numpy and within about 1% a block on ttsim (NOTES, "Qwen3.5's and Qwen3.6's
   language models").
-- [ ] **Sessions**: several sequences at once, each with its own states; each session's cache rows and DeltaNet states
+- [x] **Sessions**: several sequences at once, each with its own states; each session's cache rows and DeltaNet states
   kept on the host between its turns and brought back for the next; the server's slots for them, and tool calls in
-  Qwen's template.
+  Qwen's template (NOTES, "Serving").
 - [ ] **Speculative decoding** with its multi-token prediction layer, a rejected draft's DeltaNet states put back.
 - [ ] **The cost model**: what a model reads and holds a token and how many sessions a card keeps, and with the probe's
   numbers, tokens/s and dollars a million tokens.

@@ -1,10 +1,11 @@
 # An OpenAI-compatible server for a Llama-family model on ferrite (ROADMAP, Stage 3). Requests join and leave a batch
-# that decodes together: each sequence has a slot of one KV cache, and every step is one replayed call for all the
-# slots. A prompt goes to the free slot whose last sequence began the same way, so what they share (a system prompt, a
-# conversation so far) is not prefilled again: a prefix cache with nothing to copy.
+# that decodes together: each sequence has a slot of one KV cache (and of Gated DeltaNet's states), and every step is
+# one replayed call for all the slots. A prompt goes to the free slot whose last sequence began the same way, or takes
+# a session saved on the host that did, so what they share (a system prompt, an agent's conversation so far) is not
+# prefilled again.
 #   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt]   # a folder or a model id
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import json, os, queue, shutil, sys, threading, time, urllib.error, urllib.request
+import collections, json, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -47,47 +48,82 @@ class Request:
     if len(text) > len(self.said): self.out.put(text[len(self.said):]); self.said = text
 
 class Engine:
-  """Sequences decoding together on the chip, a slot of `places` rows of one KV cache each. Every step runs every slot,
-  one that is free or still prefilling on its last row, which no sequence reaches, so the step's shapes never change
-  and it is replayed (jit). A prompt is prefilled `chunk` tokens at a time, from what its slot holds of it already, a
-  chunk between steps, so a long one slows the others' tokens rather than stopping them."""
-  def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=256):
-    self.rt, self.t, self.c, self.tok, self.places, self.chunk = rt, t, c, tokenizer, places, chunk
-    self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)))
+  """Sequences decoding together on the chip, a slot of `places` rows of one KV cache each (and Gated DeltaNet's states
+  each). Every step runs every slot, one that is free or still prefilling on its last row, which no sequence reaches,
+  and leaving its states as they are, so the step's shapes never change and it is replayed (jit). A prompt is
+  prefilled `chunk` tokens at a time, from what its slot holds of it already, a chunk between steps, so a long one
+  slows the others' tokens rather than stopping them.
+  A session (its tokens, its slot's rows of each cache and its states) is saved on the host when its prompt is in and
+  again when its request ends, up to `keep` bytes, the least recently used going first, so an agent's next turn,
+  whose prompt is its last prompt and answer and more, starts where the last left off whichever slot it gets. A KV
+  cache's rows serve any start of what they hold; Gated DeltaNet's states are for exactly what they took in."""
+  def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=256, keep=4 << 30):
+    assert places % 32 == 0, "slots of whole tiles"
+    self.rt, self.t, self.c, self.tok, self.places, self.chunk, self.keep = rt, t, c, tokenizer, places, chunk, keep
+    self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)), slots)
+    self.slot = [llama.states(c, self.kv, u) for u in range(slots)]  # the caches as slot u's alone
+    self.linear = any(llama.linear(c, l) for l in range(c.layers))  # (its states then say where a slot can go on from)
     self.starts, self.held, self.busy = [places * u for u in range(slots)], [[] for _ in range(slots)], [None] * slots
     self.used = [0] * slots  # when each slot last took a request: of those sharing as much, the one used longest ago goes
-    self.step = jit(lambda ids, places, starts: llama.forward(ids, places, t, c, self.kv, starts))
+    self.step = jit(lambda ids, places, starts, live: llama.forward(ids, places, t, c, self.kv, starts, live=live))
     self.waiting, self.prefilled = queue.Queue(), 0  # (tokens prefilled in all: what the prefix cache saves shows here)
+    self.saved = collections.OrderedDict()  # tokens -> (each block's bytes: a KV cache's rows, or Gated DeltaNet's states)
 
-  def on(self, row): return Tensor.of(self.rt, [row], "int32")
+  def on(self, row, dtype="int32"): return Tensor.of(self.rt, [row], dtype)
 
-  def admit(self, r):  # into the free slot holding the longest start of its prompt (its last token runs again for its logits)
+  def reach(self, held, ids):  # how much of a prompt can go on from what held is the state after (its last token runs again)
+    if self.linear: return len(held) if len(held) < len(ids) and list(ids[:len(held)]) == list(held) else 0
+    return min(next((i for i, (a, b) in enumerate(zip(held, ids)) if a != b), min(len(held), len(ids))), len(ids) - 1)
+
+  def admit(self, r):  # into the free slot that holds the most of its prompt, or one that takes the saved session that does
     if r.gone: return
-    shared = lambda u: next((i for i, (a, b) in enumerate(zip(self.held[u], r.ids)) if a != b), min(len(self.held[u]), len(r.ids)))
-    u = max((u for u, b in enumerate(self.busy) if b is None), key=lambda u: (shared(u), -self.used[u]))
+    free = [u for u, b in enumerate(self.busy) if b is None]
+    u = max(free, key=lambda u: (self.reach(self.held[u], r.ids), -self.used[u]))
+    best = max(self.saved, key=lambda k: self.reach(k, r.ids), default=())
+    if self.reach(best, r.ids) > self.reach(self.held[u], r.ids): self.restore(u := min(free, key=lambda u: self.used[u]), best)
     self.used[u], self.busy[u] = max(self.used) + 1, r
-    self.held[u] = r.ids[:min(shared(u), len(r.ids) - 1)]
+    n = self.reach(self.held[u], r.ids)
+    if self.linear and n < len(self.held[u]): self.restore(u)  # its states from the start again
+    self.held[u] = r.ids[:n]
+
+  def save(self, u):  # slot u's session to the host: its tokens, its rows of each KV cache (whole tiles) and its states
+    key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32
+    if not key or key in self.saved or not self.keep: return
+    at = self.starts[u]
+    self.saved[key] = [tuple(x.tobytes() for x in s) if llama.linear(self.c, l) else s[:, at:at + rows, :].tobytes() for l, s in enumerate(self.slot[u])]
+    size = lambda v: sum(len(b) for x in v for b in (x if isinstance(x, tuple) else [x]))
+    while sum(size(v) for v in self.saved.values()) > self.keep: self.saved.popitem(last=False)
+
+  def restore(self, u, key=()):  # a saved session into slot u, its tokens what the slot holds (none: its states all 0)
+    if key: self.saved.move_to_end(key)
+    rows, at = -(-len(key) // 32) * 32, self.starts[u]
+    for l, s in enumerate(self.slot[u]):
+      data = self.saved[key][l] if key else None
+      if llama.linear(self.c, l):
+        for i, x in enumerate(s): x.assign(Tensor.frombytes(self.rt, x.rows, x.cols, data[i] if data else bytes(4 * x.batch * x.rows * x.cols), x.batch, "fp32"))
+      elif data: s.put(self.on(list(range(at, at + rows))), Tensor.frombytes(self.rt, rows, s.cols, data, s.batch))
+    self.held[u] = list(key)
 
   def fill(self, u):  # the next chunk of slot u's prompt; the last one's last logits give the first new token
     r, at = self.busy[u], len(self.held[u])
     if r.gone: return self.take(u, None)
     ids = r.ids[at:at + self.chunk]
-    out = llama.forward(self.on(ids), self.on(list(range(at, at + len(ids)))), self.t, self.c, self.kv, self.on([self.starts[u]] * len(ids)))
+    out = llama.forward(self.on(ids), self.on(list(range(at, at + len(ids)))), self.t, self.c, self.slot[u], self.on([self.starts[u]] * len(ids)))
     self.held[u] += ids
     self.prefilled += len(ids)
-    if len(self.held[u]) == len(r.ids): self.take(u, gpt2.values(out[len(ids) - 1:len(ids), :])[0])
+    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, gpt2.values(out[len(ids) - 1:len(ids), :])[0])
 
   def advance(self):  # one step for every slot: each decoding one's last token in, its next one out
     live = [r if r and r.made else None for r in self.busy]
     if not any(live): return
     ids = [r.made[-1] if r else 0 for r in live]
     places = [len(h) if r else self.places - 1 for h, r in zip(self.held, live)]
-    logits = gpt2.values(self.step(self.on(ids), self.on(places), self.on(self.starts)))
+    logits = gpt2.values(self.step(self.on(ids), self.on(places), self.on(self.starts), self.on([float(bool(r)) for r in live], "fp32")))
     for u, r in enumerate(live):
       if r: self.held[u].append(r.made[-1]); self.take(u, logits[u])
 
-  def take(self, u, logits):  # a slot's request takes its next token; a finished one leaves its slot (and its rows' keys)
-    if self.busy[u].take(logits, len(self.held[u]) < self.places - 1): self.busy[u] = None
+  def take(self, u, logits):  # a slot's request takes its next token; a finished one leaves its slot (its session saved)
+    if self.busy[u].take(logits, len(self.held[u]) < self.places - 1): self.save(u); self.busy[u] = None
 
   def run(self):  # the engine's thread: admit while a slot is free, a chunk of a prompt, a step; on an error, every request ends
     try:
@@ -101,7 +137,9 @@ class Engine:
         if r: r.finish = "error"; r.out.put(None)
       raise
 
-def chat(template, messages, thinking=True, effort="medium"):  # messages as the prompt the model was trained on, for the kinds of template it can be
+def chat(template, messages, thinking=True, effort="medium", tools=None):  # messages as the prompt the model was trained on, for the kinds of
+  if "<tool_call>\n<function=" in template: return qwen(messages, thinking, tools)  # template it can be
+  if tools: raise ValueError("tools, with a chat template other than Qwen3.5's")
   if "<|channel|>" in template:  # gpt-oss's (harmony): its own system message, a first system message as a developer's, the turns
     system = (f"You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: {time.strftime('%Y-%m-%d')}\n\n"
               f"Reasoning: {effort}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.")
@@ -118,6 +156,62 @@ def chat(template, messages, thinking=True, effort="medium"):  # messages as the
     return prompt if thinking or "<think>" not in template else prompt + "<think>\n\n</think>\n\n"
   raise ValueError("a chat template other than gpt-oss's, Llama 3's or ChatML")
 
+CALLING = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
+           "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+           "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the "
+           "specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required "
+           "parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function "
+           "call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do "
+           "not tell the user about function calls\n</IMPORTANT>")  # Qwen3.5's template's words on how to call a tool
+
+def qwen(messages, thinking=True, tools=None):
+  """Qwen3.5's and Qwen3.6's chat template (its chat_template.jinja, for text): the tools described in the system turn,
+  each assistant turn after the last question with its reasoning (an agent's tool calls since: the next prompt then
+  goes on from the last one and its answer), tool calls as XML, tool results in a user turn of their own."""
+  text = lambda m: (m.get("content") or "").strip()
+  question = [i for i, m in enumerate(messages) if m["role"] == "user" and not (text(m).startswith("<tool_response>") and text(m).endswith("</tool_response>"))]
+  if not question: raise ValueError("no question among the messages")
+  system = text(messages[0]) if messages[0]["role"] == "system" else None
+  out = ""
+  if tools: out = "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>" + "".join(
+    "\n" + json.dumps(t, ensure_ascii=False) for t in tools) + "\n</tools>" + CALLING + (f"\n\n{system}" if system else "") + "<|im_end|>\n"
+  elif system is not None: out = f"<|im_start|>system\n{system}<|im_end|>\n"
+  for i, m in enumerate(messages):
+    if m["role"] == "user": out += f"<|im_start|>user\n{text(m)}<|im_end|>\n"
+    elif m["role"] == "assistant":
+      content, reasoning = text(m), m.get("reasoning_content")
+      if not isinstance(reasoning, str):
+        reasoning = content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n") if "</think>" in content else ""
+        content = content.split("</think>")[-1].lstrip("\n")
+      out += "<|im_start|>assistant\n" + (f"<think>\n{reasoning.strip()}\n</think>\n\n" if i > question[-1] else "") + content
+      for j, call in enumerate(m.get("tool_calls") or []):
+        f = call.get("function", call)
+        args = json.loads(f.get("arguments") or "{}") if isinstance(f.get("arguments"), str) else f.get("arguments") or {}
+        out += ("\n\n" if content.strip() else "") if j == 0 else "\n"
+        out += f"<tool_call>\n<function={f['name']}>\n" + "".join(
+          f"<parameter={k}>\n{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}\n</parameter>\n" for k, v in args.items()) + "</function>\n</tool_call>"
+      out += "<|im_end|>\n"
+    elif m["role"] == "tool":
+      if i == 0 or messages[i - 1]["role"] != "tool": out += "<|im_start|>user"
+      out += f"\n<tool_response>\n{text(m)}\n</tool_response>"
+      if i == len(messages) - 1 or messages[i + 1]["role"] != "tool": out += "<|im_end|>\n"
+    elif m["role"] != "system" or i: raise ValueError(f"a {m['role']} message there")
+  return out + "<|im_start|>assistant\n" + ("<think>\n" if thinking else "<think>\n\n</think>\n\n")
+
+def calls(text, tools=()):
+  """An answer's tool calls in Qwen3.5's XML, OpenAI's way: (the text before them, the calls), each call's arguments
+  as JSON, a value taken as the tool's schema says (a string as it is, anything else read as JSON where it is)."""
+  head, mark, rest = text.partition("<tool_call>")
+  schema = {t.get("function", t).get("name"): t.get("function", t).get("parameters", {}).get("properties", {}) for t in tools or ()}
+  def value(name, key, v):
+    if schema.get(name, {}).get(key, {}).get("type", "string") == "string": return v
+    try: return json.loads(v)
+    except ValueError: return v
+  found = [(name, {k: value(name, k, v) for k, v in re.findall(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", body, re.S)})
+           for name, body in re.findall(r"<function=([^>\n]+)>(.*?)</function>", mark + rest, re.S)]
+  return head.strip(), [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+                        for name, args in found]
+
 def answer(text):  # a thinking model's text as its reasoning and its answer (none until it comes): Qwen3's around </think>,
   if text.startswith("<|channel|>"):  # or gpt-oss's analysis channel, until its <|end|>, and its final one
     if "<|message|>" not in text: return "", ""  # (the channel's name still coming)
@@ -130,7 +224,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
   """An HTTP server for the engine (its thread must be running): /v1/models, and /v1/completions and
   /v1/chat/completions, whole or streamed (server-sent events). A model that thinks (its template has <think>, or
   gpt-oss's channels) gives its reasoning apart from its answer (reasoning_content), unless chat_template_kwargs'
-  enable_thinking is false (Qwen3's); gpt-oss reasons as hard as reasoning_effort says (low, medium or high). A
+  enable_thinking is false (Qwen3's); gpt-oss reasons as hard as reasoning_effort says (low, medium or high). Given
+  tools (Qwen3.5's template), the answer's tool calls come as OpenAI's tool_calls, a stream's after its text. A
   piece of text not ready in `wait` seconds ends the request: a hung chip is reported, not waited on."""
   class Handler(BaseHTTPRequestHandler):
     def reply(self, code, body):
@@ -145,8 +240,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
       if not is_chat and self.path != "/v1/completions": return self.reply(404, {"error": {"message": f"no {self.path}"}})
       try:
         q = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-        thinking = (q.get("chat_template_kwargs") or {}).get("enable_thinking", True) is not False
-        prompt = chat(template, q["messages"], thinking, q.get("reasoning_effort") or "medium") if is_chat else q["prompt"]
+        thinking, tools = (q.get("chat_template_kwargs") or {}).get("enable_thinking", True) is not False, is_chat and q.get("tools")
+        prompt = chat(template, q["messages"], thinking, q.get("reasoning_effort") or "medium", tools) if is_chat else q["prompt"]
         ids = engine.tok.encode(prompt, special=is_chat)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens: a slot holds {engine.places - 2}"}})
@@ -156,13 +251,19 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
       head = {"id": f"ferrite-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       apart = is_chat and (thinking and "<think>" in template or "<|channel|>" in template)
       seen = {"text": "", "reasoning_content": "", "content": ""}
-      def delta(text):  # a chat's next piece: its text, or a thinking model's new reasoning and answer, apart
-        if not apart: return {"content": text} if text else {}
+      def parts(text):  # a chat's text as a thinking model's reasoning and answer, apart, and only the answer's text before its tool calls
+        out = dict(zip(("reasoning_content", "content"), answer(text))) if apart else {"content": text}
+        if tools:  # (and before what may be the start of one)
+          shown = out["content"].partition("<tool_call>")[0]
+          out["content"] = shown[:len(shown) - max((k for k in range(1, 11) if shown.endswith("<tool_call>"[:k])), default=0)]
+        return out
+      def delta(text):  # a chat's next piece: what is new of each part
         seen["text"] += text
-        new = dict(zip(("reasoning_content", "content"), answer(seen["text"])))
+        new = parts(seen["text"])
         out = {k: v[len(seen[k]):] for k, v in new.items() if len(v) > len(seen[k])}
         seen.update(new)
         return out
+      called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the answer's text and tool calls
       piece = lambda text, done: ({"index": 0, "delta": delta(text)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
       if q.get("stream"):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
@@ -171,16 +272,19 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         try:
           if is_chat: send(head | {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
           while (text := r.out.get(timeout=wait)) is not None: send(head | {"choices": [piece(text, None)]})
-          send(head | {"choices": [piece("", r.finish)]})
+          if made := called(seen["text"])[1]:
+            send(head | {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}, "finish_reason": None}]})
+          send(head | {"choices": [piece("", "tool_calls" if made else r.finish)]})
           return self.wfile.write(b"data: [DONE]\n\n")
         except (OSError, queue.Empty): r.gone = True  # the client went, or no text came: its slot is let go
         return
       try: text = "".join(iter(lambda: r.out.get(timeout=wait), None))
       except queue.Empty: return self.reply(504, {"error": {"message": f"no text in {wait}s: the chip hangs"}})
       if r.finish == "error": return self.reply(500, {"error": {"message": "the engine stopped"}})
-      message = dict(zip(("reasoning_content", "content"), answer(text))) if apart else {"content": text}
+      message, (content, made) = parts(text), called(text)
+      if made: message |= {"content": content or None, "tool_calls": made}
       choice = {"index": 0, "message": {"role": "assistant"} | message} if is_chat else {"index": 0, "text": text, "logprobs": None}
-      self.reply(200, head | {"choices": [choice | {"finish_reason": r.finish}],
+      self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}],
                               "usage": {"prompt_tokens": len(ids), "completion_tokens": len(r.made), "total_tokens": len(ids) + len(r.made)}})
   return ThreadingHTTPServer(("", port), Handler)
 

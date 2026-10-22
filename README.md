@@ -58,9 +58,10 @@ code on the Ethernet tiles (`Tensor.to`).
 
 Serving: `models/serve.py` is an OpenAI-compatible server (`/v1/completions`, `/v1/chat/completions`, whole or streamed)
 for these models, from a folder or a Hugging Face model id; a thinking model's reasoning (Qwen3's) comes apart from its
-answer. Requests decode together, each in a slot of one KV cache, every step one replayed call for all of them, and a
-prompt goes to the slot that already holds the longest start of it, so a shared prefix is not prefilled again.
-SmolLM-135M answers "The meaning of life is" over HTTP as above.
+answer, and Qwen3.6's tool calls come back as OpenAI's `tool_calls`. Requests decode together, each in a slot of one KV
+cache (and of Gated DeltaNet's states), every step one replayed call for all of them, and a prompt goes to the slot
+that already holds the longest start of it, or takes a session saved on the host, so a shared prefix (an agent's
+conversation so far) is not prefilled again. SmolLM-135M answers "The meaning of life is" over HTTP as above.
 
     TTSIM=... python3 models/serve.py SmolLM-135M 8000
     curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 6, "temperature": 0}'

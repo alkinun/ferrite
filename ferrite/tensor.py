@@ -268,7 +268,7 @@ class Tensor:
     """x's value in this tensor, in place, as an optimizer updates a weight: x is computed into its DRAM and becomes a
     view of it. A kernel reads each tile of its elementwise inputs before it writes that tile, but a matmul reads whole
     rows and columns, so one is computed first, on its own."""
-    assert self.op is None and self.owner is None and (x.shape, x.dtype) == (self.shape, self.dtype), "a whole tensor, its own shape and dtype"
+    assert self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype), "a tensor or view, its own shape and dtype"
     if any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
     (x if x.op not in (None, "T", "move") else x + 0).realize(self)  # computed already, or a move: copied in by + 0
     return self
