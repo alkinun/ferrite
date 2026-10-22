@@ -101,23 +101,35 @@ class Engine:
         if r: r.finish = "error"; r.out.put(None)
       raise
 
-def chat(template, messages, thinking=True):  # messages as the prompt the model was trained on, for the two kinds of template it can be
+def chat(template, messages, thinking=True, effort="medium"):  # messages as the prompt the model was trained on, for the kinds of template it can be
+  if "<|channel|>" in template:  # gpt-oss's (harmony): its own system message, a first system message as a developer's, the turns
+    system = (f"You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: {time.strftime('%Y-%m-%d')}\n\n"
+              f"Reasoning: {effort}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.")
+    head, turns = f"<|start|>system<|message|>{system}<|end|>", messages
+    if messages and messages[0]["role"] in ("system", "developer"):
+      head, turns = head + f"<|start|>developer<|message|># Instructions\n\n{messages[0]['content']}\n\n<|end|>", messages[1:]
+    said = lambda m: "<|start|>user<|message|>" if m["role"] == "user" else "<|start|>assistant<|channel|>final<|message|>"
+    return head + "".join(f"{said(m)}{m['content']}<|end|>" for m in turns) + "<|start|>assistant"
   if "<|start_header_id|>" in template:  # Llama 3's
     turn = lambda m: f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{m['content']}<|eot_id|>"
     return "<|begin_of_text|>" + "".join(map(turn, messages)) + "<|start_header_id|>assistant<|end_header_id|>\n\n"
   if "<|im_start|>" in template:  # ChatML: SmolLM's instruct models', Qwen's; Qwen3's not thinking, its reasoning given as none
     prompt = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages) + "<|im_start|>assistant\n"
     return prompt if thinking or "<think>" not in template else prompt + "<think>\n\n</think>\n\n"
-  raise ValueError("a chat template other than Llama 3's or ChatML")
+  raise ValueError("a chat template other than gpt-oss's, Llama 3's or ChatML")
 
-def answer(text):  # a thinking model's text (Qwen3's) as its reasoning and its answer: before </think> and after (none until it comes)
+def answer(text):  # a thinking model's text as its reasoning and its answer (none until it comes): Qwen3's around </think>,
+  if text.startswith("<|channel|>"):  # or gpt-oss's analysis channel, until its <|end|>, and its final one
+    head, _, content = text.partition("<|channel|>final<|message|>")
+    return head.removeprefix("<|channel|>analysis<|message|>").partition("<|end|>")[0].strip(), content
   reasoning, _, content = text.partition("</think>")
   return reasoning.removeprefix("<think>").strip(), content.lstrip()
 
 def server(engine, name, template="", eos=(), port=8000, wait=600):
   """An HTTP server for the engine (its thread must be running): /v1/models, and /v1/completions and
-  /v1/chat/completions, whole or streamed (server-sent events). A model that thinks (its template has <think>) gives
-  its reasoning apart from its answer (reasoning_content), unless chat_template_kwargs' enable_thinking is false. A
+  /v1/chat/completions, whole or streamed (server-sent events). A model that thinks (its template has <think>, or
+  gpt-oss's channels) gives its reasoning apart from its answer (reasoning_content), unless chat_template_kwargs'
+  enable_thinking is false (Qwen3's); gpt-oss reasons as hard as reasoning_effort says (low, medium or high). A
   piece of text not ready in `wait` seconds ends the request: a hung chip is reported, not waited on."""
   class Handler(BaseHTTPRequestHandler):
     def reply(self, code, body):
@@ -133,14 +145,16 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
       try:
         q = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         thinking = (q.get("chat_template_kwargs") or {}).get("enable_thinking", True) is not False
-        ids = engine.tok.encode(chat(template, q["messages"], thinking), special=True) if is_chat else engine.tok.encode(q["prompt"])
+        prompt = chat(template, q["messages"], thinking, q.get("reasoning_effort") or "medium") if is_chat else q["prompt"]
+        ids = engine.tok.encode(prompt, special=is_chat)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens: a slot holds {engine.places - 2}"}})
       r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), q.get("temperature", 1.0), q.get("top_p", 1.0),
                   q.get("stop"), eos, q.get("seed"))
       engine.waiting.put(r)
       head = {"id": f"ferrite-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
-      apart, seen = is_chat and thinking and "<think>" in template, {"text": "", "reasoning_content": "", "content": ""}
+      apart = is_chat and (thinking and "<think>" in template or "<|channel|>" in template)
+      seen = {"text": "", "reasoning_content": "", "content": ""}
       def delta(text):  # a chat's next piece: its text, or a thinking model's new reasoning and answer, apart
         if not apart: return {"content": text} if text else {}
         seen["text"] += text

@@ -1706,8 +1706,8 @@ def test_serve(chip, tmp_path):
   # the others' tokens keep coming. A request ends at a stop string (without its text), at an end-of-sequence token,
   # or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP, /v1/completions
   # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
-  # template; a thinking model's reasoning comes apart from its answer, whole and streamed, or not at all when it is
-  # told not to think
+  # template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and streamed, or not
+  # at all when it is told not to think
   import threading, urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -1782,6 +1782,11 @@ def test_serve(chip, tmp_path):
   think.shutdown()
   assert serve.chat("<|im_start|> <think>", hi[1:], False) == "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
   assert serve.answer("<think>\nLet me see.\n</think>\n\nHi!") == ("Let me see.", "Hi!") and serve.answer("<think>\nHm") == ("Hm", "")
+  harmony = serve.chat("<|channel|>", hi, effort="low")  # gpt-oss's: its own system message, the system one as a developer's, and its channels
+  assert harmony.startswith("<|start|>system<|message|>You are ChatGPT") and "Reasoning: low" in harmony and harmony.endswith(
+    "<|start|>developer<|message|># Instructions\n\nBe brief.\n\n<|end|><|start|>user<|message|>Hi<|end|><|start|>assistant")
+  assert serve.answer("<|channel|>analysis<|message|>Greet.<|end|><|start|>assistant<|channel|>final<|message|>Hello!") == ("Greet.", "Hello!")
+  assert serve.answer("<|channel|>analysis<|message|>Gree") == ("Gree", "") and serve.answer("<|channel|>final<|message|>Hi") == ("", "Hi")
 
 def test_fetch(tmp_path, monkeypatch):
   # serve.fetch: a model id's files from Hugging Face's resolve URLs (a local server in its place, by HF_ENDPOINT), the
