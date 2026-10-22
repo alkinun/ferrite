@@ -248,7 +248,7 @@ def python_regex(pat):  # tokenizer.json's split for Python's re: \p{L}, \p{N} a
 class Tokenizer:
   """tokenizer.json's byte-level BPE in plain Python, as tiktoken does it: the text split by its regex, and each piece
   that is not a token itself merged a pair of parts at a time, the lowest-ranked first (ids are in merge order, so they
-  are the ranks). Special tokens in the text are taken as text."""
+  are the ranks). Special tokens in the text are taken as text, unless encode is told to take them as tokens."""
   def __init__(self, folder):
     t = read_json(os.path.join(folder, "tokenizer.json"))
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
@@ -256,6 +256,7 @@ class Tokenizer:
     special = {a["content"]: a["id"] for a in t["added_tokens"]}
     self.ranks = {bytes(byte[ch] for ch in tok): i for tok, i in t["model"]["vocab"].items() if tok not in special}
     self.bytes = {i: b for b, i in self.ranks.items()} | {i: s.encode() for s, i in special.items()}
+    self.special, self.specials = special, re.compile("(" + "|".join(map(re.escape, sorted(special, key=len, reverse=True))) + ")")
     pre = t.get("pre_tokenizer") or {}  # the split before BPE: tokenizer.json's own (Llama 3's), else SmolLM's
     split = [p["pattern"]["Regex"] for p in pre.get("pretokenizers", [pre]) if p.get("type") == "Split" and "Regex" in p.get("pattern", {})]
     self.split, self.pieces = python_regex(split[0] if split else SPLIT), {}
@@ -269,7 +270,9 @@ class Tokenizer:
         parts[i:i + 2] = [parts[i] + parts[i + 1]]
       self.pieces[piece] = [self.ranks[p] for p in parts]
     return self.pieces[piece]
-  def encode(self, text): return [i for piece in self.split.findall(text) for i in self.bpe(piece.encode())]
+  def encode(self, text, special=False):  # special: a special token's text in it is that token (a chat template's)
+    if special: return [i for part in self.specials.split(text) if part for i in ([self.special[part]] if part in self.special else self.encode(part))]
+    return [i for piece in self.split.findall(text) for i in self.bpe(piece.encode())]
   def decode(self, ids): return b"".join(self.bytes[i] for i in ids).decode("utf-8", "replace")
 
 def main():

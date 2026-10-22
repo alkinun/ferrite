@@ -8,7 +8,7 @@ Sources: **ISA** = tt-isa-documentation/BlackholeA0, **sim** = ttsim `src/`, **k
 Contents: the chip from the host (address map, TLBs, reset, the cores, what tt-kmd does); the launch loop and the
 command queue (`runtime.py`); the Tensix coprocessor and the compiler (the pipeline, matmul, fusion, elementwise,
 reductions and passes, shapes and movement, dtypes, autograd); the models; ttsim; the record of the numbers; what the
-compiler does next; tinygrad on ferrite (and PyTorch through it); bring-up on a p150; and what is still unknown.
+compiler does next; tinygrad on ferrite (and PyTorch through it); serving; bring-up on a p150; and what is still unknown.
 
 ## Address map
 
@@ -584,6 +584,18 @@ A token's DRAM reads went from 222.8k tiles to 136.7k with a token's A shared an
 
   For a like-for-like B2, tinygrad's path needs bf16 activations, or the adapter to multiply fp32 by bf16 as one bf16 matmul; a cache in a dtype the chip holds (fp16 on the chip, or a cache dtype tinygrad lets its caller choose); replay of a step whose place is symbolic; formats per weight; and Llama 3's RoPE scaling in tinygrad.
 - **Not done yet.** Shapes with tinygrad's symbolic variables in them on the chip (they run on the host); a store through a bitcast or a pad; masked views over several merged axes (through the host); dtypes other than float32, bfloat16, int32 and bool (on the host); a jitted call with random numbers, replayed.
+
+## Serving
+
+`test/serve.py` (`test_serve`, `test_fetch`), an OpenAI-compatible server for a Llama-family model: ROADMAP's Stage 3 asks for one that takes a Hugging Face model id and batches many requests, with a prefix cache.
+
+- **Slots.** The engine's KV cache has `slots` slots of `places` rows, side by side as several sequences' are ("A Llama-family model"), and each step is one call of `forward` for every slot, with `starts`. A free slot takes part too, its token at its last row, which no sequence reaches (one may hold `places - 2` tokens), so the step's shapes never change and it is replayed (`jit`) whoever comes and goes. A prompt is prefilled into its slot `chunk` tokens at a time, between steps; the step after takes it in.
+- **The prefix cache.** Each slot remembers the tokens whose keys and values its rows hold. A prompt goes to the free slot that holds the longest start of it (of slots holding as much, the one used longest ago) and only the rest is prefilled, from its last token at least, whose logits give the first new one: a system prompt or a conversation so far costs nothing the second time, and nothing is copied. `test_serve` checks that a prompt run again gives the same tokens with one token prefilled, and that a free slot's step spoils nothing its slot holds.
+- **Requests.** Greedy at temperature 0, else sampled on the host from the softmax at that temperature with the least likely past `top_p` left out (a seed makes it repeat); until an end-of-sequence token (`generation_config.json`'s, or `config.json`'s), a stop string, `max_tokens`, or a full slot. Text goes out as it is made, held back only while a stop string might be beginning at its end or a character's bytes are still coming.
+- **HTTP** (`http.server`, a thread a connection): `/v1/models`, and `/v1/completions` and `/v1/chat/completions`, whole or as server-sent events; chat messages go into the model's template, Llama 3's or ChatML, told apart by `tokenizer_config.json`'s (a template is Jinja, which the standard library cannot run; Llama 3.1's default system message, with its dates, is left out), their special tokens taken as tokens. A prompt longer than a slot is refused, and a request with no text for 600 s ends with a 504: a hung chip is reported.
+- **A model id** (`fetch`): Hugging Face's files for it, downloaded once into `~/.cache/ferrite/hub` (from `HF_ENDPOINT` if set, with `HF_TOKEN` for a gated model): config, tokenizer, the configs of generation and chat it has, and its weights in one file or the shards its index names; a finished download is marked and not asked for again.
+- **Measured.** On ttsim, SmolLM-135M (bf16, two slots of 256 places) answers "The meaning of life is" with " a question that has been asked", as `test/llama.py` does, and two requests at once ("The capital of France is", " Paris. It is the"; "Once upon a time" streamed, ", there was a curious") come back whole.
+- **Not yet.** Log probabilities, several choices a request, penalties, tools; stopping a request whose client has gone (it runs to its end); more requests at once than slots (they wait); and attention over every slot's rows, masked, where one slot's would do ("Several sequences at once").
 
 ## Bring-up on a p150
 

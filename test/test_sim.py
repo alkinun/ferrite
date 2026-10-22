@@ -7,7 +7,7 @@ from ferrite.chip import Chip
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
-import benchmark, gpt2, llama, train
+import benchmark, gpt2, llama, serve, train
 from types import SimpleNamespace
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
@@ -1515,6 +1515,76 @@ def test_batched_decode(chip):
       want = llama.forward(s[-1:], [places[u]], w, c, np_kv[u])[0]
       assert np.abs(got[u] - want).max() < 0.03 * np.abs(want).max(), (i, u, np.abs(got[u] - want).max())
       s.append(int(want.argmax()))
+
+def test_serve(chip, tmp_path):
+  # test/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
+  # longest ago) decode together, then the last two again alone, the last first (the slot used longer ago holds the
+  # other), each in the slot that holds it already, so a token of each is prefilled and the rest come from the cache:
+  # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
+  # reaches (on any other it would spoil what its slot holds). A request ends at a stop string,
+  # without its text, or at an end-of-sequence token, and says no text in which a stop string might yet begin. Over
+  # HTTP, /v1/completions whole and streamed give the engine's text, and /v1/models the model
+  import threading, urllib.request
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
+  c, w = smol(rng, 2)
+  w = {k: bf16(v * 10) if k.endswith("_proj") else v for k, v in w.items()}  # sharp attention, so every cached row counts
+  t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
+  bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # a byte-level vocabulary of the 256 bytes
+  chars = map(chr, bs + [256 + i for i in range(256 - len(bs))])
+  (tmp_path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {ch: b for ch, b in zip(chars, bs + [b for b in range(256) if b not in bs])}}, "added_tokens": []}))
+  tok = llama.Tokenizer(str(tmp_path))
+  engine = serve.Engine(rt, t, c, tok, slots=2, places=64, chunk=16)
+  threading.Thread(target=engine.run, daemon=True).start()
+  def done(r):
+    while r.out.get(timeout=600) is not None: pass
+    return r.made
+  prompts = [[7, 200, 31, 64, 5], [5, 64], list(range(40, 60))]  # the last longer than a chunk
+  together = [serve.Request(tok, p, 6, 0) for p in prompts]
+  for r in together: engine.waiting.put(r)
+  together = [done(r) for r in together]
+  before = engine.prefilled
+  assert [done(r) for r in [serve.Request(tok, p, 6, 0) for p in prompts[:0:-1]] if not engine.waiting.put(r)] == together[:0:-1]
+  assert engine.prefilled - before == 2, "the prompts' last tokens, the rest in their slots already"
+  r = serve.Request(tok, [], 9, 0, stop=["bc"])
+  said = lambda: [r.out.get_nowait() for _ in range(r.out.qsize())]
+  assert not r.take(np.eye(256)[97], True) and said() == ["a"]
+  assert not r.take(np.eye(256)[98], True) and said() == [], "b might begin the stop string"
+  assert r.take(np.eye(256)[99], True) and said() == [None] and (r.said, r.finish) == ("a", "stop")
+  r = serve.Request(tok, [], 9, 0, eos=[0])
+  assert not r.take(np.eye(256)[97], True) and r.take(np.eye(256)[0], True) and (r.made, r.said, r.finish) == ([97], "a", "stop")
+  http = serve.server(engine, "smol", port=0)
+  threading.Thread(target=http.serve_forever, daemon=True).start()
+  url = f"http://127.0.0.1:{http.server_address[1]}/v1"
+  post = lambda body: urllib.request.urlopen(urllib.request.Request(url + "/completions", json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=600)
+  r = serve.Request(tok, tok.encode("Hi there"), 6, 0)
+  engine.waiting.put(r)
+  text = tok.decode(done(r))
+  reply = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0}))
+  assert reply["choices"][0]["text"] == text and reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 6
+  events = [json.loads(line[6:]) for line in post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}).read().decode().split("\n\n")
+            if line.startswith("data: {")]
+  assert "".join(e["choices"][0]["text"] for e in events) == text and events[-1]["choices"][0]["finish_reason"] == "length"
+  assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
+  http.shutdown()
+
+def test_fetch(tmp_path, monkeypatch):
+  # serve.fetch: a model id's files from Hugging Face's resolve URLs (a local server in its place, by HF_ENDPOINT), the
+  # checkpoint's shards by its index, the configs it has and not those it has not; a finished download is not asked
+  # for again, and a folder is taken as it is
+  import functools, http.server, threading
+  hub = tmp_path / "hub" / "org" / "model" / "resolve" / "main"
+  hub.mkdir(parents=True)
+  files = {"config.json": "{}", "tokenizer.json": "{}", "generation_config.json": "{}", "model-1.safetensors": "1", "model-2.safetensors": "2",
+           "model.safetensors.index.json": json.dumps({"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors", "c": "model-1.safetensors"}})}
+  for name, text in files.items(): (hub / name).write_text(text)
+  quiet = type("Quiet", (http.server.SimpleHTTPRequestHandler,), {"log_message": lambda *a: None})
+  hf = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(quiet, directory=str(tmp_path / "hub")))
+  threading.Thread(target=hf.serve_forever, daemon=True).start()
+  monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{hf.server_address[1]}")
+  folder = serve.fetch("org/model", str(tmp_path / "cache"))
+  assert sorted(os.listdir(folder)) == sorted([*files, ".done"]) and all((pathlib.Path(folder) / n).read_text() == t for n, t in files.items())
+  hf.shutdown()
+  assert serve.fetch("org/model", str(tmp_path / "cache")) == folder and serve.fetch(folder) == folder, "once, and a folder as is"
 
 @pytest.mark.skipif("LLAMA" not in os.environ, reason="LLAMA=/path/to/SmolLM-135M (Hugging Face HuggingFaceTB/SmolLM-135M) runs it")
 def test_llama_model(chip):
