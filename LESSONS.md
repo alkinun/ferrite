@@ -217,6 +217,11 @@ append a correction.
     held every one of them: Llama-3.1-8B's would have filled about 22 GB of a card's 32, and filled 24 GB of the host's
     memory under ttsim, which keeps each page it touches. Waiting for each cast leaves the formats and one matrix more.
     (`test_llama_precision`)
+33. **A value not yet computed is not one value.** Each kernel that reads it computes it again, and two kernels may round
+    it differently: a router's softmax, computed in the kernel of its max and again in the kernel that looked for the
+    column holding that max, came out an ulp apart, no column matched, and the expert index was 8 of 8. What lay past
+    the last expert's weights was small enough to pass in one layout of DRAM and not in another, so the model's test
+    failed alone and passed after others. What compares a value with itself computes it once first. (`test_moe`)
 
 ## Working method
 

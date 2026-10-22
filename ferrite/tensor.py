@@ -363,9 +363,11 @@ class Tensor:
   def topk(self, k):
     """tinygrad's along each row, largest first: (values, int32 indices), from k passes of the row's max, the first
     column that holds it (a minimum, as the max of negatives), and that column left out of the next (columns as bf16, so
-    at most 256: a mixture of experts' router)."""
+    at most 256: a mixture of experts' router). The rows are computed once first: two kernels may round a value not yet
+    computed differently (a matmul's softmax, in the kernel of its max, came out an ulp from its own), and then no
+    column holds the max."""
     assert self.cols <= 256, "columns numbered in bf16"
-    cols, x, out = Tensor.of(self.rt, [list(range(self.cols))]), self, []
+    cols, x, out = Tensor.of(self.rt, [list(range(self.cols))]), self.realize(), []
     for _ in range(k):
       m = x.max(2)
       i = -(x.eq(m).where(-cols, -self.cols)).max(2)
