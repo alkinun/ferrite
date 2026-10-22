@@ -1423,7 +1423,7 @@ def test_moe(chip):
 
 def test_qwen3_moe(chip, tmp_path):
   # Qwen3's mixture of experts as test/llama.py reads Hugging Face's files for it (transformers 5's config, RoPE's
-  # parameters in one place): a dense block, then one with a router and experts (a tensor each, stacked into one batch
+  # parameters in one place; a config cut to its first blocks reads only them): a dense block, then one with a router and experts (a tensor each, stacked into one batch
   # by fuse) weighted by their probabilities among all (norm_topk_prob off, transformers' default), RMSNorms on each
   # head of q and k, heads whose width the config gives (4 of 32 in a model 64 wide), and an output layer of its own.
   # Hugging Face's own model (transformers, float32, random bf16 weights) is the reference: numpy's logits within 0.5%
@@ -1439,6 +1439,9 @@ def test_qwen3_moe(chip, tmp_path):
   model.save_pretrained(tmp_path)
   ids = [3, 1, 4, 1, 5, 9, 2, 6]
   with torch.no_grad(): want = model(torch.tensor([ids])).logits[0].numpy()
+  (tmp_path / "config.json").write_text(json.dumps(json.loads((tmp_path / "config.json").read_text()) | {"num_hidden_layers": 1}))
+  assert not any(k.startswith("layers.1.") for k in llama.load(str(tmp_path), 32)[1]), "a config cut to its first block reads only it"
+  (tmp_path / "config.json").write_text(json.dumps(json.loads((tmp_path / "config.json").read_text()) | {"num_hidden_layers": 2}))
   c, weights = llama.load(str(tmp_path), 32)
   assert (c.k, llama.head(c)) == (2, 32) and {"router", "experts.gate_up", "experts.down", "qk_norm", "qk_on"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.1.")}
   rel = lambda got: max(np.abs(got[r] - want[r]).max() / np.abs(want[r]).max() for r in range(len(ids)))

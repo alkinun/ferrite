@@ -223,6 +223,7 @@ def load(folder, places=4096):
       if name == "__metadata__": continue
       name = name.removeprefix("model.").replace("self_attn.", "").replace("mlp.", "").replace("block_sparse_moe.", "").removesuffix(".weight")
       name = re.sub(r"(experts\.\d+)\.w([123])$", lambda m: m[1] + (".gate_proj", ".down_proj", ".up_proj")[int(m[2]) - 1], name)  # Mixtral's
+      if name.startswith("layers.") and int(name.split(".")[1]) >= c.layers: continue  # (a config cut to its first blocks)
       out[name] = Weight(functools.partial(gpt2.tensor_bits, data, t, name.endswith("_proj") or name == "lm_head"))
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = out.pop("lm_head", None) or Weight(lambda e=out["embed"]: np.ascontiguousarray(e.bits().T))  # tied, or its own
