@@ -1548,6 +1548,31 @@ t = Tensor.of(rts[0], x)  # 24 tiles: 6 chunks through the 2 slots, so the credi
 for ch, (_, back) in links_a.items():
   y = t.to(rts[1], ch, back)
   assert y.rt is rts[1] and y.tolist() == t.tolist() and (y * 2).to(rts[0], back, ch).tolist() == (t * 2).tolist(), ch
+import sys, numpy as np  # a model split across the two chips: its first block on chip 0, its second and its head on chip 1
+from types import SimpleNamespace
+sys.path.insert(0, "test")
+import gpt2, llama
+c, rng = SimpleNamespace(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
+draw = lambda mean, std, shape: gpt2.bf16_floats(gpt2.bf16_bits(rng.normal(mean, std, shape)))
+w = {f"layers.{l}.{k}": draw(*how) for l in range(2) for k, how in (("input_layernorm", (1, 0.1, (1, 128))), ("qkv_proj", (0, 0.05, (128, 256))),
+     ("o_proj", (0, 0.05, (128, 128))), ("post_attention_layernorm", (1, 0.1, (1, 128))), ("gate_up_proj", (0, 0.05, (128, 512))), ("down_proj", (0, 0.05, (256, 128))))}
+w |= {"norm": draw(1, 0.1, (1, 128)), "embed": draw(0, 1, (256, 128))}
+w |= {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, 32)))
+ids = [5, 17, 3, 200, 9]
+want = llama.forward(ids, list(range(5)), w, c, llama.kv_cache(c, 32, np.zeros))[0]
+up = [{k: Tensor.of(rt, v.tolist()) for k, v in w.items()} for rt in rts]
+places = [Tensor.of(rt, [list(range(5))], "int32") for rt in rts]
+caches = [llama.kv_cache(c, 32, llama.zeros(rt)) for rt in rts]
+f = llama.fns(up[0]["norm"])
+x = f.rows(up[0]["embed"], Tensor.of(rts[0], [ids], "int32"))
+ch, (_, back) = next(iter(links_a.items()))
+for l, n in ((0, 0), (1, 1)):
+  if x.rt is not rts[n]: x = x.to(rts[n], ch, back)  # the hidden state crosses the link
+  rotary = (f.rows(up[n]["cos"], places[n]), f.rows(up[n]["sin"], places[n]), up[n]["turn"])
+  p = {k[len(f"layers.{l}."):]: v for k, v in up[n].items() if k.startswith(f"layers.{l}.")}
+  x = llama.layer(x, p, c, rotary, gpt2.mask(places[n], 32), caches[n][l], places[n], l, True)
+got = llama.logits(f.mm(f.rows(llama.rms(x, up[1]["norm"], c.eps), [4]), up[1]["embed.T"], None))
+assert np.abs(got - want).max() < 0.02 * np.ptp(want) and got.argmax() == want.argmax(), (np.abs(got - want).max(), np.ptp(want))
 print("ok")
 """
 
@@ -1557,7 +1582,9 @@ def test_two_chips():
   # process, since one process has one libttsim): a runtime on each computes, Chip.links finds both links up on both
   # chips and pairs them (each side's peer the other's ASIC id and channel), Chip.send moves data across each link
   # both ways, from one Ethernet tile's L1 into the other's, a flag sent after it landing after it, and Tensor.to copies
-  # a tensor from one chip's DRAM into the other's across each link and back, kernels on both chips driving the links
+  # a tensor from one chip's DRAM into the other's across each link and back, kernels on both chips driving the links;
+  # and a model split across the two (its first block on one chip, its second and its head on the other, the hidden
+  # state crossing the link between them) gives numpy's logits for the whole model
   import subprocess
   run = subprocess.run([sys.executable, "-c", TWO_CHIPS], env=os.environ | {"TTSIM": os.environ["TTSIM2"]}, capture_output=True, text=True,
                        timeout=600, cwd=pathlib.Path(__file__).parent.parent)
