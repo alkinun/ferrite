@@ -296,6 +296,7 @@ class Tokenizer:
     pre = t.get("pre_tokenizer") or {}  # the split before BPE: tokenizer.json's own (Llama 3's), else SmolLM's
     split = [p["pattern"]["Regex"] for p in pre.get("pretokenizers", [pre]) if p.get("type") == "Split" and "Regex" in p.get("pattern", {})]
     self.split, self.pieces = python_regex(split[0] if split else SPLIT), {}
+    self.nfc = (t.get("normalizer") or {}).get("type") == "NFC"  # Qwen's: text composed first (an e and its accent as one letter)
 
   def bpe(self, piece):  # a piece's bytes as ids
     if piece not in self.pieces:
@@ -308,7 +309,7 @@ class Tokenizer:
     return self.pieces[piece]
   def encode(self, text, special=False):  # special: a special token's text in it is that token (a chat template's)
     if special: return [i for part in self.specials.split(text) if part for i in ([self.special[part]] if part in self.special else self.encode(part))]
-    return [i for piece in self.split.findall(text) for i in self.bpe(piece.encode())]
+    return [i for piece in self.split.findall(unicodedata.normalize("NFC", text) if self.nfc else text) for i in self.bpe(piece.encode())]
   def decode(self, ids): return b"".join(self.bytes[i] for i in ids).decode("utf-8", "replace")
 
 def main():
