@@ -1205,6 +1205,62 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+def group_kernel(rows, k, n):
+  """A mixture of experts' tokens grouped by expert (Tensor.group), args [first unit, units, the order's address, the
+  tiles', the places', then the choices' address, tile stride for rows, and tile offset]. BRISC alone, on one worker:
+  the choices (rows x k, values below n) come in, each value's are counted, its run of slots starts where the runs of
+  the values before it end, each rounded up to a whole tile, and each choice takes the next slot of its value's run.
+  The order (a row of the token each slot holds), the tiles (a column of each tile's value) and the places (a row of k
+  runs, each choice's slot) are built in L1 as plain arrays and sent a tile at a time, a row's tile holding the row
+  32 times and a column's the column, as every tensor's does."""
+  t, rp = -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32  # tiles of slots: enough for any choices; a run of places
+  start = DATA + -(-rows // 32) * 4096
+  out = (start + 4 * (2 * n + 33 * t + k * rp) + 63) // 64 * 64
+  assert out + 4096 <= OUTS, "the choices and their arrays in L1"
+  return compile_kernel(f"""
+#define IDS {DATA:#x}
+#define START {start:#x}
+#define FILL (START + {4 * n})
+#define ORDER (FILL + {4 * n})
+#define TILES (ORDER + {4 * 32 * t})
+#define PLACES (TILES + {4 * t})
+#define OUT {out:#x}
+{BANKS}
+static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
+static unsigned choice(unsigned r, unsigned j) {{ return ((volatile unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
+static void send(unsigned base, unsigned i) {{ noc_write(OUT, BANK(i), AT(base, i, 4096), 4096); noc_wait(); }}
+void kmain(volatile unsigned *a) {{
+  volatile unsigned *start = (volatile unsigned *)START, *fill = (volatile unsigned *)FILL, *order = (volatile unsigned *)ORDER;
+  volatile unsigned *tiles = (volatile unsigned *)TILES, *places = (volatile unsigned *)PLACES, *out = (volatile unsigned *)OUT;
+  if (!a[1]) return;
+  for (unsigned i = 0; i < {-(-rows // 32)}; i++) {{ unsigned u = a[7] + i * a[6]; noc_get(BANK(u), AT(a[5], u, 4096), IDS + i * 4096, 4096); }}
+  for (unsigned e = 0; e < {n}; e++) fill[e] = 0;
+  for (unsigned s = 0; s < {32 * t}; s++) order[s] = 0;
+  for (unsigned i = 0; i < {t}; i++) tiles[i] = 0;
+  for (unsigned s = 0; s < {k * rp}; s++) places[s] = 0;
+  noc_wait();
+  for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) fill[choice(r, j)]++;
+  for (unsigned e = 0, s = 0; e < {n}; e++) {{
+    start[e] = s;
+    for (unsigned end = s + (fill[e] + 31) / 32 * 32; s < end; s += 32) tiles[s / 32] = e;
+    fill[e] = start[e];
+  }}
+  for (unsigned r = 0; r < {rows}; r++)
+    for (unsigned j = 0; j < {k}; j++) {{ unsigned s = fill[choice(r, j)]++; order[s] = r; places[j * {rp} + r] = s; }}
+  for (unsigned i = 0; i < {t}; i++) {{  // the order and the places, rows; the tiles, a column
+    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = order[i * 32 + c];
+    send(a[2], i);
+  }}
+  for (unsigned i = 0; i < {-(-t // 32)}; i++) {{
+    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = i * 32 + r < {t} ? tiles[i * 32 + r] : 0;
+    send(a[3], i);
+  }}
+  for (unsigned i = 0; i < {k * rp // 32}; i++) {{
+    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = places[i * 32 + c];
+    send(a[4], i);
+  }}
+}}""")
+
 def readback_kernel(dtype):
   """A tensor's tiles into host memory (Runtime.back) for tobytes, since a read of DRAM over the BARs waits on PCIe for
   each load: args [first unit, units, the first tile, the tensor's address, tile strides for batch and row, tile offset,

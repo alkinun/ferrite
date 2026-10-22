@@ -1383,14 +1383,15 @@ def test_topk(chip):
 def test_moe(chip):
   # a mixture of experts in the MLP's place (llama.moe): a token's router logits choose its k experts on the chip
   # (topk), matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen
-  # logits and summed, as numpy does for one token and for three; and a two-block model of them decodes from a replay
-  # (tensor.jit) bit for bit as it does op by op, so a replayed step reads whatever experts its token chose, and near numpy
+  # logits and summed, as numpy does for one token and for three (a batch entry each token and expert) and for 40 (each
+  # expert's tokens grouped into tiles, Tensor.group); and a two-block model of them decodes from a replay (tensor.jit)
+  # bit for bit as it does op by op, so a replayed step reads whatever experts its token chose, and near numpy
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
   experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
   c, w = SimpleNamespace(dim=64, k=4), experts(64, 16, 64)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
-  for n in (1, 3):
+  for n in (1, 3, 40):
     h = bf16(rng.normal(0, 1, (n, 64)))
     got, want = value(llama.moe(Tensor.of(rt, h.tolist()), t, c))[0], llama.moe(h, w, c)
     assert np.abs(got - want).max() < 0.02 * np.abs(want).max(), (n, np.abs(got - want).max())

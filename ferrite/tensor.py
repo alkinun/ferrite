@@ -5,7 +5,7 @@
 import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
-from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel, transpose_kernel
+from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -370,6 +370,21 @@ class Tensor:
     values.addr, ids.addr = values._alloc(), ids._alloc()
     return values._run(_cached(("topk", k, x.cols), lambda: topk_kernel(k, x.cols)), values.addr, ids.addr, *x._where(), x.rows,
                        units=x.batch * -(-x.rows // 32), name="topk"), ids
+  def group(self, n):
+    """A mixture of experts' tokens grouped by expert, from int32 choices (rows x k, values below n), as three int32
+    tensors: order, a row of 32 t slots in which each value's choices have a run of whole tiles (t enough for any
+    choices: a tile for every 32, and one more for each value that can come), each slot the row it holds (0 for none);
+    tiles, a column of t, each tile's value (0 past those used); places, a row of k runs, each of the rows rounded up to
+    a tile, run j holding the slot of each row's choice j. Each expert's tokens are then a batch entry of whole tiles
+    for a matmul that picks its weights (index=tiles). By one kernel of BRISC's alone (group_kernel)."""
+    assert self.dtype == "int32" and self.batch == 1 and self.cols <= 32, "a matrix of int32 choices, at most 32 a row"
+    x, rows, k = _plain(self.realize()), self.rows, self.cols
+    t, rp = -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32
+    order, tiles, places = Tensor(self.rt, 1, 32 * t, dtype="int32"), Tensor(self.rt, t, 1, dtype="int32"), Tensor(self.rt, 1, k * rp, dtype="int32")
+    for u in (order, tiles, places): u.addr = u._alloc()
+    order._run(_cached(("group", rows, k, n), lambda: group_kernel(rows, k, n)), order.addr, tiles.addr, places.addr, x.addr, x.stride, x.offset,
+               units=1, name="group")
+    return order, tiles, places
   def softmax(self, axis=-1):  # max first, so exp stays in range
     e = (self - self.max(axis)).exp()
     return e / e.sum(axis)

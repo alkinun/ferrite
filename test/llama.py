@@ -23,11 +23,10 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a),
                            silu=lambda a: a / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0), mm=lambda a, b, phases: a @ b,
                            topk=lambda a, k: (np.take_along_axis(a, i := np.argsort(-a, -1, kind="stable")[..., :k], -1), i),
-                           pick=lambda a, w, ids, phases: np.stack([a[b % len(a)] @ w[i] for b, i in enumerate(ids.flat)]),  # (a batch of 1 repeats)
-                           cat=lambda xs: np.concatenate(xs))
+                           experts=numpy_experts, cat=lambda xs: np.concatenate(xs))
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, repeat=Tensor.repeat_interleave,
                          mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's products are exact at any phases
-                         pick=lambda a, w, ids, phases: a.matmul(w, fidelity=phases, index=ids), cat=lambda xs: xs[0].cat(*xs[1:]))
+                         experts=chip_experts, cat=lambda xs: xs[0].cat(*xs[1:]))
 
 def precision(c, mode="bf16"):
   """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
@@ -79,17 +78,36 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
 
 def moe(h, p, c, phases=lambda op: None):
   """A mixture of experts in the MLP's place (Qwen3's, Mixtral's): each token's router logits, its c.k best experts
-  (topk, on the chip), their SwiGLUs by matmuls that pick each one's weights where they lie (a batch entry a token and
-  expert: the token's row by its expert's matrix), weighted by the softmax of their logits (which Qwen3's top-k
-  probabilities, renormalized, are too) and summed. p: router (dim x experts), experts.gate_up and experts.down (a
-  batch of the experts' matrices); phases(op): the fidelity phases of the experts' gate_up and down."""
-  f, n, k, m, norm = fns(h), h.shape[-2], c.k, p["experts.down"].shape[-2], getattr(c, "norm_topk", True)
+  (topk, on the chip), and their SwiGLUs weighted by the softmax of their logits (which Qwen3's top-k probabilities,
+  renormalized, are too) and summed. p: router (dim x experts), experts.gate_up and experts.down (a batch of the
+  experts' matrices); phases(op): the fidelity phases of the experts' gate_up and down."""
+  f, norm = fns(h), getattr(c, "norm_topk", True)
   logits = f.mm(h, p["router"], None)  # (without norm_topk_prob, the chosen experts' probabilities among all, as they are)
-  values, ids = f.topk(logits if norm else f.softmax(logits), k)
-  x = h.reshape(n, 1, h.shape[-1])
-  gate_up = f.pick(f.repeat(x, k) if n > 1 else x, p["experts.gate_up"], ids, phases("gate_up"))
-  y = f.pick(f.silu(gate_up[:, :, :m]) * gate_up[:, :, m:], p["experts.down"], ids, phases("down"))
-  return (y * (f.softmax(values) if norm else values).reshape(n * k, 1, 1)).reshape(n, k, y.shape[-1]).sum(1).reshape(n, y.shape[-1])
+  values, ids = f.topk(logits if norm else f.softmax(logits), c.k)
+  return f.experts(h, p["experts.gate_up"], p["experts.down"], ids, f.softmax(values) if norm else values, (phases("gate_up"), phases("down")))
+
+def numpy_experts(h, gate_up, down, ids, w, phases):  # each token's chosen experts' SwiGLUs, weighted by w and summed
+  m = down.shape[-2]
+  swiglu = lambda g: g[:m] / (1 + np.exp(-g[:m])) * g[m:]
+  return np.stack([sum(w[t, j] * (swiglu(h[t] @ gate_up[e]) @ down[e]) for j, e in enumerate(ids[t])) for t in range(len(h))])
+
+def chip_experts(h, gate_up, down, ids, w, phases):
+  """numpy_experts on the chip, by matmuls that pick each expert's weights where they lie (index=). For a few tokens (a
+  decode step) a batch entry for each token and expert, the token's row by its expert's matrices; for more choices
+  than twice the experts (a prompt), each expert's tokens grouped into whole tiles (Tensor.group), a batch entry for
+  each tile, so its weights are read once for every 32 of its tokens rather than once for each. Either replays."""
+  (n, k), m, dim = ids.shape[1:], down.rows, down.cols
+  if n * k <= 2 * gate_up.batch:
+    x = h.reshape(n, 1, dim)
+    gate_up = (x.repeat_interleave(k) if n > 1 else x).matmul(gate_up, fidelity=phases[0], index=ids)
+    y = (gate_up[:, :, :m].silu() * gate_up[:, :, m:]).matmul(down, fidelity=phases[1], index=ids)
+    return (y * w.reshape(n * k, 1, 1)).reshape(n, k, dim).sum(1).reshape(n, dim)
+  order, tiles, places = ids.group(gate_up.batch)
+  gate_up = h.gather(order).split(tiles.rows, 0).matmul(gate_up, fidelity=phases[0], index=tiles)
+  y = (gate_up[:, :, :m].silu() * gate_up[:, :, m:]).matmul(down, fidelity=phases[1], index=tiles).reshape(order.cols, dim)
+  run = places.cols // k  # choice j's places
+  terms = [y.gather(places[:, :, j * run:j * run + n]) * w[:, :, j:j + 1] for j in range(k)]
+  return sum(terms[1:], terms[0])
 
 def frequencies(c):  # RoPE's, a head's half of them, in fp32 as Hugging Face computes them; with Llama 3's scaling
   hd = head(c)  # (rope_type llama3), long wavelengths slowed down by its factor, short ones kept, and those
