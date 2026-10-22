@@ -1160,8 +1160,9 @@ void kmain(volatile unsigned *a) {{
 def topk_kernel(k, cols):
   """Each row's k largest of its cols (at most 256) and their columns, the first of equals first, args [first unit,
   units, the values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows].
-  BRISC alone, a unit one tile row of x: its tiles come in, and each row is scanned k times, a column left out once
-  picked. bf16 compares as an integer once its sign orders it (negatives flipped, -0 as 0). The values' tile (bf16) and
+  BRISC alone, a unit one tile row of x: its tiles come in, and each row is scanned once, its k best so far kept in
+  order, each new one larger than the last moving up past the smaller ones (an equal one stays behind, so the first of
+  equals comes first). bf16 compares as an integer once its sign orders it (negatives flipped, -0 as 0). The values' tile (bf16) and
   the indices' (int32) are written whole: zeros past the rows and the k columns, but a dimension of 1 fills its tile
   with copies, as every tensor's does."""
   ct = -(-cols // 32)
@@ -1183,18 +1184,16 @@ void kmain(volatile unsigned *a) {{
     for (unsigned i = 0; i < 1024; i++) values[i] = 0, ids[i] = 0;
     noc_wait();
     unsigned n = rows == 1 ? 1 : rows - t % tr * 32 < 32 ? rows - t % tr * 32 : 32;  // x's rows in this tile row
-    for (unsigned r = 0; r < n; r++) {{
-      unsigned taken[{ct}];
-      for (unsigned j = 0; j < {ct}; j++) taken[j] = 0;
-      for (unsigned j = 0; j < {k}; j++) {{
-        unsigned best = {cols}, top = 0;
-        for (unsigned c = 0; c < {cols}; c++) {{
-          unsigned v = key(x[c / 32 * 1024 + at(r, c % 32)]);
-          if (!(taken[c / 32] >> c % 32 & 1) && (best == {cols} || v > top)) best = c, top = v;
-        }}
-        taken[best / 32] |= 1u << best % 32;
-        values[at(r, j)] = x[best / 32 * 1024 + at(r, best % 32)], ids[at(r, j)] = best;
+    for (unsigned r = 0; r < n; r++) {{  // its k best so far, in order
+      unsigned top[{k}], col[{k}], kept = 0;
+      for (unsigned c = 0; c < {cols}; c++) {{
+        unsigned v = key(x[c / 32 * 1024 + at(r, c % 32)]);
+        if (kept == {k} && v <= top[{k} - 1]) continue;  // no better than the last kept (an equal one, later, stays behind)
+        unsigned i = kept < {k} ? kept++ : {k} - 1;
+        for (; i > 0 && top[i - 1] < v; i--) top[i] = top[i - 1], col[i] = col[i - 1];
+        top[i] = v, col[i] = c;
       }}
+      for (unsigned j = 0; j < {k}; j++) values[at(r, j)] = x[col[j] / 32 * 1024 + at(r, col[j] % 32)], ids[at(r, j)] = col[j];
     }}
     for (unsigned r = 0; r < 32; r++)  // one row of x fills the tile with copies of its row, k of 1 with copies of its column
       for (unsigned c = 0; c < 32; c++)
