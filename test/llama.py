@@ -130,17 +130,20 @@ def prefill(ids, w, c, caches, chunk, on=lambda row: row):
 def kv_cache(c, size, zeros):  # each block's keys' heads then its values', a row for each of size places, made by zeros(shape)
   return [zeros((2 * c.kv, size, c.dim // c.heads)) for _ in range(c.layers)]
 
+def read_json(path):
+  with open(path, encoding="utf-8") as f: return json.load(f)
+
 def load(folder, places=4096):
   """The config, and {name: Weight} from model.safetensors, or from the files model.safetensors.index.json names (each 8
   bytes of header size, a JSON header naming each tensor's dtype, shape and byte range, then the data), named without
   "model.", linear weights transposed (so x @ w), vectors as one-row matrices; the output layer is the embedding unless
   the model has its own (lm_head). RoPE's tables have a row for each of the first `places` places (at most the model's)."""
-  j = json.load(open(os.path.join(folder, "config.json")))
+  j = read_json(os.path.join(folder, "config.json"))
   c = SimpleNamespace(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=j["num_hidden_layers"],
                       eps=j["rms_norm_eps"], theta=j["rope_theta"], places=min(j["max_position_embeddings"], places),
                       rope=j.get("rope_scaling"), vocab=j["vocab_size"], ffn=j["intermediate_size"])
   index = os.path.join(folder, "model.safetensors.index.json")
-  files = sorted(set(json.load(open(index))["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
+  files = sorted(set(read_json(index)["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
   out = {}
   for file in files:
     header, data = gpt2.safetensors(os.path.join(folder, file))
@@ -247,7 +250,7 @@ class Tokenizer:
   that is not a token itself merged a pair of parts at a time, the lowest-ranked first (ids are in merge order, so they
   are the ranks). Special tokens in the text are taken as text."""
   def __init__(self, folder):
-    t = json.loads(open(os.path.join(folder, "tokenizer.json"), encoding="utf-8").read())
+    t = read_json(os.path.join(folder, "tokenizer.json"))
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
     byte = dict(zip(map(chr, bs + [256 + i for i in range(256 - len(bs))]), bs + [b for b in range(256) if b not in bs]))
     special = {a["content"]: a["id"] for a in t["added_tokens"]}
