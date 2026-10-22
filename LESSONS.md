@@ -222,6 +222,11 @@ append a correction.
     column holding that max, came out an ulp apart, no column matched, and the expert index was 8 of 8. What lay past
     the last expert's weights was small enough to pass in one layout of DRAM and not in another, so the model's test
     failed alone and passed after others. What compares a value with itself computes it once first. (`test_moe`)
+34. **Small, irregular work belongs on the RISC-V cores.** A router's top 8 of 128 as passes of the Tensix's max took 42
+    launches, 2000 a decode token of Qwen3-30B-A3B, and compared values that two kernels rounded apart; thirty lines of
+    C on BRISC, each row scanned k times, take one launch and compare the stored bits. Grouping a prompt's tokens by
+    expert, a counting sort, went the same way. The Tensix is for tiles; a few thousand scalar steps go to the core
+    that already moves the tiles. (`test_topk`)
 
 ## Working method
 
