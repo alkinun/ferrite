@@ -129,9 +129,9 @@ def chip_experts(h, p, ids, w, phases, limit=None):
     order, picks, places = ids.group(gate_up.batch)
     x = h.gather(order).split(picks.rows, 0)
   else: x, picks = h.reshape(n, 1, dim) if n == 1 else h.reshape(n, 1, dim).repeat_interleave(k), ids
-  def plus(y, name):  # each entry's expert's bias, if it has one
-    if name not in p: return y
-    return y + p[name].gather(picks.reshape(1, picks.rows * picks.cols)).reshape(picks.rows * picks.cols, 1, p[name].cols)
+  entries = picks.rows * picks.cols
+  row = picks.reshape(1, entries) if {"experts.gate_up_bias", "experts.down_bias"} & set(p) else None  # the picks as a row, to gather biases by
+  plus = lambda y, name: y + p[name].gather(row).reshape(entries, 1, p[name].cols) if name in p else y  # each entry's expert's bias
   x = plus(x.matmul(gate_up, fidelity=phases[0], index=picks), "experts.gate_up_bias")
   y = plus(glu(x[:, :, :m], x[:, :, m:], limit).matmul(down, fidelity=phases[1], index=picks), "experts.down_bias")
   if picks is ids: return (y * w.reshape(n * k, 1, 1)).reshape(n, k, dim).sum(1).reshape(n, dim)
