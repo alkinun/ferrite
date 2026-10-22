@@ -1672,7 +1672,8 @@ def test_serve(chip, tmp_path):
   # the others' tokens keep coming. A request ends at a stop string (without its text), at an end-of-sequence token,
   # or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP, /v1/completions
   # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
-  # template
+  # template; a thinking model's reasoning comes apart from its answer, whole and streamed, or not at all when it is
+  # told not to think
   import threading, urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -1731,6 +1732,22 @@ def test_serve(chip, tmp_path):
   assert serve.chat("... <|im_start|> ...", hi) == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
   assert serve.chat("... <|start_header_id|> ...", hi[1:]) == ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"
                                                                "<|start_header_id|>assistant<|end_header_id|>\n\n")
+  think = serve.server(engine, "smol", "<|im_start|> <think>", port=0)  # a thinking model's template (Qwen3's)
+  threading.Thread(target=think.serve_forever, daemon=True).start()
+  ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{think.server_address[1]}/v1/chat/completions", json.dumps(body).encode(),
+                                                                   {"Content-Type": "application/json"}), timeout=600)
+  r = serve.Request(tok, tok.encode(serve.chat("<|im_start|> <think>", hi[1:]), special=True), 6, 0)
+  engine.waiting.put(r)
+  text, body = tok.decode(done(r)), {"messages": hi[1:], "max_tokens": 6, "temperature": 0}
+  assert json.load(ask(body))["choices"][0]["message"] == {"role": "assistant", "reasoning_content": text.strip(), "content": ""}  # no </think> came
+  events = [json.loads(line[6:]) for line in ask(body | {"stream": True}).read().decode().split("\n\n") if line.startswith("data: {")]
+  assert "".join(e["choices"][0]["delta"].get("reasoning_content", "") for e in events) == text.strip() and not any("content" in e["choices"][0]["delta"] for e in events)
+  off = len(tok.encode(serve.chat("<|im_start|> <think>", hi[1:], False), special=True))  # not thinking: the prompt's reasoning given, empty,
+  with pytest.raises(urllib.error.HTTPError) as e: ask(body | {"chat_template_kwargs": {"enable_thinking": False}})  # too long for these slots
+  assert json.load(e.value)["error"]["message"].startswith(f"{off} tokens")
+  think.shutdown()
+  assert serve.chat("<|im_start|> <think>", hi[1:], False) == "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  assert serve.answer("<think>\nLet me see.\n</think>\n\nHi!") == ("Let me see.", "Hi!") and serve.answer("<think>\nHm") == ("Hm", "")
 
 def test_fetch(tmp_path, monkeypatch):
   # serve.fetch: a model id's files from Hugging Face's resolve URLs (a local server in its place, by HF_ENDPOINT), the
