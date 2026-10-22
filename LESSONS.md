@@ -212,6 +212,11 @@ append a correction.
     heaviest branch, which in an RMSNorm over a long residual stream is its sum of squares: the stream was added up in
     two kernels and the norm took three. Computing first the value two of its ops read made it two, and a SmolLM token
     25 launches fewer. (NOTES: "Next for the compiler")
+32. **Freed is not reused.** DRAM a launch may still read goes back only once that launch is done, and an allocation
+    takes fresh room while there is any, so a loader that freed each bf16 weight right after queueing its cast still
+    held every one of them: Llama-3.1-8B's would have filled about 22 GB of a card's 32, and filled 24 GB of the host's
+    memory under ttsim, which keeps each page it touches. Waiting for each cast leaves the formats and one matrix more.
+    (`test_llama_precision`)
 
 ## Working method
 
