@@ -49,10 +49,10 @@ in bfp8), each token the one numpy picks. Mixtures of experts run with their exp
 a RISC-V core takes each token's best experts, matmuls read the chosen experts' weights where they lie, and a prompt's
 tokens are grouped by expert, so a decode step replays with whatever experts its tokens pick. Qwen3-30B-A3B's first two
 blocks, with its real weights, pick numpy's token at every place of a prompt and decode as numpy does. `test/llama.py`
-reads Llama's, Mistral's, Qwen2's and Qwen3's checkpoints, and Mixtral's, Qwen2-MoE's and Qwen3-MoE's, each checked
-against transformers' own model. Two chips (ttsim's two-chip build) find their Ethernet links and copy a tensor from
-one's DRAM to the other's across one, kernels on both chips driving it, with no code on the Ethernet tiles
-(`Tensor.to`).
+reads Llama's, Mistral's, Qwen2's and Qwen3's checkpoints, and Mixtral's, Qwen2-MoE's, Qwen3-MoE's and gpt-oss's (its
+MXFP4 experts too), each checked against transformers' own model. Two chips (ttsim's two-chip build) find their
+Ethernet links and copy a tensor from one's DRAM to the other's across one, kernels on both chips driving it, with no
+code on the Ethernet tiles (`Tensor.to`).
 
 Serving: `test/serve.py` is an OpenAI-compatible server (`/v1/completions`, `/v1/chat/completions`, whole or streamed)
 for these models, from a folder or a Hugging Face model id; a thinking model's reasoning (Qwen3's) comes apart from its
