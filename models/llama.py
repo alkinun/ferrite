@@ -383,13 +383,9 @@ def states(c, caches, u):  # caches made for several sequences as sequence u's a
 def read_json(path):
   with open(path, encoding="utf-8") as f: return json.load(f)
 
-def load(folder, places=4096):
-  """The config, and {name: Weight} from model.safetensors, or from the files model.safetensors.index.json names (each 8
-  bytes of header size, a JSON header naming each tensor's dtype, shape and byte range, then the data), named without
-  "model.", linear weights transposed (so x @ w), vectors as one-row matrices; the output layer is the embedding unless
-  the model has its own (lm_head); a mixture of experts' as fuse stacks them. RoPE's tables have a row for each of the first
-  `places` places (at most the model's). A model that also sees images (Qwen3.5's, Qwen3.6's) is read as its language
-  model: its vision tower, and its multi-token prediction layer, are left out."""
+def config(folder, places=4096):
+  """A model's config.json as models/llama.py reads it (a model that also sees images: its language model's). places:
+  the most places RoPE's tables need rows for (at most the model's)."""
   j = read_json(os.path.join(folder, "config.json"))
   j = j.get("text_config", j)
   rope = j.get("rope_parameters") or (j.get("rope_scaling") or {}) | {"rope_theta": j["rope_theta"]}  # transformers 5's, else the two before it
@@ -406,7 +402,21 @@ def load(folder, places=4096):
                       limit=j.get("swiglu_limit", 7.0 if j.get("model_type") == "gpt_oss" else None),  # gpt-oss's GLU
                       sliding=j.get("sliding_window") if j.get("use_sliding_window", True) else None,
                       partial=partial, gated=j.get("attn_output_gate", qwen35), centered=qwen35, conv=j.get("linear_conv_kernel_dim"),  # Qwen3.5's
-                      kh=j.get("linear_num_key_heads"), vh=j.get("linear_num_value_heads"), kd=j.get("linear_key_head_dim"), vd=j.get("linear_value_head_dim"))
+                      kh=j.get("linear_num_key_heads"), vh=j.get("linear_num_value_heads"), kd=j.get("linear_key_head_dim"), vd=j.get("linear_value_head_dim"),
+                      experts=j.get("num_experts") or j.get("num_local_experts"), tied=j.get("tie_word_embeddings", False),  # (what the cost model reads)
+                      moe=j.get("moe_intermediate_size") or ((j.get("num_experts") or j.get("num_local_experts")) and j.get("intermediate_size")),
+                      shared=j.get("shared_expert_intermediate_size"), mtp=j.get("mtp_num_hidden_layers", 0),
+                      dense=[l for l in range(j["num_hidden_layers"]) if l in j.get("mlp_only_layers", []) or (l + 1) % j.get("decoder_sparse_step", 1)])
+  return c
+
+def load(folder, places=4096):
+  """The config (config), and {name: Weight} from model.safetensors, or from the files model.safetensors.index.json
+  names (each 8 bytes of header size, a JSON header naming each tensor's dtype, shape and byte range, then the data),
+  named without "model.", linear weights transposed (so x @ w), vectors as one-row matrices; the output layer is the
+  embedding unless the model has its own (lm_head); a mixture of experts' as fuse stacks them. RoPE's tables have a row
+  for each of the first `places` places (at most the model's). A model that also sees images (Qwen3.5's, Qwen3.6's) is
+  read as its language model, its vision tower left out; its multi-token prediction layer is a block past the last."""
+  c = config(folder, places)
   index = os.path.join(folder, "model.safetensors.index.json")
   files = sorted(set(read_json(index)["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
   out, tensors = {}, {}

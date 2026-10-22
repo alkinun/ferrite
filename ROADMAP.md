@@ -94,8 +94,13 @@ first (NOTES, "Bring-up on a p150").
 - [x] **Speculative decoding** with its multi-token prediction layer, a rejected draft's DeltaNet states put back
   (NOTES, "Qwen3.5's and Qwen3.6's language models", "Serving"); how many drafts the real layer gets right waits for
   the whole model.
-- [ ] **The cost model**: what a model reads and holds a token and how many sessions a card keeps, and with the probe's
-  numbers, tokens/s and dollars a million tokens.
+- [x] **The cost model**: what a model reads and holds a token and how many sessions a card keeps, and with the probe's
+  numbers, tokens/s and dollars a million tokens (`models/cost.py`; NOTES, "The cost model").
+- [ ] **Attention over a session's own rows** in a batched step, where it reads every session's: four times the step at
+  eight users with 32K-token sessions.
+- [ ] **Fewer launches a Gated DeltaNet block** than its 86 (the chunk's small ops, a kernel each): a quarter of a
+  one-user step.
+- [ ] **Qwen3.6's KV cache in bfp8**, its token accuracy kept: a session's rows, most of what a step reads, halved.
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode; the whole model is 72 GB
   in bf16, and the token accuracy waits for it on a disk with room.

@@ -102,8 +102,8 @@ is on a real card waits for one; `COMPARE.md` has the numbers and what carries o
   tile's five cores: BRISC's moves tiles in and out, and one for each TRISC feeds the unpack, math or pack thread.
 - `ferrite/bh.py`: Blackhole's facts as data: addresses, limits, instruction and config encodings.
 - `adapters/tinygrad_ferrite.py`: tinygrad on ferrite, and PyTorch through tinygrad's frontend.
-- `models/`: GPT-2 and the Llama-family models (`gpt2.py`, `llama.py`), written once for ferrite and numpy, and the
-  OpenAI-compatible server for them (`serve.py`).
+- `models/`: GPT-2 and the Llama-family models (`gpt2.py`, `llama.py`), written once for ferrite and numpy, the
+  OpenAI-compatible server for them (`serve.py`), and what one costs to serve on a card (`cost.py`).
 - `test/`: every step on the simulator (`test_sim.py`), training, and the benchmarks.
 
 ## Docs

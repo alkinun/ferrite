@@ -8,7 +8,7 @@ from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "models"))  # (gpt2, llama, serve)
-import benchmark, gpt2, llama, serve, train
+import benchmark, cost, gpt2, llama, serve, train
 from types import SimpleNamespace
 
 def bf16(a, packer=False):  # numpy, rounded to bf16 and back: to nearest even as we upload, or half up as the packer does
@@ -2138,6 +2138,41 @@ def test_chat_tools(tmp_path):
   assert "".join(e["delta"].get("content", "") for e in events).strip() == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
   assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
   http.shutdown()
+
+def test_cost(tmp_path):
+  # models/cost.py from a config alone: Qwen3.6-35B-A3B's 35.5B parameters (its multi-token prediction layer's 0.9B
+  # among them) and 2.95B a token, about 21.7 GB with its experts in bfp4, its KV cache rows 20 KB a token (10 attention
+  # blocks of 2 key and value heads of 256) and Gated DeltaNet states 66 MB a session (30 blocks of 32 heads' 128 x 128
+  # in fp32 and the conv's last 3 inputs), each to the byte; Llama-3.1-8B in Tenstorrent's performance precision reads
+  # COMPARE's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
+  # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; ferrite's batched
+  # attention today reads every session's rows, never less; the probe's numbers, read from its file, give the rates
+  qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
+          "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
+          "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
+          "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "mtp_num_hidden_layers": 1,
+          "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 10, "model_type": "qwen3_5_moe_text",
+          "rope_parameters": {"rope_theta": 1e7, "partial_rotary_factor": 0.25, "rope_type": "default"}}}
+  llama8b = {"hidden_size": 4096, "num_attention_heads": 32, "num_key_value_heads": 8, "num_hidden_layers": 32, "rms_norm_eps": 1e-5,
+             "max_position_embeddings": 131072, "vocab_size": 128256, "intermediate_size": 14336, "rope_theta": 5e5}
+  for name, j in (("qwen", qwen), ("llama", llama8b)): (tmp_path / name).mkdir(); (tmp_path / name / "config.json").write_text(json.dumps(j))
+  c = llama.config(str(tmp_path / "qwen"))
+  s, use = cost.shape(c, "experts"), dict(cost.USE)
+  assert 35.4e9 < s.held < 35.6e9 and 2.9e9 < s.values < 3.0e9 and 21.5e9 < s.bytes < 21.9e9, (s.held, s.values, s.bytes)
+  one = cost.session(c, use | {"context": 1})
+  assert (one.kv, one.state) == (10 * 2 * 2 * 256 * 2, 30 * 4 * (32 * 128 * 128 + 3 * (2 * 16 * 128 + 32 * 128)))
+  l8 = llama.config(str(tmp_path / "llama"))
+  read = cost.shape(l8, "bfp4").every + cost.session(l8, use | {"context": 612.5, "kv": "bfp8"}).kv
+  assert abs(read / 6.20e9 - 1) < 0.02, read
+  card = dict(cost.CARD)
+  t = cost.step(c, s, use, card, 4)
+  assert t.today >= t.reads and t.late >= t.seconds and math.isclose(cost.hourly(card) / (4 * t.rate * 3600) * 1e6, cost.hourly(card) / (4 / t.seconds) / 3600 * 1e6)
+  (tmp_path / "probe.json").write_text(json.dumps({"DRAM reads, 4 in flight: all workers": 300.0, "DRAM reads, 8 in flight: all workers": 420.0,
+                                                   "matmul step, 1 phase, unpacks included": 16.0, "launch, 100 queued: chip each": 2700.0,
+                                                   "upload over PCIe": 20.0, "read back over PCIe": 12.0}))
+  measured = cost.probed(card, str(tmp_path / "probe.json"))
+  assert measured["bandwidth"] == 420e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
+  assert "a prompt token" in cost.report(str(tmp_path / "qwen"), "experts", context="8192", kv="bfp8")
 
 def test_fetch(tmp_path, monkeypatch):
   # serve.fetch: a model id's files from Hugging Face's resolve URLs (a local server in its place, by HF_ENDPOINT), the

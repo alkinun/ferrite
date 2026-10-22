@@ -6,8 +6,8 @@
 # router's choices are cheap enough on a RISC-V core. Small kernels built from the compiler's own pieces, timed by the tile's
 # wall clock. On ttsim the numbers mean nothing (Tensix instructions take no time there, the NoC and DRAM answer at once):
 # it only checks that each probe runs.
-#   TTSIM=/path/to/libttsim.so python3 -m ferrite.probe [MiB]   # MiB: how much to upload and read back (8)
-import functools, sys, time
+#   TTSIM=/path/to/libttsim.so python3 -m ferrite.probe [MiB] [out.json]   # MiB: how much to upload and read back (8); out.json:
+import functools, json, sys, time                                            # the numbers, for models/cost.py
 from ferrite import bh, pci
 from ferrite.chip import Chip
 from ferrite.compiler import (BANKS, DST_HALF, FRAMES, MATH_END, _math, _packer, _unpacker, allocate, kernel_config, math_begin,
@@ -134,5 +134,6 @@ if __name__ == "__main__":
   chip = Chip(pci.open_device())
   sim = isinstance(chip.pci, pci.Sim)
   print("ttsim: these numbers check that each probe runs, they are not silicon's" if sim else f"{chip.pci.sys}: the card")
-  for what, value, against, unit in probe(chip, upload=(int(sys.argv[1]) if len(sys.argv) > 1 else 8) << 20):
-    print(f"  {what:48s} {value:12.2f} {unit:9s}" + (f" (bound: {against})" if against is not None else ""))
+  rows = probe(chip, upload=(int(sys.argv[1]) if len(sys.argv) > 1 else 8) << 20)
+  for what, value, against, unit in rows: print(f"  {what:48s} {value:12.2f} {unit:9s}" + (f" (bound: {against})" if against is not None else ""))
+  if len(sys.argv) > 2: json.dump({what: value for what, value, _, _ in rows}, open(sys.argv[2], "w"), indent=1)
