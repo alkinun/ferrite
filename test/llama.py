@@ -263,8 +263,10 @@ class Tokenizer:
   def bpe(self, piece):  # a piece's bytes as ids
     if piece not in self.pieces:
       parts = [piece] if piece in self.ranks else [piece[i:i + 1] for i in range(len(piece))]
-      while len(parts) > 1 and (best := min((self.ranks.get(a + b, math.inf), i) for i, (a, b) in enumerate(zip(parts, parts[1:]))))[0] < math.inf:
-        parts[best[1]:best[1] + 2] = [parts[best[1]] + parts[best[1] + 1]]
+      while len(parts) > 1:
+        rank, i = min((self.ranks.get(a + b, math.inf), i) for i, (a, b) in enumerate(zip(parts, parts[1:])))
+        if rank == math.inf: break
+        parts[i:i + 2] = [parts[i] + parts[i + 1]]
       self.pieces[piece] = [self.ranks[p] for p in parts]
     return self.pieces[piece]
   def encode(self, text): return [i for piece in self.split.findall(text) for i in self.bpe(piece.encode())]
