@@ -1046,16 +1046,15 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   image = compile_kernel(brisc, _unpacker(program(U), config), _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 
-def _rows(dtype):  # C shared by gather and move: the banks, copies inside this L1, and a row filling its tile
-  face, run = tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a face, and in a face's row
-  return BANKS + f"""
-static void copy(unsigned from, unsigned to, unsigned n) {{ noc_get(noc_me() & 63, noc_me() >> 6, from, to, n); }}
-static void row_down(unsigned tile) {{  // row 0 of faces 0 and 1 down their 16 rows, then faces 0-1 onto 2-3
+ROWS = BANKS + """
+static void copy(unsigned from, unsigned to, unsigned n) { noc_get(noc_me() & 63, noc_me() >> 6, from, to, n); }
+static void row_down(unsigned tile, unsigned item) {  // a tile of item-byte values: row 0 of faces 0 and 1 down their 16 rows,
+  unsigned face = 256 * item;                         // then faces 0-1 onto 2-3
   l1_settle(tile);
-  for (unsigned n = {run}; n < {face}; n *= 2) {{ copy(tile, tile + n, n); copy(tile + {face}, tile + {face} + n, n); noc_wait(); }}
-  copy(tile, tile + {2 * face}, {2 * face});
+  for (unsigned n = 16 * item; n < face; n *= 2) { copy(tile, tile + n, n); copy(tile + face, tile + face + n, n); noc_wait(); }
+  copy(tile, tile + 2 * face, 2 * face);
   noc_wait();
-}}"""
+}"""  # C shared by the kernels of BRISC's alone: the banks, copies inside this L1, and a row filling its tile
 
 def gather_kernel(dtype):
   """Rows of a tensor into a new one, args [first unit, units, out, the tensor's address, tile stride, tile offset, the
@@ -1069,7 +1068,7 @@ def gather_kernel(dtype):
 #define SLOT {DATA:#x}
 #define BLOCK {DATA + tb:#x}
 #define IDS {DATA + tb + 64:#x}
-{_rows(dtype)}
+{ROWS}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // index r of this tile's 32, in row 0
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
@@ -1088,7 +1087,7 @@ void kmain(volatile unsigned *a) {{
         for (unsigned k = 0; k < {run // 4}; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
       }}
     }}
-    if (rows == 1) row_down(SLOT);
+    if (rows == 1) row_down(SLOT, {ITEMSIZE[dtype]});
     noc_write(SLOT, BANK(t), AT(a[2], t, {tb}), {tb});
     noc_wait();
   }}
@@ -1170,7 +1169,7 @@ def topk_kernel(k, cols):
 #define X {DATA:#x}
 #define VALUES {DATA + ct * 2048:#x}
 #define IDS {DATA + (ct + 1) * 2048:#x}
-{BANKS}
+{ROWS}
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
 static unsigned key(unsigned v) {{ return v == 0x8000 ? 0x8000 : v & 0x8000 ? 0xFFFF & ~v : v | 0x8000; }}  // bf16's order
 void kmain(volatile unsigned *a) {{
@@ -1181,7 +1180,7 @@ void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, first = t / tr * a[5] + t % tr * a[6] + a[7];  // x's tile row t % tr of matrix t / tr
     for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, 2048), X + j * 2048, 2048);
-    for (unsigned i = 0; i < 1024; i++) values[i] = 0, ids[i] = 0;
+    copy({ZEROS:#x}, VALUES, 2048), copy({ZEROS:#x}, IDS, 4096);  // zeros past the rows and the k columns
     noc_wait();
     unsigned n = rows == 1 ? 1 : rows - t % tr * 32 < 32 ? rows - t % tr * 32 : 32;  // x's rows in this tile row
     for (unsigned r = 0; r < n; r++) {{  // its k best so far, in order
@@ -1195,12 +1194,9 @@ void kmain(volatile unsigned *a) {{
       }}
       for (unsigned j = 0; j < {k}; j++) values[at(r, j)] = x[col[j] / 32 * 1024 + at(r, col[j] % 32)], ids[at(r, j)] = col[j];
     }}
-    for (unsigned r = 0; r < 32; r++)  // one row of x fills the tile with copies of its row, k of 1 with copies of its column
-      for (unsigned c = 0; c < 32; c++)
-        if ((rows == 1 && r) || ({k} == 1 && c)) {{
-          unsigned from = at(rows == 1 ? 0 : r, {k} == 1 ? 0 : c);
-          values[at(r, c)] = values[from], ids[at(r, c)] = ids[from];
-        }}
+    for (unsigned r = 0; {k} == 1 && r < n; r++)  // k of 1 fills the tile with copies of its column, one row of x with copies of its row
+      for (unsigned c = 1; c < 32; c++) values[at(r, c)] = values[at(r, 0)], ids[at(r, c)] = ids[at(r, 0)];
+    if (rows == 1) row_down(VALUES, 2), row_down(IDS, 4);
     noc_write(VALUES, BANK(t), AT(a[2], t, 2048), 2048);
     noc_write(IDS, BANK(t), AT(a[3], t, 4096), 4096);
     noc_wait();
@@ -1227,7 +1223,7 @@ def group_kernel(rows, k, n):
 #define TILES (ORDER + {4 * 32 * t})
 #define PLACES (TILES + {4 * t})
 #define OUT {out:#x}
-{BANKS}
+{ROWS}
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
 static unsigned choice(unsigned r, unsigned j) {{ return ((volatile unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
 static void send(unsigned base, unsigned i) {{ noc_write(OUT, BANK(i), AT(base, i, 4096), 4096); noc_wait(); }}
@@ -1249,17 +1245,17 @@ void kmain(volatile unsigned *a) {{
   }}
   for (unsigned r = 0; r < {rows}; r++)
     for (unsigned j = 0; j < {k}; j++) {{ unsigned s = fill[choice(r, j)]++; order[s] = r; places[j * {rp} + r] = s; }}
-  for (unsigned i = 0; i < {t}; i++) {{  // the order and the places, rows; the tiles, a column
-    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = order[i * 32 + c];
-    send(a[2], i);
+  for (unsigned i = 0; i < {t}; i++) {{  // the order and the places, rows: each tile's row 0, copied down it; the tiles, a column
+    for (unsigned c = 0; c < 32; c++) out[at(0, c)] = order[i * 32 + c];
+    row_down(OUT, 4), send(a[2], i);
   }}
   for (unsigned i = 0; i < {-(-t // 32)}; i++) {{
     for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = i * 32 + r < {t} ? tiles[i * 32 + r] : 0;
     send(a[3], i);
   }}
   for (unsigned i = 0; i < {k * rp // 32}; i++) {{
-    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = places[i * 32 + c];
-    send(a[4], i);
+    for (unsigned c = 0; c < 32; c++) out[at(0, c)] = places[i * 32 + c];
+    row_down(OUT, 4), send(a[4], i);
   }}
 }}""")
 
@@ -1373,7 +1369,7 @@ def move_kernel(dtype):
 #define OUT {DATA:#x}
 #define CACHE {DATA + tb:#x}
 typedef {"unsigned short" if ITEMSIZE[dtype] == 2 else "unsigned"} datum;
-{_rows(dtype)}
+{ROWS}
 static unsigned held[{MOVE_SLOTS}];  // tile number + 1 of what each cache slot holds (0: nothing yet)
 static volatile datum *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
   unsigned s = t % {MOVE_SLOTS};
@@ -1460,7 +1456,7 @@ void kmain(volatile unsigned *a) {{
       }}
       if (down && cols == 1)  // a single column: made once, copied across
         for (int r = r0; r < r1; r++) for (unsigned c = 1; c < 32; c++) out[at(r, c)] = out[at(r, 0)];
-      if (rows == 1 && r1) row_down(OUT);
+      if (rows == 1 && r1) row_down(OUT, {ITEMSIZE[dtype]});
     }}
     noc_write(OUT, BANK(t), AT(a[2], t, {tb}), {tb});
     noc_wait();

@@ -1,8 +1,9 @@
 # The numbers ttsim cannot give, measured on a card (ROADMAP, Stage 1; NOTES.md, "Bring-up"):
 # what a launch costs and how it grows with the rectangle, DRAM bandwidth by reads in flight, NoC latency, the rates of
 # the Tensix units a kernel feeds (MVMUL alone, a matmul step with its unpacks at 1, 2 and 4 fidelity phases, the packer,
-# the SFPU), and PCIe both ways. Each decides something: DEPTH, the fidelity a matmul can use before its unpacks bound
-# it, how many launches a token can afford. Small kernels built from the compiler's own pieces, timed by the tile's
+# the SFPU), BRISC's scalar work for a mixture of experts (topk, group), and PCIe both ways. Each decides something:
+# DEPTH, the fidelity a matmul can use before its unpacks bound it, how many launches a token can afford, whether a
+# router's choices are cheap enough on a RISC-V core. Small kernels built from the compiler's own pieces, timed by the tile's
 # wall clock. On ttsim the numbers mean nothing (Tensix instructions take no time there, the NoC and DRAM answer at once):
 # it only checks that each probe runs.
 #   TTSIM=/path/to/libttsim.so python3 -m ferrite.probe [MiB]   # MiB: how much to upload and read back (8)
@@ -92,6 +93,15 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
   rows.append(("MVMUL alone", 64 * n / max(timed(k["mvmul"], (n,), 1), 1), 1, "per cycle"))
   rows.append(("pack a bf16 tile", timed(k["pack"], (n,), 1) / n, None, "cycles"))
   rows.append(("SFPU exp of a tile", timed(k["exp"], (n,), 1) / n, None, "cycles"))
+  # BRISC's scalar work, a mixture of experts': a token's best 8 of 128 experts (topk), a 256-token prompt's 2048 choices grouped by expert
+  since = rt.launches
+  Tensor.of(rt, [[float(i * 37 % 128) for i in range(128)]]).topk(8)
+  rt.wait()
+  rows.append(("topk, a token's 8 of 128 experts", rt.profile(since)[0][2], None, "cycles"))
+  since = rt.launches
+  Tensor.of(rt, [[(r * 8 + j) * 37 % 128 for j in range(8)] for r in range(256)], "int32").group(128)
+  rt.wait()
+  rows.append(("group, 256 tokens' 8 of 128 experts", rt.profile(since)[0][2], None, "cycles"))
   # DRAM: one worker, then all, by reads in flight (bandwidth from the slowest worker's cycles)
   for depth in (1, 2, 4, 8):
     at = rt.dram_alloc(-(-workers * depth // len(bh.DRAM)) * 2048)

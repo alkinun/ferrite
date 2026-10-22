@@ -184,7 +184,7 @@ def test_probe(chip):
   before = reads()
   rows = probe.probe(chip, n=4, rounds=2, upload=1 << 16)
   names = [what for what, *_ in rows]
-  assert len(names) == len(set(names)) == 24 and all(value > 0 for _, value, *_ in rows), rows
+  assert len(names) == len(set(names)) == 26 and all(value > 0 for _, value, *_ in rows), rows
   workers = len(chip.tensix) - 1
   assert reads() - before >= sum(2 * d * (1 + workers) for d in (1, 2, 4, 8)), "the DRAM probes' reads"
 
