@@ -23,10 +23,10 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a),
                            silu=lambda a: a / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0), mm=lambda a, b, phases: a @ b,
                            topk=lambda a, k: (np.take_along_axis(a, i := np.argsort(-a, -1, kind="stable")[..., :k], -1), i),
-                           experts=numpy_experts, cat=lambda xs: np.concatenate(xs))
+                           experts=numpy_experts, where=np.where)
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, repeat=Tensor.repeat_interleave,
                          mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's products are exact at any phases
-                         experts=chip_experts, cat=lambda xs: xs[0].cat(*xs[1:]))
+                         experts=chip_experts, where=lambda cond, a, b: cond.where(a, b))
 
 def precision(c, mode="bf16"):
   """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
@@ -62,8 +62,8 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c.eps)
   qkv = f.split(f.mm(h, p["qkv_proj"], phases("qkv")), n)
-  if "q_norm" in p:  # Qwen3's: each head of q and of k RMS-normed before it turns
-    qkv = f.cat([rms(qkv[:c.heads, :, :], p["q_norm"], c.eps), rms(qkv[c.heads:c.heads + c.kv, :, :], p["k_norm"], c.eps), qkv[c.heads + c.kv:, :, :]])
+  if "qk_norm" in p:  # Qwen3's: each head of q and of k RMS-normed before it turns, in one kernel with v's, which qk_on keeps
+    qkv = qkv * f.where(p["qk_on"], f.rsqrt(f.mean(qkv * qkv) + c.eps) * p["qk_norm"], 1)
   qkv = rope(qkv, f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
   kv = qkv[c.heads:, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a bfp8 cache does
   f.put(cache, rows, gpt2.bfp(kv) if isinstance(kv, np.ndarray) and cache_format(c) == "bfp8" else kv)
@@ -136,13 +136,19 @@ class Weight:
   def __init__(self, bits): self.bits = bits
   def values(self): return gpt2.bf16_floats(self.bits())
 
-def fuse(w):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls; a mixture
-  # of experts' router (gate, Qwen3's) transposed for x @ w, and its experts' gates and ups, and downs, each a batch
+def fuse(w, c):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls; a
+  # mixture of experts' router (gate, Qwen3's) transposed for x @ w, and its experts' gates and ups, and downs, each a
+  # batch; Qwen3's norms of q's and k's heads as a batch of every head's (v's 1s), and which heads they norm (qk_on)
   cat = lambda xs: np.ascontiguousarray(np.concatenate(xs, 1))
   join = lambda *xs: Weight(lambda: cat([x.bits() for x in xs])) if isinstance(xs[0], Weight) else cat(xs)
   stack = lambda xs: Weight(lambda: np.stack([x.bits() for x in xs])) if isinstance(xs[0], Weight) else np.stack(xs)
+  const = lambda shape, v: Weight(lambda: np.full(shape, gpt2.bf16_bits(np.float32(v)), np.uint16))
   for pre in {k[:k.index(".", 7) + 1] for k in w if k.startswith("layers.")}:
     w[pre + "qkv_proj"] = join(*(w.pop(pre + n) for n in ("q_proj", "k_proj", "v_proj")))
+    if pre + "q_norm" in w:
+      q, k = w.pop(pre + "q_norm"), w.pop(pre + "k_norm")
+      w[pre + "qk_norm"] = stack([q] * c.heads + [k] * c.kv + [const((1, head(c)), 1)] * c.kv)
+      w[pre + "qk_on"] = stack([const((1, 1), 1)] * (c.heads + c.kv) + [const((1, 1), 0)] * c.kv)
     if pre + "gate" not in w: w[pre + "gate_up_proj"] = join(w.pop(pre + "gate_proj"), w.pop(pre + "up_proj")); continue
     r = w.pop(pre + "gate")
     w[pre + "router"] = Weight(lambda r=r: np.ascontiguousarray(r.bits().T)) if isinstance(r, Weight) else np.ascontiguousarray(r.T)
@@ -208,7 +214,7 @@ def load(folder, places=4096):
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = out.pop("lm_head", None) or Weight(lambda e=out["embed"]: np.ascontiguousarray(e.bits().T))  # tied, or its own
   for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: gpt2.bf16_bits(a))
-  return c, fuse(out)
+  return c, fuse(out, c)
 
 def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks', their
   # experts' as their MLP's, and the output layer) in the one prec (precision's) gives them, the rest, and all without prec, bf16

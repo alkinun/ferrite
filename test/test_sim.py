@@ -1244,7 +1244,7 @@ def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's 
             "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
   w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
   w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
-  return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, places))))
+  return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, places))), c)
 
 def test_llama_frequencies():
   # Llama 3.1's RoPE scaling (rope_type llama3: long wavelengths slowed by 8, short ones kept, those between blended):
@@ -1440,7 +1440,7 @@ def test_qwen3_moe(chip, tmp_path):
   ids = [3, 1, 4, 1, 5, 9, 2, 6]
   with torch.no_grad(): want = model(torch.tensor([ids])).logits[0].numpy()
   c, weights = llama.load(str(tmp_path), 32)
-  assert (c.k, llama.head(c)) == (2, 32) and {"router", "experts.gate_up", "experts.down", "q_norm"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.1.")}
+  assert (c.k, llama.head(c)) == (2, 32) and {"router", "experts.gate_up", "experts.down", "qk_norm", "qk_on"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.1.")}
   rel = lambda got: max(np.abs(got[r] - want[r]).max() / np.abs(want[r]).max() for r in range(len(ids)))
   assert rel(llama.forward(ids, list(range(8)), llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros), every=True)) < 0.005
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
