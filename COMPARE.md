@@ -29,7 +29,7 @@ cache, and both write the same tokens, " a question that has been".
 |---|---|---|---|
 | a decode token, replayed | **156k cycles** | **174k** | 1,602k (performance or accuracy mode) |
 | the prompt's prefill, 5 tokens | **174k** | **192k** | 2,108k (performance; 3,064k the first time) |
-| a decode step for 32 users, a token each | **340k** | **359k** | 1,829k (performance) |
+| a decode step for 32 users, a token each | **866k** | **884k** | 1,829k (performance) |
 | a decode token at place 1000 (a cache of 1024) | **206k** | **224k** | 1,602k (performance) |
 | launches a decode token | **358** | **358** | about 1,360 TT-NN operations, each one or more programs |
 | weights read a decode token | 269 MB | 143 MB | 116 MB (performance), 168 MB (accuracy) |
@@ -47,11 +47,11 @@ longer cache costs TT's attention no more control, while ferrite's grows with it
 tiles a head on 9 workers, is 46k of the 206k against 14k at 32 places, and the cache's put 23k against 11k). At that
 rate ferrite would reach TT's 1.6M near 29,000 places, far past SmolLM's 2,048.
 
-32 users decoding together (all from the same prompt, each at its own places; `llama.forward`'s starts, TT's batch)
-take ferrite 5 times fewer cycles a step than TT, 10.6k a token against 57k. Batching gains TT more: it computes 32
-rows for one user anyway, so 32 users cost it 14% more than one, and ferrite 2.2 times one. TT's attention is per
-user, where ferrite's runs over every user's cache, masked: no more tile work, but one line of work a head, 9 lines
-for 119 workers (NOTES, "A Llama-family model").
+32 users decoding together (all from the same prompt, each at its own places; `llama.forward`'s slots, TT's batch)
+take ferrite 2.1 times fewer cycles a step than TT, 27k a token against 57k. Batching gains TT more: it computes 32
+rows for one user anyway, so 32 users cost it 14% more than one, and ferrite 5.6 times one. Both read each user's
+own rows; ferrite moves each block's queries into a batch entry of each key head and user, and the output back, a
+datum at a time: 586k of its 866k cycles (NOTES, "A Llama-family model").
 
 What it could mean on a card: if silicon's RISC-V control work is anything like ttsim's count (in-order cores, about
 an instruction a clock at 1.35 GHz), TT's 1.6M cycles are 1.2 ms of control a token, five times its 0.23 ms of DRAM

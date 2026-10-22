@@ -97,17 +97,20 @@ def forward(ids, w, mask, places=None, caches=None):
     x = layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask, HEADS, caches and caches[l], places)
   return f.rows(layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), [x.shape[-2] - 1]) @ w["wte.T"]
 
-def mask(places, size, starts=None, window=None):
-  """-1e9 where a token at places, among size places, would look past its own (or, given its sequence's start, before
-  that, on the chip only; or given a window, as far back as window places or more), else 0: in numpy, or on the chip
-  from int32 rows of places, so a decode step's mask is data, not a shape."""
-  if not isinstance(places, Tensor):
-    q, k = np.asarray(places)[:, None], np.arange(size)
-    return np.where((k > q) | ((k <= q - window) if window else False), np.float32(-1e9), np.float32(0))
-  cols, column = Tensor.of(places.rt, [list(range(size))], "int32"), lambda row: row.reshape(1, row.cols, 1)
-  out = cols > column(places)
-  if window: out = out + (cols < column(places) - (window - 1))
-  return ((out if starts is None else out + (cols < column(starts))) * -1e9).cast("bf16")
+def mask(places, size, window=None):
+  """-1e9 where a token at places, among size places, would look past its own (or, given a window, as far back as
+  window places or more), else 0: in numpy, or on the chip from an int32 row of places, so a decode step's mask is
+  data, not a shape."""
+  return masked(np.asarray(places)[:, None] if not isinstance(places, Tensor) else places.reshape(1, places.cols, 1), size, window)
+
+def masked(column, size, window=None):  # mask's, from a column of places: a batch of them, laid out as attention's scores' rows
+  if not isinstance(column, Tensor):
+    k = np.arange(size)
+    return np.where((k > column) | ((k <= column - window) if window else False), np.float32(-1e9), np.float32(0))
+  cols = Tensor.of(column.rt, [list(range(size))], "int32")
+  out = cols > column
+  if window: out = out + (cols < column - (window - 1))
+  return (out * -1e9).cast("bf16")
 
 def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # each block's, by zeros(shape)
 

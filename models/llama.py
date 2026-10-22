@@ -3,8 +3,8 @@
 # The model is written once, for ferrite Tensors and numpy arrays alike, as models/gpt2.py is. Its KV cache has a fixed
 # size and a token's place is data, not a shape, so on ferrite every decode step launches the same kernels: after the
 # first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
-# starts), a token each a step. Qwen3.5's and Qwen3.6's language models too: three Gated DeltaNet blocks (delta) to each
-# attention block, whose state is a few fixed-size tensors rather than a cache that grows.
+# slots), a token each a step, each reading only its own. Qwen3.5's and Qwen3.6's language models too: three Gated
+# DeltaNet blocks (delta) to each attention block, whose state is a few fixed-size tensors rather than a cache that grows.
 #   TTSIM=/path/to/libttsim.so python3 models/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
 #   ... python3 models/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]   # token accuracy, Tenstorrent's way
 # (numpy: the weight values the chip holds in mode's formats, with exact products, in numpy alone: no chip)
@@ -28,7 +28,8 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                            mm=lambda a, b, phases: a @ b, experts=numpy_experts, where=np.where, minimum=np.minimum, maximum=np.maximum,
                            sink_softmax=sink_softmax, exp=np.exp, log=np.log, float=lambda a: a, bf16=lambda a: a, now=lambda a: a, swap=lambda a: a.transpose(1, 0, 2),
                            cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None], assign=lambda a, b: a.__setitem__(..., b),
-                           tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)))
+                           tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)),
+                           parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to)
   sink_softmax = lambda a, sink: (e := (a - (m := a.max(2).maximum(sink))).exp()) / (e.sum(2) + (sink - m).exp())  # one more logit, left out
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid,
                          repeat=Tensor.repeat_interleave, mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's
@@ -36,7 +37,8 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                          sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, float=Tensor.float, bf16=Tensor.bfloat16,  # are exact
                          now=Tensor.realize, cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0),  # at any phases
                          swap=lambda a: a.permute(1, 0, 2),
-                         assign=Tensor.assign, tri=lambda n, lower=False: triangle(x.rt, n, lower))
+                         assign=Tensor.assign, tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
+                         expand=lambda a, shape: a.expand(*shape))
 
 @functools.cache
 def triangle(rt, n, lower=False):  # ones on and above the diagonal (or on and below it), n x n in fp32, on the chip once
@@ -69,39 +71,48 @@ def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 a
 
 def cache_format(c): return (getattr(c, "precision", None) or {}).get(("kv", None), ("bf16", None))[0]  # the KV cache's format
 
-def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None):
+def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None):
   """One block, block l: attention (or Gated DeltaNet, where its weights have a conv: delta) then a SwiGLU MLP (or a
   mixture of experts: moe), each after an RMSNorm and added back. p: the block's weights (as x @ w, so the Hugging Face
   ones transposed, q, k and v's side by side, and gate and up's; and what other families add: Qwen2's qkv_bias, Qwen3's
   qk_norm and qk_on, gpt-oss's sinks and o_proj.bias), c: the config (its precision, if it has one, says each matmul's
   fidelity phases), rotary: (cos, sin, turn), the tables' rows for this call's places; cache: this block's keys' heads
   then its values', each with a row for every place, this call's written at its rows (or Gated DeltaNet's states);
-  mask: -1e9 where a token must not look (gpt2.mask); prefill: a prompt's tokens at once, not decode's; live, accept:
-  delta's."""
+  mask: -1e9 where a token must not look (gpt2.mask, or around's for slots); prefill: a prompt's tokens at once, not
+  decode's; live, accept: delta's; slots: forward's."""
   phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c)
-  x = x + (delta(h, p, c, cache, phases, live, accept) if "conv" in p else attention(h, p, c, rotary, mask, cache, rows, phases, prefill))
+  x = x + (delta(h, p, c, cache, phases, live, accept) if "conv" in p else attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots))
   h = rms(x, p["post_attention_layernorm"], c)
   return x + (moe(h, p, c, phases) if "router" in p else mlp(h, p, phases))
 
-def attention(h, p, c, rotary, mask, cache, rows, phases, prefill):  # a block's attention over its cache (layer)
-  f, gated = fns(h), getattr(c, "gated", False)
-  n = c.heads + 2 * c.kv + (c.heads if gated else 0)  # (Qwen3.5's output gate: a head's each, after v's)
+def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
+  """A block's attention over its cache (layer). For several sequences (slots: as many tokens of each, in turn), each
+  over its own part of the cache, which a batch of each key head and sequence views in place, its query heads' rows
+  (a token's each) side by side: no key head repeated, no token reading another sequence's rows."""
+  f, gated, hd, rep = fns(h), getattr(c, "gated", False), head(c), c.heads // c.kv
+  nh = c.heads + 2 * c.kv + (c.heads if gated else 0)  # (Qwen3.5's output gate: a head's each, after v's)
   qkv = f.mm(h, p["qkv_proj"], phases("qkv"))
-  qkv = f.split(qkv + p["qkv_bias"] if "qkv_bias" in p else qkv, n)  # (Qwen2's bias)
+  qkv = f.split(qkv + p["qkv_bias"] if "qkv_bias" in p else qkv, nh)  # (Qwen2's bias)
   if "qk_norm" in p:  # Qwen3's: each head of q and of k RMS-normed before it turns, in one kernel with v's, which qk_on keeps
     r = f.rsqrt(f.mean(qkv * qkv) + c.eps)
     qkv = qkv * f.where(p["qk_on"], r * p["qk_norm"] + r if getattr(c, "centered", False) else r * p["qk_norm"], 1)
-  qkv = rope(qkv, f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
-  kv = qkv[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a bfp8 cache does
+  qkv = f.merge(rope(qkv, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))  # a token's heads side by side again
+  heads = f.split(qkv, nh)
+  kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a bfp8 cache does
   f.put(cache, rows, gpt2.bfp(kv) if isinstance(kv, np.ndarray) and cache_format(c) == "bfp8" else kv)
-  k, v = (f.repeat(t, c.heads // c.kv) for t in (cache[:c.kv, :, :], cache[c.kv:, :, :]))  # a head for each query's, in place
-  attention = phases("attention", "prefill" if prefill else "decode")
-  s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(head(c)))
-  probs = f.softmax(s + mask) if "sinks" not in p else f.sink_softmax(s + mask, p["sinks"])  # (gpt-oss's: a logit of each head's own, left out)
-  o = f.merge(f.mm(probs, v, attention))
-  if gated: o = o * f.sigmoid(f.merge(qkv[c.heads + 2 * c.kv:, :, :]))
-  o = f.mm(o, p["o_proj"], phases("o"))
+  attention, n = phases("attention", "prefill" if prefill else "decode"), h.shape[-2]
+  q, k, v, sinks = heads[:c.heads, :, :], cache[:c.kv, :, :], cache[c.kv:, :, :], p.get("sinks")  # (gpt-oss's sinks: a logit of each head's own, left out)
+  if slots:  # (a key head's and sequence's batch entry: its query heads' rows, a token's each, side by side: one move)
+    k, v, t = f.parts(k, slots), f.parts(v, slots), n // slots
+    q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv * slots, t * rep, hd)
+    if sinks is not None: sinks = f.expand(sinks.reshape(c.kv, 1, rep), (c.kv, n, rep)).reshape(c.kv * slots, t * rep, 1)
+  else: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a head for each query's, in place
+  s = f.mm(q, f.t(k), attention) * (1 / math.sqrt(hd))
+  o = f.mm(f.softmax(s + mask) if sinks is None else f.sink_softmax(s + mask, sinks), v, attention)
+  if slots: o = o.reshape(c.kv, n, rep * hd)  # each key head's query heads side by side again
+  if gated: o = o * f.sigmoid(f.split(qkv[:, (c.heads + 2 * c.kv) * hd:], o.shape[0]))
+  o = f.mm(f.merge(o), p["o_proj"], phases("o"))
   return o + p["o_proj.bias"] if "o_proj.bias" in p else o
 
 def delta(h, p, c, state, phases, live=None, accept=None):
@@ -316,46 +327,59 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
     w[pre + "experts.gate_up"], w[pre + "experts.down"] = stack([join(g, u) for g, u in zip(gates, ups)]), stack(expert("down_proj"))
   return w
 
-def around(w, places, size, starts=None):  # for tokens at places: their caches' rows, the rotary tables' rows, and the mask
-  f = fns(w["norm"])                        # over a cache of size rows (gpt2.mask)
-  rows = places if starts is None else places + starts
-  return rows, (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(rows, size, starts)
+def around(w, c, places, size, slots=None):
+  """For tokens at places: their caches' rows, the rotary tables' rows, and attention's masks over a cache of size rows,
+  a sliding window's too (or None). For several sequences (slots), the next tokens of each in turn: each one's rows
+  in its own part of the caches (size / slots rows), the masks laid out as attention lays out their scores."""
+  f, window = fns(w["norm"]), getattr(c, "sliding", None)
+  rotary = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"])
+  if not slots: return places, rotary, gpt2.mask(places, size), window and gpt2.mask(places, size, window)
+  numpy, (part, rep) = not isinstance(places, Tensor), (size // slots, c.heads // c.kv)
+  n = len(places) if numpy else places.cols
+  rows = np.asarray(places) + firsts(None, n, slots, part) if numpy else places + firsts(places.rt, n, slots, part)
+  column = f.expand(np.asarray(places).reshape(1, n, 1) if numpy else places.reshape(1, n, 1), (1, n, rep)).reshape(1, n * rep, 1)
+  column = f.expand(column, (c.kv, n * rep, 1)).reshape(c.kv * slots, n // slots * rep, 1)  # (a key head's and sequence's rows)
+  return rows, rotary, gpt2.masked(column, part), window and gpt2.masked(column, part, window)
 
-def forward(ids, places, w, c, caches, starts=None, every=False, live=None, accept=None, hidden=False):
+@functools.cache
+def firsts(rt, n, slots, part):  # n tokens' sequences' first rows, n / slots tokens each in turn: a row of int32 on the chip
+  row = [i // (n // slots) * part for i in range(n)]
+  return np.asarray(row) if rt is None else Tensor.of(rt, [row], "int32")
+
+def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accept=None, hidden=False):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (a
-  block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids and places are
-  rows: lists for numpy, int32 tensors for ferrite. starts: several sequences decoding together (a batch of users), their
-  caches side by side, each token's sequence starting at its start's row and each token seeing only its own sequence;
-  then the logits are every token's, the next token of each (on the chip only). every: every token's logits, not only
-  the last's. w is looked up a block at a time (arrays makes numpy's weights as they are looked up). live, accept: with
-  starts, for Gated DeltaNet's states (delta). hidden: (the logits, every token's hidden state, normed: what the
-  multi-token prediction layer takes, draft)."""
+  block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids
+  and places are rows: lists for numpy, int32 tensors for ferrite. slots: several sequences decoding together (a
+  batch of users), the next tokens of each in turn, as many each, their caches side by side (kv_cache's sequences:
+  each a part of every block's), each token reading only its own sequence's; then the logits are every token's.
+  every: every token's logits, not only the last's. w is looked up a block at a time (arrays makes numpy's weights as
+  they are looked up). live, accept: with slots, for Gated DeltaNet's states (delta). hidden: (the logits, every
+  token's hidden state, normed: what the multi-token prediction layer takes, draft)."""
   f = fns(w["norm"])
   x, size = f.rows(w["embed"], ids), next(k.shape[-2] for k in caches if not isinstance(k, list))  # an attention block's places
-  rows, rotary, mask = around(w, places, size, starts)
-  window = gpt2.mask(rows, size, starts, c.sliding) if getattr(c, "sliding", None) else None  # (a sliding window's blocks)
+  rows, rotary, mask, window = around(w, c, places, size, slots)
   sliding = lambda l: window is not None and (not getattr(c, "layer_types", None) or c.layer_types[l] == "sliding_attention")
-  prefill = starts is None and x.shape[-2] > 1
+  prefill = slots is None and x.shape[-2] > 1
   for l in range(c.layers):
     p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
-    x = layer(x, p, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill, live, accept)
+    x = layer(x, p, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill, live, accept, slots)
   h = rms(x, w["norm"], c)
   phases = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]  # the output layer's
-  logits = f.mm(h if starts is not None or every or hidden else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases)
+  logits = f.mm(h if slots or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases)
   return (logits, h) if hidden else logits
 
-def draft(ids, places, h, w, c, caches, starts=None):
+def draft(ids, places, h, w, c, caches, slots=None):
   """Qwen3.5's multi-token prediction layer (block c.layers, which forward does not run), as vLLM runs it: for each
   token at places, h its hidden state (forward's) and ids the token after it, the logits of the token after that. That
   token's embedding and h, each RMS-normed, side by side through fc, then the block (its keys and values into its
-  cache, caches[c.layers], at places), its norm, and the model's output layer."""
+  cache, caches[c.layers], at places), its norm, and the model's output layer. slots: forward's."""
   f, d, l = fns(h), c.dim, c.layers
   e, h = rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), rms(h, w["mtp.pre_fc_norm_hidden"], c)
   fc = w["mtp.fc"]
   x = f.mm(e, fc[:d, :], None) + f.mm(h, fc[d:, :], None)
-  rows, rotary, mask = around(w, places, caches[l].shape[-2], starts)
+  rows, rotary, mask, _ = around(w, c, places, caches[l].shape[-2], slots)
   p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
-  x = layer(x, p, c, rotary, mask, caches[l], rows, l, starts is None and x.shape[-2] > 1)
+  x = layer(x, p, c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, slots=slots)
   return f.mm(rms(x, w["mtp.norm"], c), w["embed.T"], None)
 
 def prefill(ids, w, c, caches, chunk, on=lambda row: row):
@@ -376,8 +400,9 @@ def kv_cache(c, size, zeros, sequences=1, speculative=False):  # each block's ke
 
 def linear(c, l): return l < len(getattr(c, "layer_types", None) or ()) and c.layer_types[l] == "linear_attention"  # a Gated DeltaNet block?
 
-def states(c, caches, u):  # caches made for several sequences as sequence u's alone: its Gated DeltaNet states, in place
-  return [[s[u:u + 1, :, :] if i % 2 == 0 else s[u * c.vh:(u + 1) * c.vh, :, :] for i, s in enumerate(kv)] if linear(c, l) else kv
+def slot(c, caches, u, slots):  # caches made for several sequences (slots) as sequence u's alone, in place: its part of each KV
+  part = lambda kv: kv[:, u * kv.shape[-2] // slots:(u + 1) * kv.shape[-2] // slots, :]  # cache, its Gated DeltaNet states
+  return [[s[u:u + 1, :, :] if i % 2 == 0 else s[u * c.vh:(u + 1) * c.vh, :, :] for i, s in enumerate(kv)] if linear(c, l) else part(kv)
           for l, kv in enumerate(caches)]
 
 def read_json(path):

@@ -102,17 +102,14 @@ def ferrite(folder, prompt, after, top5, book, s):
     into each one's rows of the cache: the steps after the warm-up (the first two: jit runs, then records) over their
     time, each from the token ids on the host to the next ones there."""
     n, size = len(prompt), -(-(len(prompt) + s.steps) // 32) * 32
-    kv, starts = llama.kv_cache(c, size * users, llama.zeros(rt, llama.cache_format(c))), [size * u for u in range(users)]
-    tokens = []
-    for u in range(users):  # batch 1 as a prompt (prefill), more as rows of a batch, and each one's next token
-      if users == 1: last = llama.forward(on(prompt), on(list(range(n))), t, c, kv)
-      else: last = llama.forward(on(prompt), on(list(range(n))), t, c, kv, on([starts[u]] * n))[n - 1:n, :]
-      tokens.append(int(llama.logits(last).argmax()))
-    step, times = jit(lambda ids, places, starts=None: llama.forward(ids, places, t, c, kv, starts)), []
+    kv, tokens = llama.kv_cache(c, size * users, llama.zeros(rt, llama.cache_format(c)), users), []
+    for u in range(users):  # each one's prompt into its part of the cache (prefill), and its next token
+      tokens.append(int(llama.logits(llama.forward(on(prompt), on(list(range(n))), t, c, llama.slot(c, kv, u, users))).argmax()))
+    step, times = jit(lambda ids, places: llama.forward(ids, places, t, c, kv, users if users > 1 else None)), []
     for i in range(s.steps):
       start = clock()
       ids, places = on(tokens), on([n + i] * users)
-      tokens = [int(x) for x in gpt2.values(step(ids, places) if users == 1 else step(ids, places, on(starts))).argmax(-1)]
+      tokens = [int(x) for x in gpt2.values(step(ids, places)).argmax(-1)]
       times.append(clock() - start)
     return (s.steps - 2) / sum(times[2:])
 

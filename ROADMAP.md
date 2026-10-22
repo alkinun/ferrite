@@ -96,8 +96,9 @@ first (NOTES, "Bring-up on a p150").
   the whole model.
 - [x] **The cost model**: what a model reads and holds a token and how many sessions a card keeps, and with the probe's
   numbers, tokens/s and dollars a million tokens (`models/cost.py`; NOTES, "The cost model").
-- [ ] **Attention over a session's own rows** in a batched step, where it reads every session's: four times the step at
-  eight users with 32K-token sessions.
+- [x] **Attention over a session's own rows** in a batched step, a key head's rows read once for all its query heads,
+  where they were read once a query head: eight times for Qwen3.6 (NOTES, "A Llama-family model"). Its two moves a
+  block cost more than they save at short contexts on ttsim, a datum at a time (NOTES, "Next for the compiler", 6).
 - [ ] **Fewer launches a Gated DeltaNet block** than its 86 (the chunk's small ops, a kernel each): a quarter of a
   one-user step.
 - [ ] **Qwen3.6's KV cache in bfp8**, its token accuracy kept: a session's rows, most of what a step reads, halved.

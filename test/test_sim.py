@@ -1602,19 +1602,19 @@ def test_qwen3_5_sequences(chip):
   on, ids = lambda row, d="int32": Tensor.of(rt, [row], d), {u: list(s) for u, s in prompts.items()}
   rel = lambda got, want: np.abs(got - want).max() / np.abs(want).max()
   for u, s in prompts.items():
-    got = gpt2.values(llama.forward(on(s), on(list(range(len(s)))), t, c, llama.states(c, kv, u), on([size * u] * len(s))))[len(s) - 1]
+    got = gpt2.values(llama.forward(on(s), on(list(range(len(s)))), t, c, llama.slot(c, kv, u, 3), every=True))[len(s) - 1]
     want = llama.forward(s, list(range(len(s))), w, c, np_kv[u])[0]
     assert rel(got, want) < 0.03 and near([got], [want]), (u, rel(got, want))
     ids[u].append(int(want.argmax()))
-  step = tensor.jit(lambda ids, places, starts, live: llama.forward(ids, places, t, c, kv, starts, live=live))
+  step = tensor.jit(lambda ids, places, live: llama.forward(ids, places, t, c, kv, 3, live=live))
   for i in range(4):
     places = [len(ids[u]) - 1 if u in ids else size - 1 for u in range(3)]
-    got = gpt2.values(step(on([ids[u][-1] if u in ids else 0 for u in range(3)]), on(places), on([size * u for u in range(3)]), on([1.0, 0.0, 1.0], "fp32")))
+    got = gpt2.values(step(on([ids[u][-1] if u in ids else 0 for u in range(3)]), on(places), on([1.0, 0.0, 1.0], "fp32")))
     for u in prompts:
       want = llama.forward(ids[u][-1:], [places[u]], w, c, np_kv[u])[0]
       assert rel(got[u], want) < 0.03 and near([got[u]], [want]), (i, u, rel(got[u], want))
       ids[u].append(int(want.argmax()))
-  free = llama.states(c, kv, 1)
+  free = llama.slot(c, kv, 1, 3)
   assert not any(np.any(np.frombuffer(s.tobytes(), np.float32)) for l in range(3) for s in free[l]), "the free slot's states stay 0"
 
 def test_speculative(chip):
@@ -1633,23 +1633,23 @@ def test_speculative(chip):
   ref = lambda s: llama.forward(s, list(range(len(s))), w, c, llama.kv_cache(c, size, np.zeros), every=True)  # numpy, from nothing
   seqs = {0: [7, 200, 31], 1: [5, 64, 9, 9, 9]}  # each a prompt, then the tokens it knows
   for u, s in seqs.items():
-    got, h = llama.forward(on(s), on(list(range(len(s)))), t, c, llama.states(c, kv, u), on([size * u] * len(s)), hidden=True)
+    got, h = llama.forward(on(s), on(list(range(len(s)))), t, c, llama.slot(c, kv, u, 3), hidden=True)
     want = ref(s)
     assert rel(gpt2.values(got)[-1], want[-1]) < 0.03
     s.append(int(want[-1].argmax()))
     if u == 0:  # the multi-token prediction layer over the prompt: each place's hidden state and the token after it
       _, nh = llama.forward(s[:-1], list(range(len(s) - 1)), w, c, llama.kv_cache(c, size, np.zeros), hidden=True)
-      mine = gpt2.values(llama.draft(on(s[1:]), on(list(range(len(s) - 1))), h, t, c, llama.states(c, kv, u), on([0] * (len(s) - 1))))
+      mine = gpt2.values(llama.draft(on(s[1:]), on(list(range(len(s) - 1))), h, t, c, llama.slot(c, kv, u, 3)))
       theirs = llama.draft(s[1:], list(range(len(s) - 1)), nh, w, c, llama.kv_cache(c, size, np.zeros))
       assert max(rel(mine[r], theirs[r]) for r in range(len(s) - 1)) < 0.03
-  step = tensor.jit(lambda ids, places, starts, live, accept: llama.forward(ids, places, t, c, kv, starts, live=live, accept=accept))
+  step = tensor.jit(lambda ids, places, live, accept: llama.forward(ids, places, t, c, kv, 3, live=live, accept=accept))
   accept = [1.0, 1.0, 1.0]
   for i in range(6):
     right = {u: int(ref(s)[-1].argmax()) for u, s in seqs.items()}
     drafts = {u: right[u] if (i + u) % 2 == 0 else (right[u] + 1) % 256 for u in seqs}
     ids = [x for u in range(3) for x in ([seqs[u][-1], drafts[u]] if u in seqs else [0, 0])]
     places = [p for u in range(3) for p in ([len(seqs[u]) - 1, len(seqs[u])] if u in seqs else [size - 1, size - 1])]
-    got = gpt2.values(step(on(ids), on(places), on([size * u for u in range(3) for _ in range(2)]), on([1.0, 1.0, 0.0], "fp32"), on(accept, "fp32")))
+    got = gpt2.values(step(on(ids), on(places), on([1.0, 1.0, 0.0], "fp32"), on(accept, "fp32")))
     for u, s in seqs.items():
       want = ref(s + [drafts[u]])[-2:]
       assert rel(got[2 * u], want[0]) < 0.03 and rel(got[2 * u + 1], want[1]) < 0.03, (i, u, rel(got[2 * u], want[0]), rel(got[2 * u + 1], want[1]))
@@ -1901,7 +1901,7 @@ def test_bfp8_cache(chip):
 
 def test_batched_decode(chip):
   # four sequences decoding together, a token each a step, from prompts of different lengths: their KV caches side by
-  # side in one (sequence u's places from row 32 u), each token seeing only its own sequence's places up to its own.
+  # side in one (sequence u's places from row 32 u), each token reading only its own sequence's rows (forward's slots).
   # Each prompt is prefilled into its rows, then every step is one call for all four, replayed from the third
   # (tensor.jit), against each sequence decoded alone in numpy
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(19)
@@ -1910,15 +1910,15 @@ def test_batched_decode(chip):
   kv = llama.kv_cache(c, size * len(prompts), lambda shape: Tensor.of(rt, np.zeros(shape).tolist()))
   np_kv = [llama.kv_cache(c, size, np.zeros) for _ in prompts]
   on = lambda row: Tensor.of(rt, [row], "int32")
-  step, ids = tensor.jit(lambda ids, places, starts: llama.forward(ids, places, t, c, kv, starts)), [list(p) for p in prompts]
+  step, ids = tensor.jit(lambda ids, places: llama.forward(ids, places, t, c, kv, len(prompts))), [list(p) for p in prompts]
   for u, p in enumerate(prompts):  # each prompt into its own rows; its last token's logits give its next token
-    got = gpt2.values(llama.forward(on(p), on(list(range(len(p)))), t, c, kv, on([size * u] * len(p))))[len(p) - 1]
+    got = gpt2.values(llama.forward(on(p), on(list(range(len(p)))), t, c, llama.slot(c, kv, u, len(prompts))))[0]
     want = llama.forward(p, range(len(p)), w, c, np_kv[u])[0]
     assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (u, np.abs(got - want).max())
     ids[u].append(int(want.argmax()))
   for i in range(4):
     places = [len(s) - 1 for s in ids]
-    got = gpt2.values(step(on([s[-1] for s in ids]), on(places), on([size * u for u in range(len(ids))])))
+    got = gpt2.values(step(on([s[-1] for s in ids]), on(places)))
     for u, s in enumerate(ids):
       want = llama.forward(s[-1:], [places[u]], w, c, np_kv[u])[0]
       assert np.abs(got[u] - want).max() < 0.03 * np.abs(want).max(), (i, u, np.abs(got[u] - want).max())
@@ -2145,8 +2145,8 @@ def test_cost(tmp_path):
   # blocks of 2 key and value heads of 256) and Gated DeltaNet states 66 MB a session (30 blocks of 32 heads' 128 x 128
   # in fp32 and the conv's last 3 inputs), each to the byte; Llama-3.1-8B in Tenstorrent's performance precision reads
   # COMPARE's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
-  # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; ferrite's batched
-  # attention today reads every session's rows, never less; the probe's numbers, read from its file, give the rates
+  # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; the probe's numbers,
+  # read from its file, give the rates
   qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
           "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
           "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
@@ -2166,7 +2166,7 @@ def test_cost(tmp_path):
   assert abs(read / 6.20e9 - 1) < 0.02, read
   card = dict(cost.CARD)
   t = cost.step(c, s, use, card, 4)
-  assert t.today >= t.reads and t.late >= t.seconds and math.isclose(cost.hourly(card) / (4 * t.rate * 3600) * 1e6, cost.hourly(card) / (4 / t.seconds) / 3600 * 1e6)
+  assert math.isclose(cost.hourly(card) / (4 * t.rate * 3600) * 1e6, cost.hourly(card) / (4 / t.seconds) / 3600 * 1e6)
   (tmp_path / "probe.json").write_text(json.dumps({"DRAM reads, 4 in flight: all workers": 300.0, "DRAM reads, 8 in flight: all workers": 420.0,
                                                    "matmul step, 1 phase, unpacks included": 16.0, "launch, 100 queued: chip each": 2700.0,
                                                    "upload over PCIe": 20.0, "read back over PCIe": 12.0}))

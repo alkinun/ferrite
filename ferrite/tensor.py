@@ -215,14 +215,14 @@ class Tensor:
     return v._track("repeat", (self,), n)
 
   def split(self, n, axis=1):
-    """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads.
-    The parts are whole tiles. A sum not yet computed of computed tensors (a matmul's parts of K) splits term by term,
-    and stays a sum."""
+    """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads;
+    by rows, each matrix of a batch too, its parts one after another (a KV cache's heads as each sequence's part of
+    them). The parts are whole tiles. A sum not yet computed of computed tensors (a matmul's parts of K) splits term by
+    term, and stays a sum."""
     if terms := _terms(self): return sum((t.split(n, axis) for t in terms[1:]), terms[0].split(n, axis))
-    assert self.batch == 1
-    if axis: assert self.cols % (32 * n) == 0; return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
-    assert self.rows % (32 * n) == 0
-    return self._view(self.rows // n, self.cols, n, 0, self.rows // n // 32 * self.stride)._track("split", (self,), axis)
+    if axis: assert self.batch == 1 and self.cols % (32 * n) == 0; return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
+    assert self.rows % (32 * n) == 0 and (self.batch == 1 or self.bstride == self.rows // 32 * self.stride), "whole tiles, matrices one after another"
+    return self._view(self.rows // n, self.cols, self.batch * n, 0, self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
   def merge(self):
     """The batch side by side as one matrix, the inverse of split: x.split(n).merge() is x. The kernel computing it

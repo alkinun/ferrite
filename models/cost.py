@@ -27,7 +27,8 @@ CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 ban
             launch=1e-6, pcie=25e9,  # a launch on the card (NOTES, "Next for the compiler"), and PCIe 4.0 x16's bytes/s
             price=1299, host=600, years=3, watts=300, host_watts=75, kwh=0.15)  # the p150a at its launch, a share of a host,
             # three years; the card's power and its host's share, at $0.15 a kWh
-USE = dict(context=32768, kv="bf16", accept=0.0)  # each session's tokens and its KV cache's format; the share of drafts taken
+USE = dict(context=32768, kv="bf16", accept=0.0)  # each session's places (its slot's: a token reads them all, those its session
+# has not filled yet too) and its KV cache's format; the share of drafts taken
 
 def probed(card, path):  # the probe's numbers (python3 -m ferrite.probe 8 path) in place of the specification's
   p = json.load(open(path))
@@ -66,13 +67,12 @@ def session(c, use, speculative=False):
 
 def step(c, s, use, card, users, speculative=False, cards=1):
   """A decode step for `users` sessions at once, a token each, or a token and a draft each then the next drafts (two
-  calls): the bytes it reads (ferrite's batched attention reads every session's rows, not only a token's own: today),
-  its flops, launches and seconds (waiting on DRAM or on the matmuls, whichever is longer, then on the launches), and
-  tokens/s a user."""
+  calls): the bytes it reads, its flops, launches and seconds (waiting on DRAM or on the matmuls, whichever is longer,
+  then on the launches), and tokens/s a user."""
   n, one, d = users * (1 + speculative), session(c, use, speculative), c.dim
   touched = lambda tokens: c.experts * (1 - (1 - c.k / c.experts) ** tokens) if c.experts else 0  # a block's experts some token picks
   reads = s.every + s.moe * touched(n) * s.expert + n * one.kv + users * one.state * (1.5 if speculative else 1)  # states read and written, twice
-  today = reads + n * (users - 1) * one.kv                                                                   # when speculating
+                                                                                                             # when speculating
   flops = 2 * n * s.values + n * sum(4 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))
   linear = sum(llama.linear(c, l) for l in range(c.layers))
   launches = (c.layers - linear) * LAUNCHES["attention"] + linear * LAUNCHES["deltanet verify" if speculative else "deltanet"]
@@ -81,10 +81,8 @@ def step(c, s, use, card, users, speculative=False, cards=1):
     reads += s.draft + c.mtp * touched(2 * users) * s.expert + c.vocab * d * BYTES["bfp8"] + 2 * users * one.draft
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)
     launches += LAUNCHES["draft"]
-  rate = lambda bytes_: card["bandwidth"] * card["reach"] * cards
-  seconds = lambda bytes_: max(bytes_ / rate(bytes_), flops / (card["tflops"] / card["phases"] * cards)) + launches * card["launch"]
-  return SimpleNamespace(reads=reads, today=today, seconds=seconds(reads), late=seconds(today), launches=launches, flops=flops,
-                         rate=(1 + use["accept"] if speculative else 1) / seconds(reads))
+  seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + launches * card["launch"]
+  return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, flops=flops, rate=(1 + use["accept"] if speculative else 1) / seconds)
 
 def hourly(card): return (card["price"] + card["host"]) / (card["years"] * 8766) + (card["watts"] + card["host_watts"]) / 1000 * card["kwh"]
 
@@ -107,13 +105,12 @@ def report(folder, mode="bf16", **keys):
     out.append(f"  a session of {use['context']} tokens: {one.kv / 1e9:.2f} GB of KV cache rows ({one.kv / use['context'] / 1e3:.1f} KB a token, {use['kv']})"
                + (f" and {one.state / 1e6:.0f} MB of Gated DeltaNet states" if one.state else "") + f": {most} on the card{'s' * (cards > 1)}")
     out.append(f"  decode, {'a token and a draft' if speculative else 'a token'} a user a step" + (f", {use['accept']:.0%} of drafts taken" if speculative else "") + ":")
-    out.append("     users   reads, GB   step, ms   launches   tokens/s a user   a card   $ a million out   ferrite today, ms"
-               + ("   drafts to take, to pay" if speculative else ""))
+    out.append("     users   reads, GB   step, ms   launches   tokens/s a user   a card   $ a million out" + ("   drafts to take, to pay" if speculative else ""))
     for users in [u for u in (1, 2, 4, 8, 16, 32, 64, 128) if u <= most]:
       t = step(c, s, use, card, users, speculative, cards)
       pays = f"{step(c, s, use, card, users, True, cards).seconds / step(c, s, use, card, users, False, cards).seconds - 1:23.0%}" if speculative else ""
       out.append(f"  {users:8d} {t.reads / 1e9:11.2f} {t.seconds * 1e3:10.1f} {t.launches:10d} {t.rate:17.1f} {users * t.rate:8.0f} "
-                 f"{hour / (users * t.rate * 3600) * 1e6:17.3f} {t.late * 1e3:19.1f}{pays}")
+                 f"{hour / (users * t.rate * 3600) * 1e6:17.3f}{pays}")
   prompt = 2 * s.values + sum(2 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))  # half the context, on average
   fill = card["tflops"] / card["phases"] * cards / prompt
   out.append(f"  a prompt token: {prompt / 1e9:.1f} GFLOP, {fill:,.0f} tokens/s a card were its matmuls never idle, ${hour / (fill * 3600) * 1e6:.4f} a million")

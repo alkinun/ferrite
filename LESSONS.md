@@ -246,6 +246,12 @@ append a correction.
 39. **Say done when you are done.** A request said it had ended before the engine saved its session, which reads the
     chip back, so a test that went on to the next opened another runtime on a chip still in use, and ttsim stopped the
     process with a NoC command from nowhere. Only in a full run, and only in that order. The engine now saves first.
+40. **Trace a cost to the kernel that pays it.** The cost model had a batched step's attention reading every session's
+    rows for every token; one matmul over all the tokens reads them once, and what multiplied the reads was each key
+    head repeated for its query heads, eight times for Qwen3.6, one user or many. The fix was the same, a key head's
+    query heads as the rows of one batch entry, but its first layout took five moves a block, a datum at a time, and
+    made a short step on ttsim five times slower; one move each way, from rows where the heads already lie side by
+    side, made it 2.5. (NOTES: "A Llama-family model")
 
 ## Working method
 
