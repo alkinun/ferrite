@@ -1512,8 +1512,13 @@ void kmain(volatile unsigned *a) {{
           if (xi >= xr) {{ xi -= xr; xb++; }}
         }}
       }}
-      if (down && cols == 1)  // a single column: made once, copied across
-        for (int r = r0; r < r1; r++) for (unsigned c = 1; c < 32; c++) out[at(r, c)] = out[at(r, 0)];
+      if (down && cols == 1)  // a single column: made once, copied across, along its row's runs in the left and right faces
+        for (int r = r0; r < r1; r++) {{
+          volatile datum *left = out + at(r, 0), *right = out + at(r, 16);
+          datum v = *left;
+          for (unsigned c = 1; c < 16; c++) left[c] = v;
+          for (unsigned c = 0; c < 16; c++) right[c] = v;
+        }}
       if (rows == 1 && r1) row_down(OUT, {ITEMSIZE[dtype]});
     }}
     noc_write(OUT, BANK(t), AT(a[2], t, {tb}), {tb});
