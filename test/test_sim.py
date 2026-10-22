@@ -1950,11 +1950,12 @@ def test_sampling():
     r.made = made
     assert r.pick(logits) == want, (made, prompt, kw)
 
-def test_tool_choice(tmp_path):
-  # serve.chosen's shapes for tool_choice, kept by Request.pick: a model that would greet first (its logits most for
-  # each next character of a text, then for an end of sequence) is held to a call of the tools when one is required,
-  # and to a call of the named tool when one is named; one that would call a tool is kept from it by none; and a whole
-  # call may end, finished as the model goes on
+def test_shapes(tmp_path):
+  # the shapes an answer keeps to, through Request.pick: tool_choice's (serve.chosen): a model that would greet first
+  # (its logits most for each next character of a text, then for an end of sequence) is held to a call of the tools
+  # when one is required, and to a call of the named tool when one is named; one that would call a tool is kept from it
+  # by none; and a whole call may end. response_format's (serve.formatted): texts a JSON schema's value can or cannot
+  # begin, or is, and a model of random logits sampled to an answer that is one, every time
   tok = bytes_tokenizer(tmp_path)
   tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
   call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
@@ -1973,6 +1974,21 @@ def test_tool_choice(tmp_path):
   said, finish = spell(call, len(call) + 5, "none")
   assert "<tool_call>" not in said and said.startswith("<tool_callH") and finish == "stop", said
   with pytest.raises(ValueError): serve.chosen({"type": "function", "function": {"name": "write"}}, tools)
+  schema = {"type": "object", "properties": {"ok": {"type": "boolean"}, "unit": {"enum": ["C", "F"]}, "n": {"type": "integer"},
+                                             "tags": {"type": "array", "items": {"$ref": "#/$defs/tag"}, "maxItems": 2}, "note": {"anyOf": [{"const": "hi"}, {"type": "null"}]}},
+            "required": ["ok", "unit", "n", "tags", "note"], "additionalProperties": False, "$defs": {"tag": {"enum": ["a", "b"]}}}
+  fits = serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
+  whole = '{"ok": true, "unit": "C", "n": -12, "tags": ["a"], "note": null}'
+  assert [fits(whole[:k]) for k in (0, 1, 9, 20, 32, len(whole) - 1, len(whole))] == [1, 1, 1, 1, 1, 1, 2] and fits(whole + "\n") == 2
+  for text in ('{"ok": 1', '{"unit": "K"', '{"n": 1.5', '{"n": 1.', '{"n": -e', '{"x"', '{"tags": ["a", "b", "a"]', '{"note": "ho"', whole + "x", "```json", "{\n  "):
+    assert fits(text) == 0, text
+  assert serve.formatted({"type": "json_object"})('{"a": [1, {"b": "c\\n"}]}') == 2 and serve.formatted({"type": "json_object"})("[1]") == 0
+  for seed in range(3):  # (random logits: most bytes would not do, so most tokens are drawn again)
+    rng, r = np.random.default_rng(seed), serve.Request(tok, [], 300, 1.0, eos=[0], seed=seed, shape=fits)
+    while not r.take(rng.normal(0, 1, 256).astype(np.float32), True): pass
+    got = json.loads(tok.decode(r.made))
+    assert r.finish == "stop" and set(got) == set(schema["properties"]) and isinstance(got["ok"], bool) and isinstance(got["n"], int)
+    assert got["unit"] in ("C", "F") and set(got["tags"]) <= {"a", "b"} and len(got["tags"]) <= 2 and got["note"] in ("hi", None), got
 
 def test_serve(chip, tmp_path):
   # models/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
@@ -1984,7 +2000,8 @@ def test_serve(chip, tmp_path):
   # or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP, /v1/completions
   # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
   # template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and streamed, or not
-  # at all when it is told not to think; usage counts the prompt's tokens its slot held (cached), and ends a stream
+  # at all when it is told not to think; usage counts the prompt's tokens its slot held (cached), and ends a stream; an
+  # answer to a JSON schema (response_format) is one
   import urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -2040,6 +2057,9 @@ def test_serve(chip, tmp_path):
   assert reply["usage"]["prompt_tokens_details"]["cached_tokens"] == held, "all but the prompt's last token, which runs again"
   events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}))
   assert "".join(e["text"] for e in events) == text and events[-1]["finish_reason"] == "length" and usage["completion_tokens"] == 6
+  shaped = json.load(post({"prompt": "Hi there", "max_tokens": 80, "temperature": 0, "response_format": {"type": "json_schema", "json_schema": {"schema": {
+    "type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"], "additionalProperties": False}}}}))["choices"][0]
+  assert json.loads(shaped["text"])["answer"] in ("yes", "no") and shaped["finish_reason"] == "stop", shaped  # (ended once nothing else fits)
   chances = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "logprobs": 2}))["choices"][0]["logprobs"]  # greedy: each
   assert len(chances["tokens"]) == 6 and all(p == max(top.values()) <= 0 for p, top in zip(chances["token_logprobs"], chances["top_logprobs"]))  # the most likely
   assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
@@ -2152,7 +2172,8 @@ def test_chat_tools(tmp_path):
   # tools, thinking and not. An answer's tool calls in its XML come out OpenAI's way (serve.calls: a value as its tool's
   # schema types it), and go back into the template as they came. Over HTTP, an answer (a stand-in engine's) with a
   # tool call gives its reasoning, its text before the call and the call, finish_reason tool_calls; streamed, the text
-  # stops where the call begins and the call comes after it; a tool_choice of no tool given is refused
+  # stops where the call begins and the call comes after it; a tool_choice of no tool given is refused, and a
+  # response_format of no kind there is
   import queue, urllib.request
   qwen = "<|im_start|> <think> <tool_call>\n<function="  # (what in a template says it is Qwen3.5's)
   tools = [{"type": "function", "function": {"name": "read", "description": "A file's text", "parameters": {"type": "object",
@@ -2193,6 +2214,8 @@ def test_chat_tools(tmp_path):
   assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
   with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": messages[:2], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "write"}}})
   assert e.value.code == 400 and "no such tool" in json.load(e.value)["error"]["message"]
+  with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": messages[:2], "response_format": {"type": "xml"}})
+  assert e.value.code == 400
   http.shutdown()
 
 def test_cost(tmp_path):

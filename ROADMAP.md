@@ -117,8 +117,9 @@ first (NOTES, "Bring-up on a p150").
   whole sort of Qwen3.6's vocabulary was 6 (NOTES, "Serving").
 - [x] **tool_choice**: none, required or a named function, as a shape the answer keeps to: a token drawn is taken if
   the text it makes still fits, else drawn again without it (NOTES, "Serving").
-- [ ] **Structured outputs**: answers to a JSON schema (response_format), in the same way (OpenRouter's Auto Exacto
-  counts the tool calls that parse, and agents ask for JSON).
+- [x] **Structured outputs**: answers to a JSON schema (response_format) as a shape, its prefix parsed as it comes; no
+  start of one leads nowhere, and whitespace and numbers are bounded, which a shape's model would otherwise run on in
+  (NOTES, "Serving").
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the

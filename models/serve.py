@@ -6,7 +6,7 @@
 #   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt] [bf16|bfp8]   # a folder or a
 #   model id; the weights' formats (llama.precision), then the KV cache's
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import collections, json, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
+import collections, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -44,7 +44,8 @@ class Request:
     for _ in range(32):
       if self.fits(token := self.draw(logits)): return token
       logits[token] = -np.inf
-    return next(int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t)))  # (the likeliest that fits)
+    return next((int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t))), None)  # the likeliest that
+    # fits, else None: the end (a whole shape, for a model without an end of sequence; else a shape that leads nowhere)
 
   def fits(self, token):  # whether the text with token keeps to the shape (or, token an end of sequence, the text is whole)
     return self.shape(self.tok.decode(self.made)) == 2 if token in self.eos else self.shape(self.tok.decode(self.made + [token])) > 0
@@ -69,7 +70,8 @@ class Request:
   def take(self, logits, room):  # the next token from its logits (room: whether its slot has a place for one more): done?
     if self.gone: self.finish = "gone"; return True
     token = self.pick(logits)
-    if token not in self.eos:
+    end = token is None or token in self.eos
+    if not end:
       self.made.append(token)
       if self.logprobs is not None:  # (the model's own: its logits before any penalty or temperature, as vLLM gives them)
         lp = logits - logits.max()
@@ -78,9 +80,9 @@ class Request:
         self.probs.append((token, float(lp[token]), [(int(t), float(lp[t])) for t in sorted(top, key=lambda t: -lp[t])]))
     text = self.tok.decode(self.made)
     cut = min((i for i in (text.find(s) for s in self.stop) if i >= 0), default=-1)
-    if token in self.eos or cut >= 0 or len(self.made) == self.max_tokens or not room:
+    if end or cut >= 0 or len(self.made) == self.max_tokens or not room:
       self.say(text if cut < 0 else text[:cut])
-      self.finish = "stop" if token in self.eos or cut >= 0 else "length"
+      self.finish = "stop" if end or cut >= 0 else "length"
       return True
     hold = max((k for s in self.stop for k in range(1, len(s)) if text.endswith(s[:k])), default=0)  # a stop string's start
     self.say(text[:len(text) - hold].rstrip("\ufffd"))  # (or a character whose bytes are still coming)
@@ -326,6 +328,115 @@ def chosen(choice, tools):
     return 2 if text.rstrip().endswith("</tool_call>") and calls(text, tools)[1] else 1
   return fits
 
+class Short(Exception): pass  # the text ends inside a value: a start of one, so far
+class Bad(Exception): pass  # the text cannot begin one
+
+def formatted(form):
+  """The shape response_format gives an answer (chosen's kind), or None for any text: json_object, a JSON object;
+  json_schema, a JSON value of its schema. Of JSON Schema, type (or several), properties, required,
+  additionalProperties, items, minItems and maxItems, enum and const (as json.dumps writes them), anyOf and oneOf, $ref
+  into $defs or definitions; the rest (a string's pattern or format, a number's bounds) is not kept to. Between its
+  tokens is one space, tab or newline at most, and a number has 32 characters at most: either could go on for ever (a
+  model's whitespace does, held to a shape: vLLM's Qwen models have). A comma comes only where a key or an item may
+  follow it, so no start of a shape leads nowhere."""
+  kind = (form or {}).get("type", "text")
+  if kind == "text": return None
+  if kind not in ("json_object", "json_schema"): raise ValueError(f"response_format: no {kind}")
+  root = {"type": "object"} if kind == "json_object" else form["json_schema"]["schema"]
+  def fits(text):
+    i = 0
+    def ws():
+      nonlocal i
+      start = i
+      while i < len(text) and text[i] in " \t\n\r": i += 1
+      if i - start > 1: raise Bad
+    def peek():
+      ws()
+      if i == len(text): raise Short
+      return text[i]
+    def word(w):  # a literal (true, false, null), as far as the text goes
+      nonlocal i
+      if not w.startswith(text[i:i + len(w)]): raise Bad
+      if i + len(w) > len(text): raise Short
+      i += len(w)
+    def string(allowed=None):  # its value (Short: the text ends inside it); Bad once it begins none of allowed, as JSON
+      nonlocal i
+      start, i = i, i + 1
+      while i < len(text) and text[i] != '"':
+        if ord(text[i]) < 32: raise Bad
+        if text[i] == "\\":
+          escape = text[i + 1:i + 2]
+          if escape and escape not in '"\\/bfnrtu' or escape == "u" and not re.fullmatch("[0-9a-fA-F]*", text[i + 2:i + 6]): raise Bad
+          i += 6 if escape == "u" else 2
+        else: i += 1
+      if allowed is not None and not any(json.dumps(a, ensure_ascii=False).startswith(text[start:i + 1]) for a in allowed): raise Bad
+      if i >= len(text): raise Short
+      i += 1
+      return json.loads(text[start:i])
+    def value(sc):
+      nonlocal i
+      sc = sc or {}
+      while "$ref" in sc: sc = root["$defs" if "$defs" in sc["$ref"] else "definitions"][sc["$ref"].rsplit("/", 1)[1]]
+      if "anyOf" in sc or "oneOf" in sc:  # (the first whole one; a start, if any could still be one)
+        start, short = i, False
+        for alt in sc.get("anyOf") or sc["oneOf"]:
+          try: return value({k: v for k, v in sc.items() if k not in ("anyOf", "oneOf")} | alt)
+          except Short: short = True
+          except Bad: pass
+          i = start
+        raise Short if short else Bad
+      c, kinds = peek(), sc.get("type") or ["object", "array", "string", "number", "boolean", "null"]
+      kinds = [kinds] if isinstance(kinds, str) else kinds
+      if "enum" in sc or "const" in sc:  # one of them, as json.dumps writes it
+        texts = [json.dumps(v, ensure_ascii=False) for v in sc.get("enum", [sc.get("const")])]
+        if done := [t for t in texts if text.startswith(t, i)]: i += len(max(done, key=len)); return
+        raise Short if any(t.startswith(text[i:]) for t in texts) else Bad
+      if c == '"' and "string" in kinds: string()
+      elif c in "-0123456789" and {"number", "integer"} & set(kinds):
+        start = i
+        while i < len(text) and text[i] in "-+0123456789.eE": i += 1
+        number = text[start:i]
+        if len(number) > 32: raise Bad
+        if not re.fullmatch(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?", number):  # else a start of one, which a digit
+          begun = re.fullmatch(r"-?((0|[1-9][0-9]*)(\.[0-9]*|(\.[0-9]+)?[eE][-+]?[0-9]*)?)?", number)  # more makes whole
+          if i == len(text) and begun and len(number) < 32 and ("number" in kinds or not re.search("[.eE]", number)): raise Short
+          raise Bad
+        if "number" not in kinds and re.search("[.eE]", number): raise Bad
+      elif c in "tfn":
+        if ("null" if c == "n" else "boolean") not in kinds: raise Bad
+        word({"t": "true", "f": "false", "n": "null"}[c])
+      elif c == "{" and "object" in kinds:
+        i, seen = i + 1, set()
+        props, extra = sc.get("properties", {}), sc.get("additionalProperties", True)
+        while True:
+          if peek() == "}" and set(sc.get("required", ())) <= seen: i += 1; return
+          if seen and (text[i] != "," or extra is False and set(props) <= seen): raise Bad  # (a comma only if a key may follow)
+          if seen: i += 1
+          if peek() != '"': raise Bad
+          key = string(None if extra is not False else [k for k in props if k not in seen])
+          if key in seen or key not in props and extra is False: raise Bad
+          if peek() != ":": raise Bad
+          i += 1
+          value(props.get(key, extra if isinstance(extra, dict) else {}))
+          seen.add(key)
+      elif c == "[" and "array" in kinds:
+        i, n = i + 1, 0
+        while True:
+          if peek() == "]" and n >= sc.get("minItems", 0): i += 1; return
+          if n and text[i] != ",": raise Bad
+          if n: i += 1
+          if n >= sc.get("maxItems", math.inf): raise Bad
+          value(sc.get("items", {}))
+          n += 1
+      else: raise Bad
+    try:
+      value(root)
+      ws()
+      return 2 if i == len(text) else 0
+    except Short: return 1
+    except Bad: return 0
+  return fits
+
 def answer(text):  # a thinking model's text as its reasoning and its answer (none until it comes): Qwen3's around </think>,
   if text.startswith("<|channel|>"):  # or gpt-oss's analysis channel, until its <|end|>, and its final one
     if "<|message|>" not in text: return "", ""  # (the channel's name still coming)
@@ -362,7 +473,11 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         top = (q.get("top_logprobs") or 0 if q.get("logprobs") else None) if is_chat else q.get("logprobs")  # (a completion's: how many)
         if top is not None and not 0 <= top <= 20: raise ValueError("logprobs: at most 20 a token")
         apart = is_chat and (thinking and "<think>" in template or "<|channel|>" in template)
-        fits = chosen(q.get("tool_choice"), tools)
+        choice, form = q.get("tool_choice"), formatted(q.get("response_format"))
+        fits = chosen(choice, tools)
+        if form and choice in (None, "auto", "none"):  # its format, or with tools it may call (auto) a call
+          call = chosen("required", tools) if tools and choice != "none" else None
+          fits = form if call is None else (lambda text: max(form(text), call(text)))
         shape = fits and apart and (lambda text: fits(answer(text)[1])) or fits  # (a thinking model's on its answer alone)
         r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), q.get("temperature", 1.0), q.get("top_p", 1.0),
                     q.get("stop"), eos, q.get("seed"), max(q.get("top_k") or 0, 0), q.get("min_p") or 0.0, q.get("presence_penalty") or 0.0,
