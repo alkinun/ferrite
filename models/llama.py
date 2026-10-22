@@ -38,7 +38,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                          sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, float=Tensor.float, bf16=Tensor.bfloat16,  # are exact
                          now=Tensor.realize, cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0),  # at any phases
                          swap=lambda a: a.permute(1, 0, 2),
-                         assign=Tensor.assign, tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
+                         assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
                          expand=lambda a, shape: a.expand(*shape), down=lambda a: a.sum(1))
 
 @functools.cache
@@ -120,29 +120,34 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
 def delta(h, p, c, state, phases, live=None, accept=None):
   """Gated DeltaNet (Qwen3.5's linear attention) over this call's tokens: one sequence's next ones, or as many of each
   of several (a decode step of a batch, whose live row, 1 or 0 for each, says which are a sequence's: the others
-  leave their states as they were). state: [the conv's last c.conv - 1 inputs, S] of each sequence (one batch entry,
-  and c.vh of them), updated in place; S is each value head's memory (a key's width by a value's), which a token decays
-  by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T k)^T, and reads with its query.
-  A speculative step's state also keeps both after its first token alone ([..., conv's, S]), and its accept row (1 or
+  leave their states as they were). state: [the conv's last c.conv - 1 inputs (each place's a matrix, its sequences'
+  rows), S (c.vh batch entries a sequence)], updated in place; S is each value head's memory (a key's width by a
+  value's), which a token decays by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T
+  k)^T, and reads with its query. A speculative step's state also keeps both after its first token alone ([..., conv's, S]), and its accept row (1 or
   0 a sequence) says which the next step goes on from: after both tokens, or after the first when its second, a
-  draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps as rows), decay
+  draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay
   (-exp(A_log)), dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it), a decode or verify
   step's tokens one at a time (step), else a chunk of at most 64 tokens at a time (chunk)."""
   f, (past, S) = fns(h), state[:2]
-  n, seqs, qk, vw, r = h.shape[-2], past.shape[0], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
-  m, width = n // seqs, 2 * qk + vw  # each sequence's tokens; the conv's channels
-  live = None if live is None else live.reshape(seqs, 1, 1)
+  past = past.get() if isinstance(past, Row) else past  # (a sequence's, of several's)
+  n, seqs, qk, vw, r = h.shape[-2], past.shape[1], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
+  m, width, taps = n // seqs, 2 * qk + vw, p["conv"]  # each sequence's tokens; the conv's channels, and its taps (a batch entry each)
+  live, cols = (None, None) if live is None else (live.reshape(seqs, 1, 1), live.reshape(1, seqs, 1))  # (the sequences as rows)
   if accept is not None:  # where a speculative step goes on from, computed before it is written over
     a = accept.reshape(seqs, 1, 1)
-    past, S = f.now(state[2] + a * (past - state[2])), f.now(state[3] + f.repeat(a, c.vh) * (S - state[3]))
+    past, S = f.now(state[2] + accept.reshape(1, seqs, 1) * (past - state[2])), f.now(state[3] + f.repeat(a, c.vh) * (S - state[3]))
   x = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32")
-  rows = f.now(f.cat(past, x[:, :width].reshape(seqs, m, width)))  # each sequence's conv inputs: the last ones, then this
-  taps = p["conv"]                                                  # call's, computed before the last are written over
-  y = f.down(rows * taps) if m == 1 else sum(rows[:, j:j + m, :] * taps[:, j:j + 1, :] for j in range(c.conv))
+  keep = lambda old, new: new if live is None else old + cols * (new - old)
+  if m == 1 and not isinstance(state[0], Row):  # a token of each: the conv over each place's inputs where they lie (its
+    y = f.now(sum((past[j:j + 1, :, :] * taps[j:j + 1, :, :] for j in range(c.conv - 1)), x[:, :width] * taps[c.conv - 1:, :, :]))
+    for j in range(c.conv - 1):  # sequences' rows, as x's), then each place's the next's, in turn: none written over unread
+      f.assign(state[0][j:j + 1, :, :], keep(state[0][j:j + 1, :, :], past[j + 1:j + 2, :, :] if j < c.conv - 2 else x[:, :width]))
+  else:
+    rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))  # each sequence's conv inputs: the last ones, then
+    y = sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))  # this call's, computed before the last are written over
+    f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
+    if accept is not None: f.assign(state[2], keep(state[2], f.swap(rows[:, 1:c.conv, :])))
   y = f.silu(y).reshape(n, width)
-  keep = lambda old, new: new if live is None else old + live * (new - old)
-  f.assign(state[0], keep(state[0], rows[:, m:, :]))
-  if accept is not None: f.assign(state[2], keep(state[2], rows[:, 1:c.conv, :]))
   def each(t, d):  # (tokens, heads of d side by side) as (a sequence's heads, its tokens, d): a batch entry a head
     if m == 1 and seqs > 1: return t.reshape(seqs * t.shape[-1] // d, 1, d)
     heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
@@ -315,7 +320,7 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
     if pre + "conv1d" in w:  # Gated DeltaNet's: q, k and v, then z, b and a, as one matmul
       w[pre + "qkv_proj"] = join(*(w.pop(pre + "in_proj_" + n) for n in ("qkv", "z", "b", "a")))
       w[pre + "o_proj"], conv, A = w.pop(pre + "out_proj"), w.pop(pre + "conv1d"), w.pop(pre + "A_log")
-      w[pre + "conv"] = Weight(lambda conv=conv: np.ascontiguousarray(conv.bits().reshape(-1, c.conv).T.reshape(1, c.conv, -1)))
+      w[pre + "conv"] = Weight(lambda conv=conv: np.ascontiguousarray(conv.bits().reshape(-1, c.conv).T.reshape(c.conv, 1, -1)))
       w[pre + "decay"] = Weight(lambda A=A: gpt2.bf16_bits(-np.exp(A.values())))
     else:
       q = w.pop(pre + "q_proj")
@@ -420,18 +425,28 @@ def prefill(ids, w, c, caches, chunk, on=lambda row: row):
 
 def kv_cache(c, size, zeros, sequences=1, speculative=False):  # each block's keys' heads then its values', a row for each of size
   # places, made by zeros(shape) (and the multi-token prediction block's); a Gated DeltaNet block's states instead, [its
-  # conv's last inputs, S] (delta) for each of sequences, in float32 (zeros(shape, "float32")), twice when speculative
+  # conv's last inputs, S] (delta) of sequences, in float32 (zeros(shape, "float32")), twice when speculative
   def block(l):
     if not linear(c, l): return zeros((2 * c.kv, size, head(c)))
-    return [zeros(shape, "float32") for _ in range(1 + speculative) for shape in ((sequences, c.conv - 1, 2 * c.kh * c.kd + c.vh * c.vd), (sequences * c.vh, c.kd, c.vd))]
+    return [zeros(shape, "float32") for _ in range(1 + speculative) for shape in ((c.conv - 1, sequences, 2 * c.kh * c.kd + c.vh * c.vd), (sequences * c.vh, c.kd, c.vd))]
   return [block(l) for l in range(c.layers + getattr(c, "mtp", 0))]
 
 def linear(c, l): return l < len(getattr(c, "layer_types", None) or ()) and c.layer_types[l] == "linear_attention"  # a Gated DeltaNet block?
 
 def slot(c, caches, u, slots):  # caches made for several sequences (slots) as sequence u's alone, in place: its part of each KV
-  part = lambda kv: kv[:, u * kv.shape[-2] // slots:(u + 1) * kv.shape[-2] // slots, :]  # cache, its Gated DeltaNet states
-  return [[s[u:u + 1, :, :] if i % 2 == 0 else s[u * c.vh:(u + 1) * c.vh, :, :] for i, s in enumerate(kv)] if linear(c, l) else part(kv)
+  part = lambda kv: kv[:, u * kv.shape[-2] // slots:(u + 1) * kv.shape[-2] // slots, :]  # cache, its Gated DeltaNet states (its
+  conv = lambda s: s[:, u:u + 1, :] if isinstance(s, np.ndarray) else Row(s, u)  # row of the conv's)
+  return [[conv(s) if i % 2 == 0 else s[u * c.vh:(u + 1) * c.vh, :, :] for i, s in enumerate(kv)] if linear(c, l) else part(kv)
           for l, kv in enumerate(caches)]
+
+class Row:
+  """Row u of each matrix of a tensor whose sequences are its rows (Gated DeltaNet's conv states: each place's inputs a
+  matrix of every sequence's), as slot gives a sequence its own. No view can be one, so it is read by a move and
+  written by put."""
+  def __init__(self, t, u): self.t, self.u, self.at, self.batch, self.rows, self.cols = t, u, Tensor.of(t.rt, [[u]], "int32"), t.batch, 1, t.cols
+  def get(self): return self.t[:, self.u:self.u + 1, :]
+  def assign(self, x): self.t.put(self.at, x.get() if isinstance(x, Row) else x); return self
+  def tobytes(self): return self.get().tobytes()
 
 def read_json(path):
   with open(path, encoding="utf-8") as f: return json.load(f)

@@ -20,7 +20,7 @@ LAUNCHES = {"attention": 12, "experts": 18, "deltanet": 27, "deltanet verify": 6
 # for several slots: an attention block's (with its norms), a mixture of experts' more, a Gated DeltaNet block's (and one
 # taking a token and a draft at once), the rest (the embedding's gather, the step's masks, the final norm and the output
 # layer), the multi-token prediction layer's call. Counted on ttsim at Qwen3.6's shapes, four slots (cmp/qwen36/launches.py).
-CONTROL = {"deltanet": (20400, 26400), "attention": (17900, 11100), "rest": (3500, 1200)}  # a decode step's RISC-V work as ttsim
+CONTROL = {"deltanet": (17600, 17400), "attention": (17900, 11100), "rest": (3500, 1200)}  # a decode step's RISC-V work as ttsim
 # counts it, in cycles: a Gated DeltaNet block's (with its experts), an attention block's (with its experts), the rest's,
 # so many and so many more a token (cmp/qwen36/control.py at Qwen3.6's shapes, one slot and eight: its moves, most of it)
 WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
