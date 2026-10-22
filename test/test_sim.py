@@ -1300,15 +1300,18 @@ def test_tokenizer(tmp_path):
   # Llama 3's split (its \p{L}, \p{N} and \s spelled out for Python's re, whose \s also takes in four controls) and with
   # SmolLM's, on digits, contractions in capitals, CRLFs, odd spaces, controls (a token only Unicode's \s keeps whole),
   # accents and emoji (a whole piece that is a token is taken as it is: the lone emoji, whose bytes no merge joins), and
-  # with Qwen's NFC first (an e and its combining accent the token of the one letter); and decodes it back
+  # with Qwen's NFC first (an e and its combining accent the token of the one letter), and with gpt-oss's o200k split
+  # (letters by case: \p{Lu}, \p{Ll}, \p{Lt}, \p{Lm}, \p{Lo} and marks); and decodes it back
   tiktoken = pytest.importorskip("tiktoken")
   bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
   char = dict(zip(bs + [b for b in range(256) if b not in bs], map(chr, bs + [256 + i for i in range(256 - len(bs))])))
   tokens = [bytes([b]) for b in range(256)] + [b"th", b"he", b"the", b" the", b"in", b"ing", b"12", b"123", b"\r\n", b"\x1cthe", "é".encode(), "😀".encode()]
   vocab = {"".join(char[b] for b in t): i for i, t in enumerate(tokens)}  # ids in merge order
-  text = "The thing's THE THING'LL 1234567 x²³ ½ ٣٤٥ in\u00a0the\u2003end \t\tthing\r\n\r\nthe \x1c\x1dctrl \x1cthe café 😀😀 x😀y e\u0301 "
+  text = "The thing's THE THING'LL 1234567 x²³ ½ ٣٤٥ in\u00a0the\u2003end \t\tthing\r\n\r\nthe \x1c\x1dctrl \x1cthe café 😀😀 x😀y e\u0301 McDonald's ǅungla ʰa/\n"
   llama3 = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-  for split, nfc in ((llama3, False), (None, False), (llama3, True)):
+  o200k = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?"
+           r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+  for split, nfc in ((llama3, False), (None, False), (llama3, True), (o200k, False)):
     pre = {"type": "Split", "pattern": {"Regex": split}} if split else {"type": "ByteLevel"}
     (tmp_path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": vocab}, "added_tokens": [{"content": "<|end|>", "id": len(vocab)}], "pre_tokenizer": pre,
                                                          "normalizer": {"type": "NFC"} if nfc else None}))

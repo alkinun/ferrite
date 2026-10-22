@@ -351,19 +351,22 @@ WHITE = "\t-\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"  # Uni
 SPLIT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""  # SmolLM's (GPT-2's, digits one at a time)
 
 @functools.cache
-def letters_numbers():  # \p{L} and \p{N}, which Python's re lacks, as a character class's ranges from unicodedata
-  runs = {"L": [], "N": []}
+def categories(names):  # Unicode's general categories (L, or Lu, ...), which Python's re lacks, as a character class's ranges
+  runs = {n: [] for n in names}
   for cp in range(0x110000):
-    if (r := runs.get(unicodedata.category(chr(cp))[0])) is not None:
+    cat = unicodedata.category(chr(cp))
+    for r in (runs.get(cat[0]), runs.get(cat)):
+      if r is None: continue
       if r and r[-1][1] == cp - 1: r[-1][1] = cp
       else: r.append([cp, cp])
   return {k: "".join(re.escape(chr(a)) + (f"-{re.escape(chr(b))}" if b > a else "") for a, b in r) for k, r in runs.items()}
 
-def python_regex(pat):  # tokenizer.json's split for Python's re: \p{L}, \p{N} and \s spelled out (Python's \s also takes
-  ranges, out, inside, i = letters_numbers() | {"s": WHITE}, [], False, 0  # in four controls), bare inside a class
+def python_regex(pat):  # tokenizer.json's split for Python's re: \p{L}, \p{Lu}, ... and \s spelled out (Python's \s also
+  ranges = categories(tuple(sorted(set(re.findall(r"\\p\{(\w+)\}", pat))))) | {"s": WHITE}  # takes in four controls), bare inside a class
+  out, inside, i = [], False, 0
   while i < len(pat):
     if pat.startswith(("\\p{", "\\s", "\\S"), i):
-      key, i = (pat[i + 3], i + 5) if pat[i + 1] == "p" else (pat[i + 1], i + 2)
+      key, i = (pat[i + 3:pat.index("}", i)], pat.index("}", i) + 1) if pat[i + 1] == "p" else (pat[i + 1], i + 2)
       assert not (inside and key == "S"), "\\S in a class"
       out.append(f"[^{WHITE}]" if key == "S" else ranges[key] if inside else f"[{ranges[key]}]")
     else:
