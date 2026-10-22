@@ -44,10 +44,19 @@ MLP in bfp4 too, as Tenstorrent's own code keeps it: add `bfp4`).
     TTSIM=... python3 test/llama.py SmolLM-135M "The meaning of life is" 6
     The meaning of life is a question that has been asked
 
+Llama-3.1-8B-Instruct runs whole on the simulator at Tenstorrent's performance precision (MLP weights in bfp4, the
+rest in bfp8), each token the one numpy picks. Mixtures of experts run with their experts chosen on the chip: one
+kernel of a RISC-V core takes each token's best experts, matmuls read the chosen experts' weights where they lie, and
+a prompt's tokens are grouped by expert, so a decode step replays with whatever experts its tokens pick.
+Qwen3-30B-A3B's first two blocks, with its real weights, pick numpy's token at every place of a prompt and decode as
+numpy does. `test/llama.py` reads Llama's, Mistral's, Qwen2's and Qwen3's checkpoints, and Mixtral's, Qwen2-MoE's and
+Qwen3-MoE's, each checked against transformers' own model.
+
 Serving: `test/serve.py` is an OpenAI-compatible server (`/v1/completions`, `/v1/chat/completions`, whole or streamed)
-for these models, from a folder or a Hugging Face model id. Requests decode together, each in a slot of one KV cache,
-every step one replayed call for all of them, and a prompt goes to the slot that already holds the longest start of
-it, so a shared prefix is not prefilled again. SmolLM-135M answers "The meaning of life is" over HTTP as above.
+for these models, from a folder or a Hugging Face model id; a thinking model's reasoning (Qwen3's) comes apart from its
+answer. Requests decode together, each in a slot of one KV cache, every step one replayed call for all of them, and a
+prompt goes to the slot that already holds the longest start of it, so a shared prefix is not prefilled again.
+SmolLM-135M answers "The meaning of life is" over HTTP as above.
 
     TTSIM=... python3 test/serve.py SmolLM-135M 8000
     curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 6, "temperature": 0}'
