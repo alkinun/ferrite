@@ -1454,6 +1454,39 @@ def test_qwen3_moe(chip, tmp_path):
   want = llama.forward(ids, list(range(8)), llama.arrays(weights, c.precision), c, llama.kv_cache(c, 32, np.zeros), every=True)
   assert np.array_equal(got.argmax(-1), want.argmax(-1)) and np.abs(got - want).max() < 0.01 * np.ptp(want), np.abs(got - want).max() / np.ptp(want)
 
+FAMILIES = {"qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mistral": ("Mistral", dict(sliding_window=None)),
+            "qwen2_moe": ("Qwen2Moe", dict(moe_intermediate_size=64, shared_expert_intermediate_size=96, num_experts=8, num_experts_per_tok=2)),
+            "mixtral": ("Mixtral", dict(num_local_experts=8, num_experts_per_tok=2))}
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_hf_families(chip, tmp_path, family):
+  # test/llama.py reads other families' checkpoints as Hugging Face saves them: Qwen3's dense one (q and k normed per
+  # head), Qwen2's (biases on q, k and v), Mistral's, Qwen2-MoE's (a shared expert, gated by a sigmoid, beside the
+  # chosen ones) and Mixtral's (its experts' w1, w3 and w2 its gate, up and down). transformers' own model (float32,
+  # random bf16 weights, the biases and norms made to count) is the reference: numpy within 0.5% of its logits at every
+  # place, the chip within 2% and picking the same tokens, or one within 0.1% of the span of it (Qwen2-MoE's has such a tie)
+  torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
+  name, extra = FAMILIES[family]
+  torch.manual_seed(0)
+  config = getattr(transformers, name + "Config")(hidden_size=128, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                                                  vocab_size=256, max_position_embeddings=64, rope_theta=1e4, tie_word_embeddings=False, **extra)
+  model = getattr(transformers, name + "ForCausalLM")(config)
+  for p in model.parameters():  # biases start at 0 and norms at 1: make them count
+    if p.ndim == 1: p.data.normal_(1, 0.2) if torch.all(p == 1) else p.data.normal_(0, 0.5)
+  model = model.to(torch.bfloat16).float()
+  model.save_pretrained(tmp_path)
+  ids = [3, 1, 4, 1, 5, 9, 2, 6]
+  with torch.no_grad(): want = model(torch.tensor([ids])).logits[0].numpy()
+  c, weights = llama.load(str(tmp_path), 32)
+  rel = lambda got: max(np.abs(got[r] - want[r]).max() / np.abs(want[r]).max() for r in range(len(ids)))
+  numpy = rel(llama.forward(ids, list(range(8)), llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros), every=True))
+  assert numpy < 0.005, numpy
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  on = lambda row: Tensor.of(rt, [row], "int32")
+  got = gpt2.values(llama.forward(on(ids), on(list(range(8))), llama.upload(rt, weights), c, llama.kv_cache(c, 32, llama.zeros(rt)), every=True))
+  ties = [want[r].max() - want[r][got[r].argmax()] <= 0.001 * np.ptp(want[r]) for r in range(len(ids))]  # its best, or one bf16 cannot tell from it
+  assert rel(got) < 0.02 and all(ties), (rel(got), ties)
+
 @pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
 def test_llama_8b_shapes(chip):
   # one block in Llama-3.1-8B's shapes (4096 wide, 32 query heads sharing 8 KV heads, an MLP of 14336, Llama 3's RoPE

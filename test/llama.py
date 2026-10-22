@@ -21,10 +21,10 @@ import gpt2
 def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llama adds
   if isinstance(x, np.ndarray):
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a),
-                           silu=lambda a: a / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0), mm=lambda a, b, phases: a @ b,
+                           silu=lambda a: a / (1 + np.exp(-a)), sigmoid=lambda a: 1 / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0), mm=lambda a, b, phases: a @ b,
                            topk=lambda a, k: (np.take_along_axis(a, i := np.argsort(-a, -1, kind="stable")[..., :k], -1), i),
                            experts=numpy_experts, where=np.where)
-  return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, repeat=Tensor.repeat_interleave,
+  return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid, repeat=Tensor.repeat_interleave,
                          mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's products are exact at any phases
                          experts=chip_experts, where=lambda cond, a, b: cond.where(a, b))
 
@@ -61,7 +61,8 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   f, n = fns(x), c.heads + 2 * c.kv
   phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c.eps)
-  qkv = f.split(f.mm(h, p["qkv_proj"], phases("qkv")), n)
+  qkv = f.mm(h, p["qkv_proj"], phases("qkv"))
+  qkv = f.split(qkv + p["qkv_bias"] if "qkv_bias" in p else qkv, n)  # (Qwen2's bias)
   if "qk_norm" in p:  # Qwen3's: each head of q and of k RMS-normed before it turns, in one kernel with v's, which qk_on keeps
     qkv = qkv * f.where(p["qk_on"], f.rsqrt(f.mean(qkv * qkv) + c.eps) * p["qk_norm"], 1)
   qkv = rope(qkv, f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
@@ -72,19 +73,25 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(head(c)))
   x = x + f.mm(f.merge(f.mm(f.softmax(s + mask), v, attention)), p["o_proj"], phases("o"))
   h = rms(x, p["post_attention_layernorm"], c.eps)
-  if "router" in p: return x + moe(h, p, c, phases)
-  gate_up, m = f.mm(h, p["gate_up_proj"], phases("gate_up")), p["down_proj"].shape[-2]
-  return x + f.mm(f.silu(gate_up[:, :m]) * gate_up[:, m:], p["down_proj"], phases("down"))
+  return x + (moe(h, p, c, phases) if "router" in p else mlp(h, p, phases))
+
+def mlp(h, p, phases, pre=""):  # a SwiGLU: silu(h @ gate) * (h @ up), then down; p[pre + "gate_up_proj"] holds gate and up side by side
+  f, m = fns(h), p[pre + "down_proj"].shape[-2]
+  gate_up = f.mm(h, p[pre + "gate_up_proj"], phases("gate_up"))
+  return f.mm(f.silu(gate_up[:, :m]) * gate_up[:, m:], p[pre + "down_proj"], phases("down"))
 
 def moe(h, p, c, phases=lambda op: None):
   """A mixture of experts in the MLP's place (Qwen3's, Mixtral's): each token's router logits, its c.k best experts
   (topk, on the chip), and their SwiGLUs weighted by the softmax of their logits (which Qwen3's top-k probabilities,
-  renormalized, are too) and summed. p: router (dim x experts), experts.gate_up and experts.down (a batch of the
-  experts' matrices); phases(op): the fidelity phases of the experts' gate_up and down."""
+  renormalized, are too) and summed; and a shared expert's SwiGLU, if the block has one, gated by a sigmoid of its own.
+  p: router (dim x experts), experts.gate_up and experts.down (a batch of the experts' matrices); phases(op): the
+  fidelity phases of the experts' gate_up and down."""
   f, norm = fns(h), getattr(c, "norm_topk", True)
   logits = f.mm(h, p["router"], None)  # (without norm_topk_prob, the chosen experts' probabilities among all, as they are)
   values, ids = f.topk(logits if norm else f.softmax(logits), c.k)
-  return f.experts(h, p["experts.gate_up"], p["experts.down"], ids, f.softmax(values) if norm else values, (phases("gate_up"), phases("down")))
+  y = f.experts(h, p["experts.gate_up"], p["experts.down"], ids, f.softmax(values) if norm else values, (phases("gate_up"), phases("down")))
+  if "shared_expert_gate" not in p: return y
+  return y + f.sigmoid(f.mm(h, p["shared_expert_gate"], None)) * mlp(h, p, phases, "shared_expert.")  # Qwen2-MoE's, every token's
 
 def numpy_experts(h, gate_up, down, ids, w, phases):  # each token's chosen experts' SwiGLUs, weighted by w and summed
   m = down.shape[-2]
@@ -145,6 +152,11 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
   const = lambda shape, v: Weight(lambda: np.full(shape, gpt2.bf16_bits(np.float32(v)), np.uint16))
   for pre in {k[:k.index(".", 7) + 1] for k in w if k.startswith("layers.")}:
     w[pre + "qkv_proj"] = join(*(w.pop(pre + n) for n in ("q_proj", "k_proj", "v_proj")))
+    if pre + "q_proj.bias" in w: w[pre + "qkv_bias"] = join(*(w.pop(pre + n) for n in ("q_proj.bias", "k_proj.bias", "v_proj.bias")))
+    if pre + "shared_expert_gate" in w:  # Qwen2-MoE's shared expert, and its gate transposed for x @ w
+      w[pre + "shared_expert.gate_up_proj"] = join(w.pop(pre + "shared_expert.gate_proj"), w.pop(pre + "shared_expert.up_proj"))
+      g = w.pop(pre + "shared_expert_gate")
+      w[pre + "shared_expert_gate"] = Weight(lambda g=g: np.ascontiguousarray(g.bits().T)) if isinstance(g, Weight) else np.ascontiguousarray(g.T)
     if pre + "q_norm" in w:
       q, k = w.pop(pre + "q_norm"), w.pop(pre + "k_norm")
       w[pre + "qk_norm"] = stack([q] * c.heads + [k] * c.kv + [const((1, head(c)), 1)] * c.kv)
@@ -209,7 +221,8 @@ def load(folder, places=4096):
     header, data = gpt2.safetensors(os.path.join(folder, file))
     for name, t in header.items():
       if name == "__metadata__": continue
-      name = name.removeprefix("model.").replace("self_attn.", "").replace("mlp.", "").removesuffix(".weight")
+      name = name.removeprefix("model.").replace("self_attn.", "").replace("mlp.", "").replace("block_sparse_moe.", "").removesuffix(".weight")
+      name = re.sub(r"(experts\.\d+)\.w([123])$", lambda m: m[1] + (".gate_proj", ".down_proj", ".up_proj")[int(m[2]) - 1], name)  # Mixtral's
       out[name] = Weight(functools.partial(gpt2.tensor_bits, data, t, name.endswith("_proj") or name == "lm_head"))
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = out.pop("lm_head", None) or Weight(lambda e=out["embed"]: np.ascontiguousarray(e.bits().T))  # tied, or its own
