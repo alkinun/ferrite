@@ -393,6 +393,21 @@ def test_matmul_multicast(chip):
   x, w, d, bias = (Tensor.of(rt, bf16(rng.uniform(-1, 1, shape)).tolist()) for shape in ((96, 64), (64, 200), (96, 200), (1, 200)))
   assert (x @ w * d + bias).tolist() == unfused(x @ w * d + bias).tolist()
 
+def test_matmul_indexed(chip):
+  # x.matmul(w, index=ids), a mixture of experts' matmul: batch entry b of the result is row b // k of x (a batch of 1,
+  # or of rows times k by repeat_interleave) by the matrix of w that ids picks, ids[b // k, b % k], which BRISC reads on
+  # the chip, so a replay reads whatever experts its tokens chose. One token's 8 experts (a grid row each, A's row
+  # shared), and 4 tokens' 3 each (12 entries, more than the grid's rows), in bf16 and bfp4: each entry bit for bit the
+  # plain matmul by its expert
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(29)
+  experts = Tensor.of(rt, rng.normal(0, 0.1, (16, 96, 160)).tolist())
+  for wt in ("bf16", "bfp4"):
+    w = experts if wt == "bf16" else experts.cast(wt).realize()
+    for n, k in ((1, 8), (4, 3)):
+      ids, x = rng.integers(0, 16, (n, k)), Tensor.of(rt, rng.normal(0, 1, (n, 1, 96)).tolist())
+      got = value((x.repeat_interleave(k) if n > 1 else x).matmul(w, index=Tensor.of(rt, ids.tolist(), "int32")))
+      assert all(np.array_equal(got[b], value(x[b // k] @ w[int(ids[b // k, b % k])])[0]) for b in range(n * k)), (wt, n, k)
+
 def test_stream_on_one_worker(chip):
   # one worker gets every tile, so the pipeline really cycles: L1 slots and Dst halves alternate, the threads hand
   # tiles along by semaphore, and BRISC fetches and writes back around them. 32 elementwise tiles, then a 128x96 @ 96x128

@@ -371,15 +371,23 @@ class Tensor:
     return c * ((c * c).mean(axis) + eps).rsqrt()
 
   def __matmul__(self, x): return self.matmul(x)
-  def matmul(self, x, dtype=None, fidelity=None):
+  def matmul(self, x, dtype=None, fidelity=None, index=None):
     """Matrix by matrix through a batch (a batch of 1 repeats), summed in fp32 in Dst and written as dtype: bf16, or fp32
     if either operand is, unless said. fp32 operands go as bf16x3: each is hi + lo, both bf16, and hi@hi + hi@lo + lo@hi
     sum in fp32 (lo@lo, 2^-16 of the rest, is left out), about 16 bits of each operand where fp32 has 24; but the FPU
     adds products 8 at a time to about 2^-11 of the largest (NOTES, "Matmul precision"), which bounds any matmul's
     result. fidelity: the phases a bf16 product takes (FIDELITY unless said; compiler.matmul says what each leaves out);
     fp32's take all four. x may be a block float (a weight cast once: bfp8, read at about half a bf16's bytes, or bfp4, a
-    quarter) when self is bf16."""
+    quarter) when self is bf16. index: an int32 (rows, k) tensor picking, for each batch entry b of the result, which of
+    x's matrices to multiply by, index's (b // k, b % k), read on the chip from where they lie: a mixture of experts'
+    choice, so a replayed step reads the experts its tokens chose (self: a batch of 1, or of rows times k)."""
     fidelity = fidelity or FIDELITY
+    if index is not None:
+      assert index.dtype == "int32" and self.dtype == "bf16" and self.cols == x.rows and self.batch in (1, index.rows * index.cols), \
+        f"{self.shape} @ {x.shape} picked by {index.shape} {index.dtype}"
+      out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x, index), index.rows * index.cols, dtype or "bf16")
+      out.fidelity = fidelity
+      return out
     if x.tiles <= 16 and (terms := _terms(self)):  # by a small matrix, a sum not yet computed (RoPE's turn of a split K's
       return sum((t.matmul(x, dtype, fidelity) for t in terms[1:]), terms[0].matmul(x, dtype, fidelity))  # parts): term by term
     assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
@@ -620,11 +628,12 @@ def _expr(t, shape, inputs, kernel):
     kernel[2].add(id(t))
   if t.op in ("T", "move"): return _expr(t.realize(), shape, inputs, kernel)  # kernels of their own (a matmul's B may be read transposed, below)
   if t.op == "matmul":  # its operands are whole matrices, not tiles: realize them on their own first
-    a, b = t.srcs
+    a, b, *picked = t.srcs  # (and the indices picking B's matrices)
     if b.op == "T":  # read transposed; a block float (a bfp8 key cache) as it is, transposed on its way in too
       src = b.srcs[0].realize()
       b = ("T" + src.dtype, _input(src, inputs)) if src.dtype in BFP else ("T", _expr(src, shape, inputs, kernel))
     else: b = (b.dtype, _input(b.realize(), inputs)) if b.dtype in BFP else _expr(b.realize(), shape, inputs, kernel)
+    if picked: b = ("I" + b[0], b[1], _input(picked[0].realize(), inputs)) if isinstance(b, tuple) else ("I", b, _input(picked[0].realize(), inputs))
     return ("matmul", _expr(a.realize(), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 

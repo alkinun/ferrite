@@ -713,10 +713,12 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     if isinstance(e, int): return e
     if e in refs: return refs[e]
     if e[0] == "matmul":  # B is an input, or (how, input): ("T", input) that input transposed, ("bfp8", input) a block float,
-      how, y = e[2] if isinstance(e[2], tuple) else ("", e[2])  # ("Tbfp8", input) a block float transposed (a bfp8 key cache)
-      a, bt, wt = shapes[e[1]], how.startswith("T"), how.removeprefix("T") or None
-      op = dict(kind="matmul", x=e[1], y=y, how=2 if wt else int(bt), bt=bt, wt=wt, kt=ext(a, 2),  # how: B fetched as a bf16 tile (0, 1) or a block float's (2)
-                shape=(max(a[0], shapes[y][0]), a[1], shapes[y][1 if bt else 2]), phases=e[3] if len(e) > 3 else 4)
+      how, y, *ids = e[2] if isinstance(e[2], tuple) else ("", e[2])  # ("Tbfp8", input) a block float transposed (a bfp8 key
+      how, ids = how.removeprefix("I"), ids[0] if ids else None  # cache); ("I" + how, input, ids) for each batch entry b the matrix
+      a, bt, wt = shapes[e[1]], how.startswith("T"), how.removeprefix("T") or None  # of B the int32 input ids picks (b // k, b % k)
+      batch = shapes[ids][1] * shapes[ids][2] if ids is not None else max(a[0], shapes[y][0])
+      op = dict(kind="matmul", x=e[1], y=y, ids=ids, how=2 if wt else int(bt), bt=bt, wt=wt, kt=ext(a, 2),  # how: B fetched as a bf16 tile (0, 1) or a block float's (2)
+                shape=(batch, a[1], shapes[y][1 if bt else 2]), phases=e[3] if len(e) > 3 else 4)
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
@@ -901,7 +903,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
         bt, bs = op["bt"], 0 if how == 2 else 1  # B transposed; B's first stream slot (a block float's are at B8)
         x, y = arg(op["x"]), arg(op["y"])
         bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
-        in_batch = matrix(op["y"], y)
+        in_batch = f"ids(b) * a[{y + 1}] + " if op["ids"] is not None else matrix(op["y"], y)  # B's matrix: picked, or the batch's
         b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
         on = tt(haloize(1) * bt + (bfp_b(wt, b8) if how == 2 else []))  # unpacker 0 transposing faces, reading a block float
         off = tt(haloize(0) * bt + (bfp_b(wt, 0) if how == 2 else []))
@@ -1022,6 +1024,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
 {sweeps}
   }}"""
   total = f"a[1] * {L if swept(me) else 1}" if reducing else "tiles"  # results this worker sends home
+  first = ""
   if bcast:  # before its first tile, each worker waits for A's row, which the first grid row of its matrix's reads and multicasts
     (gx_n, gy_n), (xs, ys), kt, x = bcast, grid, ops[matmuls[0]]["kt"], arg(ops[matmuls[0]]["x"])
     rects = [bh.noc_rect((xs[0], ys[g]), (xs[gx_n - 1], ys[g + gy_n - 1])) for g in range(0, nb * gy_n, gy_n)]  # each matrix's rows
@@ -1030,7 +1033,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     first = (f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, end = (gx + 1) * {kt} / {gx_n};\n"
              f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
              f"      share(SLOT({rows_at[0]} + e), (end - e) * {tile_bytes(dtype)}, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
-  brisc = _brisc(total, (first if bcast else "") + program(B), dtype, out, decls, tail, b8, wt)
+  picked = [ops[j]["ids"] for j in matmuls if ops[j]["ids"] is not None]  # B's matrices picked by an int32 tensor: its one tile
+  if picked:  # comes in first, where nothing else goes (past the slots and a block float's buffers)
+    (r,), k = picked, shapes[picked[0]][2]
+    assert shapes[r][0] == 1 and shapes[r][1] <= 32 and k <= 32, "the indices in one tile"
+    decls += (f"#define IDS {OUTS - tile_bytes('int32'):#x}\nstatic unsigned ids(unsigned b) {{ unsigned t = b / {k}, j = b % {k};  // index (t, j)\n"
+              f"  return ((volatile unsigned *)IDS)[(t / 16 * 2 + j / 16) * 256 + t % 16 * 16 + j % 16]; }}\n")
+    first = f"  noc_get(BANK(a[{arg(r) + 3}]), AT(a[{arg(r)}], a[{arg(r) + 3}], {tile_bytes('int32')}), IDS, {tile_bytes('int32')}); noc_wait();\n" + first
+  brisc = _brisc(total, first + program(B), dtype, out, decls, tail, b8, wt)
   image = compile_kernel(brisc, _unpacker(program(U), config), _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 
