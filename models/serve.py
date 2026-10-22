@@ -17,11 +17,12 @@ class Request:
   """A prompt's tokens and how to go on from them: greedy at temperature 0, else sampled from the softmax at that
   temperature with its least likely tokens past top_p left out, until a token in eos, a stop string or max_tokens.
   Each piece of new text goes into out as soon as no stop string could still begin in it, then None once the engine
-  is done with it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot."""
+  is done with it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot.
+  cached: its prompt's tokens that its slot, or a session saved on the host, held already, which were not prefilled."""
   def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None):
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
     self.stop, self.eos, self.rng = [stop] if isinstance(stop, str) else list(stop or ()), set(eos), np.random.default_rng(seed)
-    self.made, self.said, self.out, self.finish, self.gone = [], "", queue.Queue(), None, False
+    self.made, self.said, self.out, self.finish, self.gone, self.cached = [], "", queue.Queue(), None, False, 0
 
   def pick(self, logits):
     if self.temperature == 0: return int(logits.argmax())
@@ -98,7 +99,7 @@ class Engine:
       for l, s in enumerate(self.slot[u]):
         if llama.linear(self.c, l): s[0].assign(s[2]), s[1].assign(s[3])
       self.taken[u] = 1.0
-    self.held[u] = r.ids[:n]
+    self.held[u], r.cached = r.ids[:n], n
 
   def save(self, u):  # slot u's session to the host: its tokens, its rows of each KV cache (whole tiles) and its states (after a
     key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32  # turned-down draft, those after the token before it)
@@ -281,8 +282,10 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
   /v1/chat/completions, whole or streamed (server-sent events). A model that thinks (its template has <think>, or
   gpt-oss's channels) gives its reasoning apart from its answer (reasoning_content), unless chat_template_kwargs'
   enable_thinking is false (Qwen3's); gpt-oss reasons as hard as reasoning_effort says (low, medium or high). Given
-  tools (Qwen3.5's template), the answer's tool calls come as OpenAI's tool_calls, a stream's after its text. A
-  piece of text not ready in `wait` seconds ends the request: a hung chip is reported, not waited on."""
+  tools (Qwen3.5's template), the answer's tool calls come as OpenAI's tool_calls, a stream's after its text. Its
+  usage counts the prompt's tokens that were cached (prompt_tokens_details), as OpenRouter bills them, and ends a stream
+  too, a chunk of its own, as OpenRouter's does. A piece of text not ready in `wait` seconds ends the request: a hung
+  chip is reported, not waited on."""
   class Handler(BaseHTTPRequestHandler):
     def reply(self, code, body):
       data = json.dumps(body).encode()
@@ -321,6 +324,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         return out
       called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the answer's text and tool calls
       piece = lambda text, done: ({"index": 0, "delta": delta(text)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
+      usage = lambda: {"prompt_tokens": len(ids), "completion_tokens": len(r.made), "total_tokens": len(ids) + len(r.made),
+                       "prompt_tokens_details": {"cached_tokens": r.cached}}
       if q.get("stream"):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
         send = lambda body: (self.wfile.write(f"data: {json.dumps(body)}\n\n".encode()), self.wfile.flush())
@@ -331,6 +336,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
           if made := called(seen["text"])[1]:
             send(head | {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}, "finish_reason": None}]})
           send(head | {"choices": [piece("", "tool_calls" if made else r.finish)]})
+          send(head | {"choices": [], "usage": usage()})
           return self.wfile.write(b"data: [DONE]\n\n")
         except (OSError, queue.Empty): r.gone = True  # the client went, or no text came: its slot is let go
         return
@@ -340,8 +346,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
       message, (content, made) = parts(text), called(text)
       if made: message |= {"content": content or None, "tool_calls": made}
       choice = {"index": 0, "message": {"role": "assistant"} | message} if is_chat else {"index": 0, "text": text, "logprobs": None}
-      self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}],
-                              "usage": {"prompt_tokens": len(ids), "completion_tokens": len(r.made), "total_tokens": len(ids) + len(r.made)}})
+      self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}], "usage": usage()})
   return ThreadingHTTPServer(("", port), Handler)
 
 def fetch(model, cache=os.path.expanduser("~/.cache/ferrite/hub")):

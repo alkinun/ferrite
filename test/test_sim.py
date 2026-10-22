@@ -1940,7 +1940,7 @@ def test_serve(chip, tmp_path):
   # or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP, /v1/completions
   # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
   # template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and streamed, or not
-  # at all when it is told not to think
+  # at all when it is told not to think; usage counts the prompt's tokens its slot held (cached), and ends a stream
   import urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -1991,11 +1991,11 @@ def test_serve(chip, tmp_path):
   r = serve.Request(tok, tok.encode("Hi there"), 6, 0)
   engine.waiting.put(r)
   text = tok.decode(done(r))
-  reply = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0}))
+  reply, held = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0})), len(tok.encode("Hi there")) - 1  # (its slot's)
   assert reply["choices"][0]["text"] == text and reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 6
-  events = [json.loads(line[6:]) for line in post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}).read().decode().split("\n\n")
-            if line.startswith("data: {")]
-  assert "".join(e["choices"][0]["text"] for e in events) == text and events[-1]["choices"][0]["finish_reason"] == "length"
+  assert reply["usage"]["prompt_tokens_details"]["cached_tokens"] == held, "all but the prompt's last token, which runs again"
+  events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}))
+  assert "".join(e["text"] for e in events) == text and events[-1]["finish_reason"] == "length" and usage["completion_tokens"] == 6
   assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
   http.shutdown()
   hi = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
@@ -2010,8 +2010,8 @@ def test_serve(chip, tmp_path):
   engine.waiting.put(r)
   text, body = tok.decode(done(r)), {"messages": hi[1:], "max_tokens": 6, "temperature": 0}
   assert json.load(ask(body))["choices"][0]["message"] == {"role": "assistant", "reasoning_content": text.strip(), "content": ""}  # no </think> came
-  events = [json.loads(line[6:]) for line in ask(body | {"stream": True}).read().decode().split("\n\n") if line.startswith("data: {")]
-  assert "".join(e["choices"][0]["delta"].get("reasoning_content", "") for e in events) == text.strip() and not any("content" in e["choices"][0]["delta"] for e in events)
+  events = streamed(ask(body | {"stream": True}))[0]
+  assert "".join(e["delta"].get("reasoning_content", "") for e in events) == text.strip() and not any("content" in e["delta"] for e in events)
   off = len(tok.encode(serve.chat("<|im_start|> <think>", hi[1:], False), special=True))  # not thinking: the prompt's reasoning given, empty,
   with pytest.raises(urllib.error.HTTPError) as e: ask(body | {"chat_template_kwargs": {"enable_thinking": False}})  # too long for these slots
   assert json.load(e.value)["error"]["message"].startswith(f"{off} tokens")
@@ -2033,6 +2033,11 @@ def agrees(r, w, c):  # a finished request: each token's logits within 3% of num
   want = llama.forward(ids, list(range(len(ids))), w, c, llama.kv_cache(c, 64, np.zeros), every=True)[len(r.ids) - 1:][:len(r.logits)]
   worst = max(np.abs(g - v).max() / np.abs(v).max() for g, v in zip(r.logits, want))
   assert worst < 0.03 and near(r.logits, want), worst
+
+def streamed(response):  # a server-sent stream's choices, and its usage, its last chunk's
+  events = [json.loads(line[6:]) for line in response.read().decode().split("\n\n") if line.startswith("data: {")]
+  assert events[-1]["choices"] == [] and "usage" in events[-1], "usage, a stream's last chunk"
+  return [e["choices"][0] for e in events[:-1]], events[-1]["usage"]
 
 def served(engine, *requests):  # requests put to an engine, each when the last has ended (None) or all at once (a list)
   for batch in requests:
@@ -2063,7 +2068,7 @@ def test_serve_sessions(chip, tmp_path):
     before, r = engine.prefilled, Kept(tok, turn, 4, 0)
     served(engine, r)
     agrees(r, w, c)
-    assert engine.prefilled - before == len(turn) - len(saved), engine.prefilled - before
+    assert engine.prefilled - before == len(turn) - len(saved) == len(turn) - r.cached, (engine.prefilled - before, r.cached)
 
 def test_serve_speculative(chip, tmp_path):
   # models/serve.py's engine drafting with Qwen3.5's multi-token prediction layer (qwen35's, at random): each step
@@ -2135,7 +2140,7 @@ def test_chat_tools(tmp_path):
   reply = json.load(ask({"messages": messages[:2], "tools": tools}))["choices"][0]
   assert reply["finish_reason"] == "tool_calls" and reply["message"]["content"] == "Let me look." and reply["message"]["reasoning_content"] == "I should read it."
   assert json.loads(reply["message"]["tool_calls"][0]["function"]["arguments"]) == {"path": "a.txt", "lines": 2}
-  events = [json.loads(line[6:])["choices"][0] for line in ask({"messages": messages[:2], "tools": tools, "stream": True}).read().decode().split("\n\n") if line.startswith("data: {")]
+  events = streamed(ask({"messages": messages[:2], "tools": tools, "stream": True}))[0]
   assert "".join(e["delta"].get("content", "") for e in events).strip() == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
   assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
   http.shutdown()
