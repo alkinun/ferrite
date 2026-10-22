@@ -1523,7 +1523,8 @@ def test_serve(chip, tmp_path):
   # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
   # reaches (on any other it would spoil what its slot holds). A request ends at a stop string,
   # without its text, or at an end-of-sequence token, and says no text in which a stop string might yet begin. Over
-  # HTTP, /v1/completions whole and streamed give the engine's text, and /v1/models the model
+  # HTTP, /v1/completions whole and streamed give the engine's text, and /v1/models the model; chat messages go into
+  # ChatML's or Llama 3's template
   import threading, urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -1566,6 +1567,10 @@ def test_serve(chip, tmp_path):
   assert "".join(e["choices"][0]["text"] for e in events) == text and events[-1]["choices"][0]["finish_reason"] == "length"
   assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
   http.shutdown()
+  hi = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
+  assert serve.chat("... <|im_start|> ...", hi) == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+  assert serve.chat("... <|start_header_id|> ...", hi[1:]) == ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"
+                                                               "<|start_header_id|>assistant<|end_header_id|>\n\n")
 
 def test_fetch(tmp_path, monkeypatch):
   # serve.fetch: a model id's files from Hugging Face's resolve URLs (a local server in its place, by HF_ENDPOINT), the
