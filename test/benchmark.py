@@ -142,7 +142,7 @@ def ferrite(folder, prompt, after, top5, book, s):
   out[f"B2 decode, batch {s.users}"] = {"tokens/s a user": tps, "tokens/s": tps * s.users}
   top1, five, _ = llama.accuracy(rt, t, c, prompt, after, top5, s.accuracy)
   out["B2 token accuracy"] = {"top-1": top1, "top-5": five, "steps": s.accuracy}
-  ids = llama.tokenizer(folder).encode(book)
+  ids = llama.Tokenizer(folder).encode(book)
   for n in s.lengths:  # a prompt ferrite cannot run yet is published as such
     try: out[f"B3 prefill, {n} tokens"] = dict(zip(("seconds to first token", "chunk"), prefill(t, c, ids[:n])))
     except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run yet": f"{type(e).__name__}: {e}"}

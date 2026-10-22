@@ -11,7 +11,7 @@
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).
 # bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and the rest in bfp8 (numpy then has
 # them as the chip does), tt: TT's performance precision, formats and fidelity phases both (precision).
-import functools, json, math, os, sys, time
+import functools, json, math, os, re, sys, time, unicodedata
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -216,19 +216,56 @@ def accuracy(rt, t, c, prompt, after, top5, steps=500):
     for i in range(steps - 1): picks.append(int(logits(replay(on([after[i]]), on([n + i]))).argmax()))
   return sum(p == f[0] for p, f in zip(picks, top5)) / steps, sum(p in f for p, f in zip(picks, top5)) / steps, picks
 
-def tokenizer(folder):
-  """tiktoken over tokenizer.json's byte-level BPE (ids in merge order, so they are the ranks), split as it says."""
-  import tiktoken
-  t = json.load(open(os.path.join(folder, "tokenizer.json")))
-  bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
-  cs = bs + [256 + i for i in range(256 - len(bs))]
-  byte = dict(zip(map(chr, cs), bs + [b for b in range(256) if b not in bs]))
-  special = {a["content"]: a["id"] for a in t["added_tokens"]}
-  ranks = {bytes(byte[ch] for ch in tok): i for tok, i in t["model"]["vocab"].items() if tok not in special}
-  pre = t.get("pre_tokenizer") or {}  # the split before BPE: tokenizer.json's own (Llama 3's), else SmolLM's
-  split = [p["pattern"]["Regex"] for p in pre.get("pretokenizers", [pre]) if p.get("type") == "Split" and "Regex" in p.get("pattern", {})]
-  pat = split[0] if split else r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-  return tiktoken.Encoding(os.path.basename(folder.rstrip("/")), pat_str=pat, mergeable_ranks=ranks, special_tokens=special)
+WHITE = "\t-\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"  # Unicode's White_Space: what tiktoken's \s matches
+SPLIT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""  # SmolLM's (GPT-2's, digits one at a time)
+
+@functools.cache
+def letters_numbers():  # \p{L} and \p{N}, which Python's re lacks, as a character class's ranges from unicodedata
+  runs = {"L": [], "N": []}
+  for cp in range(0x110000):
+    if (r := runs.get(unicodedata.category(chr(cp))[0])) is not None:
+      if r and r[-1][1] == cp - 1: r[-1][1] = cp
+      else: r.append([cp, cp])
+  return {k: "".join(re.escape(chr(a)) + (f"-{re.escape(chr(b))}" if b > a else "") for a, b in r) for k, r in runs.items()}
+
+def python_regex(pat):  # tokenizer.json's split for Python's re: \p{L}, \p{N} and \s spelled out (Python's \s also takes
+  ranges, out, inside, i = letters_numbers() | {"s": WHITE}, [], False, 0  # in four controls), bare inside a class
+  while i < len(pat):
+    if pat.startswith(("\\p{", "\\s", "\\S"), i):
+      key, i = (pat[i + 3], i + 5) if pat[i + 1] == "p" else (pat[i + 1], i + 2)
+      assert not (inside and key == "S"), "\\S in a class"
+      out.append(f"[^{WHITE}]" if key == "S" else ranges[key] if inside else f"[{ranges[key]}]")
+    else:
+      n = 2 if pat[i] == "\\" else 1
+      inside = pat[i] == "[" if not inside else pat[i] != "]"
+      out.append(pat[i:i + n])
+      i += n
+  return re.compile("".join(out))
+
+class Tokenizer:
+  """tokenizer.json's byte-level BPE in plain Python, as tiktoken does it: the text split by its regex, and each piece
+  that is not a token itself merged a pair of parts at a time, the lowest-ranked first (ids are in merge order, so they
+  are the ranks). Special tokens in the text are taken as text."""
+  def __init__(self, folder):
+    t = json.loads(open(os.path.join(folder, "tokenizer.json"), encoding="utf-8").read())
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
+    byte = dict(zip(map(chr, bs + [256 + i for i in range(256 - len(bs))]), bs + [b for b in range(256) if b not in bs]))
+    special = {a["content"]: a["id"] for a in t["added_tokens"]}
+    self.ranks = {bytes(byte[ch] for ch in tok): i for tok, i in t["model"]["vocab"].items() if tok not in special}
+    self.bytes = {i: b for b, i in self.ranks.items()} | {i: s.encode() for s, i in special.items()}
+    pre = t.get("pre_tokenizer") or {}  # the split before BPE: tokenizer.json's own (Llama 3's), else SmolLM's
+    split = [p["pattern"]["Regex"] for p in pre.get("pretokenizers", [pre]) if p.get("type") == "Split" and "Regex" in p.get("pattern", {})]
+    self.split, self.pieces = python_regex(split[0] if split else SPLIT), {}
+
+  def bpe(self, piece):  # a piece's bytes as ids
+    if piece not in self.pieces:
+      parts = [piece] if piece in self.ranks else [piece[i:i + 1] for i in range(len(piece))]
+      while len(parts) > 1 and (best := min((self.ranks.get(a + b, math.inf), i) for i, (a, b) in enumerate(zip(parts, parts[1:]))))[0] < math.inf:
+        parts[best[1]:best[1] + 2] = [parts[best[1]] + parts[best[1] + 1]]
+      self.pieces[piece] = [self.ranks[p] for p in parts]
+    return self.pieces[piece]
+  def encode(self, text): return [i for piece in self.split.findall(text) for i in self.bpe(piece.encode())]
+  def decode(self, ids): return b"".join(self.bytes[i] for i in ids).decode("utf-8", "replace")
 
 def main():
   from ferrite import pci
@@ -249,7 +286,7 @@ def main():
       top1, top5_share, _ = accuracy(rt, t, c, first, after, top5, steps)
     return print(f"token accuracy over {steps} steps after a {len(first)}-token prompt{' in numpy' if on_host else ''}: top-1 {100 * top1:.1f}%, top-5 {100 * top5_share:.1f}%"
                  f" ({time.time() - start:.0f}s)")
-  enc, chip = tokenizer(folder), Chip(pci.open_device())
+  enc, chip = Tokenizer(folder), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   start = time.time()
   ids, agree = enc.encode(prompt), 0
