@@ -19,25 +19,41 @@ class Request:
   it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot. cached: its
   prompt's tokens that its slot, or a session saved on the host, held already, which were not prefilled. logprobs: for
   each token made, its log probability and those of the logprobs most likely (probs), from the model's logits as they
-  are; marks: how many it had at each piece of text."""
+  are; marks: how many it had at each piece of text. shape: what its text must keep to (pick), or None."""
   def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None, top_k=0, min_p=0.0,
-               presence=0.0, frequency=0.0, repetition=1.0, logprobs=None):
+               presence=0.0, frequency=0.0, repetition=1.0, logprobs=None, shape=None):
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
     self.stop, self.eos, self.rng = [stop] if isinstance(stop, str) else list(stop or ()), set(eos), np.random.default_rng(seed)
     self.top_k, self.min_p, self.presence, self.frequency, self.repetition, self.logprobs = top_k, min_p, presence, frequency, repetition, logprobs
+    self.shape = shape
     self.made, self.said, self.out, self.finish, self.gone, self.cached, self.probs, self.marks = [], "", queue.Queue(), None, False, 0, [], []
 
   def pick(self, logits):
     """The next token: the logits less the penalties (presence and frequency by the tokens made so far, repetition by
-    the prompt's and those made, as vLLM applies them), then greedy at temperature 0, else sampled at that temperature
-    from the top_k most likely (0: all), the fewest of those whose probabilities sum to top_p, and of those the ones at
-    least min_p of the most likely's. The fewest are sought among the 1,024 most likely first: a sort of a vocabulary
-    of 248K is 5 ms of the host's a token, where a decode step of eight users takes the card 28."""
+    the prompt's and those made, as vLLM applies them), then drawn (draw). With a shape (a function of the text made: 0
+    if it cannot begin one, 1 if it can, 2 if it is a whole one), the token drawn is taken if the text it makes can
+    still begin one (an end of sequence, if the text is a whole one), else drawn again with that one left out: no mask
+    over 248K tokens a step, and a check or two when the model is in the shape already."""
     if self.presence or self.frequency or self.repetition != 1:
       made = np.bincount(self.made, minlength=len(logits))[:len(logits)]
       logits = logits - self.presence * (made > 0) - self.frequency * made
       seen = (made > 0) | (np.bincount(self.ids, minlength=len(logits))[:len(logits)] > 0)
       logits = np.where(seen, np.where(logits > 0, logits / self.repetition, logits * self.repetition), logits)
+    if self.shape is None: return self.draw(logits)
+    logits = np.array(logits, np.float32)
+    for _ in range(32):
+      if self.fits(token := self.draw(logits)): return token
+      logits[token] = -np.inf
+    return next(int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t)))  # (the likeliest that fits)
+
+  def fits(self, token):  # whether the text with token keeps to the shape (or, token an end of sequence, the text is whole)
+    return self.shape(self.tok.decode(self.made)) == 2 if token in self.eos else self.shape(self.tok.decode(self.made + [token])) > 0
+
+  def draw(self, logits):
+    """Greedy at temperature 0, else sampled at that temperature from the top_k most likely (0: all), the fewest of
+    those whose probabilities sum to top_p, and of those the ones at least min_p of the most likely's. The fewest are
+    sought among the 1,024 most likely first: a sort of a vocabulary of 248K is 5 ms of the host's a token, where a
+    decode step of eight users takes the card 28."""
     if self.temperature == 0: return int(logits.argmax())
     p, keep = np.exp((logits - logits.max()) / self.temperature), None  # (None: every token)
     if self.top_k or self.top_p < 1:
@@ -294,6 +310,22 @@ def calls(text, tools=()):
   return head.strip(), [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
                         for name, args in found]
 
+def chosen(choice, tools):
+  """The shape tool_choice gives an answer (Request's: a function of its text, 0 if it cannot begin one, 1 if it can,
+  2 if it is a whole one), or None for any (auto). none: no tool call; required: one or more calls of the tools, and
+  nothing before them; a function by name: calls of it alone. A thinking model's answer is its text after its
+  reasoning (answer)."""
+  if choice in (None, "auto"): return None
+  if choice == "none": return lambda text: 0 if "<tool_call>" in text else 2
+  names = [t.get("function", t).get("name") for t in tools or ()]
+  if choice != "required": names = [n for n in names if n == choice["function"]["name"]]
+  if not names: raise ValueError(f"tool_choice: no such tool among the tools: {choice}")
+  can = lambda part, whole: whole.startswith(part) or part.startswith(whole)  # (part, as far as it has come, is or begins whole)
+  def fits(text):  # (at once: whitespace first could go on for ever)
+    if not can(text, "<tool_call>\n<function=") or not all(any(can(part, n + ">") for n in names) for part in text.split("<function=")[1:]): return 0
+    return 2 if text.rstrip().endswith("</tool_call>") and calls(text, tools)[1] else 1
+  return fits
+
 def answer(text):  # a thinking model's text as its reasoning and its answer (none until it comes): Qwen3's around </think>,
   if text.startswith("<|channel|>"):  # or gpt-oss's analysis channel, until its <|end|>, and its final one
     if "<|message|>" not in text: return "", ""  # (the channel's name still coming)
@@ -329,14 +361,16 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         ids = engine.tok.encode(prompt, special=is_chat)
         top = (q.get("top_logprobs") or 0 if q.get("logprobs") else None) if is_chat else q.get("logprobs")  # (a completion's: how many)
         if top is not None and not 0 <= top <= 20: raise ValueError("logprobs: at most 20 a token")
+        apart = is_chat and (thinking and "<think>" in template or "<|channel|>" in template)
+        fits = chosen(q.get("tool_choice"), tools)
+        shape = fits and apart and (lambda text: fits(answer(text)[1])) or fits  # (a thinking model's on its answer alone)
         r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), q.get("temperature", 1.0), q.get("top_p", 1.0),
                     q.get("stop"), eos, q.get("seed"), max(q.get("top_k") or 0, 0), q.get("min_p") or 0.0, q.get("presence_penalty") or 0.0,
-                    q.get("frequency_penalty") or 0.0, q.get("repetition_penalty") or 1.0, top)
+                    q.get("frequency_penalty") or 0.0, q.get("repetition_penalty") or 1.0, top, shape)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens: a slot holds {engine.places - 2}"}})
       engine.waiting.put(r)
       head = {"id": f"ferrite-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
-      apart = is_chat and (thinking and "<think>" in template or "<|channel|>" in template)
       seen = {"text": "", "reasoning_content": "", "content": ""}
       def parts(text):  # a chat's text as a thinking model's reasoning and answer, apart, and only the answer's text before its tool calls
         out = dict(zip(("reasoning_content", "content"), answer(text))) if apart else {"content": text}

@@ -1950,6 +1950,30 @@ def test_sampling():
     r.made = made
     assert r.pick(logits) == want, (made, prompt, kw)
 
+def test_tool_choice(tmp_path):
+  # serve.chosen's shapes for tool_choice, kept by Request.pick: a model that would greet first (its logits most for
+  # each next character of a text, then for an end of sequence) is held to a call of the tools when one is required,
+  # and to a call of the named tool when one is named; one that would call a tool is kept from it by none; and a whole
+  # call may end, finished as the model goes on
+  tok = bytes_tokenizer(tmp_path)
+  tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+  call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+  def spell(text, n, choice):  # greedy: each step's logits most for the text's next character (or an end, 0), next for "H"
+    r = serve.Request(tok, [], n, 0, eos=[0], shape=serve.chosen(choice, tools))
+    for i in range(n):
+      logits = np.zeros(256, np.float32)
+      logits[ord("H")], logits[ord(text[i]) if i < len(text) else 0] = 1, 2
+      if r.take(logits, True): break
+    return tok.decode(r.made), r.finish
+  assert spell("Hi there", 40, None) == ("Hi there", "stop")
+  said, finish = spell("Hi there", 40, "required")
+  assert said.startswith("<tool_call>\n<function=read>") and finish == "length", said
+  assert spell(call, 100, "required") == (call, "stop"), "a whole call may end"
+  assert spell(call.replace("read", "rest"), 40, {"type": "function", "function": {"name": "read"}})[0].startswith("<tool_call>\n<function=read>")
+  said, finish = spell(call, len(call) + 5, "none")
+  assert "<tool_call>" not in said and said.startswith("<tool_callH") and finish == "stop", said
+  with pytest.raises(ValueError): serve.chosen({"type": "function", "function": {"name": "write"}}, tools)
+
 def test_serve(chip, tmp_path):
   # models/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
   # longest ago) decode together, numpy's greedy tokens for each, then the last two again alone, the last first (the slot used longer ago holds the
@@ -2128,7 +2152,7 @@ def test_chat_tools(tmp_path):
   # tools, thinking and not. An answer's tool calls in its XML come out OpenAI's way (serve.calls: a value as its tool's
   # schema types it), and go back into the template as they came. Over HTTP, an answer (a stand-in engine's) with a
   # tool call gives its reasoning, its text before the call and the call, finish_reason tool_calls; streamed, the text
-  # stops where the call begins and the call comes after it
+  # stops where the call begins and the call comes after it; a tool_choice of no tool given is refused
   import queue, urllib.request
   qwen = "<|im_start|> <think> <tool_call>\n<function="  # (what in a template says it is Qwen3.5's)
   tools = [{"type": "function", "function": {"name": "read", "description": "A file's text", "parameters": {"type": "object",
@@ -2167,6 +2191,8 @@ def test_chat_tools(tmp_path):
   events = streamed(ask({"messages": messages[:2], "tools": tools, "stream": True}))[0]
   assert "".join(e["delta"].get("content", "") for e in events).strip() == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
   assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
+  with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": messages[:2], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "write"}}})
+  assert e.value.code == 400 and "no such tool" in json.load(e.value)["error"]["message"]
   http.shutdown()
 
 def test_cost(tmp_path):
