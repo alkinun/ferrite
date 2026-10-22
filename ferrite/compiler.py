@@ -1212,13 +1212,12 @@ def group_kernel(rows, k, n):
   runs, each choice's slot) are built in L1 as plain arrays and sent a tile at a time, a row's tile holding the row
   32 times and a column's the column, as every tensor's does."""
   t, rp = -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32  # tiles of slots: enough for any choices; a run of places
-  start = DATA + -(-rows // 32) * 4096
-  out = (start + 4 * (2 * n + 33 * t + k * rp) + 63) // 64 * 64
+  fill = DATA + -(-rows // 32) * 4096  # past the choices: each value's count, then its next slot
+  out = (fill + 4 * (n + 33 * t + k * rp) + 63) // 64 * 64
   assert out + 4096 <= OUTS, "the choices and their arrays in L1"
   return compile_kernel(f"""
 #define IDS {DATA:#x}
-#define START {start:#x}
-#define FILL (START + {4 * n})
+#define FILL {fill:#x}
 #define ORDER (FILL + {4 * n})
 #define TILES (ORDER + {4 * 32 * t})
 #define PLACES (TILES + {4 * t})
@@ -1228,7 +1227,7 @@ static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256
 static unsigned choice(unsigned r, unsigned j) {{ return ((volatile unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
 static void send(unsigned base, unsigned i) {{ noc_write(OUT, BANK(i), AT(base, i, 4096), 4096); noc_wait(); }}
 void kmain(volatile unsigned *a) {{
-  volatile unsigned *start = (volatile unsigned *)START, *fill = (volatile unsigned *)FILL, *order = (volatile unsigned *)ORDER;
+  volatile unsigned *fill = (volatile unsigned *)FILL, *order = (volatile unsigned *)ORDER;
   volatile unsigned *tiles = (volatile unsigned *)TILES, *places = (volatile unsigned *)PLACES, *out = (volatile unsigned *)OUT;
   if (!a[1]) return;
   for (unsigned i = 0; i < {-(-rows // 32)}; i++) {{ unsigned u = a[7] + i * a[6]; noc_get(BANK(u), AT(a[5], u, 4096), IDS + i * 4096, 4096); }}
@@ -1238,10 +1237,10 @@ void kmain(volatile unsigned *a) {{
   for (unsigned s = 0; s < {k * rp}; s++) places[s] = 0;
   noc_wait();
   for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) fill[choice(r, j)]++;
-  for (unsigned e = 0, s = 0; e < {n}; e++) {{
-    start[e] = s;
-    for (unsigned end = s + (fill[e] + 31) / 32 * 32; s < end; s += 32) tiles[s / 32] = e;
-    fill[e] = start[e];
+  for (unsigned e = 0, s = 0; e < {n}; e++) {{  // each value's run: its count rounded up to whole tiles, after the runs before it
+    unsigned count = fill[e];
+    fill[e] = s;
+    for (unsigned end = s + (count + 31) / 32 * 32; s < end; s += 32) tiles[s / 32] = e;
   }}
   for (unsigned r = 0; r < {rows}; r++)
     for (unsigned j = 0; j < {k}; j++) {{ unsigned s = fill[choice(r, j)]++; order[s] = r; places[j * {rp} + r] = s; }}
