@@ -253,7 +253,9 @@ append a correction.
    bugs no test reached: each `Runtime` took a TLB it never gave back (the 201st would have failed), indexing a repeat
    of heads read the wrong matrices, and the compile cache's pruning would have crashed on a folder a week later. A
    review of the card path against tt-kmd and UMD found what no ISA page asks for: the chip left in ASIC state 3 when
-   kmd lets go, a busy clock to ask for, BARs that libc's memcpy may copy a byte at a time. A test checks what its
+   kmd lets go, a busy clock to ask for, BARs that libc's memcpy may copy a byte at a time. A read of a day's mixture
+   of experts and Ethernet work found DRAM taken twice and kept, a credit still on the link when the next copy zeroed
+   it, and a stream's reasoning starting with a channel's name, all past green tests. A test checks what its
    writer thought of; a reader hunting for faults finds the rest. (NOTES: "What tt-kmd does that a userspace driver
    must do instead")
 
