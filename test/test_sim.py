@@ -1495,6 +1495,29 @@ def test_hf_families(chip, tmp_path, family):
   ties = [want[r].max() - want[r][got[r].argmax()] <= 0.001 * np.ptp(want[r]) for r in range(len(ids))]  # its best, or one bf16 cannot tell from it
   assert rel(got) < 0.02 and all(ties), (rel(got), ties)
 
+def test_mxfp4(tmp_path):
+  # gpt-oss's checkpoints keep the experts in MXFP4 (a tensor's _blocks of 4-bit values and its _scales): llama.mxfp4
+  # unpacks them as transformers does (convert_moe_packed_tensors), bit for bit in bf16, and llama.load reads a
+  # checkpoint of them as its experts' matrices, gate and up taken apart
+  torch, packed = pytest.importorskip("torch"), pytest.importorskip("transformers.integrations.mxfp4")
+  st = pytest.importorskip("safetensors.numpy")
+  rng = np.random.default_rng(43)
+  blocks, scales = rng.integers(0, 256, (2, 64, 3, 16), dtype=np.uint8), rng.integers(118, 136, (2, 64, 3), dtype=np.uint8)
+  want = packed.convert_moe_packed_tensors(torch.from_numpy(blocks), torch.from_numpy(scales)).view(torch.int16).numpy().view(np.uint16)
+  assert np.array_equal(llama.mxfp4(blocks, scales), want)
+  config = {"hidden_size": 96, "num_attention_heads": 3, "num_key_value_heads": 1, "num_hidden_layers": 1, "rms_norm_eps": 1e-5, "rope_theta": 1e4,
+            "max_position_embeddings": 32, "vocab_size": 32, "intermediate_size": 32, "head_dim": 32, "num_experts_per_tok": 1, "model_type": "gpt_oss"}
+  (tmp_path / "config.json").write_text(json.dumps(config))
+  f32 = lambda *shape: rng.normal(0, 1, shape).astype(np.float32)
+  attention = {f"model.layers.0.self_attn.{n}_proj.weight": f32(*shape) for n, shape in (("q", (96, 96)), ("k", (32, 96)), ("v", (32, 96)), ("o", (96, 96)))}
+  st.save_file(attention | {"model.embed_tokens.weight": f32(32, 96), "model.norm.weight": f32(96), "lm_head.weight": f32(32, 96),
+                "model.layers.0.mlp.experts.gate_up_proj_blocks": blocks, "model.layers.0.mlp.experts.gate_up_proj_scales": scales,
+                "model.layers.0.mlp.experts.gate_up_proj_bias": f32(2, 64), "model.layers.0.mlp.experts.down_proj": f32(2, 32, 96),
+                "model.layers.0.mlp.experts.down_proj_bias": f32(2, 96), "model.layers.0.mlp.router.weight": f32(2, 96), "model.layers.0.mlp.router.bias": f32(2)},
+               str(tmp_path / "model.safetensors"))
+  c, weights = llama.load(str(tmp_path), 32)
+  assert np.array_equal(weights["layers.0.experts.gate_up"].bits(), np.concatenate([want[..., ::2], want[..., 1::2]], -1)) and c.limit == 7.0
+
 @pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
 def test_llama_8b_shapes(chip):
   # one block in Llama-3.1-8B's shapes (4096 wide, 32 query heads sharing 8 KV heads, an MLP of 14336, Llama 3's RoPE

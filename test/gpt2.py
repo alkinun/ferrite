@@ -37,6 +37,8 @@ def safetensors(path):  # a safetensors file: its JSON header (each tensor's dty
     header = json.loads(f.read(size))
   return header, np.memmap(path, np.uint8, "r", offset=8 + size)
 
+def u8(data, t): assert t["dtype"] == "U8"; return data[t["data_offsets"][0]:t["data_offsets"][1]].reshape(t["shape"])  # bytes (MXFP4's) as they are
+
 def tensor_bits(data, t, transpose=False):  # one tensor of a safetensors file as bf16 bits (fp32 rounded to nearest even), a vector as one row
   raw = data[t["data_offsets"][0]:t["data_offsets"][1]]
   if t["dtype"] == "F32": bits = bf16_bits(raw.view(np.float32))

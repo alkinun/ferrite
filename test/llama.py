@@ -255,19 +255,32 @@ def load(folder, places=4096):
                       sliding=j.get("sliding_window") if j.get("use_sliding_window", True) else None, layer_types=j.get("layer_types"))
   index = os.path.join(folder, "model.safetensors.index.json")
   files = sorted(set(read_json(index)["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
-  out = {}
+  out, tensors = {}, {}
   for file in files:
     header, data = gpt2.safetensors(os.path.join(folder, file))
-    for name, t in header.items():
-      if name == "__metadata__": continue
-      name = name.removeprefix("model.").replace("self_attn.", "").replace("mlp.", "").replace("block_sparse_moe.", "").removesuffix(".weight")
-      name = re.sub(r"(experts\.\d+)\.w([123])$", lambda m: m[1] + (".gate_proj", ".down_proj", ".up_proj")[int(m[2]) - 1], name)  # Mixtral's
-      if name.startswith("layers.") and int(name.split(".")[1]) >= c.layers: continue  # (a config cut to its first blocks)
-      out[name] = Weight(functools.partial(gpt2.tensor_bits, data, t, (name.endswith("_proj") or name == "lm_head") and len(t["shape"]) == 2))
+    tensors |= {name: (data, t) for name, t in header.items() if name != "__metadata__"}
+  for full, (data, t) in tensors.items():
+    if full.endswith("_scales"): continue  # (an MXFP4 tensor's, read with its blocks)
+    name = full.removeprefix("model.").replace("self_attn.", "").replace("mlp.", "").replace("block_sparse_moe.", "").removesuffix(".weight")
+    name = re.sub(r"(experts\.\d+)\.w([123])$", lambda m: m[1] + (".gate_proj", ".down_proj", ".up_proj")[int(m[2]) - 1], name)  # Mixtral's
+    if name.startswith("layers.") and int(name.split(".")[1]) >= c.layers: continue  # (a config cut to its first blocks)
+    if name.endswith("_blocks"):
+      scales = tensors[full.removesuffix("_blocks") + "_scales"]
+      out[name.removesuffix("_blocks")] = Weight(lambda b=(data, t), s=scales: mxfp4(gpt2.u8(*b), gpt2.u8(*s)))
+    else: out[name] = Weight(functools.partial(gpt2.tensor_bits, data, t, (name.endswith("_proj") or name == "lm_head") and len(t["shape"]) == 2))
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = out.pop("lm_head", None) or Weight(lambda e=out["embed"]: np.ascontiguousarray(e.bits().T))  # tied, or its own
   for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: gpt2.bf16_bits(a))
   return c, fuse(out, c)
+
+def mxfp4(blocks, scales):
+  """gpt-oss's experts in MXFP4: 4-bit values (sign, 2 bits of exponent, 1 of mantissa), two to a byte, the low one
+  first, each 32 sharing a power of 2 (a byte, 127 for 1), as a batch of (out x in) matrices; as bf16 bits, exactly (a
+  value has 2 significant bits at most), each matrix transposed for x @ w."""
+  values = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
+  v = np.stack([values[blocks & 15], values[blocks >> 4]], -1).reshape(*scales.shape, 32)
+  v = np.ldexp(v, scales.astype(np.int32)[..., None] - 127).reshape(*scales.shape[:-1], -1)
+  return gpt2.bf16_bits(np.ascontiguousarray(np.swapaxes(v, -1, -2)))
 
 def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks', their
   # experts' as their MLP's, and the output layer) in the one prec (precision's) gives them, the rest, and all without prec, bf16
