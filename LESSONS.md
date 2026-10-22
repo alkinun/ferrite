@@ -252,6 +252,11 @@ append a correction.
     query heads as the rows of one batch entry, but its first layout took five moves a block, a datum at a time, and
     made a short step on ttsim five times slower; one move each way, from rows where the heads already lie side by
     side, made it 2.5. (NOTES: "A Llama-family model")
+41. **Let a model that wants nothing test a grammar.** A shape that keeps tokens to a JSON schema passed every text
+    written by hand; a model of random logits found what they missed: a comma after the last key a schema allows,
+    which no text can follow, a number begun as "-e" or "1.", and whitespace and digits that never end. Each start of
+    a shape must lead somewhere and each run must end; 480 random answers to four schemas now all parse and stop.
+    (NOTES: "Serving")
 
 ## Working method
 
