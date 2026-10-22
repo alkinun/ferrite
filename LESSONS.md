@@ -227,6 +227,10 @@ append a correction.
     C on BRISC, each row scanned k times, take one launch and compare the stored bits. Grouping a prompt's tokens by
     expert, a counting sort, went the same way. The Tensix is for tiles; a few thousand scalar steps go to the core
     that already moves the tiles. (`test_topk`)
+35. **A random model hides what starts at 0 or 1.** transformers makes biases zeros and norms ones, so a reader that
+    dropped Qwen2's biases or gpt-oss's would have matched its random model exactly. Drawn at random too, each one a
+    family adds (biases, sinks, the q and k norms, a window, YaRN) moves numpy past the test's bound when it is left
+    out, and that was checked one at a time. (`test_hf_families`)
 
 ## Working method
 
