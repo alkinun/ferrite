@@ -175,7 +175,7 @@ def arrays(weights, prec=None):
   up and not kept, so numpy holds no more of a model than the block it is running, whatever the model's size."""
   def made(name, w):
     v, f = w.values(), weight_format(name, prec)
-    return v if f == "bf16" else np.concatenate([gpt2.bfp(v[i:i + 1024], f) for i in range(0, len(v), 1024)]).astype(np.float32)
+    return v if f == "bf16" else np.concatenate([gpt2.bfp(v[i:i + 1024], f).astype(np.float32) for i in range(0, len(v), 1024)])
   return Made({name: functools.partial(made, name, w) for name, w in weights.items()})
 
 def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector

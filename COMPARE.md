@@ -146,7 +146,8 @@ the p150b passive), run by `test/benchmark.py`:
 - **B1, matmul:** (4096 x 4096) @ (4096 x 4096) in bf16, at two fidelity phases (HiFi2, what tt_transformers uses for
   most of its matmuls) and at four.
 - **B2, decode:** `meta-llama/Llama-3.1-8B-Instruct` at TT's performance precision: tokens/s, effective DRAM bandwidth
-  and token accuracy, for one user and for 32 at once.
+  and token accuracy, for one user and for 32 at once. ferrite's formats alone, in numpy with exact products, score 91.8% and 98.2% (NOTES,
+  "A Llama-family model").
 - **B3, long-context prefill:** time to first token for B2's model, with prompts of 4,096 and 32,768 tokens.
 
 ### Measurement
