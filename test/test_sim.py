@@ -1706,7 +1706,7 @@ def test_fetch(tmp_path, monkeypatch):
   import functools, http.server, threading
   hub = tmp_path / "hub" / "org" / "model" / "resolve" / "main"
   hub.mkdir(parents=True)
-  files = {"config.json": "{}", "tokenizer.json": "{}", "generation_config.json": "{}", "model-1.safetensors": "1", "model-2.safetensors": "2",
+  files = {"config.json": "{}", "tokenizer.json": "{}", "generation_config.json": "{}", "chat_template.jinja": "<|im_start|>", "model-1.safetensors": "1", "model-2.safetensors": "2",
            "model.safetensors.index.json": json.dumps({"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors", "c": "model-1.safetensors"}})}
   for name, text in files.items(): (hub / name).write_text(text)
   quiet = type("Quiet", (http.server.SimpleHTTPRequestHandler,), {"log_message": lambda *a: None})

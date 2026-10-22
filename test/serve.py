@@ -156,8 +156,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
 def fetch(model, cache=os.path.expanduser("~/.cache/ferrite/hub")):
   """A model's folder: model itself if it is one, else Hugging Face's files for that model id, downloaded once into
   cache (from HF_ENDPOINT if set, with HF_TOKEN for a gated model): its config and tokenizer, the configs it has of
-  generation and chat, and its weights, in one file or in the shards its index names. A finished download is marked
-  (.done), and not asked for again."""
+  generation and chat (and a chat template in a file of its own), and its weights, in one file or in the shards its
+  index names. A finished download is marked (.done), and not asked for again."""
   if os.path.isdir(model): return model
   folder = os.path.join(cache, model)
   if os.path.exists(os.path.join(folder, ".done")): return folder
@@ -174,7 +174,8 @@ def fetch(model, cache=os.path.expanduser("~/.cache/ferrite/hub")):
       return None
     os.replace(path + ".part", path)
     return path
-  for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"): get(name, name in ("config.json", "tokenizer.json"))
+  for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"):
+    get(name, name in ("config.json", "tokenizer.json"))
   if index := get("model.safetensors.index.json", False):
     for shard in sorted(set(llama.read_json(index)["weight_map"].values())): get(shard)
   else: get("model.safetensors")
@@ -196,7 +197,8 @@ def main():
   eos = (config("generation_config.json") or config("config.json")).get("eos_token_id")
   threading.Thread(target=engine.run, daemon=True).start()
   print(f"{os.path.basename(folder.rstrip('/'))} on the chip in {time.time() - start:.0f}s ({mode}), {slots} slots of {places} places, port {port}", flush=True)
-  server(engine, os.path.basename(folder.rstrip("/")), config("tokenizer_config.json").get("chat_template") or "",
-         eos if isinstance(eos, list) else [eos] if eos is not None else [], port).serve_forever()
+  jinja = os.path.join(folder, "chat_template.jinja")  # where transformers 5 keeps it
+  template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
+  server(engine, os.path.basename(folder.rstrip("/")), template, eos if isinstance(eos, list) else [eos] if eos is not None else [], port).serve_forever()
 
 if __name__ == "__main__": main()
