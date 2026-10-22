@@ -147,18 +147,18 @@ class Tensor:
 
   def __getitem__(self, key):
     """x[b], one matrix of a batch; x[rows, cols] of every matrix, or x[batch, rows, cols], with slices (any step). A
-    slice of whole tiles (starting on tile boundaries, ending on one or at the end, step 1) is a view, read in place;
-    any other is a copy (_move)."""
+    slice of whole tiles (starting on tile boundaries, ending on one or at the end, step 1; of the batch, any step
+    forward) is a view, read in place; any other is a copy (_move)."""
     if self.rep > 1: return (self + 0)[key]  # of a repeat's copy, whose matrices are stored one after another
     if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)._track("index", (self,), key)
     assert isinstance(key, tuple) and len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
     ranges = [range(*k.indices(n)) for k, n in zip((slice(None),) * (3 - len(key)) + tuple(key), self.shape)]
     shape = tuple(map(len, ranges))
     assert all(shape), f"an empty slice of {self.shape}"
-    if all(g.step == 1 and (ax == 0 or g.start % 32 == 0 and (g.stop % 32 == 0 or g.stop == n) and (len(g) > 1 or n == 1))
+    if all(g.step > 0 if ax == 0 else g.step == 1 and g.start % 32 == 0 and (g.stop % 32 == 0 or g.stop == n) and (len(g) > 1 or n == 1)
            for ax, (g, n) in enumerate(zip(ranges, self.shape))):  # whole tiles; a dimension of 1 must fill its tile
       b, r, c = (g.start for g in ranges)
-      t = self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32, self.bstride)
+      t = self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32, self.bstride * ranges[0].step)
     else:
       t = self._map(shape, (0, 1, 2), [g.start for g in ranges], [g.step for g in ranges])
     return t._track("slice", (self,), ranges)

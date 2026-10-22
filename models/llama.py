@@ -255,7 +255,9 @@ def chip_experts(h, p, ids, w, phases, limit=None):
   plus = lambda y, name: y + p[name].gather(row).reshape(entries, 1, p[name].cols) if name in p else y  # each entry's expert's bias
   x = plus(x.matmul(gate_up, fidelity=phases[0], index=picks), "experts.gate_up_bias")
   y = plus(glu(x[:, :, :m], x[:, :, m:], limit).matmul(down, fidelity=phases[1], index=picks), "experts.down_bias")
-  if picks is ids: return (y * w.reshape(n * k, 1, 1)).reshape(n, k, dim).sum(1).reshape(n, dim)
+  if picks is ids:  # each token's k entries one after another: each choice's entries a view, every k-th, weighted and summed
+    w = w.reshape(n * k, 1, 1)
+    return sum((y[j::k, :, :] * w[j::k, :, :] for j in range(1, k)), y[0::k, :, :] * w[0::k, :, :]).reshape(n, dim)
   y, run = y.reshape(order.cols, dim), places.cols // k  # choice j's places
   terms = [y.gather(places[:, :, j * run:j * run + n]) * w[:, :, j:j + 1] for j in range(k)]
   return sum(terms[1:], terms[0])

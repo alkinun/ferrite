@@ -733,7 +733,7 @@ def test_batch(chip):
 
 def test_movement(chip):
   # reshape, permute, expand, pad and slices at any offset and step, against numpy bit for bit (a move only copies).
-  # Slices of whole tiles stay views; the rest is one launch each, and so is a chain of them. A moved tensor goes home
+  # Slices of whole tiles stay views, and so do a batch's at any step; the rest is one launch each, and so is a chain of them. A moved tensor goes home
   # with tidy padding, so a matmul and a reduction can read it. Then random chains of moves, on one worker, whose cache
   # of tiles cycles
   rng = np.random.default_rng(7)
@@ -749,6 +749,9 @@ def test_movement(chip):
   launches, t = rt.launches, tx.reshape(135, 70)[:, 7:100:2, ::-1].pad(((1, 0), (3, 1), (2, 5))).permute(2, 1, 0)[:, 1:4, 1:2].expand(77, 3, 40)
   want = np.broadcast_to(np.pad(x.reshape(1, 135, 70)[:, 7:100:2, ::-1], ((1, 0), (3, 1), (2, 5))).transpose(2, 1, 0)[:, 1:4, 1:2], (77, 3, 40))
   assert value(t).tolist() == want.tolist() and kernels(rt, launches) == 1, "a chain of moves is one move"
+  every = Tensor.of(rt, bf16(rng.uniform(-2, 2, (7, 32, 64))).tolist())  # a batch slice with a step: a view, its matrices every 3rd
+  launches, t = rt.launches, every[1::3, :, :] * 2
+  assert t.realize() and value(t).tolist() == (value(every)[1::3] * 2).tolist() and kernels(rt, launches) == 1, "read in place"
   # the move kernel's ways, in fp32 (a word a datum): whole tiles as they are (a pad on tile boundaries) or transposed, runs
   # along x's rows (a reshape, an unaligned slice) and down its columns (attention's heads apart), datum by datum (a permute)
   y = rng.uniform(-2, 2, (2, 64, 96)).astype(np.float32)
