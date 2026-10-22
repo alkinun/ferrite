@@ -6,11 +6,11 @@
 # starts), a token each a step.
 #   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
 #   ... python3 test/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]   # token accuracy, Tenstorrent's way
-# (numpy: the same weight values, as the chip holds them in mode's formats, in numpy with exact products)
+# (numpy: the weight values the chip holds in mode's formats, with exact products, in numpy alone: no chip)
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors (or another
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).
 # bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and the rest in bfp8 (numpy then has
-# them as the chip does), tt: TT's performance precision, formats and fidelity phases both (precision). A model too big to check in numpy on the host (over 2 billion weights) is generated unchecked.
+# them as the chip does), tt: TT's performance precision, formats and fidelity phases both (precision).
 import functools, json, math, os, sys, time
 from types import SimpleNamespace
 import numpy as np
@@ -102,21 +102,22 @@ def fuse(w):  # each block's q, k and v projections as one matrix, and its gate 
     w[pre + "gate_up_proj"] = join(w.pop(pre + "gate_proj"), w.pop(pre + "up_proj"))
   return w
 
-def forward(ids, places, w, c, caches, starts=None):
+def forward(ids, places, w, c, caches, starts=None, every=False):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (a
   block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids and places are
   rows: lists for numpy, int32 tensors for ferrite. starts: several sequences decoding together (a batch of users), their
   caches side by side, each token's sequence starting at its start's row and each token seeing only its own sequence;
-  then the logits are every token's, the next token of each (on the chip only)."""
-  f = fns(w["embed"])
+  then the logits are every token's, the next token of each (on the chip only). every: every token's logits, not only
+  the last's. w is looked up a block at a time (arrays makes numpy's weights as they are looked up)."""
+  f = fns(w["norm"])
   x, rows = f.rows(w["embed"], ids), places if starts is None else places + starts
   rotary, mask = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), gpt2.mask(rows, caches[0].shape[-2], starts)
   prefill = starts is None and x.shape[-2] > 1
   for l in range(c.layers):
-    x = layer(x, {k[len(f"layers.{l}."):]: v for k, v in w.items() if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], rows, l, prefill)
+    x = layer(x, {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}, c, rotary, mask, caches[l], rows, l, prefill)
   h = rms(x, w["norm"], c.eps)
   head = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]
-  return f.mm(h if starts is not None else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], head)
+  return f.mm(h if starts is not None or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], head)
 
 def prefill(ids, w, c, caches, chunk, on=lambda row: row):
   """forward over a prompt from place 0, chunk tokens at a time, as Tenstorrent's prefill takes a long one: each chunk's
@@ -165,8 +166,17 @@ def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a 
     if (f := weight_format(name, prec)) != "bf16": t[name] = x.cast(f).realize()
   return t
 
-def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip (upload), those not in bf16 as the chip has them
-  return {name: w.values() for name, w in weights.items()} | {k: gpt2.values(x) for k, x in (t or {}).items() if x.dtype != "bf16"}
+class Made(dict):  # name -> what makes its value: made at each lookup and not kept
+  def __getitem__(self, k): return super().__getitem__(k)()
+
+def arrays(weights, prec=None):
+  """The same as numpy float32 arrays, each as the chip holds it in its format (weight_format), a block float rounded as
+  the chip rounds it (gpt2.bfp, bit for bit: test_bfp), a thousand rows at a time. Each is read and made only when looked
+  up and not kept, so numpy holds no more of a model than the block it is running, whatever the model's size."""
+  def made(name, w):
+    v, f = w.values(), weight_format(name, prec)
+    return v if f == "bf16" else np.concatenate([gpt2.bfp(v[i:i + 1024], f) for i in range(0, len(v), 1024)]).astype(np.float32)
+  return Made({name: functools.partial(made, name, w) for name, w in weights.items()})
 
 def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector
 
@@ -189,18 +199,18 @@ def accuracy(rt, t, c, prompt, after, top5, steps=500):
   then each step fed the reference's next token whatever the model predicted (teacher forcing), the steps replayed
   (jit). (top-1, top-5, the model's tokens): the shares of steps whose most likely token is the reference model's most
   likely, or among its five. rt None: the model in numpy, t its weights as numpy arrays (arrays: as the chip holds
-  them), with exact products, which tells what the formats cost from what the chip's arithmetic does."""
+  them), with exact products, which tells what the formats cost from what the chip's arithmetic does. Teacher forcing
+  knows every step's input beforehand, so numpy takes the prompt and the steps as one prefill, every place's logits at
+  once: what decode a step at a time computes, each block's weights read once rather than once a step."""
   n, size = len(prompt), -(-(len(prompt) + steps) // 32) * 32
   if rt is None:
-    kv = kv_cache(c, size, np.zeros)
-    first = step = lambda ids, places: forward(ids, places, t, c, kv)[0]
+    ids = prompt + after[:steps - 1]
+    picks = [int(row.argmax()) for row in forward(ids, list(range(len(ids))), t, c, kv_cache(c, size, np.zeros), every=True)[n - 1:]]
   else:
     on, kv = lambda row: Tensor.of(rt, [row], "int32"), kv_cache(c, size, zeros(rt, cache_format(c)))
     replay = jit(lambda ids, places: forward(ids, places, t, c, kv))
-    first = lambda ids, places: logits(forward(on(ids), on(places), t, c, kv))
-    step = lambda ids, places: logits(replay(on(ids), on(places)))
-  picks = [int(first(prompt, list(range(n))).argmax())]
-  for i in range(steps - 1): picks.append(int(step([after[i]], [n + i]).argmax()))
+    picks = [int(logits(forward(on(prompt), on(list(range(n))), t, c, kv)).argmax())]
+    for i in range(steps - 1): picks.append(int(logits(replay(on([after[i]]), on([n + i]))).argmax()))
   return sum(p == f[0] for p, f in zip(picks, top5)) / steps, sum(p in f for p, f in zip(picks, top5)) / steps, picks
 
 def tokenizer(folder):
@@ -225,15 +235,17 @@ def main():
   mode = sys.argv[4] if len(sys.argv) > 4 else "bf16"
   if prompt.endswith(".refpt"):  # token accuracy against Tenstorrent's reference file, `steps` steps (500 as it runs it)
     first, after, top5 = reference(prompt)
-    chip = Chip(pci.open_device())
-    rt, start = Runtime(chip, chip.tensix[0], chip.tensix[-1]), time.time()
     c, weights = load(folder, -(-(len(first) + steps) // 32) * 32)
-    c.precision = precision(c, mode)
-    t = upload(rt, weights, c.precision)
-    print(f"weights on the chip in {time.time() - start:.0f}s, {mode}")
-    on_host = "numpy" in sys.argv[5:]  # the same weight values in numpy, with exact products
-    top1, top5_share, _ = accuracy(None, arrays(weights, t), c, first, after, top5, steps) if on_host else accuracy(rt, t, c, first, after, top5, steps)
-    return print(f"token accuracy over {steps} steps after a {len(first)}-token prompt{' in numpy' if on_host else ''}: top-1 {100 * top1:.1f}%, top-5 {100 * top5_share:.1f}%")
+    c.precision, on_host, start = precision(c, mode), "numpy" in sys.argv[5:], time.time()  # numpy: the same weight values, exact products
+    if on_host: top1, top5_share, _ = accuracy(None, arrays(weights, c.precision), c, first, after, top5, steps)
+    else:
+      chip = Chip(pci.open_device())
+      rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+      t = upload(rt, weights, c.precision)
+      print(f"weights on the chip in {time.time() - start:.0f}s, {mode}")
+      top1, top5_share, _ = accuracy(rt, t, c, first, after, top5, steps)
+    return print(f"token accuracy over {steps} steps after a {len(first)}-token prompt{' in numpy' if on_host else ''}: top-1 {100 * top1:.1f}%, top-5 {100 * top5_share:.1f}%"
+                 f" ({time.time() - start:.0f}s)")
   enc, chip = tokenizer(folder), Chip(pci.open_device())
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   start = time.time()
@@ -241,23 +253,22 @@ def main():
   size = -(-(len(ids) + steps) // 32) * 32  # a row for each place the generation reaches, in whole tiles
   c, weights = load(folder, size)
   c.precision = precision(c, mode)
-  t = upload(rt, weights, c.precision)
+  t, w = upload(rt, weights, c.precision), arrays(weights, c.precision)
   count = sum(x.rows * x.cols for k, x in t.items() if k not in ("cos", "sin", "turn"))  # (a tied output layer twice)
-  w = arrays(weights, t) if count < 2e9 else None  # numpy's float32 copy of a bigger one would not fit the host
-  print(f"{count / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s" + ("" if w else ", too many to check in numpy"))
-  kv, np_kv = kv_cache(c, size, zeros(rt, cache_format(c))), w and kv_cache(c, size, np.zeros)
+  print(f"{count / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
+  kv, np_kv = kv_cache(c, size, zeros(rt, cache_format(c))), kv_cache(c, size, np.zeros)
   on = lambda row: Tensor.of(rt, [row], "int32")  # a row of ids or places, on the chip
   step, new = jit(lambda ids, places: forward(ids, places, t, c, kv)), ids  # a token at a time, replayed from the third
   print(prompt, end="", flush=True)
   for i in range(steps):  # the prompt at once, then a token at a time, each seeing the keys and values cached so far
     start, places = time.time(), list(range(len(ids) - len(new), len(ids)))
     got = logits(forward(on(new), on(places), t, c, kv) if i == 0 else step(on(new), on(places)))
-    want = forward(new, places, w, c, np_kv)[0] if w else got  # unchecked: ferrite's own
+    want = forward(new, places, w, c, np_kv)[0]
     agree += int(got.argmax()) == int(want.argmax())
     new = [int(want.argmax())]  # numpy's pick, so that one near tie does not send the two down different paths
     ids += new
     print(enc.decode(new) + ("" if got.argmax() == want.argmax() else f"[ferrite: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
-    print(f" ({time.time() - start:.0f}s" + (f", logits within {np.abs(got - want).max():.2f})" if w else ")"), end="", file=sys.stderr, flush=True)
-  print(f"\nferrite picked the same token as numpy {agree} times out of {steps}" if w else "")
+    print(f" ({time.time() - start:.0f}s, logits within {np.abs(got - want).max():.2f})", end="", file=sys.stderr, flush=True)
+  print(f"\nferrite picked the same token as numpy {agree} times out of {steps}")
 
 if __name__ == "__main__": main()

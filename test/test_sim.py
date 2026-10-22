@@ -1336,7 +1336,7 @@ def test_llama_8b_shapes(chip):
   weights, c.precision = {k: llama.Weight(lambda v=v: v) for k, v in w.items()}, llama.precision(c, "tt")
   t = llama.upload(rt, weights, c.precision)
   rt.wait(3600)
-  arrays, on = llama.arrays(weights, t), lambda row: Tensor.of(rt, [row], "int32")
+  arrays, on = llama.arrays(weights, c.precision), lambda row: Tensor.of(rt, [row], "int32")
   kv, np_kv = llama.kv_cache(c, 96, llama.zeros(rt, "bfp8")), llama.kv_cache(c, 96, np.zeros)
   prompt = [int(i) for i in rng.integers(0, 2048, 64)]
   for new, places in ((prompt, list(range(64))), ([5], [64]), ([9], [65])):
@@ -1376,8 +1376,8 @@ def test_llama_precision(chip):
   # TT's performance precision (llama.precision "tt"): each matmul's weights in its format (the MLP's gate and up in bfp4,
   # the rest and the output layer in bfp8) and at its fidelity phases (one for gate and up, two for the rest, attention
   # two in decode and four in prefill), Llama-3.1-8B's last block's gate and up in bfp8 at two, the KV cache in bfp8;
-  # numpy, given the same block-float values (its cache rounded as put rounds, gpt2.bfp) but
-  # exact products, picks the same tokens, its logits within 1% of their span
+  # numpy, given the same block-float values (llama.arrays rounds the weights, and layer the cache, as the chip does:
+  # gpt2.bfp) but exact products, picks the same tokens, its logits within 1% of their span
   big = SimpleNamespace(layers=32, dim=4096)
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
@@ -1385,11 +1385,12 @@ def test_llama_precision(chip):
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(5)
   c, w = smol(rng, 2)
   c.precision = llama.precision(c, "tt")
-  t = llama.upload(rt, {k: llama.Weight(lambda v=v: (np.float32(v).view(np.uint32) >> 16).astype(np.uint16)) for k, v in w.items()}, c.precision)
+  weights = {k: llama.Weight(lambda v=v: (np.float32(v).view(np.uint32) >> 16).astype(np.uint16)) for k, v in w.items()}
+  t = llama.upload(rt, weights, c.precision)
   assert {k: x.dtype for k, x in t.items() if "proj" in k or k == "embed.T"} == {k: "bfp4" if "gate_up" in k else "bfp8" for k in t if "proj" in k or k == "embed.T"}
   sizes = SimpleNamespace(**vars(c), vocab=256, places=64, ffn=1536)  # benchmark.weights, from the sizes alone, has them as upload makes them
   assert {k: (x.rows, x.cols, x.dtype) for k, x in t.items()} == {k: (x.rows, x.cols, x.dtype) for k, x in benchmark.weights(sizes).items()}
-  arrays = w | {k: gpt2.values(x) for k, x in t.items() if x.dtype != "bf16"}
+  arrays = llama.arrays(weights, c.precision)  # numpy's rounding to the formats, which is the chip's casts' (test_bfp)
   kv, np_kv = llama.kv_cache(c, 32, llama.zeros(rt, "bfp8")), llama.kv_cache(c, 32, np.zeros)  # numpy's rounded as a bfp8 cache's
   assert kv[0].dtype == "bfp8"
   on = lambda row: Tensor.of(rt, [row], "int32")
