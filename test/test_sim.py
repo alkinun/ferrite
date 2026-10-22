@@ -1365,7 +1365,7 @@ def test_topk(chip):
   # first of equals first, -0 equal to 0), for one row (its results' tiles full of copies of it, as a broadcast reads
   # them), a k of 1 (copies across), rows past one tile, a batch, columns not a multiple of 32 and 256 of them; and of a
   # matmul's softmax not yet computed, which the kernels of its max and of its columns once rounded apart (an index of 8
-  # in 8 columns, when topk was passes of max)
+  # in 8 columns, when topk was passes of max), and none of their DRAM kept after
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(37)
   for batch, rows, cols, k in ((1, 1, 128, 8), (1, 3, 16, 4), (1, 40, 40, 1), (2, 33, 256, 32)):
     x = rng.normal(0, 2, (batch, rows, cols))
@@ -1382,6 +1382,12 @@ def test_topk(chip):
   values, ids = probs.topk(2)
   got, p = value(ids)[0], value(probs)[0]  # the indices first: probs read first would be computed on its own
   assert np.array_equal(got, np.argsort(-p, -1, kind="stable")[:, :2]) and np.array_equal(value(values)[0], -np.sort(-p, -1)[:, :2])
+  held = []  # and topk and group (Tensor.group) give back all the DRAM they take: what is held is the same each time
+  for _ in range(3):
+    Tensor.of(rt, rng.normal(0, 1, (40, 16)).tolist()).topk(4)[1].group(16)
+    rt.wait(), rt.reclaim()
+    held.append(sum(rt.used.values()))
+  assert held[0] == held[1] == held[2], held
 
 def test_moe(chip):
   # a mixture of experts in the MLP's place (llama.moe): a token's router logits choose its k experts on the chip
@@ -1856,6 +1862,7 @@ def test_serve(chip, tmp_path):
     "<|start|>developer<|message|># Instructions\n\nBe brief.\n\n<|end|><|start|>user<|message|>Hi<|end|><|start|>assistant")
   assert serve.answer("<|channel|>analysis<|message|>Greet.<|end|><|start|>assistant<|channel|>final<|message|>Hello!") == ("Greet.", "Hello!")
   assert serve.answer("<|channel|>analysis<|message|>Gree") == ("Gree", "") and serve.answer("<|channel|>final<|message|>Hi") == ("", "Hi")
+  assert serve.answer("<|channel|>") == serve.answer("<|channel|>analysis") == ("", ""), "a channel's name, a token at a time, is neither"
 
 def test_fetch(tmp_path, monkeypatch):
   # serve.fetch: a model id's files from Hugging Face's resolve URLs (a local server in its place, by HF_ENDPOINT), the

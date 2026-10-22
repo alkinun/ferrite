@@ -228,8 +228,8 @@ def forward(ids, places, w, c, caches, starts=None, every=False):
     p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
     x = layer(x, p, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill)
   h = rms(x, w["norm"], c.eps)
-  head = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]
-  return f.mm(h if starts is not None or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], head)
+  phases = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]  # the output layer's
+  return f.mm(h if starts is not None or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases)
 
 def prefill(ids, w, c, caches, chunk, on=lambda row: row):
   """forward over a prompt from place 0, chunk tokens at a time, as Tenstorrent's prefill takes a long one: each chunk's
@@ -253,10 +253,12 @@ def load(folder, places=4096):
   `places` places (at most the model's)."""
   j = read_json(os.path.join(folder, "config.json"))
   rope = j.get("rope_parameters") or (j.get("rope_scaling") or {}) | {"rope_theta": j["rope_theta"]}  # transformers 5's, else the two before it
-  theta = rope.pop("rope_theta")
+  theta, kind = rope.pop("rope_theta"), rope.pop("type", None)  # (older configs say type, not rope_type)
+  rope.setdefault("rope_type", kind or "default")
+  assert rope["rope_type"] in ("default", "llama3", "yarn"), f"RoPE scaling {rope}: not yet"
   c = SimpleNamespace(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=j["num_hidden_layers"],
                       eps=j["rms_norm_eps"], theta=theta, places=min(j["max_position_embeddings"], places), vocab=j["vocab_size"],
-                      rope=rope if rope.get("rope_type", "default") != "default" else None, ffn=j["intermediate_size"], head_dim=j.get("head_dim"),
+                      rope=rope if rope["rope_type"] != "default" else None, ffn=j["intermediate_size"], head_dim=j.get("head_dim"),
                       k=j.get("num_experts_per_tok"), norm_topk=j.get("norm_topk_prob", True), layer_types=j.get("layer_types"),
                       limit=j.get("swiglu_limit", 7.0 if j.get("model_type") == "gpt_oss" else None),  # gpt-oss's GLU
                       sliding=j.get("sliding_window") if j.get("use_sliding_window", True) else None)

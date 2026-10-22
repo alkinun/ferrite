@@ -122,7 +122,8 @@ class Chip:
   def send(self, ch, src, dst, n, timeout=1.0):
     """n bytes from channel ch's tile's L1 at src into the L1 of the tile at its link's other end, at dst: a TT-link write
     by the tile's TX queue 0, which the link delivers once and in order, so a write sent after it lands after it (the
-    way to know it has). Returns once the queue has taken it: until then src must not change."""
+    way to know it has). Returns at once: the queue may still be reading src, which must not change until it is free
+    again (the next send waits for that)."""
     (x, y), reg = bh.ETH[ch], lambda name: bh.ETH_TXQ0 + bh.ETH_TXQ[name]
     assert src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, "16-byte aligned, below the firmware's L1"
     def free():  # STATUS's busy bit, read after another of the queue's registers: polled too soon after a send, it lies (BH-55)

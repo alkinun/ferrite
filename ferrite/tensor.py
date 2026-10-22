@@ -6,7 +6,7 @@ import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
 from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
-from ferrite.compiler import LINK_L1, LINK_TILES, link_kernel, transpose_kernel
+from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -368,7 +368,6 @@ class Tensor:
     assert self.dtype == "bf16" and self.cols <= 256 and k <= min(self.cols, 32), "a bf16 row of at most 256, k of at most 32"
     x = _plain(self.realize())
     values, ids = Tensor(self.rt, x.rows, k, batch=x.batch), Tensor(self.rt, x.rows, k, batch=x.batch, dtype="int32")
-    values.addr, ids.addr = values._alloc(), ids._alloc()
     return values._run(_cached(("topk", k, x.cols), lambda: topk_kernel(k, x.cols)), values.addr, ids.addr, *x._where(), x.rows,
                        units=x.batch * -(-x.rows // 32), name="topk"), ids
   def group(self, n):
@@ -380,9 +379,8 @@ class Tensor:
     for a matmul that picks its weights (index=tiles). By one kernel of BRISC's alone (group_kernel)."""
     assert self.dtype == "int32" and self.batch == 1 and self.cols <= 32, "a matrix of int32 choices, at most 32 a row"
     x, rows, k = _plain(self.realize()), self.rows, self.cols
-    t, rp = -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32
+    t, rp = group_slots(rows, k, n)
     order, tiles, places = Tensor(self.rt, 1, 32 * t, dtype="int32"), Tensor(self.rt, t, 1, dtype="int32"), Tensor(self.rt, 1, k * rp, dtype="int32")
-    for u in (order, tiles, places): u.addr = u._alloc()
     order._run(_cached(("group", rows, k, n), lambda: group_kernel(rows, k, n)), order.addr, tiles.addr, places.addr, x.addr, x.stride, x.offset,
                units=1, name="group")
     return order, tiles, places
@@ -390,11 +388,11 @@ class Tensor:
     """This tensor in DRAM of another chip's (rt's), copied across the Ethernet link at this chip's channel ch, whose other
     end is that chip's channel back (Chip.links): a worker on each chip (link_kernel), the sender's tiles a chunk at a
     time through its Ethernet tile's L1 into the receiver's, a flag after each, a credit back. Waits for what both chips
-    have queued first: each end's flag and credit start at 0."""
+    have queued first: each end's flag and credit start at 0, which a recording's replay would not redo."""
+    assert rt is not self.rt and self.rt.log is None and rt.log is None, "two chips' runtimes, outside a recording"
     x = self.realize()
     if x.owner is not None or x.rep > 1 or x.offset: x = (x + 0).realize()  # a view: a whole tensor of its own first
     out = Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype)
-    out.addr = out._alloc()
     x.rt.wait(), rt.wait()
     for chip, end in ((x.rt.chip, ch), (rt.chip, back)): chip.write(*bh.ETH[end], LINK_L1 + 2 * LINK_TILES * tile_bytes(x.dtype), bytes(48))
     out._run(_cached(("link", False, x.dtype), lambda: link_kernel(False, x.dtype)), out.addr, out.tiles, *bh.ETH[back], units=1, name="link in")

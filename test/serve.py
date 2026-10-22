@@ -120,6 +120,7 @@ def chat(template, messages, thinking=True, effort="medium"):  # messages as the
 
 def answer(text):  # a thinking model's text as its reasoning and its answer (none until it comes): Qwen3's around </think>,
   if text.startswith("<|channel|>"):  # or gpt-oss's analysis channel, until its <|end|>, and its final one
+    if "<|message|>" not in text: return "", ""  # (the channel's name still coming)
     head, _, content = text.partition("<|channel|>final<|message|>")
     return head.removeprefix("<|channel|>analysis<|message|>").partition("<|end|>")[0].strip(), content
   reasoning, _, content = text.partition("</think>")

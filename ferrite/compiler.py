@@ -1203,6 +1203,9 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+def group_slots(rows, k, n):  # Tensor.group's tiles of slots, enough for any choices (one for each 32, and one more for each
+  return -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32  # value that can come), and the length of a run of places
+
 def group_kernel(rows, k, n):
   """A mixture of experts' tokens grouped by expert (Tensor.group), args [first unit, units, the order's address, the
   tiles', the places', then the choices' address, tile stride for rows, and tile offset]. BRISC alone, on one worker:
@@ -1211,7 +1214,7 @@ def group_kernel(rows, k, n):
   The order (a row of the token each slot holds), the tiles (a column of each tile's value) and the places (a row of k
   runs, each choice's slot) are built in L1 as plain arrays and sent a tile at a time, a row's tile holding the row
   32 times and a column's the column, as every tensor's does."""
-  t, rp = -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32  # tiles of slots: enough for any choices; a run of places
+  t, rp = group_slots(rows, k, n)
   fill = DATA + -(-rows // 32) * 4096  # past the choices: each value's count, then its next slot
   out = (fill + 4 * (n + 33 * t + k * rp) + 63) // 64 * 64
   assert out + 4096 <= OUTS, "the choices and their arrays in L1"
@@ -1266,7 +1269,8 @@ def link_kernel(send, dtype):
   writes each chunk into a slot (two take turns) in its Ethernet tile's L1, and has the tile's TX queue write it, then a
   flag (the chunk's number + 1), into the same places in the peer's: the link delivers in order, so the chunk is there
   when its flag is. The receiver waits for each flag, writes the chunk into its tensor and sends back a credit (chunks
-  done), which the sender waits for before it fills a slot again. A word of another tile's (the queue's registers, a
+  done), which the sender waits for before it fills a slot again, and for the last one before it ends, so that the next
+  copy's flags and credit can start at 0. A word of another tile's (the queue's registers, a
   flag, the credit) is read and written over the NoC, from a place in L1 with the same low 4 bits, as the NoC wants."""
   tb, q = tile_bytes(dtype), lambda name: f"{bh.ETH_TXQ0 + bh.ETH_TXQ[name]:#x}"
   slot = LINK_TILES * tb
@@ -1282,6 +1286,7 @@ def link_kernel(send, dtype):
     for (unsigned i = 0; i < n; i++) noc_write(BUF + i * {tb}, BANK(t + i), AT(a[2], t + i, {tb}), {tb});
     noc_wait();
     poke(CREDIT, c + 1), link_write(CREDIT, 16);"""
+  end = f"\n  while (peek(CREDIT) < (a[3] + {LINK_TILES - 1}) / {LINK_TILES}) {{}}  // the last credit is back: nothing of this copy is left on the link" if send else ""
   return compile_kernel(f"""
 #define BUF {DATA:#x}
 #define WORD {DATA + slot:#x}
@@ -1301,7 +1306,7 @@ void kmain(volatile unsigned *a) {{
   ex = a[4], ey = a[5];
   for (unsigned c = 0, t = 0; t < a[3]; c++, t += {LINK_TILES}) {{
     unsigned n = a[3] - t < {LINK_TILES} ? a[3] - t : {LINK_TILES}, s = c % 2;{body}
-  }}
+  }}{end}
 }}""")
 
 def readback_kernel(dtype):

@@ -8,6 +8,12 @@ class Sim:
   build has several). The library is one per process: every Sim shares it, its clock and the host memory it reaches."""
   lib, dma, clocks = None, [], 0  # the library; (bus address, size, host address, buffer); chip cycles run so far
   def __init__(self, path, bdf=0):
+    Sim.load(path)
+    self.lib, self.bdf = Sim.lib, bdf
+    self.bar0 = self.cfg_read(0x10) & ~0xF | self.cfg_read(0x14) << 32  # TLB windows and registers: all ferrite uses
+
+  @staticmethod
+  def load(path):  # the library, once a process
     if Sim.lib is None:
       Sim.lib = lib = ctypes.CDLL(path)
       lib.libttsim_pci_config_rd32.restype = ctypes.c_uint32
@@ -20,12 +26,10 @@ class Sim:
       Sim.cbs = (cb(lambda bus, p, n: ctypes.memmove(p, Sim.host(bus, n), n)), cb(lambda bus, p, n: ctypes.memmove(Sim.host(bus, n), p, n)))
       lib.libttsim_set_pci_dma_mem_callbacks(*Sim.cbs)
       lib.libttsim_init()
-    self.lib, self.bdf = Sim.lib, bdf
-    self.bar0 = self.cfg_read(0x10) & ~0xF | self.cfg_read(0x14) << 32  # TLB windows and registers: all ferrite uses
 
   @staticmethod
   def chips(path):  # the PCI addresses of a build's chips (not necessarily side by side: every slot is asked)
-    Sim(path) if Sim.lib is None else None
+    Sim.load(path)
     return [bdf for bdf in range(0, 1 << 16, 8) if Sim.lib.libttsim_pci_config_rd32(bdf, 0) == bh.DEVICE << 16 | bh.VENDOR]
 
   def cfg_read(self, off): return self.lib.libttsim_pci_config_rd32(self.bdf, off)
@@ -122,14 +126,13 @@ def _write(path, s):
 def find_cards():
   """The Blackholes on the PCI bus, by their sysfs names (domain:bus:device.function)."""
   ids = lambda bdf: [int(open(f"/sys/bus/pci/devices/{bdf}/{f}").read(), 16) for f in ("vendor", "device")]
-  return [bdf for bdf in sorted(os.listdir("/sys/bus/pci/devices")) if ids(bdf) == [bh.VENDOR, bh.DEVICE]]
+  if cards := [bdf for bdf in sorted(os.listdir("/sys/bus/pci/devices")) if ids(bdf) == [bh.VENDOR, bh.DEVICE]]: return cards
+  raise RuntimeError("no Blackhole on the PCI bus; set TTSIM=/path/to/libttsim.so to use the simulator")
 
 def open_device(n=0):
   """Chip n: TTSIM=/path/to/libttsim.so selects the simulator (several chips in a multi-chip build); otherwise the n-th
   Blackhole on the PCI bus."""
-  if "TTSIM" in os.environ: return Sim(os.environ["TTSIM"], Sim.chips(os.environ["TTSIM"])[n])
-  if not (cards := find_cards()): raise RuntimeError("no Blackhole on the PCI bus; set TTSIM=/path/to/libttsim.so to use the simulator")
-  return Card(cards[n])
+  return Sim(os.environ["TTSIM"], Sim.chips(os.environ["TTSIM"])[n]) if "TTSIM" in os.environ else Card(find_cards()[n])
 
 def reset(bdf, timeout=10.0):
   """Reset the whole chip, as tt-kmd's ASIC reset does, for a card whose NoC or firmware hangs (a hung kernel needs
