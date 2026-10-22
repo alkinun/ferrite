@@ -202,7 +202,7 @@ append a correction.
 29. **Before making a copy faster, ask whether the reader could take the data where it lies.** Grouped-query attention
     stacked 9 query heads into 3 groups and back: two moves and a copy a block, a third of a SmolLM block's cycles. A
     view that reads each key head once for every query head made them nothing: a token went from 300k cycles to 180k
-    (156k now). (NOTES: "A Llama-family model")
+    (158k now). (NOTES: "A Llama-family model")
 30. **Run the framework's own tests.** tinygrad's `test_ops`, unchanged on the FERRITE device, found what our tests of
     the adapter never reached: an int product labelled int32 where ferrite made it in fp32, bools copied back as the
     bytes they were computed in, a freed buffer handed on with its old contents, a padding mask dropped on an axis of

@@ -102,9 +102,9 @@ first (NOTES, "Bring-up on a p150").
 - [x] **Fewer launches a Gated DeltaNet block**: a decode or verify step's tokens one at a time by the recurrent rule,
   and its small weights in fp32, 86 launches a block to 20 (27 for several slots), a verify step's 130 to 50; a
   Qwen3.6 step is 1,701 launches (NOTES, "Qwen3.5's and Qwen3.6's language models").
-- [ ] **A put by the rows it writes**: the KV cache's `put` visits every tile of the cache to find a step's rows, 2.5M
-  of a 32-user SmolLM step's 3.4M ttsim cycles at 1,056 places a user; a Qwen3.6 attention block's cache for eight
-  32K-token sessions is 262k tiles.
+- [x] **A put by the rows it writes**: the KV cache's `put` visited every tile of the cache to find a step's rows, 2.5M
+  of a 32-user SmolLM step's 3.4M ttsim cycles at 1,056 places a user; it now works as the rows it writes, 159k
+  (NOTES, "Rows by index").
 - [ ] **Qwen3.6's KV cache in bfp8**, its token accuracy kept: a session's rows, most of what a step reads, halved.
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode; the whole model is 72 GB

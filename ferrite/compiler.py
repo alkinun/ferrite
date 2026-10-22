@@ -1096,11 +1096,13 @@ void kmain(volatile unsigned *a) {{
 def put_kernel(dtype):
   """Rows of x into rows of a tensor, in place (gather's inverse), args [first unit, units, then the tensor's and x's
   address, tile strides for batch and row, and tile offset, the int32 row of the n rows' places' address and tile offset,
-  n, the tensor's tile columns and tile rows]. BRISC alone: a unit is one tile of the tensor, so no two workers write
-  one tile, and as many work as it has tiles. It reads the places (32 to a tile), and for each row that lands in its
-  tile, its tile once, the row's tile of x once for every row in it, the row's two runs (left and right face) copied;
-  then its tile written back, if any row came. 32 rows that fill its tile in order (a prompt's, from a tile's first
-  place) make it their tile of x as it is.
+  n, the tensor's tile columns and tile rows]. BRISC alone: a unit is a row of x in one of the tensor's matrices and tile
+  columns, so the work goes as the rows put, not as the tensor's tiles. Each worker reads the places (32 to a tile) and
+  chains the rows that land in each tile row, first to last; the unit of a tile row's first row reads its tile once,
+  each row's tile of x once for every row in it, copies the rows' two runs (left and right face) in order, so a later
+  row to the same place stays, and writes the tile back: no two workers write one tile. 32 rows that fill a tile in
+  order (a prompt's, from a tile's first place) make it their tile of x as it is. A place past the tensor's rows is left
+  out.
   Into bfp8 (a bfp8 KV cache), x is bf16 and each run of 16 is rounded as the packer rounds a cast: to its largest
   exponent, half up, 7 bits of magnitude (a 0 without its sign, which the unpacker would read as -inf)."""
   bfp = dtype == "bfp8"
@@ -1115,6 +1117,7 @@ def put_kernel(dtype):
 #define TILE {DATA:#x}
 #define FROM {DATA + 4096:#x}
 #define IDS {DATA + 8192:#x}
+#define PLACES {DATA + 12288:#x}
 {BANKS}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // place r of the 32, in row 0
 static unsigned at(unsigned r, unsigned f) {{ return (r % 32 / 16 * 2 + f) * {s // 4} + r % 16 * {run}; }}  // row r's run in face f, in x
@@ -1132,27 +1135,32 @@ static void pack(unsigned src, unsigned tile, unsigned r, unsigned f) {{
   }}
 }}
 void kmain(volatile unsigned *a) {{
-  unsigned ct = a[13], tiles = a[14] * ct;
+  unsigned n = a[12], ct = a[13], tr = a[14];
+  // each row's place, the next row to land in its tile row (~0: none), and each tile row's first row
+  volatile unsigned *place = (volatile unsigned *)PLACES, *next = place + n, *first = next + n;
+  for (unsigned i = 0; i < n; i += 32) {{
+    unsigned it = a[11] + i / 32;
+    noc_get(BANK(it), AT(a[10], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")});
+    noc_wait();
+    for (unsigned k = 0; k < 32 && i + k < n; k++) place[i + k] = id(k);
+  }}
+  for (unsigned i = 0; i < tr; i++) first[i] = ~0u;
+  for (unsigned i = n; i-- > 0;) if (place[i] / 32 < tr) {{ next[i] = first[place[i] / 32]; first[place[i] / 32] = i; }}
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, b = unit / tiles, ti = unit % tiles / ct, j = unit % ct;
-    unsigned to = b * a[3] + ti * a[4] + j + a[5], mine = 0, held = ~0u;  // this unit's tile; the x tile in FROM
-    for (unsigned i = 0; i < a[12]; i++) {{
-      unsigned from = b * a[7] + i / 32 * a[8] + j + a[9];
-      if (i % 32 == 0) {{
-        unsigned it = a[11] + i / 32, whole = i + 32 <= a[12];
-        noc_get(BANK(it), AT(a[10], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")});
-        noc_wait();
-        for (unsigned k = 0; whole && k < 32; k++) whole = id(k) == 32 * ti + k;
-        if (whole) {{ {whole} mine = 1; i += 31; continue; }}
-      }}
-      unsigned r = id(i % 32);
-      if (r / 32 != ti) continue;
-      if (!mine) {{ noc_get(BANK(to), AT(a[2], to, {t}), TILE, {t}); mine = 1; }}
-      if (from != held) {{ noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}); held = from; }}
-      noc_wait();
+    unsigned unit = a[0] + u, b = unit / (n * ct), i0 = unit / ct % n, j = unit % ct, ti = place[i0] / 32;
+    if (ti >= tr || first[ti] != i0) continue;  // the tile of an earlier row's unit, or none
+    unsigned to = b * a[3] + ti * a[4] + j + a[5], held = ~0u, whole = i0 % 32 == 0 && i0 + 32 <= n;
+    for (unsigned k = 0; whole && k < 32; k++) whole = place[i0 + k] == 32 * ti + k;
+    if (whole) {{ unsigned from = b * a[7] + i0 / 32 * a[8] + j + a[9]; {whole} }}
+    else {{ noc_get(BANK(to), AT(a[2], to, {t}), TILE, {t}); noc_wait(); }}
+    for (unsigned i = i0; i != ~0u; i = next[i]) {{
+      if (whole && i < i0 + 32) continue;
+      unsigned r = place[i], from = b * a[7] + i / 32 * a[8] + j + a[9];
+      if (from != held) {{ noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}); noc_wait(); held = from; }}
       {copy}
     }}
-    if (mine) {{ noc_write(TILE, BANK(to), AT(a[2], to, {t}), {t}); noc_wait(); }}
+    noc_write(TILE, BANK(to), AT(a[2], to, {t}), {t});
+    noc_wait();
   }}
 }}""")
 

@@ -133,10 +133,10 @@ class Tensor:
     assert (x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype == "bfp8" else self.dtype), \
       f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"  # into bfp8 (a bfp8 KV cache), bf16 rows rounded on the way
     assert self.rep == 1, "into a tensor of its own, not a repeat"
-    x, ids, ct = _plain(x.realize()), ids.realize(), -(-self.cols // 32)
-    tr = -(-self.rows // 32)
+    x, ids, ct, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
+    assert 2 * x.rows + tr <= 2**17, "the places, and the rows of each tile row, in a worker's L1"
     return self.realize()._run(_cached(("put", self.dtype), lambda: put_kernel(self.dtype)), *self._where(), *x._where(), ids.addr,
-                               ids.offset, x.rows, ct, tr, units=self.batch * tr * ct, name="put")
+                               ids.offset, x.rows, ct, tr, units=self.batch * x.rows * ct, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
     assert self.rep == 1, "a view's offsets and strides are the stored tensor's, which a repeat's matrices are not"
