@@ -14,27 +14,52 @@ from ferrite.tensor import Tensor, jit
 import gpt2, llama
 
 class Request:
-  """A prompt's tokens and how to go on from them: greedy at temperature 0, else sampled from the softmax at that
-  temperature with its least likely tokens past top_p left out, until a token in eos, a stop string or max_tokens.
-  Each piece of new text goes into out as soon as no stop string could still begin in it, then None once the engine
-  is done with it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot.
-  cached: its prompt's tokens that its slot, or a session saved on the host, held already, which were not prefilled."""
-  def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None):
+  """A prompt's tokens and how to go on from them (pick), until a token in eos, a stop string or max_tokens. Each piece
+  of new text goes into out as soon as no stop string could still begin in it, then None once the engine is done with
+  it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot. cached: its
+  prompt's tokens that its slot, or a session saved on the host, held already, which were not prefilled. logprobs: for
+  each token made, its log probability and those of the logprobs most likely (probs), from the model's logits as they
+  are; marks: how many it had at each piece of text."""
+  def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None, top_k=0, min_p=0.0,
+               presence=0.0, frequency=0.0, repetition=1.0, logprobs=None):
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
     self.stop, self.eos, self.rng = [stop] if isinstance(stop, str) else list(stop or ()), set(eos), np.random.default_rng(seed)
-    self.made, self.said, self.out, self.finish, self.gone, self.cached = [], "", queue.Queue(), None, False, 0
+    self.top_k, self.min_p, self.presence, self.frequency, self.repetition, self.logprobs = top_k, min_p, presence, frequency, repetition, logprobs
+    self.made, self.said, self.out, self.finish, self.gone, self.cached, self.probs, self.marks = [], "", queue.Queue(), None, False, 0, [], []
 
   def pick(self, logits):
+    """The next token: the logits less the penalties (presence and frequency by the tokens made so far, repetition by
+    the prompt's and those made, as vLLM applies them), then greedy at temperature 0, else sampled at that temperature
+    from the top_k most likely (0: all), the fewest of those whose probabilities sum to top_p, and of those the ones at
+    least min_p of the most likely's. The fewest are sought among the 1,024 most likely first: a sort of a vocabulary
+    of 248K is 5 ms of the host's a token, where a decode step of eight users takes the card 28."""
+    if self.presence or self.frequency or self.repetition != 1:
+      made = np.bincount(self.made, minlength=len(logits))[:len(logits)]
+      logits = logits - self.presence * (made > 0) - self.frequency * made
+      seen = (made > 0) | (np.bincount(self.ids, minlength=len(logits))[:len(logits)] > 0)
+      logits = np.where(seen, np.where(logits > 0, logits / self.repetition, logits * self.repetition), logits)
     if self.temperature == 0: return int(logits.argmax())
-    p = np.exp((logits - logits.max()) / self.temperature)
-    order = np.argsort(-p)
-    keep = order[:np.searchsorted(np.cumsum(p[order]) / p.sum(), self.top_p) + 1]
-    return int(self.rng.choice(keep, p=p[keep] / p[keep].sum()))
+    p, keep = np.exp((logits - logits.max()) / self.temperature), None  # (None: every token)
+    if self.top_k or self.top_p < 1:
+      keep = np.argpartition(-p, (n := min(self.top_k or 1024, len(p))) - 1)[:n]
+      keep = keep[np.argsort(-p[keep])]
+      if not self.top_k and p[keep].sum() < self.top_p * p.sum(): keep = np.argsort(-p)  # (a flatter distribution's)
+      if self.top_p < 1: keep = keep[:np.searchsorted(np.cumsum(p[keep]), self.top_p * (p[keep] if self.top_k else p).sum()) + 1]
+    if self.min_p: keep = np.flatnonzero(p >= self.min_p * p.max()) if keep is None else keep[p[keep] >= self.min_p * p.max()]
+    w = p if keep is None else p[keep]
+    i = min(int(np.searchsorted(np.cumsum(w), self.rng.random() * w.sum(), side="right")), len(w) - 1)
+    return i if keep is None else int(keep[i])
 
   def take(self, logits, room):  # the next token from its logits (room: whether its slot has a place for one more): done?
     if self.gone: self.finish = "gone"; return True
     token = self.pick(logits)
-    if token not in self.eos: self.made.append(token)
+    if token not in self.eos:
+      self.made.append(token)
+      if self.logprobs is not None:  # (the model's own: its logits before any penalty or temperature, as vLLM gives them)
+        lp = logits - logits.max()
+        lp = lp - np.log(np.exp(lp).sum())
+        top = np.argpartition(-lp, self.logprobs)[:self.logprobs] if self.logprobs else []
+        self.probs.append((token, float(lp[token]), [(int(t), float(lp[t])) for t in sorted(top, key=lambda t: -lp[t])]))
     text = self.tok.decode(self.made)
     cut = min((i for i in (text.find(s) for s in self.stop) if i >= 0), default=-1)
     if token in self.eos or cut >= 0 or len(self.made) == self.max_tokens or not room:
@@ -46,7 +71,7 @@ class Request:
     return False
 
   def say(self, text):
-    if len(text) > len(self.said): self.out.put(text[len(self.said):]); self.said = text
+    if len(text) > len(self.said): self.marks.append(len(self.probs)); self.out.put(text[len(self.said):]); self.said = text
 
   def end(self): self.out.put(None)
 
@@ -302,10 +327,13 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         thinking, tools = (q.get("chat_template_kwargs") or {}).get("enable_thinking", True) is not False, is_chat and q.get("tools")
         prompt = chat(template, q["messages"], thinking, q.get("reasoning_effort") or "medium", tools) if is_chat else q["prompt"]
         ids = engine.tok.encode(prompt, special=is_chat)
+        top = (q.get("top_logprobs") or 0 if q.get("logprobs") else None) if is_chat else q.get("logprobs")  # (a completion's: how many)
+        if top is not None and not 0 <= top <= 20: raise ValueError("logprobs: at most 20 a token")
+        r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), q.get("temperature", 1.0), q.get("top_p", 1.0),
+                    q.get("stop"), eos, q.get("seed"), max(q.get("top_k") or 0, 0), q.get("min_p") or 0.0, q.get("presence_penalty") or 0.0,
+                    q.get("frequency_penalty") or 0.0, q.get("repetition_penalty") or 1.0, top)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens: a slot holds {engine.places - 2}"}})
-      r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), q.get("temperature", 1.0), q.get("top_p", 1.0),
-                  q.get("stop"), eos, q.get("seed"))
       engine.waiting.put(r)
       head = {"id": f"ferrite-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       apart = is_chat and (thinking and "<think>" in template or "<|channel|>" in template)
@@ -324,6 +352,14 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         return out
       called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the answer's text and tool calls
       piece = lambda text, done: ({"index": 0, "delta": delta(text)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
+      word, raw = lambda t: engine.tok.decode([t]), lambda t: list(engine.tok.bytes[t])
+      def chances(made):  # tokens' log probabilities as OpenAI gives them: a chat's for its content, a completion's as lists
+        if is_chat: return {"content": [{"token": word(t), "logprob": p, "bytes": raw(t), "top_logprobs": [{"token": word(a), "logprob": b, "bytes": raw(a)}
+                                                                                                              for a, b in top]} for t, p, top in made]}
+        return {"tokens": [word(t) for t, _, _ in made], "token_logprobs": [p for _, p, _ in made], "top_logprobs": [{word(a): b for a, b in top} for _, _, top in made]}
+      def logprobs(k=None):  # its tokens' log probabilities, or those of its k-th piece's
+        if r.logprobs is None: return {"logprobs": None}
+        return {"logprobs": chances(r.probs if k is None else r.probs[r.marks[k - 1] if k else 0:r.marks[k]])}
       usage = lambda: {"prompt_tokens": len(ids), "completion_tokens": len(r.made), "total_tokens": len(ids) + len(r.made),
                        "prompt_tokens_details": {"cached_tokens": r.cached}}
       if q.get("stream"):
@@ -332,7 +368,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
         head["object"] += ".chunk" if is_chat else ""
         try:
           if is_chat: send(head | {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-          while (text := r.out.get(timeout=wait)) is not None: send(head | {"choices": [piece(text, None)]})
+          for k, text in enumerate(iter(lambda: r.out.get(timeout=wait), None)):  # (each piece with its tokens' log probabilities)
+            send(head | {"choices": [piece(text, None) | logprobs(k)]})
           if made := called(seen["text"])[1]:
             send(head | {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}, "finish_reason": None}]})
           send(head | {"choices": [piece("", "tool_calls" if made else r.finish)]})
@@ -345,7 +382,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
       if r.finish == "error": return self.reply(500, {"error": {"message": "the engine stopped"}})
       message, (content, made) = parts(text), called(text)
       if made: message |= {"content": content or None, "tool_calls": made}
-      choice = {"index": 0, "message": {"role": "assistant"} | message} if is_chat else {"index": 0, "text": text, "logprobs": None}
+      choice = ({"index": 0, "message": {"role": "assistant"} | message} if is_chat else {"index": 0, "text": text}) | logprobs()
       self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}], "usage": usage()})
   return ThreadingHTTPServer(("", port), Handler)
 

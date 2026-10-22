@@ -1930,6 +1930,26 @@ def bytes_tokenizer(folder):  # a byte-level vocabulary of the 256 bytes, as tok
   (folder / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {ch: b for ch, b in zip(chars, bs + [b for b in range(256) if b not in bs])}}, "added_tokens": []}))
   return llama.Tokenizer(str(folder))
 
+def test_sampling():
+  # serve.Request.pick against a whole sort of the vocabulary: the tokens sampled at top_p are its nucleus (sought among
+  # the 1,024 most likely first, and among all of a flat distribution's), at top_k the k most likely, at min_p those at
+  # least min_p of the most likely's, each one sampled at least once; and at temperature 0 the penalties as vLLM's: by
+  # the tokens made (presence, frequency) and by those and the prompt's (repetition, a positive logit divided by it)
+  rng = np.random.default_rng(5)
+  for logits in (rng.normal(0, 2, 5000), rng.normal(0, 1e-3, 5000)):  # (the second's nucleus past 1,024 tokens)
+    p, order = np.exp(logits - logits.max()), np.argsort(-logits)
+    nucleus = set(order[:np.searchsorted(np.cumsum(p[order]) / p.sum(), 0.9) + 1].tolist())
+    for keep, kw in ((nucleus, dict(top_p=0.9)), (set(order[:3].tolist()), dict(top_k=3)), (set(np.flatnonzero(p >= 0.2).tolist()), dict(min_p=0.2))):
+      r = serve.Request(None, [], seed=1, **kw)
+      got = {r.pick(logits) for _ in range(3000 if len(keep) < 1000 else 20000)}
+      assert got <= keep and (len(got) > 0.9 * len(keep) if len(keep) > 1000 else got == keep), (kw, len(got), len(keep))
+  logits = np.array([3.0, 2.5, 1.0, -1.0])
+  for made, prompt, kw, want in (([0], [], dict(presence=1.0), 1), ([0, 0], [], dict(frequency=0.4), 1), ([0], [], dict(frequency=0.4), 0),
+                                 ([], [0], dict(repetition=1.3), 1), ([], [0], dict(repetition=1.1), 0), ([], [3], dict(repetition=10.0), 0)):
+    r = serve.Request(None, prompt, temperature=0, **kw)
+    r.made = made
+    assert r.pick(logits) == want, (made, prompt, kw)
+
 def test_serve(chip, tmp_path):
   # models/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
   # longest ago) decode together, numpy's greedy tokens for each, then the last two again alone, the last first (the slot used longer ago holds the
@@ -1996,6 +2016,8 @@ def test_serve(chip, tmp_path):
   assert reply["usage"]["prompt_tokens_details"]["cached_tokens"] == held, "all but the prompt's last token, which runs again"
   events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}))
   assert "".join(e["text"] for e in events) == text and events[-1]["finish_reason"] == "length" and usage["completion_tokens"] == 6
+  chances = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "logprobs": 2}))["choices"][0]["logprobs"]  # greedy: each
+  assert len(chances["tokens"]) == 6 and all(p == max(top.values()) <= 0 for p, top in zip(chances["token_logprobs"], chances["top_logprobs"]))  # the most likely
   assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
   http.shutdown()
   hi = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
@@ -2010,8 +2032,10 @@ def test_serve(chip, tmp_path):
   engine.waiting.put(r)
   text, body = tok.decode(done(r)), {"messages": hi[1:], "max_tokens": 6, "temperature": 0}
   assert json.load(ask(body))["choices"][0]["message"] == {"role": "assistant", "reasoning_content": text.strip(), "content": ""}  # no </think> came
-  events = streamed(ask(body | {"stream": True}))[0]
+  events = streamed(ask(body | {"stream": True, "logprobs": True, "top_logprobs": 1}))[0]
   assert "".join(e["delta"].get("reasoning_content", "") for e in events) == text.strip() and not any("content" in e["delta"] for e in events)
+  made = [c for e in events if e.get("logprobs") for c in e["logprobs"]["content"]]  # each piece's tokens, with their log probabilities
+  assert b"".join(bytes(c["bytes"]) for c in made).decode("utf-8", "replace") == text and all(c["top_logprobs"][0]["logprob"] == c["logprob"] for c in made)
   off = len(tok.encode(serve.chat("<|im_start|> <think>", hi[1:], False), special=True))  # not thinking: the prompt's reasoning given, empty,
   with pytest.raises(urllib.error.HTTPError) as e: ask(body | {"chat_template_kwargs": {"enable_thinking": False}})  # too long for these slots
   assert json.load(e.value)["error"]["message"].startswith(f"{off} tokens")

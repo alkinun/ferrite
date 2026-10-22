@@ -112,8 +112,9 @@ first (NOTES, "Bring-up on a p150").
 - [x] **Usage as OpenRouter bills it**: each response's usage counts the prompt's cached tokens (those its slot or a
   saved session held, not prefilled), and a stream ends with it. OpenRouter sends an agent's next requests back to the
   provider that cached its last, when cached tokens cost less there (NOTES, "Serving").
-- [ ] **The sampling parameters OpenRouter passes**: top_k, min_p, the presence, frequency and repetition penalties, and
-  log probabilities (logprobs, top_logprobs), on the host from each token's logits.
+- [x] **The sampling parameters OpenRouter passes**: top_k, min_p, the presence, frequency and repetition penalties, and
+  log probabilities (logprobs, top_logprobs), on the host from each token's logits, a token's sampling 1.3 ms where its
+  whole sort of Qwen3.6's vocabulary was 6 (NOTES, "Serving").
 - [ ] **tool_choice and structured outputs**: none, required or a named function, and answers to a JSON schema, the
   logits masked to the tokens that keep the text valid (OpenRouter's Auto Exacto counts the tool calls that parse).
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
