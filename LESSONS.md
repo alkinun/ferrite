@@ -236,6 +236,13 @@ append a correction.
     Tenstorrent's Ethernet firmware from userspace and writes the TX queue's registers from the host. Those registers
     answer over the NoC, so a Tensix kernel drives the link too, and a tensor crosses chips with no code on the Ethernet
     tiles at all. (`test_two_chips`)
+37. **A choice among near equals is not a bug, but it hides one.** A router choosing 2 of 8 experts makes hundreds of
+    choices over a prompt, and some are 1e-5 apart whatever the seed, so bf16 sends a token elsewhere and its logits
+    move 20%. Qwen3.5's test takes every expert, weighted, which keeps the path and drops the choice; the real model's
+    flips are counted, never tolerated blindly.
+38. **Fold nothing into a weight that bf16 cannot hold.** Qwen3.5's RMSNorms scale by 1 + w; 1 + w in bf16 rounds each
+    channel by up to 2^-9, which put a block's input 0.16% from transformers' and looked like a bug in the block after it.
+    n w + n is one more op in the same kernel, and exact.
 
 ## Working method
 

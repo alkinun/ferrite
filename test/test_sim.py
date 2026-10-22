@@ -1505,6 +1505,54 @@ def test_hf_families(chip, tmp_path, family):
   ties = [want[r].max() - want[r][got[r].argmax()] <= 0.001 * np.ptp(want[r]) for r in range(len(ids))]  # its best, or one bf16 cannot tell from it
   assert rel(got) < 0.02 and all(ties), (rel(got), ties)
 
+def test_qwen3_5_moe(chip, tmp_path, monkeypatch):
+  # Qwen3.5-MoE's language model (Qwen3.6's) as models/llama.py reads Hugging Face's files for it: Gated DeltaNet blocks
+  # (a causal conv, then the gated delta rule a chunk of 64 tokens at a time, its state carried between calls), every
+  # fourth block attention gated by a sigmoid of its own and turning a quarter of each head, RMSNorms that scale by 1 + w,
+  # and experts with a shared one. transformers' own model (float32, random bf16 weights; norms and the decay made to
+  # count) is the reference: a 100-token prompt (two chunks), then decode steps from the caches and states, numpy within
+  # 0.5% of its logits at every place and step (0.13%, 0.06%), and the chip within 3% of numpy's (1.2%, 0.8%), picking the same tokens
+  # (or, 2 places of 100, one its bf16 logits cannot tell from numpy's: 0.3% of the span apart), its decode steps replayed. Each token takes all 8 experts, weighted by the router: of 400 choices of 2, some are near
+  # ties (the 2nd and 3rd 1e-5 to 1e-3 apart, whatever the seed) that bf16 logits break either way
+  torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
+  if not hasattr(transformers, "Qwen3_5MoeTextConfig"): pytest.skip("a transformers with Qwen3.5-MoE")
+  monkeypatch.setitem(sys.modules, "fla", None), monkeypatch.setitem(sys.modules, "causal_conv1d", None)  # its own torch code, not their GPU kernels
+  torch.manual_seed(0)
+  config = transformers.Qwen3_5MoeTextConfig(hidden_size=128, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+                                             linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=32, linear_value_head_dim=32,
+                                             num_experts=8, num_experts_per_tok=8, moe_intermediate_size=64, shared_expert_intermediate_size=64,
+                                             vocab_size=256, max_position_embeddings=256, layer_types=["linear_attention"] * 3 + ["full_attention"])
+  model = transformers.Qwen3_5MoeForCausalLM(config)
+  for p in model.parameters():
+    if p.ndim == 1: p.data.normal_(0, 0.3) if torch.all(p == 0) else p.data.normal_(1, 0.2)
+  model = model.to(torch.bfloat16).float()
+  model.save_pretrained(tmp_path)
+  rng = np.random.default_rng(0)
+  ids, steps = rng.integers(0, 256, 100).tolist(), rng.integers(0, 256, 3).tolist()
+  with torch.no_grad():
+    out = model(torch.tensor([ids]), use_cache=True)
+    want, cache, want_steps = out.logits[0].numpy(), out.past_key_values, []
+    for s in steps:
+      out = model(torch.tensor([[s]]), past_key_values=cache, use_cache=True)
+      want_steps.append(out.logits[0, -1].numpy())
+      cache = out.past_key_values
+  c, weights = llama.load(str(tmp_path), 128)
+  assert c.gated and c.centered and c.partial == 0.25 and {"conv", "decay", "dt_bias"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.0.")}
+  rel = lambda got, want: max(np.abs(g - w).max() / np.abs(w).max() for g, w in zip(got, want))
+  w, kv = llama.arrays(weights), llama.kv_cache(c, 128, np.zeros)
+  numpy = llama.forward(ids, list(range(100)), w, c, kv, every=True)
+  numpy_steps = [llama.forward([s], [100 + i], w, c, kv)[0] for i, s in enumerate(steps)]
+  assert rel(numpy, want) < 0.005 and rel(numpy_steps, want_steps) < 0.005, (rel(numpy, want), rel(numpy_steps, want_steps))
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  on = lambda row: Tensor.of(rt, [row], "int32")
+  t, ckv = llama.upload(rt, weights), llama.kv_cache(c, 128, llama.zeros(rt))
+  got = gpt2.values(llama.forward(on(ids), on(list(range(100))), t, c, ckv, every=True))
+  step = tensor.jit(lambda ids, places: llama.forward(ids, places, t, c, ckv))
+  got_steps = [llama.logits(step(on([s]), on([100 + i]))) for i, s in enumerate(steps)]
+  ties = lambda got, want: all(w.max() - w[g.argmax()] <= 0.005 * np.ptp(w) for g, w in zip(got, want))  # its best, or one the chip's
+  assert rel(got, numpy) < 0.03 and ties(got, numpy), rel(got, numpy)                                      # bf16 logits cannot tell from it
+  assert rel(got_steps, numpy_steps) < 0.03 and ties(got_steps, numpy_steps), rel(got_steps, numpy_steps)
+
 def test_mxfp4(tmp_path):
   # gpt-oss's checkpoints keep the experts in MXFP4 (a tensor's _blocks of 4-bit values and its _scales): llama.mxfp4
   # unpacks them as transformers does (convert_moe_packed_tensors), bit for bit in bf16, and llama.load reads a
@@ -1578,7 +1626,7 @@ for l, n in ((0, 0), (1, 1)):
   rotary = (f.rows(up[n]["cos"], places[n]), f.rows(up[n]["sin"], places[n]), up[n]["turn"])
   p = {k[len(f"layers.{l}."):]: v for k, v in up[n].items() if k.startswith(f"layers.{l}.")}
   x = llama.layer(x, p, c, rotary, gpt2.mask(places[n], 32), caches[n][l], places[n], l, True)
-got = llama.logits(f.mm(f.rows(llama.rms(x, up[1]["norm"], c.eps), [4]), up[1]["embed.T"], None))
+got = llama.logits(f.mm(f.rows(llama.rms(x, up[1]["norm"], c), [4]), up[1]["embed.T"], None))
 assert np.abs(got - want).max() < 0.02 * np.ptp(want) and got.argmax() == want.argmax(), (np.abs(got - want).max(), np.ptp(want))
 print("ok")
 """

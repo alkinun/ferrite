@@ -50,7 +50,9 @@ a RISC-V core takes each token's best experts, matmuls read the chosen experts' 
 tokens are grouped by expert, so a decode step replays with whatever experts its tokens pick. Qwen3-30B-A3B's first two
 blocks, with its real weights, pick numpy's token at every place of a prompt and decode as numpy does. `models/llama.py`
 reads Llama's, Mistral's, Qwen2's and Qwen3's checkpoints, and Mixtral's, Qwen2-MoE's, Qwen3-MoE's and gpt-oss's (its
-MXFP4 experts too), each checked against transformers' own model. Two chips (ttsim's two-chip build) find their
+MXFP4 experts too), and Qwen3.5's and Qwen3.6's, whose Gated DeltaNet blocks keep a fixed-size state rather than a
+cache, each checked against transformers' own model. Qwen3.6-35B-A3B's real blocks run on the simulator within about 1%
+a block of the same model in numpy. Two chips (ttsim's two-chip build) find their
 Ethernet links and copy a tensor from one's DRAM to the other's across one, kernels on both chips driving it, with no
 code on the Ethernet tiles (`Tensor.to`).
 
@@ -104,8 +106,8 @@ is on a real card waits for one; `COMPARE.md` has the numbers and what carries o
 ## Docs
 
 `NOTES.md`: how it works, and what is still unknown. `COMPARE.md`: ferrite against TT-NN, and how the card benchmarks
-are measured. `ROADMAP.md`: the plan, from one card to serving large models on eight. `LESSONS.md`: what the work has
-taught us.
+are measured. `ROADMAP.md`: the plan, from one card to a box of linked cards serving the open models agents run on, and
+the next steps. `LESSONS.md`: what the work has taught us.
 
 ## License
 
