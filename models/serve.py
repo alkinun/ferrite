@@ -15,8 +15,8 @@ import gpt2, llama
 class Request:
   """A prompt's tokens and how to go on from them: greedy at temperature 0, else sampled from the softmax at that
   temperature with its least likely tokens past top_p left out, until a token in eos, a stop string or max_tokens.
-  Each piece of new text goes into out as soon as no stop string could still begin in it, then None; finish says why.
-  One whose client has gone (gone) ends at its next token, or takes no slot."""
+  Each piece of new text goes into out as soon as no stop string could still begin in it, then None once the engine
+  is done with it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot."""
   def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None):
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
     self.stop, self.eos, self.rng = [stop] if isinstance(stop, str) else list(stop or ()), set(eos), np.random.default_rng(seed)
@@ -30,7 +30,7 @@ class Request:
     return int(self.rng.choice(keep, p=p[keep] / p[keep].sum()))
 
   def take(self, logits, room):  # the next token from its logits (room: whether its slot has a place for one more): done?
-    if self.gone: self.finish = "gone"; self.out.put(None); return True
+    if self.gone: self.finish = "gone"; return True
     token = self.pick(logits)
     if token not in self.eos: self.made.append(token)
     text = self.tok.decode(self.made)
@@ -38,7 +38,6 @@ class Request:
     if token in self.eos or cut >= 0 or len(self.made) == self.max_tokens or not room:
       self.say(text if cut < 0 else text[:cut])
       self.finish = "stop" if token in self.eos or cut >= 0 else "length"
-      self.out.put(None)
       return True
     hold = max((k for s in self.stop for k in range(1, len(s)) if text.endswith(s[:k])), default=0)  # a stop string's start
     self.say(text[:len(text) - hold].rstrip("\ufffd"))  # (or a character whose bytes are still coming)
@@ -46,6 +45,8 @@ class Request:
 
   def say(self, text):
     if len(text) > len(self.said): self.out.put(text[len(self.said):]); self.said = text
+
+  def end(self): self.out.put(None)
 
 class Engine:
   """Sequences decoding together on the chip, a slot of `places` rows of one KV cache each (and Gated DeltaNet's states
@@ -56,16 +57,24 @@ class Engine:
   A session (its tokens, its slot's rows of each cache and its states) is saved on the host when its prompt is in and
   again when its request ends, up to `keep` bytes, the least recently used going first, so an agent's next turn,
   whose prompt is its last prompt and answer and more, starts where the last left off whichever slot it gets. A KV
-  cache's rows serve any start of what they hold; Gated DeltaNet's states are for exactly what they took in."""
+  cache's rows serve any start of what they hold; Gated DeltaNet's states are for exactly what they took in.
+  A model with a multi-token prediction layer (Qwen3.5's) decodes speculatively: each step verifies every slot's next
+  token and a draft after it in one call (llama.forward's accept), takes the second token too where the model's pick
+  for it is the draft (a pick sampled as it would be: the tokens are the model's own at any temperature), and drafts
+  the next in another call (llama.draft); a turned-down draft's Gated DeltaNet states are put back by the next step."""
   def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=256, keep=4 << 30):
     assert places % 32 == 0, "slots of whole tiles"
     self.rt, self.t, self.c, self.tok, self.places, self.chunk, self.keep = rt, t, c, tokenizer, places, chunk, keep
-    self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)), slots)
+    self.spec = getattr(c, "mtp", 0) > 0 and "mtp.fc" in t  # (drafts from the multi-token prediction layer)
+    self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)), slots, self.spec)
     self.slot = [llama.states(c, self.kv, u) for u in range(slots)]  # the caches as slot u's alone
     self.linear = any(llama.linear(c, l) for l in range(c.layers))  # (its states then say where a slot can go on from)
     self.starts, self.held, self.busy = [places * u for u in range(slots)], [[] for _ in range(slots)], [None] * slots
     self.used = [0] * slots  # when each slot last took a request: of those sharing as much, the one used longest ago goes
     self.step = jit(lambda ids, places, starts, live: llama.forward(ids, places, t, c, self.kv, starts, live=live))
+    self.verify, self.propose = jit(self.check), jit(self.guesses)
+    self.drafts, self.taken = [0] * slots, [1.0] * slots  # each slot's draft, and whether its last was taken (its states then go on from both)
+    self.drafted = self.agreed = 0  # (drafts compared with the model's pick, and taken: what speculation saves shows here)
     self.waiting, self.prefilled = queue.Queue(), 0  # (tokens prefilled in all: what the prefix cache saves shows here)
     self.saved = collections.OrderedDict()  # tokens -> (each block's bytes: a KV cache's rows, or Gated DeltaNet's states)
 
@@ -84,13 +93,18 @@ class Engine:
     self.used[u], self.busy[u] = max(self.used) + 1, r
     n = self.reach(self.held[u], r.ids)
     if self.linear and n < len(self.held[u]): self.restore(u)  # its states from the start again
+    elif not self.taken[u]:  # its states after a turned-down draft, those after the token before it, where a prompt goes on from
+      for l, s in enumerate(self.slot[u]):
+        if llama.linear(self.c, l): s[0].assign(s[2]), s[1].assign(s[3])
+      self.taken[u] = 1.0
     self.held[u] = r.ids[:n]
 
-  def save(self, u):  # slot u's session to the host: its tokens, its rows of each KV cache (whole tiles) and its states
-    key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32
+  def save(self, u):  # slot u's session to the host: its tokens, its rows of each KV cache (whole tiles) and its states (after a
+    key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32  # turned-down draft, those after the token before it)
     if not key or key in self.saved or not self.keep: return
     at = self.starts[u]
-    self.saved[key] = [tuple(x.tobytes() for x in s) if llama.linear(self.c, l) else s[:, at:at + rows, :].tobytes() for l, s in enumerate(self.slot[u])]
+    self.saved[key] = [tuple(x.tobytes() for x in (s[:2] if self.taken[u] else s[2:])) if llama.linear(self.c, l) else s[:, at:at + rows, :].tobytes()
+                       for l, s in enumerate(self.slot[u])]
     size = lambda v: sum(len(b) for x in v for b in (x if isinstance(x, tuple) else [x]))
     while sum(size(v) for v in self.saved.values()) > self.keep: self.saved.popitem(last=False)
 
@@ -100,30 +114,72 @@ class Engine:
     for l, s in enumerate(self.slot[u]):
       data = self.saved[key][l] if key else None
       if llama.linear(self.c, l):
-        for i, x in enumerate(s): x.assign(Tensor.frombytes(self.rt, x.rows, x.cols, data[i] if data else bytes(4 * x.batch * x.rows * x.cols), x.batch, "fp32"))
+        for i, x in enumerate(s[:2]): x.assign(Tensor.frombytes(self.rt, x.rows, x.cols, data[i] if data else bytes(4 * x.batch * x.rows * x.cols), x.batch, "fp32"))
       elif data: s.put(self.on(list(range(at, at + rows))), Tensor.frombytes(self.rt, rows, s.cols, data, s.batch))
-    self.held[u] = list(key)
+    self.held[u], self.taken[u] = list(key), 1.0
 
-  def fill(self, u):  # the next chunk of slot u's prompt; the last one's last logits give the first new token
-    r, at = self.busy[u], len(self.held[u])
+  def fill(self, u):  # the next chunk of slot u's prompt; the last one's last logits give the first new token (and, speculating,
+    r, at = self.busy[u], len(self.held[u])  # the multi-token prediction layer over the chunk's places, the last its first draft)
     if r.gone: return self.take(u, None)
-    ids = r.ids[at:at + self.chunk]
-    out = llama.forward(self.on(ids), self.on(list(range(at, at + len(ids)))), self.t, self.c, self.slot[u], self.on([self.starts[u]] * len(ids)))
+    ids, places, starts = r.ids[at:at + self.chunk], self.on(list(range(at, at + min(self.chunk, len(r.ids) - at)))), self.on([self.starts[u]] * min(self.chunk, len(r.ids) - at))
+    out = llama.forward(self.on(ids), places, self.t, self.c, self.slot[u], starts, hidden=self.spec)
+    out, h = out if self.spec else (out, None)
     self.held[u] += ids
     self.prefilled += len(ids)
-    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, gpt2.values(out[len(ids) - 1:len(ids), :])[0])
+    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, gpt2.values(out[len(ids) - 1:len(ids), :])[0], 1 + self.spec)
+    if self.spec and self.busy[u] is r:  # each place's next token: the prompt's, and past its end the one just taken
+      drafts = gpt2.values(llama.draft(self.on((r.ids + r.made)[at + 1:at + len(ids) + 1]), places, h, self.t, self.c, self.slot[u], starts))
+      if r.made: self.drafts[u], self.taken[u] = self.guess(u, drafts[-1]), 1.0
 
   def advance(self):  # one step for every slot: each decoding one's last token in, its next one out
     live = [r if r and r.made else None for r in self.busy]
     if not any(live): return
+    if self.spec: return self.speculate(live)
     ids = [r.made[-1] if r else 0 for r in live]
     places = [len(h) if r else self.places - 1 for h, r in zip(self.held, live)]
     logits = gpt2.values(self.step(self.on(ids), self.on(places), self.on(self.starts), self.on([float(bool(r)) for r in live], "fp32")))
     for u, r in enumerate(live):
       if r: self.held[u].append(r.made[-1]); self.take(u, logits[u])
 
-  def take(self, u, logits):  # a slot's request takes its next token; a finished one leaves its slot (its session saved)
-    if self.busy[u].take(logits, len(self.held[u]) < self.places - 1): self.save(u); self.busy[u] = None
+  def take(self, u, logits, room=1):  # a slot's request takes its next token; a finished one leaves its slot, its session saved
+    r = self.busy[u]                   # before it ends (so whoever waits on it finds the chip idle)
+    if r.take(logits, len(self.held[u]) + room < self.places): self.save(u); self.busy[u] = None; r.end()
+    return self.busy[u] is None
+
+  def check(self, ids, places, starts, live, accept):  # (speculating, jit's) each slot's token and draft taken in, after its last step's
+    logits, self.hidden = llama.forward(ids, places, self.t, self.c, self.kv, starts, live=live, accept=accept, hidden=True)  # states (accept)
+    return logits  # their logits, and their hidden states kept for guesses
+
+  def guesses(self, ids, places, starts, taken):  # (jit's) the multi-token prediction layer over each slot's two last places
+    n, d = len(self.busy), self.c.dim     # (the second the first again where its draft was turned down): its logits
+    h = self.hidden.reshape(n, 2, d)
+    first = h[:, 0:1, :]
+    h = first.cat(first + taken.reshape(n, 1, 1) * (h[:, 1:2, :] - first), axis=1).reshape(2 * n, d).cast("bf16")  # (one or the other, exactly)
+    return llama.draft(ids, places, h, self.t, self.c, self.kv, starts)
+
+  def guess(self, u, logits): return int(logits.argmax())  # slot u's draft, from the multi-token prediction layer's logits
+
+  def speculate(self, live):  # one step for every slot: its token and its draft verified, the draft taken if the model's pick
+    n, at = len(live), [len(h) for h in self.held]  # agrees, then the next drafts
+    ids = [x for u, r in enumerate(live) for x in ([r.made[-1], self.drafts[u]] if r else [0, 0])]
+    places = [p for u, r in enumerate(live) for p in ([at[u], at[u] + 1] if r else [self.places - 1] * 2)]
+    starts = self.on([s for s in self.starts for _ in range(2)])
+    logits = gpt2.values(self.verify(self.on(ids), self.on(places), starts, self.on([float(bool(r)) for r in live], "fp32"), self.on(self.taken, "fp32")))
+    pairs = [[0, 0, self.places - 1, self.places - 1] for _ in range(n)]  # each slot's next tokens and their places, for the drafts
+    for u, r in enumerate(live):
+      if not r: continue
+      self.held[u].append(r.made[-1])
+      self.taken[u] = 0.0
+      if self.take(u, logits[2 * u], 2): continue
+      self.drafted += 1
+      if r.made[-1] != self.drafts[u]: pairs[u] = [r.made[-1], r.made[-1], at[u], at[u]]; continue
+      self.held[u].append(r.made[-1])
+      self.taken[u], self.agreed = 1.0, self.agreed + 1
+      if not self.take(u, logits[2 * u + 1], 2): pairs[u] = [self.drafts[u], r.made[-1], at[u], at[u] + 1]
+    if not any(self.busy[u] is r for u, r in enumerate(live) if r): return
+    out = gpt2.values(self.propose(self.on([t for p in pairs for t in p[:2]]), self.on([q for p in pairs for q in p[2:]]), starts, self.on(self.taken, "fp32")))
+    for u, r in enumerate(live):
+      if r and self.busy[u] is r: self.drafts[u] = self.guess(u, out[2 * u + 1])
 
   def run(self):  # the engine's thread: admit while a slot is free, a chunk of a prompt, a step; on an error, every request ends
     try:

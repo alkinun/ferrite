@@ -243,6 +243,9 @@ append a correction.
 38. **Fold nothing into a weight that bf16 cannot hold.** Qwen3.5's RMSNorms scale by 1 + w; 1 + w in bf16 rounds each
     channel by up to 2^-9, which put a block's input 0.16% from transformers' and looked like a bug in the block after it.
     n w + n is one more op in the same kernel, and exact.
+39. **Say done when you are done.** A request said it had ended before the engine saved its session, which reads the
+    chip back, so a test that went on to the next opened another runtime on a chip still in use, and ttsim stopped the
+    process with a NoC command from nowhere. Only in a full run, and only in that order. The engine now saves first.
 
 ## Working method
 

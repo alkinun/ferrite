@@ -91,7 +91,9 @@ first (NOTES, "Bring-up on a p150").
 - [x] **Sessions**: several sequences at once, each with its own states; each session's cache rows and DeltaNet states
   kept on the host between its turns and brought back for the next; the server's slots for them, and tool calls in
   Qwen's template (NOTES, "Serving").
-- [ ] **Speculative decoding** with its multi-token prediction layer, a rejected draft's DeltaNet states put back.
+- [x] **Speculative decoding** with its multi-token prediction layer, a rejected draft's DeltaNet states put back
+  (NOTES, "Qwen3.5's and Qwen3.6's language models", "Serving"); how many drafts the real layer gets right waits for
+  the whole model.
 - [ ] **The cost model**: what a model reads and holds a token and how many sessions a card keeps, and with the probe's
   numbers, tokens/s and dollars a million tokens.
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each

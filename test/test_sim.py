@@ -1254,13 +1254,15 @@ def qwen35(rng, vocab=256, places=64):
   """A small Qwen3.5-MoE at random, its weights under Hugging Face's names as llama.load reads them (Weights: bf16 bits,
   linear ones as x @ w) and fused as load fuses them, and its config: three Gated DeltaNet blocks, then a gated
   attention block (4 heads of 64 sharing 2 key and value heads, a quarter of each turning), each with 8 experts of
-  64 and a shared one: every token takes all 8, weighted by the router, so that no near tie of experts decides a test.
+  64 and a shared one: every token takes all 8, weighted by the router, so that no near tie of experts decides a test;
+  and a multi-token prediction layer (block 4, as load puts it).
   Its embedding is small next to what the blocks add (losing the Gated DeltaNet states moves its logits 100%)."""
   c = SimpleNamespace(dim=128, heads=4, kv=2, head_dim=64, layers=4, eps=1e-6, theta=1e7, partial=0.25, gated=True, centered=True, conv=4,
-                      kh=2, vh=4, kd=32, vd=32, k=8, norm_topk=True, layer_types=["linear_attention"] * 3 + ["full_attention"])
+                      kh=2, vh=4, kd=32, vd=32, k=8, norm_topk=True, layer_types=["linear_attention"] * 3 + ["full_attention"], mtp=1)
   bits = lambda *shape, mean=0.0, sd=0.05: llama.Weight(lambda a=gpt2.bf16_bits(rng.normal(mean, sd, shape)): a)
-  w = {"embed": bits(vocab, 128, sd=0.3), "embed.T": bits(128, vocab), "norm": bits(1, 128, sd=0.3)}  # its own output layer
-  for l in range(c.layers):
+  w = {"embed": bits(vocab, 128, sd=0.3), "embed.T": bits(128, vocab), "norm": bits(1, 128, sd=0.3), "mtp.fc": bits(256, 128),  # its own output layer
+       "mtp.pre_fc_norm_embedding": bits(1, 128, sd=0.3), "mtp.pre_fc_norm_hidden": bits(1, 128, sd=0.3), "mtp.norm": bits(1, 128, sd=0.3)}
+  for l in range(c.layers + c.mtp):  # (the multi-token prediction layer last: block 4, an attention block)
     pre = f"layers.{l}."
     w |= {pre + "input_layernorm": bits(1, 128, sd=0.3), pre + "post_attention_layernorm": bits(1, 128, sd=0.3), pre + "gate": bits(8, 128),
           pre + "experts.gate_up_proj": bits(8, 128, 128), pre + "experts.down_proj": bits(8, 128, 64), pre + "shared_expert.gate_proj": bits(128, 64),
@@ -1615,6 +1617,45 @@ def test_qwen3_5_sequences(chip):
   free = llama.states(c, kv, 1)
   assert not any(np.any(np.frombuffer(s.tobytes(), np.float32)) for l in range(3) for s in free[l]), "the free slot's states stay 0"
 
+def test_speculative(chip):
+  # A speculative decode step for Qwen3.5 (qwen35): for each of two slots, the token it knows and a draft after it,
+  # verified in one call, a third slot free (live 0). A draft that is the model's own next token is taken and the next
+  # step goes on from after both tokens; one that is not is turned down and the next step goes on from the Gated
+  # DeltaNet states after the first token alone (accept 0), as kept by the step. Drafts right and wrong in turn, every
+  # step replayed, each slot's two logits within 3% of numpy's for its sequence from nothing. And the multi-token
+  # prediction layer on the chip (llama.draft), over a prompt's hidden states and next tokens, within 3% of numpy's
+  rng = np.random.default_rng(37)
+  c, weights = qwen35(rng)
+  w, size = llama.arrays(weights), 32
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  t, kv = llama.upload(rt, weights), llama.kv_cache(c, 3 * size, llama.zeros(rt), 3, speculative=True)
+  on, rel = lambda row, d="int32": Tensor.of(rt, [row], d), lambda got, want: np.abs(got - want).max() / np.abs(want).max()
+  ref = lambda s: llama.forward(s, list(range(len(s))), w, c, llama.kv_cache(c, size, np.zeros), every=True)  # numpy, from nothing
+  seqs = {0: [7, 200, 31], 1: [5, 64, 9, 9, 9]}  # each a prompt, then the tokens it knows
+  for u, s in seqs.items():
+    got, h = llama.forward(on(s), on(list(range(len(s)))), t, c, llama.states(c, kv, u), on([size * u] * len(s)), hidden=True)
+    want = ref(s)
+    assert rel(gpt2.values(got)[-1], want[-1]) < 0.03
+    s.append(int(want[-1].argmax()))
+    if u == 0:  # the multi-token prediction layer over the prompt: each place's hidden state and the token after it
+      _, nh = llama.forward(s[:-1], list(range(len(s) - 1)), w, c, llama.kv_cache(c, size, np.zeros), hidden=True)
+      mine = gpt2.values(llama.draft(on(s[1:]), on(list(range(len(s) - 1))), h, t, c, llama.states(c, kv, u), on([0] * (len(s) - 1))))
+      theirs = llama.draft(s[1:], list(range(len(s) - 1)), nh, w, c, llama.kv_cache(c, size, np.zeros))
+      assert max(rel(mine[r], theirs[r]) for r in range(len(s) - 1)) < 0.03
+  step = tensor.jit(lambda ids, places, starts, live, accept: llama.forward(ids, places, t, c, kv, starts, live=live, accept=accept))
+  accept = [1.0, 1.0, 1.0]
+  for i in range(6):
+    right = {u: int(ref(s)[-1].argmax()) for u, s in seqs.items()}
+    drafts = {u: right[u] if (i + u) % 2 == 0 else (right[u] + 1) % 256 for u in seqs}
+    ids = [x for u in range(3) for x in ([seqs[u][-1], drafts[u]] if u in seqs else [0, 0])]
+    places = [p for u in range(3) for p in ([len(seqs[u]) - 1, len(seqs[u])] if u in seqs else [size - 1, size - 1])]
+    got = gpt2.values(step(on(ids), on(places), on([size * u for u in range(3) for _ in range(2)]), on([1.0, 1.0, 0.0], "fp32"), on(accept, "fp32")))
+    for u, s in seqs.items():
+      want = ref(s + [drafts[u]])[-2:]
+      assert rel(got[2 * u], want[0]) < 0.03 and rel(got[2 * u + 1], want[1]) < 0.03, (i, u, rel(got[2 * u], want[0]), rel(got[2 * u + 1], want[1]))
+      accept[u] = float(drafts[u] == right[u])
+      s += [drafts[u], int(want[1].argmax())] if accept[u] else [right[u]]
+
 def test_mxfp4(tmp_path):
   # gpt-oss's checkpoints keep the experts in MXFP4 (a tensor's _blocks of 4-bit values and its _scales): llama.mxfp4
   # unpacks them as transformers does (convert_moe_packed_tensors), bit for bit in bf16, and llama.load reads a
@@ -1937,12 +1978,12 @@ def test_serve(chip, tmp_path):
   said = lambda: [r.out.get_nowait() for _ in range(r.out.qsize())]
   assert not r.take(np.eye(256)[97], True) and said() == ["a"]
   assert not r.take(np.eye(256)[98], True) and said() == [], "b might begin the stop string"
-  assert r.take(np.eye(256)[99], True) and said() == [None] and (r.said, r.finish) == ("a", "stop")
+  assert r.take(np.eye(256)[99], True) and said() == [] and (r.said, r.finish) == ("a", "stop"), "its end (None) the engine's to send"
   r = serve.Request(tok, [], 9, 0, eos=[0])
   assert not r.take(np.eye(256)[97], True) and r.take(np.eye(256)[0], True) and (r.made, r.said, r.finish) == ([97], "a", "stop")
   r = serve.Request(tok, [], 9, 0)
   r.gone = True  # its client went
-  assert r.take(np.eye(256)[97], True) and (r.made, r.finish, r.out.get_nowait()) == ([], "gone", None)
+  assert r.take(np.eye(256)[97], True) and (r.made, r.finish) == ([], "gone") and r.out.empty()
   http = serve.server(engine, "smol", port=0)
   threading.Thread(target=http.serve_forever, daemon=True).start()
   url = f"http://127.0.0.1:{http.server_address[1]}/v1"
@@ -1984,37 +2025,72 @@ def test_serve(chip, tmp_path):
   assert serve.answer("<|channel|>analysis<|message|>Gree") == ("Gree", "") and serve.answer("<|channel|>final<|message|>Hi") == ("", "Hi")
   assert serve.answer("<|channel|>") == serve.answer("<|channel|>analysis") == ("", ""), "a channel's name, a token at a time, is neither"
 
+class Kept(serve.Request):  # a request that keeps the logits each of its tokens came from
+  def take(self, logits, room): self.logits = getattr(self, "logits", []) + [logits]; return super().take(logits, room)
+
+def agrees(r, w, c):  # a finished request: each token's logits within 3% of numpy's (from nothing, over its prompt and the
+  ids = r.ids + r.made  # tokens it took before), each picked as numpy would (near)
+  want = llama.forward(ids, list(range(len(ids))), w, c, llama.kv_cache(c, 64, np.zeros), every=True)[len(r.ids) - 1:][:len(r.logits)]
+  worst = max(np.abs(g - v).max() / np.abs(v).max() for g, v in zip(r.logits, want))
+  assert worst < 0.03 and near(r.logits, want), worst
+
+def served(engine, *requests):  # requests put to an engine, each when the last has ended (None) or all at once (a list)
+  for batch in requests:
+    for r in batch if isinstance(batch, list) else [batch]: engine.waiting.put(r)
+    for r in batch if isinstance(batch, list) else [batch]:
+      while r.out.get(timeout=600) is not None: pass
+
 def test_serve_sessions(chip, tmp_path):
   # models/serve.py's engine for a model of Gated DeltaNet blocks (qwen35): three greedy requests on two slots (a free
   # slot's and a prefilling one's states left as they are by the others' steps, a slot whose states are past where a
   # prompt parts from them taken from the start again), each token's logits within 3% of numpy's for its prompt and the
-  # tokens it took before, and picked as numpy would (near). Then an agent's next turns, once other requests hold both
+  # tokens it took before, and picked as numpy would (agrees). Then an agent's next turns, once other requests hold both
   # slots: one whose prompt is the first's prompt and answer and more goes on from the session saved on the host when
   # the first ended, its new tokens alone prefilled; one that parts from the first after its prompt goes on from the
   # session saved when that prompt was in; each the same against numpy from nothing
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
   c, weights = qwen35(rng)
   w, tok = llama.arrays(weights), bytes_tokenizer(tmp_path)
-  engine = serve.Engine(rt, llama.upload(rt, weights), c, tok, slots=2, places=64, chunk=16)
+  c.mtp = 0  # (decoding a token a step: test_serve_speculative drafts with it)
+  engine = serve.Engine(rt, llama.upload(rt, {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.4."))}), c, tok, slots=2, places=64, chunk=16)
   threading.Thread(target=engine.run, daemon=True).start()
-  class Kept(serve.Request):  # the logits each of its tokens came from
-    def take(self, logits, room): self.logits = getattr(self, "logits", []) + [logits]; return super().take(logits, room)
-  def check(r):  # against numpy over its prompt and the tokens it took
-    while r.out.get(timeout=600) is not None: pass
-    ids = r.ids + r.made
-    want = llama.forward(ids, list(range(len(ids))), w, c, llama.kv_cache(c, 64, np.zeros), every=True)[len(r.ids) - 1:][:len(r.logits)]
-    worst = max(np.abs(g - v).max() / np.abs(v).max() for g, v in zip(r.logits, want))
-    assert worst < 0.03 and near(r.logits, want), worst
-  prompts = [[7, 200, 31, 64, 5], [5, 64], list(range(40, 60))]  # the last longer than a chunk
-  together = [Kept(tok, p, 6, 0) for p in prompts]
-  for r in together: engine.waiting.put(r)
-  for r in together: check(r)
+  together = [Kept(tok, p, 6, 0) for p in ([7, 200, 31, 64, 5], [5, 64], list(range(40, 60)))]  # the last longer than a chunk
+  served(engine, together)
+  for r in together: agrees(r, w, c)
   first = together[0]
   for turn, saved in ((first.ids + first.made + [9, 8], first.ids + first.made[:-1]), (first.ids + [1, 2, 3], first.ids)):
     before, r = engine.prefilled, Kept(tok, turn, 4, 0)
-    engine.waiting.put(r)
-    check(r)
+    served(engine, r)
+    agrees(r, w, c)
     assert engine.prefilled - before == len(turn) - len(saved), engine.prefilled - before
+
+def test_serve_speculative(chip, tmp_path):
+  # models/serve.py's engine drafting with Qwen3.5's multi-token prediction layer (qwen35's, at random): each step
+  # verifies every slot's token and its draft in one call and drafts the next in another, both replayed. With drafts
+  # that are numpy's own next tokens (an oracle's) nearly every one is taken, two tokens a step; with the layer's own,
+  # at random, nearly every one is turned down and the next step goes on from the states before it. Either way three
+  # requests on two slots give tokens whose logits are numpy's (agrees), and an agent's next turn goes on from the
+  # session saved when the first ended (its states those before a turned-down draft), its new tokens alone prefilled
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
+  c, weights = qwen35(rng)
+  w, tok, t = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.upload(rt, weights)
+  class Oracle(serve.Engine):
+    def guess(self, u, logits):
+      s = self.busy[u].ids + self.busy[u].made
+      return int(llama.forward(s, list(range(len(s))), w, c, llama.kv_cache(c, 64, np.zeros))[0].argmax())
+  prompts = ([7, 200, 31, 64, 5], [5, 64], list(range(40, 60)))
+  for kind in (Oracle, serve.Engine):
+    engine = kind(rt, t, c, tok, slots=2, places=64, chunk=16)
+    threading.Thread(target=engine.run, daemon=True).start()
+    together = [Kept(tok, p, 8, 0) for p in prompts]
+    served(engine, together)
+    for r in together: agrees(r, w, c)
+    assert engine.spec and (engine.agreed >= 0.8 * engine.drafted if kind is Oracle else engine.agreed <= 0.2 * engine.drafted), (engine.agreed, engine.drafted)
+  first = together[0]
+  before, r = engine.prefilled, Kept(tok, first.ids + first.made + [9, 8], 4, 0)
+  served(engine, r)
+  agrees(r, w, c)
+  assert engine.prefilled - before == 3, engine.prefilled - before
 
 def test_chat_tools(tmp_path):
   # Qwen3.5's and Qwen3.6's chat template (serve.qwen), with tools: the strings Qwen3.6's own chat_template.jinja makes
