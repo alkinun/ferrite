@@ -20,15 +20,17 @@ import gpt2
 
 def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llama adds
   if isinstance(x, np.ndarray):
-    return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a),
-                           silu=lambda a: a / (1 + np.exp(-a)), sigmoid=lambda a: 1 / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0), mm=lambda a, b, phases: a @ b,
-                           topk=lambda a, k: (np.take_along_axis(a, i := np.argsort(-a, -1, kind="stable")[..., :k], -1), i),
-                           experts=numpy_experts, where=np.where, minimum=np.minimum, maximum=np.maximum,
-                           sink_softmax=lambda a, sink: (e := np.exp(a - (m := np.maximum(a.max(-1, keepdims=True), sink)))) / (e.sum(-1, keepdims=True) + np.exp(sink - m)))
-  return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid, repeat=Tensor.repeat_interleave,
-                         mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's products are exact at any phases
-                         experts=chip_experts, where=lambda cond, a, b: cond.where(a, b), minimum=Tensor.minimum, maximum=Tensor.maximum,
-                         sink_softmax=lambda a, sink: (e := (a - (m := a.max(2).maximum(sink))).exp()) / (e.sum(2) + (sink - m).exp()))
+    topk = lambda a, k: (np.take_along_axis(a, i := np.argsort(-a, -1, kind="stable")[..., :k], -1), i)
+    sink_softmax = lambda a, sink: (e := np.exp(a - (m := np.maximum(a.max(-1, keepdims=True), sink)))) / (e.sum(-1, keepdims=True) + np.exp(sink - m))
+    return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), topk=topk,
+                           silu=lambda a: a / (1 + np.exp(-a)), sigmoid=lambda a: 1 / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0),
+                           mm=lambda a, b, phases: a @ b, experts=numpy_experts, where=np.where, minimum=np.minimum, maximum=np.maximum,
+                           sink_softmax=sink_softmax)
+  sink_softmax = lambda a, sink: (e := (a - (m := a.max(2).maximum(sink))).exp()) / (e.sum(2) + (sink - m).exp())  # one more logit, left out
+  return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid,
+                         repeat=Tensor.repeat_interleave, mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's
+                         experts=chip_experts, where=lambda cond, a, b: cond.where(a, b), minimum=Tensor.minimum, maximum=Tensor.maximum,  # products
+                         sink_softmax=sink_softmax)  # are exact at any phases
 
 def precision(c, mode="bf16"):
   """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
@@ -55,11 +57,13 @@ def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 a
 def cache_format(c): return (getattr(c, "precision", None) or {}).get(("kv", None), ("bf16", None))[0]  # the KV cache's format
 
 def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
-  """One block, block l: attention then a SwiGLU MLP, each after an RMSNorm and added back. p: the block's weights (as
-  x @ w, so the Hugging Face ones transposed, q, k and v's side by side, and gate and up's), c: the config (its precision,
-  if it has one, says each matmul's fidelity phases), rotary: (cos, sin, turn), the tables' rows for this call's places;
-  cache: this block's keys' heads then its values', each with a row for every place, this call's written at its rows;
-  mask: -1e9 where a token must not look (gpt2.mask); prefill: a prompt's tokens at once, not decode's."""
+  """One block, block l: attention then a SwiGLU MLP (or a mixture of experts: moe), each after an RMSNorm and added
+  back. p: the block's weights (as x @ w, so the Hugging Face ones transposed, q, k and v's side by side, and gate and
+  up's; and what other families add: Qwen2's qkv_bias, Qwen3's qk_norm and qk_on, gpt-oss's sinks and o_proj.bias), c:
+  the config (its precision, if it has one, says each matmul's fidelity phases), rotary: (cos, sin, turn), the tables'
+  rows for this call's places; cache: this block's keys' heads then its values', each with a row for every place, this
+  call's written at its rows; mask: -1e9 where a token must not look (gpt2.mask); prefill: a prompt's tokens at once,
+  not decode's."""
   f, n = fns(x), c.heads + 2 * c.kv
   phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c.eps)
@@ -100,7 +104,7 @@ def moe(h, p, c, phases=lambda op: None):
   f, norm = fns(h), getattr(c, "norm_topk", True)
   logits = f.mm(h, p["router"], None)
   logits = logits + p["router.bias"] if "router.bias" in p else logits  # (gpt-oss's bias)
-  values, ids = f.topk(logits if norm else f.softmax(logits), c.k)  # (without norm_topk_prob, the chosen experts' probabilities among all, as they are)
+  values, ids = f.topk(logits if norm else f.softmax(logits), c.k)  # (without norm_topk_prob, the chosen ones' probabilities among all)
   y = f.experts(h, p, ids, f.softmax(values) if norm else values, (phases("gate_up"), phases("down")), getattr(c, "limit", None))
   if "shared_expert_gate" not in p: return y
   return y + f.sigmoid(f.mm(h, p["shared_expert_gate"], None)) * mlp(h, p, phases, "shared_expert.")  # Qwen2-MoE's, every token's
@@ -193,7 +197,8 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
     if pre + "experts.gate_up_proj" in w:  # gpt-oss's experts, a batch as x @ w takes them already, gate and up interleaved
       apart = lambda x: Weight(lambda: np.ascontiguousarray(np.concatenate([x.bits()[..., ::2], x.bits()[..., 1::2]], -1)))
       w[pre + "experts.gate_up"], w[pre + "experts.down"] = apart(w.pop(pre + "experts.gate_up_proj")), w.pop(pre + "experts.down_proj")
-      w[pre + "experts.gate_up_bias"], w[pre + "experts.down_bias"] = apart(w.pop(pre + "experts.gate_up_proj_bias")), w.pop(pre + "experts.down_proj_bias")
+      w[pre + "experts.gate_up_bias"] = apart(w.pop(pre + "experts.gate_up_proj_bias"))
+      w[pre + "experts.down_bias"] = w.pop(pre + "experts.down_proj_bias")
       r = w.pop(pre + "router")
       w[pre + "router"] = Weight(lambda r=r: np.ascontiguousarray(r.bits().T))
       continue
@@ -220,7 +225,8 @@ def forward(ids, places, w, c, caches, starts=None, every=False):
   sliding = lambda l: window is not None and (not getattr(c, "layer_types", None) or c.layer_types[l] == "sliding_attention")
   prefill = starts is None and x.shape[-2] > 1
   for l in range(c.layers):
-    x = layer(x, {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill)
+    p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
+    x = layer(x, p, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill)
   h = rms(x, w["norm"], c.eps)
   head = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]
   return f.mm(h if starts is not None or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], head)
@@ -251,8 +257,9 @@ def load(folder, places=4096):
   c = SimpleNamespace(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=j["num_hidden_layers"],
                       eps=j["rms_norm_eps"], theta=theta, places=min(j["max_position_embeddings"], places), vocab=j["vocab_size"],
                       rope=rope if rope.get("rope_type", "default") != "default" else None, ffn=j["intermediate_size"], head_dim=j.get("head_dim"),
-                      k=j.get("num_experts_per_tok"), norm_topk=j.get("norm_topk_prob", True), limit=j.get("swiglu_limit", 7.0 if j.get("model_type") == "gpt_oss" else None),
-                      sliding=j.get("sliding_window") if j.get("use_sliding_window", True) else None, layer_types=j.get("layer_types"))
+                      k=j.get("num_experts_per_tok"), norm_topk=j.get("norm_topk_prob", True), layer_types=j.get("layer_types"),
+                      limit=j.get("swiglu_limit", 7.0 if j.get("model_type") == "gpt_oss" else None),  # gpt-oss's GLU
+                      sliding=j.get("sliding_window") if j.get("use_sliding_window", True) else None)
   index = os.path.join(folder, "model.safetensors.index.json")
   files = sorted(set(read_json(index)["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
   out, tensors = {}, {}
@@ -285,7 +292,8 @@ def mxfp4(blocks, scales):
 def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks', their
   # experts' as their MLP's, and the output layer) in the one prec (precision's) gives them, the rest, and all without prec, bf16
   op = name.split(".")[-1].removesuffix("_proj")
-  key = ("head", None) if name == "embed.T" else (op, int(name.split(".")[1])) if name.endswith(("_proj", "experts.gate_up", "experts.down")) else None
+  matrix = name.endswith(("_proj", "experts.gate_up", "experts.down"))
+  key = ("head", None) if name == "embed.T" else (op, int(name.split(".")[1])) if matrix else None
   return prec[key][0] if prec and key else "bf16"
 
 def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a time, each cast on the chip to its format
@@ -308,8 +316,9 @@ def arrays(weights, prec=None):
   up and not kept, so numpy holds no more of a model than the block it is running, whatever the model's size."""
   def made(name, w):
     v, f = w.values(), weight_format(name, prec)
+    if f == "bf16": return v
     rows = v.reshape(-1, v.shape[-1])  # (a batch of experts' too)
-    return v if f == "bf16" else np.concatenate([gpt2.bfp(rows[i:i + 1024], f).astype(np.float32) for i in range(0, len(rows), 1024)]).reshape(v.shape)
+    return np.concatenate([gpt2.bfp(rows[i:i + 1024], f).astype(np.float32) for i in range(0, len(rows), 1024)]).reshape(v.shape)
   return Made({name: functools.partial(made, name, w) for name, w in weights.items()})
 
 def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector
