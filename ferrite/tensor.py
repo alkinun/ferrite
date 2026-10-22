@@ -360,6 +360,19 @@ class Tensor:
   def mean(self, axis=None):
     s = self.sum(axis)
     return s * (math.prod(s.shape) / math.prod(self.shape))
+  def topk(self, k):
+    """tinygrad's along each row, largest first: (values, int32 indices), from k passes of the row's max, the first
+    column that holds it (a minimum, as the max of negatives), and that column left out of the next (columns as bf16, so
+    at most 256: a mixture of experts' router)."""
+    assert self.cols <= 256, "columns numbered in bf16"
+    cols, x, out = Tensor.of(self.rt, [list(range(self.cols))]), self, []
+    for _ in range(k):
+      m = x.max(2)
+      i = -(x.eq(m).where(-cols, -self.cols)).max(2)
+      out.append((m, i))
+      x = cols.eq(i).where(-3e38, x)
+    values, indices = zip(*out)
+    return values[0].cat(*values[1:], axis=2), indices[0].cat(*indices[1:], axis=2).cast("int32")
   def softmax(self, axis=-1):  # max first, so exp stays in range
     e = (self - self.max(axis)).exp()
     return e / e.sum(axis)

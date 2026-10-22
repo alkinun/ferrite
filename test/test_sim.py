@@ -1355,6 +1355,46 @@ def test_kv_cache(chip):
     ids.append(int(want.argmax()))
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
+def test_moe(chip):
+  # a mixture of experts in the MLP's place (llama.moe): Tensor.topk picks each row's largest the way numpy's stable
+  # argsort does (first of ties); a token's router logits choose its k experts on the chip, matmuls that pick each
+  # one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen logits and summed, as numpy
+  # does for one token and for three; and a two-block model of them decodes from a replay (tensor.jit) bit for bit as
+  # it does op by op, so a replayed step reads whatever experts its token chose, and near numpy
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
+  x = bf16(rng.normal(0, 2, (3, 16)))
+  x[1, 9] = x[1, 3] = x[1].max()  # a tie: the first column first
+  values, indices = Tensor.of(rt, x.tolist()).topk(4)
+  assert np.array_equal(value(indices)[0], np.argsort(-x, -1, kind="stable")[:, :4]) and np.array_equal(value(values)[0], -np.sort(-x, -1)[:, :4])
+  experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
+                               "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
+  c, w = SimpleNamespace(dim=64, k=4), experts(64, 16, 64)
+  t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
+  for n in (1, 3):
+    h = bf16(rng.normal(0, 1, (n, 64)))
+    got, want = value(llama.moe(Tensor.of(rt, h.tolist()), t, c))[0], llama.moe(h, w, c)
+    assert np.abs(got - want).max() < 0.02 * np.abs(want).max(), (n, np.abs(got - want).max())
+  c, w = smol(rng, 2)
+  c.k = 2
+  for l in range(2): del w[f"layers.{l}.gate_up_proj"], w[f"layers.{l}.down_proj"]; w |= {f"layers.{l}.{k}": v for k, v in experts(576, 8, 64).items()}
+  t, on = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, lambda row: Tensor.of(rt, [row], "int32")
+  def decode(replay):  # each step's logits, for a prompt and four tokens after it (numpy's picks), and numpy's
+    kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
+    step, ids, out = tensor.jit(lambda ids, places: llama.forward(ids, places, t, c, kv)), [1, 2, 3, 4, 5], []
+    for i in range(5):
+      new = ids if i == 0 else ids[-1:]
+      places = list(range(len(ids) - len(new), len(ids)))
+      out.append((llama.logits(llama.forward(on(new), on(places), t, c, kv) if i == 0 or not replay else step(on(new), on(places))),
+                  want := llama.forward(new, places, w, c, np_kv)[0]))
+      ids.append(int(want.argmax()))
+    return out
+  # (a prompt whose tokens' router logits keep their k-th and next apart by 6% of their span, so bf16's rounding leaves
+  # the chip's choices numpy's; its experts' outputs, large and of either sign, cost the sums more of their bits than a
+  # plain MLP's, hence 6%)
+  replayed, alone = decode(True), decode(False)
+  assert all(np.array_equal(a[0], b[0]) for a, b in zip(replayed, alone)), "a replayed step is the step"
+  assert all(np.abs(got - want).max() < 0.06 * np.abs(want).max() for got, want in alone), [np.abs(g - w).max() / np.abs(w).max() for g, w in alone]
+
 @pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
 def test_llama_8b_shapes(chip):
   # one block in Llama-3.1-8B's shapes (4096 wide, 32 query heads sharing 8 KV heads, an MLP of 14336, Llama 3's RoPE
