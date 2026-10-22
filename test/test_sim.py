@@ -1521,6 +1521,42 @@ def test_mxfp4(tmp_path):
   c, weights = llama.load(str(tmp_path), 32)
   assert np.array_equal(weights["layers.0.experts.gate_up"].bits(), np.concatenate([want[..., ::2], want[..., 1::2]], -1)) and c.limit == 7.0
 
+TWO_CHIPS = r"""
+import os
+from ferrite import bh, pci
+from ferrite.chip import Chip
+from ferrite.runtime import Runtime
+from ferrite.tensor import Tensor
+chips = [Chip(pci.open_device(n)) for n in range(2)]
+for n, chip in enumerate(chips):
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  assert (Tensor.of(rt, [[1.0, 2.0]]) * (n + 2)).tolist() == [[n + 2.0, 2 * n + 4.0]], n
+(a, links_a), (b, links_b) = (chip.links() for chip in chips)
+assert a != b and len(links_a) == len(links_b) == 2, (a, links_a, b, links_b)
+assert all(peer == b and links_b[back] == (a, ch) for ch, (peer, back) in links_a.items()), (links_a, links_b)
+for src, dst, links in ((chips[0], chips[1], links_a), (chips[1], chips[0], links_b)):
+  for ch, (_, back) in links.items():
+    data, flag = os.urandom(8192), os.urandom(16)
+    src.write(*bh.ETH[ch], 0x20000, data + flag)
+    dst.write(*bh.ETH[back], 0x40000, bytes(len(data) + 16))
+    src.send(ch, 0x20000, 0x40000, len(data))
+    src.send(ch, 0x20000 + len(data), 0x40000 + len(data), 16)
+    src.wait(lambda: dst.read(*bh.ETH[back], 0x40000 + len(data), 16) == flag, "deliver the flag", 2.0)
+    assert dst.read(*bh.ETH[back], 0x40000, len(data)) == data, ch
+print("ok")
+"""
+
+@pytest.mark.skipif("TTSIM2" not in os.environ, reason="TTSIM2=path/to/ttsim's bh_x2 build (libttsim.so of two chips, linked) runs it")
+def test_two_chips():
+  # two chips in one process, ttsim's two-chip build (a P300's two Blackholes, two Ethernet links between them; its own
+  # process, since one process has one libttsim): a runtime on each computes, Chip.links finds both links up on both
+  # chips and pairs them (each side's peer the other's ASIC id and channel), and Chip.send moves data across each link
+  # both ways, from one Ethernet tile's L1 into the other's, a flag sent after it landing after it
+  import subprocess
+  run = subprocess.run([sys.executable, "-c", TWO_CHIPS], env=os.environ | {"TTSIM": os.environ["TTSIM2"]}, capture_output=True, text=True,
+                       timeout=600, cwd=pathlib.Path(__file__).parent.parent)
+  assert run.returncode == 0 and run.stdout.strip().endswith("ok"), run.stdout + run.stderr
+
 @pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
 def test_llama_8b_shapes(chip):
   # one block in Llama-3.1-8B's shapes (4096 wide, 32 query heads sharing 8 KV heads, an MLP of 14336, Llama 3's RoPE

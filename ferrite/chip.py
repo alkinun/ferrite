@@ -109,12 +109,34 @@ class Chip:
 
   def halt(self, x, y, start=None): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES, start)  # hold all five cores in reset
 
+  def links(self):
+    """This chip's ASIC id, and its Ethernet links that are up: {channel: (the peer's ASIC id, its channel)}, as
+    Tenstorrent's Ethernet firmware reports them in each tile's L1 (its chip's and its peer's chip_info)."""
+    enabled, me, up = self.telemetry().get(bh.TAG_ETH_ENABLED, 0), None, {}
+    for ch, (x, y) in enumerate(bh.ETH):
+      if enabled >> ch & 1 and self.read32(x, y, bh.ETH_PORT_STATUS) == bh.ETH_PORT_UP:
+        local, remote = self.read(x, y, bh.ETH_LOCAL, 32), self.read(x, y, bh.ETH_REMOTE, 32)
+        me, up[ch] = struct.unpack_from("<2I", local, 20), (struct.unpack_from("<2I", remote, 20), remote[2])
+    return me, up
+
+  def send(self, ch, src, dst, n, timeout=1.0):
+    """n bytes from channel ch's tile's L1 at src into the L1 of the tile at its link's other end, at dst: a TT-link write
+    by the tile's TX queue 0, which the link delivers once and in order, so a write sent after it lands after it (the
+    way to know it has). Returns once the queue has taken it: until then src must not change."""
+    (x, y), reg = bh.ETH[ch], lambda name: bh.ETH_TXQ0 + bh.ETH_TXQ[name]
+    assert src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, "16-byte aligned, below the firmware's L1"
+    def free():  # STATUS's busy bit, read after another of the queue's registers: polled too soon after a send, it lies (BH-55)
+      self.read32(x, y, reg("CMD"))
+      return not self.read32(x, y, reg("STATUS")) & bh.ETH_BUSY
+    self.wait(free, f"free Ethernet channel {ch}'s TX queue", timeout)
+    for name, v in (("START", src), ("SIZE", n), ("DEST", dst), ("CMD", bh.ETH_TT_L1_WRITE)): self.write32(x, y, reg(name), v)
+
 if __name__ == "__main__":  # what a card says about itself: the first thing to run on one (or on ttsim, with TTSIM set);
   import os, sys            # with `reset`, after resetting it (pci.reset), for a card whose NoC or firmware hangs
   from ferrite import pci
   if sys.argv[1:] == ["reset"]:
     assert "TTSIM" not in os.environ, "ttsim has no reset: a new process starts it afresh"
-    pci.reset(bdf := pci.find_card())
+    pci.reset(bdf := pci.find_cards()[0])
     dev = pci.Card(bdf)
   else: dev = pci.open_device()
   chip = Chip(dev, 300 if sys.argv[1:] == ["reset"] else 2)

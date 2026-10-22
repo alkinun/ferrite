@@ -4,25 +4,32 @@ import array, ctypes, gc, mmap, os, time
 from ferrite import bh
 
 class Sim:
-  """libttsim.so: a virtual Blackhole driven by forwarding config and BAR0 accesses. One per process."""
-  def __init__(self, path):
-    self.lib = lib = ctypes.CDLL(path)
-    lib.libttsim_pci_config_rd32.restype = ctypes.c_uint32
-    lib.libttsim_pci_config_rd32.argtypes = [ctypes.c_uint32] * 2
-    lib.libttsim_pci_config_wr32.argtypes = [ctypes.c_uint32] * 3
-    lib.libttsim_pci_mem_rd_bytes.argtypes = lib.libttsim_pci_mem_wr_bytes.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32]
-    lib.libttsim_clock.argtypes = [ctypes.c_uint32]
-    # the device reaches host memory through these; they must stay referenced for as long as the library lives
-    cb = ctypes.CFUNCTYPE(None, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32)
-    self.cbs = (cb(lambda bus, p, n: ctypes.memmove(p, self.host(bus, n), n)),
-                cb(lambda bus, p, n: ctypes.memmove(self.host(bus, n), p, n)))
-    lib.libttsim_set_pci_dma_mem_callbacks(*self.cbs)
-    lib.libttsim_init()
+  """libttsim.so: a virtual Blackhole driven by forwarding config and BAR0 accesses, at PCI address bdf (a multi-chip
+  build has several). The library is one per process: every Sim shares it, its clock and the host memory it reaches."""
+  lib, dma, clocks = None, [], 0  # the library; (bus address, size, host address, buffer); chip cycles run so far
+  def __init__(self, path, bdf=0):
+    if Sim.lib is None:
+      Sim.lib = lib = ctypes.CDLL(path)
+      lib.libttsim_pci_config_rd32.restype = ctypes.c_uint32
+      lib.libttsim_pci_config_rd32.argtypes = [ctypes.c_uint32] * 2
+      lib.libttsim_pci_config_wr32.argtypes = [ctypes.c_uint32] * 3
+      lib.libttsim_pci_mem_rd_bytes.argtypes = lib.libttsim_pci_mem_wr_bytes.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32]
+      lib.libttsim_clock.argtypes = [ctypes.c_uint32]
+      # the devices reach host memory through these; they must stay referenced for as long as the library lives
+      cb = ctypes.CFUNCTYPE(None, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32)
+      Sim.cbs = (cb(lambda bus, p, n: ctypes.memmove(p, Sim.host(bus, n), n)), cb(lambda bus, p, n: ctypes.memmove(Sim.host(bus, n), p, n)))
+      lib.libttsim_set_pci_dma_mem_callbacks(*Sim.cbs)
+      lib.libttsim_init()
+    self.lib, self.bdf = Sim.lib, bdf
     self.bar0 = self.cfg_read(0x10) & ~0xF | self.cfg_read(0x14) << 32  # TLB windows and registers: all ferrite uses
-    self.dma, self.clocks = [], 0  # (bus address, size, host address, buffer); chip cycles run so far
 
-  def cfg_read(self, off): return self.lib.libttsim_pci_config_rd32(0, off)
-  def cfg_write(self, off, val): self.lib.libttsim_pci_config_wr32(0, off, val)
+  @staticmethod
+  def chips(path):  # the PCI addresses of a build's chips (not necessarily side by side: every slot is asked)
+    Sim(path) if Sim.lib is None else None
+    return [bdf for bdf in range(0, 1 << 16, 8) if Sim.lib.libttsim_pci_config_rd32(bdf, 0) == bh.DEVICE << 16 | bh.VENDOR]
+
+  def cfg_read(self, off): return self.lib.libttsim_pci_config_rd32(self.bdf, off)
+  def cfg_write(self, off, val): self.lib.libttsim_pci_config_wr32(self.bdf, off, val)
 
   def read(self, off, n):
     buf = ctypes.create_string_buffer(n)
@@ -32,19 +39,20 @@ class Sim:
 
   def alloc(self, size):
     """Host memory the device can reach: (memoryview, bus address). Sim bus addresses are made up: one per 4 GiB."""
-    buf, bus = mmap.mmap(-1, size), (len(self.dma) + 1) << 32
-    self.dma.append((bus, size, ctypes.addressof(ctypes.c_char.from_buffer(buf)), buf))
+    buf, bus = mmap.mmap(-1, size), (len(Sim.dma) + 1) << 32
+    Sim.dma.append((bus, size, ctypes.addressof(ctypes.c_char.from_buffer(buf)), buf))
     return memoryview(buf), bus
-  def host(self, bus, n):
-    for base, size, addr, _ in self.dma:
+  @staticmethod
+  def host(bus, n):
+    for base, size, addr, _ in Sim.dma:
       if base <= bus and bus + n <= base + size: return addr + bus - base
     raise RuntimeError(f"device DMA to {bus:#x}+{n}, which is not host memory we allocated")
 
   TICK = 10  # chip clocks a poll runs, so every wait (and so every cycle count) is rounded up to a multiple of it
-  def tick(self):  # the simulator only runs when we let it
+  def tick(self):  # the simulator only runs when we let it (every chip of it)
     self.lib.libttsim_clock(self.TICK)
-    self.clocks += self.TICK
-  def now(self): return self.clocks / bh.AICLK  # seconds of chip time, by ttsim's clock, which is not silicon's timing
+    Sim.clocks += self.TICK
+  def now(self): return Sim.clocks / bh.AICLK  # seconds of chip time, by ttsim's clock, which is not silicon's timing
 
 class Card:
   """A real card from userspace: config space and BAR0 through sysfs, DMA memory from locked hugepages.
@@ -111,16 +119,17 @@ def _store(addr, data):
 def _write(path, s):
   with open(path, "w") as f: f.write(s)
 
-def find_card():
-  """The first Blackhole on the PCI bus, by its sysfs name (domain:bus:device.function)."""
-  for bdf in sorted(os.listdir("/sys/bus/pci/devices")):
-    ids = [int(open(f"/sys/bus/pci/devices/{bdf}/{f}").read(), 16) for f in ("vendor", "device")]
-    if ids == [bh.VENDOR, bh.DEVICE]: return bdf
-  raise RuntimeError("no Blackhole on the PCI bus; set TTSIM=/path/to/libttsim.so to use the simulator")
+def find_cards():
+  """The Blackholes on the PCI bus, by their sysfs names (domain:bus:device.function)."""
+  ids = lambda bdf: [int(open(f"/sys/bus/pci/devices/{bdf}/{f}").read(), 16) for f in ("vendor", "device")]
+  return [bdf for bdf in sorted(os.listdir("/sys/bus/pci/devices")) if ids(bdf) == [bh.VENDOR, bh.DEVICE]]
 
-def open_device():
-  """TTSIM=/path/to/libttsim.so selects the simulator; otherwise the first Blackhole on the PCI bus."""
-  return Sim(os.environ["TTSIM"]) if "TTSIM" in os.environ else Card(find_card())
+def open_device(n=0):
+  """Chip n: TTSIM=/path/to/libttsim.so selects the simulator (several chips in a multi-chip build); otherwise the n-th
+  Blackhole on the PCI bus."""
+  if "TTSIM" in os.environ: return Sim(os.environ["TTSIM"], Sim.chips(os.environ["TTSIM"])[n])
+  if not (cards := find_cards()): raise RuntimeError("no Blackhole on the PCI bus; set TTSIM=/path/to/libttsim.so to use the simulator")
+  return Card(cards[n])
 
 def reset(bdf, timeout=10.0):
   """Reset the whole chip, as tt-kmd's ASIC reset does, for a card whose NoC or firmware hangs (a hung kernel needs

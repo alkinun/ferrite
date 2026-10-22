@@ -44,6 +44,17 @@ NIU_CFG_0, NOC_TRANSLATED = 0x1FD04100, 1 << 14  # BAR0: the PCIe tile's NIU con
 TAG_AICLK, TAG_GDDR_STATUS, TAG_TENSIX_COLS, TAG_GDDR_ENABLED = 14, 22, 34, 36  # telemetry; GDDR_STATUS: 2 bits a bank
 TAG_FIRMWARE = 28  # the firmware bundle's version, a byte each: major, minor, patch, build (umd's FLASH_BUNDLE_VERSION)
 
+# Ethernet tiles: 14 on NoC0's row y=1, each with one 400 GbE link (a QSFP-DD port is two), Tenstorrent's Ethernet firmware
+# on its first core keeping the link up (ISA EthernetTile/, tt-metal eth_fw_api.h and dev_mem_map.h; NOTES, "Two cards")
+ETH = [(1, 1), (16, 1), (2, 1), (15, 1), (3, 1), (14, 1), (4, 1), (13, 1), (5, 1), (12, 1), (6, 1), (11, 1), (7, 1), (10, 1)]  # channel n's tile
+TAG_ETH_ENABLED = 35  # telemetry: a bit for each channel not harvested (tt-umd's channel numbers, as ETH's)
+ETH_FIRMWARE = 0x70000  # a tile's L1 from here up is the firmware's
+ETH_PORT_STATUS, ETH_PORT_UP = 0x7CC04, 1  # the firmware's boot results: the port's state, 1 when its link is up
+ETH_LOCAL, ETH_REMOTE = 0x7CFC0, 0x7CFE0  # its chip_info and its peer's: the channel at +2, the chip's ASIC id at +20 (hi, lo)
+ETH_TXQ0 = 0xFFB90000  # TX queue 0's registers, which the NoC reaches too (ISA EthernetTxRx.md), at these offsets:
+ETH_TXQ = {"CMD": 0x4, "STATUS": 0x8, "START": 0x14, "SIZE": 0x18, "DEST": 0x1C}  # (addresses and sizes a multiple of 16)
+ETH_TT_L1_WRITE, ETH_BUSY = 2, 1 << 16  # CMD: a TT-link write into the peer tile's L1; STATUS: a command still going
+
 # Tensix tile, at the same addresses over the NoC and from its own cores
 L1_SIZE = 1536 * 1024
 AICLK = 1.35e9  # Hz, the cores' and Tensix's clock (ISA BabyRISCV/README.md); telemetry TAG_AICLK has the live value

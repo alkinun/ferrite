@@ -49,7 +49,7 @@ def host():
 
 def card(sim):  # which card, and its PCIe link
   if sim: return "ttsim"
-  bdf = pci.find_card()
+  bdf = pci.find_cards()[0]
   read = lambda f: open(f"/sys/bus/pci/devices/{bdf}/{f}").read().strip()
   return f"{bdf}, PCIe {read('current_link_speed')} x{read('current_link_width')}"
 
