@@ -397,13 +397,13 @@ def test_matmul_indexed(chip):
   # x.matmul(w, index=ids), a mixture of experts' matmul: batch entry b of the result is row b // k of x (a batch of 1,
   # or of rows times k by repeat_interleave) by the matrix of w that ids picks, ids[b // k, b % k], which BRISC reads on
   # the chip, so a replay reads whatever experts its tokens chose. One token's 8 experts (a grid row each, A's row
-  # shared), and 4 tokens' 3 each (12 entries, more than the grid's rows), in bf16 and bfp4: each entry bit for bit the
-  # plain matmul by its expert
+  # shared), 4 tokens' 3 each (12 entries, more than the grid's rows) and 40 tokens' 2 (the indices two tiles), in bf16
+  # and bfp4: each entry bit for bit the plain matmul by its expert
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(29)
   experts = Tensor.of(rt, rng.normal(0, 0.1, (16, 96, 160)).tolist())
   for wt in ("bf16", "bfp4"):
     w = experts if wt == "bf16" else experts.cast(wt).realize()
-    for n, k in ((1, 8), (4, 3)):
+    for n, k in ((1, 8), (4, 3), (40, 2)):
       ids, x = rng.integers(0, 16, (n, k)), Tensor.of(rt, rng.normal(0, 1, (n, 1, 96)).tolist())
       got = value((x.repeat_interleave(k) if n > 1 else x).matmul(w, index=Tensor.of(rt, ids.tolist(), "int32")))
       assert all(np.array_equal(got[b], value(x[b // k] @ w[int(ids[b // k, b % k])])[0]) for b in range(n * k)), (wt, n, k)

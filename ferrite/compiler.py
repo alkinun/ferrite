@@ -1033,13 +1033,15 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     first = (f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, end = (gx + 1) * {kt} / {gx_n};\n"
              f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
              f"      share(SLOT({rows_at[0]} + e), (end - e) * {tile_bytes(dtype)}, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
-  picked = [ops[j]["ids"] for j in matmuls if ops[j]["ids"] is not None]  # B's matrices picked by an int32 tensor: its one tile
-  if picked:  # comes in first, where nothing else goes (past the slots and a block float's buffers)
-    (r,), k = picked, shapes[picked[0]][2]
-    assert shapes[r][0] == 1 and shapes[r][1] <= 32 and k <= 32, "the indices in one tile"
-    decls += (f"#define IDS {OUTS - tile_bytes('int32'):#x}\nstatic unsigned ids(unsigned b) {{ unsigned t = b / {k}, j = b % {k};  // index (t, j)\n"
-              f"  return ((volatile unsigned *)IDS)[(t / 16 * 2 + j / 16) * 256 + t % 16 * 16 + j % 16]; }}\n")
-    first = f"  noc_get(BANK(a[{arg(r) + 3}]), AT(a[{arg(r)}], a[{arg(r) + 3}], {tile_bytes('int32')}), IDS, {tile_bytes('int32')}); noc_wait();\n" + first
+  picked = [ops[j]["ids"] for j in matmuls if ops[j]["ids"] is not None]  # B's matrices picked by an int32 tensor: its
+  if picked:  # tiles, 32 tokens each, come in first, where nothing else goes (past the slots and a block float's buffers)
+    (r,), k, ib = picked, shapes[picked[0]][2], tile_bytes("int32")
+    n = -(-shapes[r][1] // 32)
+    assert shapes[r][0] == 1 and k <= 32 and OUTS - n * ib >= B8 + 3 * B8_SLOTS * tile_bytes("bfp8"), "the indices in a column of tiles below OUTS"
+    decls += (f"#define IDS {OUTS - n * ib:#x}\nstatic unsigned ids(unsigned b) {{ unsigned t = b / {k}, j = b % {k};  // index (t, j)\n"
+              f"  return ((volatile unsigned *)IDS)[t / 32 * 1024 + (t % 32 / 16 * 2 + j / 16) * 256 + t % 16 * 16 + j % 16]; }}\n")
+    first = (f"  for (unsigned i = 0; i < {n}; i++) {{ unsigned t = a[{arg(r) + 3}] + i * a[{arg(r) + 2}];  // the indices' tile row i\n"
+             f"    noc_get(BANK(t), AT(a[{arg(r)}], t, {ib}), IDS + i * {ib}, {ib}); }}\n  noc_wait();\n" + first)
   brisc = _brisc(total, first + program(B), dtype, out, decls, tail, b8, wt)
   image = compile_kernel(brisc, _unpacker(program(U), config), _math(slots, program(M), dst), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
