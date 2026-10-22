@@ -1198,7 +1198,10 @@ void kmain(volatile unsigned *a) {{
     }}
     for (unsigned r = 0; r < 32; r++)  // one row of x fills the tile with copies of its row, k of 1 with copies of its column
       for (unsigned c = 0; c < 32; c++)
-        if ((rows == 1 && r) || ({k} == 1 && c)) {{ unsigned from = at(rows == 1 ? 0 : r, {k} == 1 ? 0 : c); values[at(r, c)] = values[from], ids[at(r, c)] = ids[from]; }}
+        if ((rows == 1 && r) || ({k} == 1 && c)) {{
+          unsigned from = at(rows == 1 ? 0 : r, {k} == 1 ? 0 : c);
+          values[at(r, c)] = values[from], ids[at(r, c)] = ids[from];
+        }}
     noc_write(VALUES, BANK(t), AT(a[2], t, 2048), 2048);
     noc_write(IDS, BANK(t), AT(a[3], t, 4096), 4096);
     noc_wait();
