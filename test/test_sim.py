@@ -1521,10 +1521,11 @@ def test_serve(chip, tmp_path):
   # longest ago) decode together, then the last two again alone, the last first (the slot used longer ago holds the
   # other), each in the slot that holds it already, so a token of each is prefilled and the rest come from the cache:
   # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
-  # reaches (on any other it would spoil what its slot holds). A request ends at a stop string (without its text), at
-  # an end-of-sequence token, or when its client has gone, and says no text in which a stop string might yet begin.
-  # Over HTTP, /v1/completions whole and streamed give the engine's text, and /v1/models the model; chat messages go
-  # into ChatML's or Llama 3's template
+  # reaches (on any other it would spoil what its slot holds); a long prompt is prefilled a chunk between steps, so
+  # the others' tokens keep coming. A request ends at a stop string (without its text), at an end-of-sequence token,
+  # or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP, /v1/completions
+  # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
+  # template
   import threading, urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -1546,6 +1547,15 @@ def test_serve(chip, tmp_path):
   before = engine.prefilled
   assert [done(r) for r in [serve.Request(tok, p, 6, 0) for p in prompts[:0:-1]] if not engine.waiting.put(r)] == together[:0:-1]
   assert engine.prefilled - before == 2, "the prompts' last tokens, the rest in their slots already"
+  class Watched(serve.Request):  # what the engine had prefilled at each of its tokens, seen from the engine's thread
+    def take(self, logits, room): self.seen = getattr(self, "seen", []) + [engine.prefilled]; return super().take(logits, room)
+  r, deadline = Watched(tok, [3, 1, 4], 12, 0), time.time() + 600
+  engine.waiting.put(r)
+  while not getattr(r, "seen", None): assert time.time() < deadline; time.sleep(0.01)
+  engine.waiting.put(long := serve.Request(tok, list(range(100, 150)), 2, 0))  # 50 tokens: four chunks
+  done(r), done(long)
+  steps = np.diff(r.seen)
+  assert 16 in steps and steps.max() <= 16, ("a chunk of the long prompt between two of its tokens, no more", r.seen)
   r = serve.Request(tok, [], 9, 0, stop=["bc"])
   said = lambda: [r.out.get_nowait() for _ in range(r.out.qsize())]
   assert not r.take(np.eye(256)[97], True) and said() == ["a"]

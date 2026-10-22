@@ -48,8 +48,9 @@ class Request:
 
 class Engine:
   """Sequences decoding together on the chip, a slot of `places` rows of one KV cache each. Every step runs every slot,
-  a free one on its last row, which no sequence reaches, so the step's shapes never change and it is replayed (jit).
-  A prompt is prefilled `chunk` tokens at a time, after what its slot holds of it already."""
+  one that is free or still prefilling on its last row, which no sequence reaches, so the step's shapes never change
+  and it is replayed (jit). A prompt is prefilled `chunk` tokens at a time, from what its slot holds of it already, a
+  chunk between steps, so a long one slows the others' tokens rather than stopping them."""
   def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=256):
     self.rt, self.t, self.c, self.tok, self.places, self.chunk = rt, t, c, tokenizer, places, chunk
     self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)))
@@ -64,30 +65,37 @@ class Engine:
     if r.gone: return
     shared = lambda u: next((i for i, (a, b) in enumerate(zip(self.held[u], r.ids)) if a != b), min(len(self.held[u]), len(r.ids)))
     u = max((u for u, b in enumerate(self.busy) if b is None), key=lambda u: (shared(u), -self.used[u]))
-    self.used[u] = max(self.used) + 1
-    for i in range(min(shared(u), len(r.ids) - 1), len(r.ids), self.chunk):
-      ids = r.ids[i:i + self.chunk]
-      out = llama.forward(self.on(ids), self.on(list(range(i, i + len(ids)))), self.t, self.c, self.kv, self.on([self.starts[u]] * len(ids)))
-      self.prefilled += len(ids)
-    self.held[u], self.busy[u] = list(r.ids), r
-    self.take(u, gpt2.values(out[len(ids) - 1:len(ids), :])[0])
+    self.used[u], self.busy[u] = max(self.used) + 1, r
+    self.held[u] = r.ids[:min(shared(u), len(r.ids) - 1)]
 
-  def advance(self):  # one step for every slot: each busy one's last token in, its next one out
-    ids = [r.made[-1] if r else 0 for r in self.busy]
-    places = [len(h) if r else self.places - 1 for h, r in zip(self.held, self.busy)]
+  def fill(self, u):  # the next chunk of slot u's prompt; the last one's last logits give the first new token
+    r, at = self.busy[u], len(self.held[u])
+    if r.gone: return self.take(u, None)
+    ids = r.ids[at:at + self.chunk]
+    out = llama.forward(self.on(ids), self.on(list(range(at, at + len(ids)))), self.t, self.c, self.kv, self.on([self.starts[u]] * len(ids)))
+    self.held[u] += ids
+    self.prefilled += len(ids)
+    if len(self.held[u]) == len(r.ids): self.take(u, gpt2.values(out[len(ids) - 1:len(ids), :])[0])
+
+  def advance(self):  # one step for every slot: each decoding one's last token in, its next one out
+    live = [r if r and r.made else None for r in self.busy]
+    if not any(live): return
+    ids = [r.made[-1] if r else 0 for r in live]
+    places = [len(h) if r else self.places - 1 for h, r in zip(self.held, live)]
     logits = gpt2.values(self.step(self.on(ids), self.on(places), self.on(self.starts)))
-    for u, r in enumerate(self.busy):
+    for u, r in enumerate(live):
       if r: self.held[u].append(r.made[-1]); self.take(u, logits[u])
 
   def take(self, u, logits):  # a slot's request takes its next token; a finished one leaves its slot (and its rows' keys)
     if self.busy[u].take(logits, len(self.held[u]) < self.places - 1): self.busy[u] = None
 
-  def run(self):  # the engine's thread: admit while a slot is free, then step; on an error, every request waiting ends
+  def run(self):  # the engine's thread: admit while a slot is free, a chunk of a prompt, a step; on an error, every request ends
     try:
       while True:
         if not any(self.busy): self.admit(self.waiting.get())
         while None in self.busy and not self.waiting.empty(): self.admit(self.waiting.get())
-        if any(self.busy): self.advance()
+        if filling := [u for u, r in enumerate(self.busy) if r and not r.made]: self.fill(filling[0])
+        self.advance()
     except BaseException:
       for r in self.busy + list(self.waiting.queue):
         if r: r.finish = "error"; r.out.put(None)
