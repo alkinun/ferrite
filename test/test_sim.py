@@ -2047,10 +2047,11 @@ def test_serve_sessions(chip, tmp_path):
   # tokens it took before, and picked as numpy would (agrees). Then an agent's next turns, once other requests hold both
   # slots: one whose prompt is the first's prompt and answer and more goes on from the session saved on the host when
   # the first ended, its new tokens alone prefilled; one that parts from the first after its prompt goes on from the
-  # session saved when that prompt was in; each the same against numpy from nothing
+  # session saved when that prompt was in; each the same against numpy from nothing. Its KV cache is bfp8, as Qwen3.6's
+  # is served (numpy's rounded as the chip's), its sessions saved and put back in bf16, which holds bfp8's values
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
   c, weights = qwen35(rng)
-  w, tok = llama.arrays(weights), bytes_tokenizer(tmp_path)
+  w, tok, c.precision = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.precision(c, "bf16", kv="bfp8")
   c.mtp = 0  # (decoding a token a step: test_serve_speculative drafts with it)
   engine = serve.Engine(rt, llama.upload(rt, {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.4."))}), c, tok, slots=2, places=64, chunk=16)
   threading.Thread(target=engine.run, daemon=True).start()

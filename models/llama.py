@@ -45,20 +45,21 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
 def triangle(rt, n, lower=False):  # ones on and above the diagonal (or on and below it), n x n in fp32, on the chip once
   return Tensor.of(rt, (np.tril if lower else np.triu)(np.ones((n, n))).tolist(), "fp32")
 
-def precision(c, mode="bf16"):
+def precision(c, mode="bf16", kv=None):
   """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
   block, head (block None), and attention, whose B is the cache (block "decode" or "prefill", format None). bf16, bfp8, or
   bfp4 (the MLP's gate and up in bfp4, the rest in bfp8): four phases, exact products. tt: tt_transformers' performance
   mode at tt-metal 9f98dee9 (COMPARE, "TT's performance precision"): the MLP's gate and up in bfp4 at one phase, the other
   matrices and the output layer in bfp8 at two, attention at two phases in decode and four in prefill; and for
   Llama-3.1-8B (32 blocks 4096 wide) its last block's gate and up in bfp8 at two, as its
-  model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has them; the KV cache (kv, None) in bfp8."""
+  model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has them; the KV cache (kv, None) in bfp8. kv: the KV
+  cache's format, bf16 unless said (tt's bfp8)."""
   tt, fmt = mode == "tt", lambda op: "bfp4" if op == "gate_up" else "bfp8"
   p = {(op, l): (fmt(op), 1 if op == "gate_up" else 2) if tt else (fmt(op) if mode == "bfp4" else mode, 4)
        for l in range(c.layers + getattr(c, "mtp", 0)) for op in ("qkv", "o", "gate_up", "down")}
   if tt and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
   p["head", None] = ("bfp8", 2) if tt else ("bfp8" if mode == "bfp4" else mode, 4)
-  return p | {("attention", "decode"): (None, 2 if tt else 4), ("attention", "prefill"): (None, 4), ("kv", None): ("bfp8" if tt else "bf16", None)}
+  return p | {("attention", "decode"): (None, 2 if tt else 4), ("attention", "prefill"): (None, 4), ("kv", None): (kv or ("bfp8" if tt else "bf16"), None)}
 
 def rms(x, w, c):  # RMSNorm, scaled by w (Qwen3.5's by 1 + w: n w + n, exact where 1 + w would round in bf16)
   f = fns(x)

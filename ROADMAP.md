@@ -105,7 +105,12 @@ first (NOTES, "Bring-up on a p150").
 - [x] **A put by the rows it writes**: the KV cache's `put` visited every tile of the cache to find a step's rows, 2.5M
   of a 32-user SmolLM step's 3.4M ttsim cycles at 1,056 places a user; it now works as the rows it writes, 159k
   (NOTES, "Rows by index").
-- [ ] **Qwen3.6's KV cache in bfp8**, its token accuracy kept: a session's rows, most of what a step reads, halved.
+- [x] **Qwen3.6's KV cache in bfp8** (`serve.py`'s last argument): 25 sessions a card where 14 were, 283 tokens/s a card
+  at eight users. The format alone keeps Llama-3.1-8B's token accuracy (top-1 99.6% against 100%) and moves Qwen3.6's
+  real blocks' logits 0.7%, a quarter of what bfp8 weights do (NOTES, "Qwen3.5's and Qwen3.6's language models"); the
+  whole model's token accuracy waits for the whole model, as its experts' formats do.
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
-  matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode; the whole model is 72 GB
-  in bf16, and the token accuracy waits for it on a disk with room.
+  matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
+  and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the
+  model is about 27 GB, still one card); the whole model is 72 GB in bf16, and the token accuracy waits for it on a
+  disk with room.

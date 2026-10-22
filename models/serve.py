@@ -3,7 +3,8 @@
 # one replayed call for all the slots. A prompt goes to the free slot whose last sequence began the same way, or takes
 # a session saved on the host that did, so what they share (a system prompt, an agent's conversation so far) is not
 # prefilled again.
-#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt]   # a folder or a model id
+#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt] [bf16|bfp8]   # a folder or a
+#   model id; the weights' formats (llama.precision), then the KV cache's
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
 import collections, json, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -376,17 +377,17 @@ def main():
   from ferrite import pci
   from ferrite.chip import Chip
   from ferrite.runtime import Runtime
-  folder, args = fetch(sys.argv[1]), sys.argv[2:] + [None] * 4
-  port, slots, places, mode = int(args[0] or 8000), int(args[1] or 4), int(args[2] or 512), args[3] or "bf16"
+  folder, args = fetch(sys.argv[1]), sys.argv[2:] + [None] * 5
+  port, slots, places, mode, kv = int(args[0] or 8000), int(args[1] or 4), int(args[2] or 512), args[3] or "bf16", args[4]
   chip = Chip(pci.open_device())
   rt, start = Runtime(chip, chip.tensix[0], chip.tensix[-1]), time.time()
   c, weights = llama.load(folder, places)
-  c.precision = llama.precision(c, mode)
+  c.precision = llama.precision(c, mode, kv)
   engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places)
   config = lambda f: llama.read_json(os.path.join(folder, f)) if os.path.exists(os.path.join(folder, f)) else {}
   eos = (config("generation_config.json") or config("config.json")).get("eos_token_id")
   threading.Thread(target=engine.run, daemon=True).start()
-  print(f"{os.path.basename(folder.rstrip('/'))} on the chip in {time.time() - start:.0f}s ({mode}), {slots} slots of {places} places, port {port}", flush=True)
+  print(f"{os.path.basename(folder.rstrip('/'))} on the chip in {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} places, port {port}", flush=True)
   jinja = os.path.join(folder, "chat_template.jinja")  # where transformers 5 keeps it
   template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
   server(engine, os.path.basename(folder.rstrip("/")), template, eos if isinstance(eos, list) else [eos] if eos is not None else [], port).serve_forever()
