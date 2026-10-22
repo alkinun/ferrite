@@ -65,11 +65,12 @@ def timed(run, wait, clock, runs):  # seconds a run: after runs[0] warm-up runs,
   return statistics.median(times)
 
 def weights(c):  # each weight as llama.upload makes it, its rows, columns and format, from the model's sizes alone
-  hd, qkv = c.dim // c.heads, (c.heads + 2 * c.kv) * (c.dim // c.heads)
+  hd = llama.head(c)
+  qkv = (c.heads + 2 * c.kv) * hd
   shapes = {"embed": (c.vocab, c.dim), "embed.T": (c.dim, c.vocab), "norm": (1, c.dim), "cos": (c.places, qkv), "sin": (c.places, qkv), "turn": (hd, hd)}
   for l in range(c.layers):
     shapes |= {f"layers.{l}.{k}": s for k, s in (("input_layernorm", (1, c.dim)), ("post_attention_layernorm", (1, c.dim)), ("qkv_proj", (c.dim, qkv)),
-                                                 ("o_proj", (c.dim, c.dim)), ("gate_up_proj", (c.dim, 2 * c.ffn)), ("down_proj", (c.ffn, c.dim)))}
+                                                 ("o_proj", (c.heads * hd, c.dim)), ("gate_up_proj", (c.dim, 2 * c.ffn)), ("down_proj", (c.ffn, c.dim)))}
   return {k: SimpleNamespace(rows=r, cols=n, dtype=llama.weight_format(k, getattr(c, "precision", None))) for k, (r, n) in shapes.items()}
 
 def bytes_per_token(t, c, context):  # what a decode token reads (COMPARE, Measurement): every weight at its stored size
@@ -77,7 +78,7 @@ def bytes_per_token(t, c, context):  # what a decode token reads (COMPARE, Measu
   size = {"bf16": 2, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}
   rows = {"embed": c.dim, "cos": t["cos"].cols, "sin": t["sin"].cols}
   return (sum(size[x.dtype] * rows.get(k, x.rows * x.cols) for k, x in t.items())
-          + context * c.layers * 2 * c.kv * (c.dim // c.heads) * size[llama.cache_format(c)])
+          + context * c.layers * 2 * c.kv * llama.head(c) * size[llama.cache_format(c)])
 
 def model(folder, s, places):  # the model's config at TT's performance precision, and its weights, read when wanted
   c, w = llama.load(folder, places)

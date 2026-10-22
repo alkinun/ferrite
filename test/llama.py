@@ -23,10 +23,11 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a),
                            silu=lambda a: a / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0), mm=lambda a, b, phases: a @ b,
                            topk=lambda a, k: (np.take_along_axis(a, i := np.argsort(-a, -1, kind="stable")[..., :k], -1), i),
-                           pick=lambda a, w, ids, phases: np.stack([a[b % len(a)] @ w[i] for b, i in enumerate(ids.flat)]))  # (a batch of 1 repeats)
+                           pick=lambda a, w, ids, phases: np.stack([a[b % len(a)] @ w[i] for b, i in enumerate(ids.flat)]),  # (a batch of 1 repeats)
+                           cat=lambda xs: np.concatenate(xs))
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, repeat=Tensor.repeat_interleave,
                          mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's products are exact at any phases
-                         pick=lambda a, w, ids, phases: a.matmul(w, fidelity=phases, index=ids))
+                         pick=lambda a, w, ids, phases: a.matmul(w, fidelity=phases, index=ids), cat=lambda xs: xs[0].cat(*xs[1:]))
 
 def precision(c, mode="bf16"):
   """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
@@ -45,6 +46,8 @@ def precision(c, mode="bf16"):
 
 def rms(x, w, eps): f = fns(x); return x * f.rsqrt(f.mean(x * x) + eps) * w
 
+def head(c): return getattr(c, "head_dim", None) or c.dim // c.heads  # a head's width: Qwen3's says it, Llama's is dim / heads
+
 def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 a head's halves, (-x2, x1) as x @ turn
   return x * cos + (x @ turn) * sin
 
@@ -59,12 +62,15 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False):
   f, n = fns(x), c.heads + 2 * c.kv
   phases = lambda op, block=l: (getattr(c, "precision", None) or {}).get((op, block), (None, None))[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c.eps)
-  qkv = rope(f.split(f.mm(h, p["qkv_proj"], phases("qkv")), n), f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
+  qkv = f.split(f.mm(h, p["qkv_proj"], phases("qkv")), n)
+  if "q_norm" in p:  # Qwen3's: each head of q and of k RMS-normed before it turns
+    qkv = f.cat([rms(qkv[:c.heads, :, :], p["q_norm"], c.eps), rms(qkv[c.heads:c.heads + c.kv, :, :], p["k_norm"], c.eps), qkv[c.heads + c.kv:, :, :]])
+  qkv = rope(qkv, f.split(rotary[0], n), f.split(rotary[1], n), rotary[2])
   kv = qkv[c.heads:, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a bfp8 cache does
   f.put(cache, rows, gpt2.bfp(kv) if isinstance(kv, np.ndarray) and cache_format(c) == "bfp8" else kv)
   k, v = (f.repeat(t, c.heads // c.kv) for t in (cache[:c.kv, :, :], cache[c.kv:, :, :]))  # a head for each query's, in place
   attention = phases("attention", "prefill" if prefill else "decode")
-  s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(c.dim // c.heads))
+  s = f.mm(qkv[:c.heads, :, :], f.t(k), attention) * (1 / math.sqrt(head(c)))
   x = x + f.mm(f.merge(f.mm(f.softmax(s + mask), v, attention)), p["o_proj"], phases("o"))
   h = rms(x, p["post_attention_layernorm"], c.eps)
   if "router" in p: return x + moe(h, p, c)
@@ -77,15 +83,16 @@ def moe(h, p, c):
   expert: the token's row by its expert's matrix), weighted by the softmax of their logits (which Qwen3's top-k
   probabilities, renormalized, are too) and summed. p: router (dim x experts), experts.gate_up and experts.down (a
   batch of the experts' matrices)."""
-  f, n, k, m = fns(h), h.shape[-2], c.k, p["experts.down"].shape[-2]
-  values, ids = f.topk(f.mm(h, p["router"], None), k)
+  f, n, k, m, norm = fns(h), h.shape[-2], c.k, p["experts.down"].shape[-2], getattr(c, "norm_topk", True)
+  logits = f.mm(h, p["router"], None)  # (without norm_topk_prob, the chosen experts' probabilities among all, as they are)
+  values, ids = f.topk(logits if norm else f.softmax(logits), k)
   x = h.reshape(n, 1, h.shape[-1])
   gate_up = f.pick(f.repeat(x, k) if n > 1 else x, p["experts.gate_up"], ids, None)
   y = f.pick(f.silu(gate_up[:, :, :m]) * gate_up[:, :, m:], p["experts.down"], ids, None)
-  return (y * f.softmax(values).reshape(n * k, 1, 1)).reshape(n, k, y.shape[-1]).sum(1).reshape(n, y.shape[-1])
+  return (y * (f.softmax(values) if norm else values).reshape(n * k, 1, 1)).reshape(n, k, y.shape[-1]).sum(1).reshape(n, y.shape[-1])
 
 def frequencies(c):  # RoPE's, a head's half of them, in fp32 as Hugging Face computes them; with Llama 3's scaling
-  hd = c.dim // c.heads  # (rope_type llama3), long wavelengths slowed down by its factor, short ones kept, and those
+  hd = head(c)  # (rope_type llama3), long wavelengths slowed down by its factor, short ones kept, and those
   inv = 1 / c.theta ** (np.arange(0, hd, 2, dtype=np.float32) / hd)  # between blended
   if (r := getattr(c, "rope", None)) and r.get("rope_type") == "llama3":
     old, wavelen = r["original_max_position_embeddings"], 2 * math.pi / inv
@@ -97,7 +104,7 @@ def frequencies(c):  # RoPE's, a head's half of them, in fp32 as Hugging Face co
 
 def rotary(c, n):  # cos and sin for places 0 to n - 1, as Hugging Face's (angles in fp32, the tables in bf16), a head's
   # for each of q's, k's and v's heads (v's 1 and 0: they do not turn, so one kernel turns them all), and turn:
-  hd, inv = c.dim // c.heads, frequencies(c)  # x @ turn is (-x2, x1), each of its entries one of x's, so exact
+  hd, inv = head(c), frequencies(c)  # x @ turn is (-x2, x1), each of its entries one of x's, so exact
   angles = np.arange(n, dtype=np.float32)[:, None] * inv[None]
   bf16 = lambda a: gpt2.bf16_floats(gpt2.bf16_bits(a))
   turn = np.zeros((hd, hd), np.float32)
@@ -111,12 +118,20 @@ class Weight:
   def __init__(self, bits): self.bits = bits
   def values(self): return gpt2.bf16_floats(self.bits())
 
-def fuse(w):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls
+def fuse(w):  # each block's q, k and v projections as one matrix, and its gate and up: fewer and wider matmuls; a mixture
+  # of experts' router (gate, Qwen3's) transposed for x @ w, and its experts' gates and ups, and downs, each a batch
   cat = lambda xs: np.ascontiguousarray(np.concatenate(xs, 1))
   join = lambda *xs: Weight(lambda: cat([x.bits() for x in xs])) if isinstance(xs[0], Weight) else cat(xs)
+  stack = lambda xs: Weight(lambda: np.stack([x.bits() for x in xs])) if isinstance(xs[0], Weight) else np.stack(xs)
   for pre in {k[:k.index(".", 7) + 1] for k in w if k.startswith("layers.")}:
     w[pre + "qkv_proj"] = join(*(w.pop(pre + n) for n in ("q_proj", "k_proj", "v_proj")))
-    w[pre + "gate_up_proj"] = join(w.pop(pre + "gate_proj"), w.pop(pre + "up_proj"))
+    if pre + "gate" not in w: w[pre + "gate_up_proj"] = join(w.pop(pre + "gate_proj"), w.pop(pre + "up_proj")); continue
+    r = w.pop(pre + "gate")
+    w[pre + "router"] = Weight(lambda r=r: np.ascontiguousarray(r.bits().T)) if isinstance(r, Weight) else np.ascontiguousarray(r.T)
+    n = sum(k.startswith(pre + "experts.") and k.endswith(".down_proj") for k in w)
+    expert = lambda name: [w.pop(f"{pre}experts.{e}.{name}") for e in range(n)]
+    gates, ups = expert("gate_proj"), expert("up_proj")
+    w[pre + "experts.gate_up"], w[pre + "experts.down"] = stack([join(g, u) for g, u in zip(gates, ups)]), stack(expert("down_proj"))
   return w
 
 def forward(ids, places, w, c, caches, starts=None, every=False):
@@ -145,7 +160,7 @@ def prefill(ids, w, c, caches, chunk, on=lambda row: row):
   return out
 
 def kv_cache(c, size, zeros):  # each block's keys' heads then its values', a row for each of size places, made by zeros(shape)
-  return [zeros((2 * c.kv, size, c.dim // c.heads)) for _ in range(c.layers)]
+  return [zeros((2 * c.kv, size, head(c))) for _ in range(c.layers)]
 
 def read_json(path):
   with open(path, encoding="utf-8") as f: return json.load(f)
@@ -154,11 +169,15 @@ def load(folder, places=4096):
   """The config, and {name: Weight} from model.safetensors, or from the files model.safetensors.index.json names (each 8
   bytes of header size, a JSON header naming each tensor's dtype, shape and byte range, then the data), named without
   "model.", linear weights transposed (so x @ w), vectors as one-row matrices; the output layer is the embedding unless
-  the model has its own (lm_head). RoPE's tables have a row for each of the first `places` places (at most the model's)."""
+  the model has its own (lm_head); a mixture of experts' as fuse stacks them. RoPE's tables have a row for each of the first
+  `places` places (at most the model's)."""
   j = read_json(os.path.join(folder, "config.json"))
+  rope = j.get("rope_parameters") or (j.get("rope_scaling") or {}) | {"rope_theta": j["rope_theta"]}  # transformers 5's, else the two before it
+  theta = rope.pop("rope_theta")
   c = SimpleNamespace(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=j["num_hidden_layers"],
-                      eps=j["rms_norm_eps"], theta=j["rope_theta"], places=min(j["max_position_embeddings"], places),
-                      rope=j.get("rope_scaling"), vocab=j["vocab_size"], ffn=j["intermediate_size"])
+                      eps=j["rms_norm_eps"], theta=theta, places=min(j["max_position_embeddings"], places), vocab=j["vocab_size"],
+                      rope=rope if rope.get("rope_type", "default") != "default" else None, ffn=j["intermediate_size"], head_dim=j.get("head_dim"),
+                      k=j.get("num_experts_per_tok"), norm_topk=j.get("norm_topk_prob", True))
   index = os.path.join(folder, "model.safetensors.index.json")
   files = sorted(set(read_json(index)["weight_map"].values())) if os.path.exists(index) else ["model.safetensors"]
   out = {}
@@ -182,7 +201,7 @@ def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a 
   t = {}                                # and waited for, so the next weight's bf16 copy goes where this one's was: a model
   for name, w in weights.items():       # takes the DRAM its formats need and one matrix more, not all its bf16 besides
     bits = w.bits()
-    x = t[name] = Tensor.frombytes(rt, *bits.shape, bits.tobytes())
+    x = t[name] = Tensor.frombytes(rt, *bits.shape[-2:], bits.tobytes(), bits.shape[0] if bits.ndim == 3 else 1)
     if (f := weight_format(name, prec)) != "bf16":
       t[name] = x.cast(f).realize()
       del x

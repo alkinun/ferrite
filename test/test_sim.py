@@ -1401,6 +1401,31 @@ def test_moe(chip):
   assert all(np.array_equal(a[0], b[0]) for a, b in zip(replayed, alone)), "a replayed step is the step"
   assert all(np.abs(got - want).max() < 0.06 * np.abs(want).max() for got, want in alone), [np.abs(g - w).max() / np.abs(w).max() for g, w in alone]
 
+def test_qwen3_moe(chip, tmp_path):
+  # Qwen3's mixture of experts as test/llama.py reads Hugging Face's files for it (transformers 5's config, RoPE's
+  # parameters in one place): a dense block, then one with a router and experts (a tensor each, stacked into one batch
+  # by fuse) weighted by their probabilities among all (norm_topk_prob off, transformers' default), RMSNorms on each
+  # head of q and k, heads whose width the config gives (4 of 32 in a model 64 wide), and an output layer of its own.
+  # Hugging Face's own model (transformers, float32, random bf16 weights) is the reference: numpy's logits within 0.5%
+  # of its at every place (0.12%), the chip's within 2% (1%) and picking the same tokens
+  torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
+  torch.manual_seed(0)
+  config = transformers.Qwen3MoeConfig(hidden_size=64, intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=2, num_attention_heads=4,
+                                       num_key_value_heads=2, head_dim=32, num_experts=8, num_experts_per_tok=2, decoder_sparse_step=2, vocab_size=256,
+                                       max_position_embeddings=64, rope_theta=1e6, tie_word_embeddings=False)
+  model = transformers.Qwen3MoeForCausalLM(config).to(torch.bfloat16).float()
+  model.save_pretrained(tmp_path)
+  ids = [3, 1, 4, 1, 5, 9, 2, 6]
+  with torch.no_grad(): want = model(torch.tensor([ids])).logits[0].numpy()
+  c, weights = llama.load(str(tmp_path), 32)
+  assert (c.k, llama.head(c)) == (2, 32) and {"router", "experts.gate_up", "experts.down", "q_norm"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.1.")}
+  rel = lambda got: max(np.abs(got[r] - want[r]).max() / np.abs(want[r]).max() for r in range(len(ids)))
+  assert rel(llama.forward(ids, list(range(8)), llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros), every=True)) < 0.005
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  on = lambda row: Tensor.of(rt, [row], "int32")
+  got = gpt2.values(llama.forward(on(ids), on(list(range(8))), llama.upload(rt, weights), c, llama.kv_cache(c, 32, llama.zeros(rt)), every=True))
+  assert rel(got) < 0.02 and np.array_equal(got.argmax(-1), want.argmax(-1)), rel(got)
+
 @pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
 def test_llama_8b_shapes(chip):
   # one block in Llama-3.1-8B's shapes (4096 wide, 32 query heads sharing 8 KV heads, an MLP of 14336, Llama 3's RoPE
