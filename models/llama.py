@@ -25,20 +25,21 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
     sink_softmax = lambda a, sink: (e := np.exp(a - (m := np.maximum(a.max(-1, keepdims=True), sink)))) / (e.sum(-1, keepdims=True) + np.exp(sink - m))
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), topk=topk,
                            silu=lambda a: a / (1 + np.exp(-a)), sigmoid=lambda a: 1 / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0),
-                           mm=lambda a, b, phases: a @ b, experts=numpy_experts, where=np.where, minimum=np.minimum, maximum=np.maximum,
+                           mm=lambda a, b, phases, dtype=None: a @ b, experts=numpy_experts, where=np.where, minimum=np.minimum, maximum=np.maximum,
                            sink_softmax=sink_softmax, exp=np.exp, log=np.log, float=lambda a: a, bf16=lambda a: a, now=lambda a: a, swap=lambda a: a.transpose(1, 0, 2),
                            cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None], assign=lambda a, b: a.__setitem__(..., b),
                            tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)),
-                           parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to)
+                           parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to,
+                           down=lambda a: a.sum(-2, keepdims=True))
   sink_softmax = lambda a, sink: (e := (a - (m := a.max(2).maximum(sink))).exp()) / (e.sum(2) + (sink - m).exp())  # one more logit, left out
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid,
-                         repeat=Tensor.repeat_interleave, mm=lambda a, b, phases: a.matmul(b, fidelity=phases), topk=Tensor.topk,  # numpy's
+                         repeat=Tensor.repeat_interleave, mm=lambda a, b, phases, dtype=None: a.matmul(b, dtype, fidelity=phases), topk=Tensor.topk,  # numpy's
                          experts=chip_experts, where=lambda cond, a, b: cond.where(a, b), minimum=Tensor.minimum, maximum=Tensor.maximum,  # products
                          sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, float=Tensor.float, bf16=Tensor.bfloat16,  # are exact
                          now=Tensor.realize, cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0),  # at any phases
                          swap=lambda a: a.permute(1, 0, 2),
                          assign=Tensor.assign, tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
-                         expand=lambda a, shape: a.expand(*shape))
+                         expand=lambda a, shape: a.expand(*shape), down=lambda a: a.sum(1))
 
 @functools.cache
 def triangle(rt, n, lower=False):  # ones on and above the diagonal (or on and below it), n x n in fp32, on the chip once
@@ -123,40 +124,64 @@ def delta(h, p, c, state, phases, live=None, accept=None):
   by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T k)^T, and reads with its query.
   A speculative step's state also keeps both after its first token alone ([..., conv's, S]), and its accept row (1 or
   0 a sequence) says which the next step goes on from: after both tokens, or after the first when its second, a
-  draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay
-  (-exp(A_log)), dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it), a chunk of at most
-  64 tokens at a time (chunk); a decode step is a chunk of one."""
+  draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps as rows), decay
+  (-exp(A_log)), dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it), a decode or verify
+  step's tokens one at a time (step), else a chunk of at most 64 tokens at a time (chunk)."""
   f, (past, S) = fns(h), state[:2]
-  n, seqs, qk, vw = h.shape[-2], past.shape[0], c.kh * c.kd, c.vh * c.vd
+  n, seqs, qk, vw, r = h.shape[-2], past.shape[0], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
   m, width = n // seqs, 2 * qk + vw  # each sequence's tokens; the conv's channels
+  live = None if live is None else live.reshape(seqs, 1, 1)
   if accept is not None:  # where a speculative step goes on from, computed before it is written over
     a = accept.reshape(seqs, 1, 1)
     past, S = f.now(state[2] + a * (past - state[2])), f.now(state[3] + f.repeat(a, c.vh) * (S - state[3]))
-  x = f.mm(h, p["qkv_proj"], phases("qkv"))
+  x = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32")
   rows = f.now(f.cat(past, x[:, :width].reshape(seqs, m, width)))  # each sequence's conv inputs: the last ones, then this
-  y = f.silu(sum(rows[:, j:j + m, :] * p["conv"][j] for j in range(c.conv)).reshape(n, width))  # call's, computed before
-  keep = lambda old, new: new if live is None else old + live.reshape(seqs, 1, 1) * (new - old)  # the last are written over
+  taps = p["conv"]                                                  # call's, computed before the last are written over
+  y = f.down(rows * taps) if m == 1 else sum(rows[:, j:j + m, :] * taps[:, j:j + 1, :] for j in range(c.conv))
+  y = f.silu(y).reshape(n, width)
+  keep = lambda old, new: new if live is None else old + live * (new - old)
   f.assign(state[0], keep(state[0], rows[:, m:, :]))
   if accept is not None: f.assign(state[2], keep(state[2], rows[:, 1:c.conv, :]))
+  def each(t, d):  # (tokens, heads of d side by side) as (a sequence's heads, its tokens, d): a batch entry a head
+    if m == 1 and seqs > 1: return t.reshape(seqs * t.shape[-1] // d, 1, d)
+    heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
+    return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, m * d)).reshape(seqs * heads.shape[0], m, d)
   unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # each head's query and key to length 1
-  q, k = (f.repeat(unit(f.split(y[:, a:a + qk], c.kh)), c.vh // c.kh) for a in (0, qk))  # a key head for each value head's
-  q, v, zba = q * c.kd ** -0.5, f.split(y[:, 2 * qk:], c.vh), x[:, width:]
-  z, b, a = zba[:, :vw], zba[:, vw:vw + c.vh], f.float(zba[:, vw + c.vh:]) + p["dt_bias"]
-  g = f.heads(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))))  # softplus, each head's as a column
-  apart = lambda t: t if seqs == 1 else f.swap(t.reshape(c.vh, seqs, m * t.shape[-1])).reshape(seqs * c.vh, m, t.shape[-1])  # each
-  beta, out = f.heads(f.sigmoid(b)), []  # sequence's heads a batch entry each, its tokens their rows
-  big = lambda old, new: new if live is None else old + f.repeat(live.reshape(seqs, 1, 1), c.vh) * (new - old)
-  for s in range(0, m, 64):
-    part = lambda t: apart(t)[:, s:s + 64, :]
-    o, S2, S1 = chunk(*map(part, (q, k, v, beta, g)), S)
-    out.append(f.now(o))  # read from S before S is written over
-    if accept is not None: f.assign(state[3], big(state[3], S1))
+  q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))  # a key head for r value heads
+  v, zba = each(y[:, 2 * qk:], c.vd), x[:, width:]
+  z, b, a = zba[:, :vw], zba[:, vw:vw + c.vh], zba[:, vw + c.vh:] + p["dt_bias"]
+  g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus, each head's log decay
+  beta, big = f.sigmoid(each(b, 1)), lambda old, new: new if live is None else old + f.repeat(live, c.vh) * (new - old)
+  if m <= 2:  # a decode step's token, or a verify step's token and its draft: one at a time, q and k as columns (each
+    out = []  # transposed before it is repeated)
+    for i in range(m):
+      o, S2 = step(*(f.repeat(f.t(t[:, i:i + 1, :]), r) for t in (q, k)), *(t[:, i:i + 1, :] for t in (v, beta, g)), S)
+      out.append(f.now(o))  # read from S before S is written over
+      if i == 0 and accept is not None: f.assign(state[3], big(state[3], S2))  # (after the first token alone)
+      if i < m - 1: S = state[3] if accept is not None else f.now(S2)
     f.assign(state[1], big(state[1], S2))
-    S = state[1]
-  o = out[0] if len(out) == 1 else f.cat(*out)
-  o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)  # each head's tokens again
+  else:
+    q, k, out = f.repeat(q, r), f.repeat(k, r), []
+    for s in range(0, m, 64):
+      o, S2, S1 = chunk(*(t[:, s:s + 64, :] for t in (q, k, v, beta, g)), S)
+      out.append(f.now(o))
+      if accept is not None and s == 0: f.assign(state[3], big(state[3], S1))
+      f.assign(state[1], big(state[1], S2))
+      S = state[1]
+  o = out[0] if len(out) == 1 else f.cat(*out)  # each head's tokens again
+  o = o if seqs == 1 else f.split(o.reshape(n, vw), c.vh) if m == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(z, c.vh))  # each head RMS-normed and gated by z
   return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"))
+
+def step(q, k, v, beta, g, S):
+  """One token's gated delta rule, recurrent (transformers' torch_recurrent_gated_delta_rule), its query and key as
+  columns: its output and the state after it. The state is read by products summed down its rows, in fp32 and a
+  kernel each, where chunk's fp32 matmuls take several."""
+  f = fns(v)
+  e = f.exp(g)
+  vnew = beta * (v - e * f.down(k * S))  # the correction, less what the decayed state already says
+  S = e * S + k * vnew
+  return f.down(q * S), S
 
 def chunk(q, k, v, beta, g, S):
   """A chunk's gated delta rule all at once, as transformers' torch_chunk_gated_delta_rule (the DeltaNet paper's UT
@@ -287,7 +312,7 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
     if pre + "conv1d" in w:  # Gated DeltaNet's: q, k and v, then z, b and a, as one matmul
       w[pre + "qkv_proj"] = join(*(w.pop(pre + "in_proj_" + n) for n in ("qkv", "z", "b", "a")))
       w[pre + "o_proj"], conv, A = w.pop(pre + "out_proj"), w.pop(pre + "conv1d"), w.pop(pre + "A_log")
-      w[pre + "conv"] = Weight(lambda conv=conv: np.ascontiguousarray(conv.bits().reshape(-1, c.conv).T.reshape(c.conv, 1, -1)))
+      w[pre + "conv"] = Weight(lambda conv=conv: np.ascontiguousarray(conv.bits().reshape(-1, c.conv).T.reshape(1, c.conv, -1)))
       w[pre + "decay"] = Weight(lambda A=A: gpt2.bf16_bits(-np.exp(A.values())))
     else:
       q = w.pop(pre + "q_proj")
@@ -476,8 +501,10 @@ def mxfp4(blocks, scales):
   return gpt2.bf16_bits(np.ascontiguousarray(np.swapaxes(v, -1, -2)))
 
 def weight_format(name, prec):  # a weight's format on the chip: the matrices a matmul reads as its B (the blocks', their
-  # experts' as their MLP's, and the output layer) in the one prec (precision's) gives them, the rest, and all without prec, bf16
+  # experts' as their MLP's, and the output layer) in the one prec (precision's) gives them; Gated DeltaNet's conv, decay,
+  # dt_bias and norm, which it computes with in fp32, fp32; the rest, and all without prec, bf16
   op = name.split(".")[-1].removesuffix("_proj")
+  if name.startswith("layers.") and op in ("conv", "decay", "dt_bias", "norm"): return "fp32"
   matrix = name.endswith(("_proj", "experts.gate_up", "experts.down"))
   key = ("head", None) if name == "embed.T" else (op, int(name.split(".")[1])) if matrix else None
   return prec[key][0] if prec and key else "bf16"
@@ -502,7 +529,7 @@ def arrays(weights, prec=None):
   up and not kept, so numpy holds no more of a model than the block it is running, whatever the model's size."""
   def made(name, w):
     v, f = w.values(), weight_format(name, prec)
-    if f == "bf16": return v
+    if f in ("bf16", "fp32"): return v
     rows = v.reshape(-1, v.shape[-1])  # (a batch of experts' too)
     return np.concatenate([gpt2.bfp(rows[i:i + 1024], f).astype(np.float32) for i in range(0, len(rows), 1024)]).reshape(v.shape)
   return Made({name: functools.partial(made, name, w) for name, w in weights.items()})

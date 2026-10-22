@@ -16,10 +16,10 @@ BYTES = {"bf16": 2.0, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}  # a value's, wit
 MODES = {"bf16": {}, "bfp8": {"*": "bfp8"},  # each kind of matrix's format, Tenstorrent's performance precision's, and with
          "bfp4": {"*": "bfp8", "gate_up": "bfp4"},  # every expert matrix in bfp4 (Qwen3.6 on a card). The embedding stays
          "experts": {"*": "bfp8", "gate_up": "bfp4", "down": "bfp4"}}  # bf16 (a token's row is gathered), and so do the routers
-LAUNCHES = {"attention": 12, "experts": 19, "deltanet": 86, "deltanet verify": 130, "rest": 5, "draft": 44}  # a decode step's: an
-# attention block's (with its norms and MLP), a mixture of experts' more, a Gated DeltaNet block's (and one taking a
-# token and a draft at once), the embedding's, final norm's and output layer's, the multi-token prediction layer's
-# call. Counted on ttsim at Qwen3.6's shapes (cmp/qwen36/launches.py), SmolLM's for an attention block's 12.
+LAUNCHES = {"attention": 12, "experts": 19, "deltanet": 27, "deltanet verify": 65, "rest": 11, "draft": 46}  # a decode step's
+# for several slots: an attention block's (with its norms), a mixture of experts' more, a Gated DeltaNet block's (and one
+# taking a token and a draft at once), the rest (the embedding's gather, the step's masks, the final norm and the output
+# layer), the multi-token prediction layer's call. Counted on ttsim at Qwen3.6's shapes, four slots (cmp/qwen36/launches.py).
 WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 banks of 4 GiB, a GiB of it for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # its 512 GB/s, and the share of it a decode step reaches (a guess)
