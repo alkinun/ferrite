@@ -1384,8 +1384,9 @@ def test_moe(chip):
   # a mixture of experts in the MLP's place (llama.moe): a token's router logits choose its k experts on the chip
   # (topk), matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen
   # logits and summed, as numpy does for one token and for three (a batch entry each token and expert) and for 40 (each
-  # expert's tokens grouped into tiles, Tensor.group); and a two-block model of them decodes from a replay (tensor.jit)
-  # bit for bit as it does op by op, so a replayed step reads whatever experts its token chose, and near numpy
+  # expert's tokens grouped into tiles, Tensor.group), replayed (tensor.jit) bit for bit as op by op; and a two-block
+  # model of them decodes from a replay as it does op by op, so a replayed step reads whatever experts its token chose,
+  # and near numpy
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
   experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
@@ -1395,6 +1396,10 @@ def test_moe(chip):
     h = bf16(rng.normal(0, 1, (n, 64)))
     got, want = value(llama.moe(Tensor.of(rt, h.tolist()), t, c))[0], llama.moe(h, w, c)
     assert np.abs(got - want).max() < 0.02 * np.abs(want).max(), (n, np.abs(got - want).max())
+  grouped, prompts = tensor.jit(lambda h: llama.moe(h, t, c)), np.random.default_rng(41)  # grouping replays: each call its own
+  for _ in range(3):
+    h = Tensor.of(rt, bf16(prompts.normal(0, 1, (40, 64))).tolist())
+    assert np.array_equal(value(grouped(h)), value(llama.moe(h, t, c))), "a replayed grouping is the grouping"
   c, w = smol(rng, 2)
   c.k = 2
   for l in range(2): del w[f"layers.{l}.gate_up_proj"], w[f"layers.{l}.down_proj"]; w |= {f"layers.{l}.{k}": v for k, v in experts(576, 8, 64).items()}
