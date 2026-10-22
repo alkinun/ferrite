@@ -1774,7 +1774,7 @@ def test_batched_decode(chip):
 
 def test_serve(chip, tmp_path):
   # test/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
-  # longest ago) decode together, then the last two again alone, the last first (the slot used longer ago holds the
+  # longest ago) decode together, numpy's greedy tokens for each, then the last two again alone, the last first (the slot used longer ago holds the
   # other), each in the slot that holds it already, so a token of each is prefilled and the rest come from the cache:
   # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
   # reaches (on any other it would spoil what its slot holds); a long prompt is prefilled a chunk between steps, so
@@ -1801,6 +1801,12 @@ def test_serve(chip, tmp_path):
   together = [serve.Request(tok, p, 6, 0) for p in prompts]
   for r in together: engine.waiting.put(r)
   together = [done(r) for r in together]
+  def greedy(prompt, n):  # numpy's tokens for the same prompt, as test/llama.py decodes
+    kv, ids = llama.kv_cache(c, 64, np.zeros), list(prompt)
+    logits = llama.forward(ids, list(range(len(ids))), w, c, kv)[0]
+    for i in range(n - 1): ids.append(int(logits.argmax())); logits = llama.forward(ids[-1:], [len(ids) - 1], w, c, kv)[0]
+    return ids[len(prompt):] + [int(logits.argmax())]
+  assert together == [greedy(p, 6) for p in prompts], "numpy's greedy tokens, each request's while all decode together"
   before = engine.prefilled
   assert [done(r) for r in [serve.Request(tok, p, 6, 0) for p in prompts[:0:-1]] if not engine.waiting.put(r)] == together[:0:-1]
   assert engine.prefilled - before == 2, "the prompts' last tokens, the rest in their slots already"
