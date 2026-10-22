@@ -41,7 +41,7 @@ def tensor_bits(data, t, transpose=False):  # one tensor of a safetensors file a
   raw = data[t["data_offsets"][0]:t["data_offsets"][1]]
   if t["dtype"] == "F32": bits = bf16_bits(raw.view(np.float32))
   else: assert t["dtype"] == "BF16", t["dtype"]; bits = raw.view(np.uint16)
-  bits = bits.reshape(t["shape"] if len(t["shape"]) == 2 else (1, -1))
+  bits = bits.reshape(t["shape"] if len(t["shape"]) >= 2 else (1, -1))  # (a batch of matrices: gpt-oss's experts)
   return np.ascontiguousarray(bits.T) if transpose else bits
 
 def fns(x):  # what numpy and ferrite spell differently
@@ -95,13 +95,16 @@ def forward(ids, w, mask, places=None, caches=None):
     x = layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask, HEADS, caches and caches[l], places)
   return f.rows(layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), [x.shape[-2] - 1]) @ w["wte.T"]
 
-def mask(places, size, starts=None):
+def mask(places, size, starts=None, window=None):
   """-1e9 where a token at places, among size places, would look past its own (or, given its sequence's start, before
-  that, on the chip only), else 0: in numpy, or on the chip from int32 rows of places, so a decode step's mask is data,
-  not a shape."""
-  if not isinstance(places, Tensor): return np.where(np.arange(size) > np.asarray(places)[:, None], np.float32(-1e9), np.float32(0))
+  that, on the chip only; or given a window, as far back as window places or more), else 0: in numpy, or on the chip
+  from int32 rows of places, so a decode step's mask is data, not a shape."""
+  if not isinstance(places, Tensor):
+    q, k = np.asarray(places)[:, None], np.arange(size)
+    return np.where((k > q) | ((k <= q - window) if window else False), np.float32(-1e9), np.float32(0))
   cols, column = Tensor.of(places.rt, [list(range(size))], "int32"), lambda row: row.reshape(1, row.cols, 1)
   out = cols > column(places)
+  if window: out = out + (cols < column(places) - (window - 1))
   return ((out if starts is None else out + (cols < column(starts))) * -1e9).cast("bf16")
 
 def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # each block's, by zeros(shape)

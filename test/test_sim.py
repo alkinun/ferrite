@@ -1459,13 +1459,18 @@ def test_qwen3_moe(chip, tmp_path):
 
 FAMILIES = {"qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mistral": ("Mistral", dict(sliding_window=None)),
             "qwen2_moe": ("Qwen2Moe", dict(moe_intermediate_size=64, shared_expert_intermediate_size=96, num_experts=8, num_experts_per_tok=2)),
-            "mixtral": ("Mixtral", dict(num_local_experts=8, num_experts_per_tok=2))}
+            "mixtral": ("Mixtral", dict(num_local_experts=8, num_experts_per_tok=2)),
+            "gpt_oss": ("GptOss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=4, layer_types=["sliding_attention", "full_attention"],
+                                       rope_parameters={"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False,
+                                                        "original_max_position_embeddings": 8, "rope_theta": 1e4}))}
 
 @pytest.mark.parametrize("family", FAMILIES)
 def test_hf_families(chip, tmp_path, family):
   # test/llama.py reads other families' checkpoints as Hugging Face saves them: Qwen3's dense one (q and k normed per
   # head), Qwen2's (biases on q, k and v), Mistral's, Qwen2-MoE's (a shared expert, gated by a sigmoid, beside the
-  # chosen ones) and Mixtral's (its experts' w1, w3 and w2 its gate, up and down). transformers' own model (float32,
+  # chosen ones), Mixtral's (its experts' w1, w3 and w2 its gate, up and down) and gpt-oss's (attention sinks, a sliding
+  # window every other block, YaRN, biases on the router and the experts, a clamped GLU; each of them alone off takes
+  # numpy past 0.5%). transformers' own model (float32,
   # random bf16 weights, the biases and norms made to count) is the reference: numpy within 0.5% of its logits at every
   # place, the chip within 2% and picking the same tokens, or one within 0.1% of the span of it (Qwen2-MoE's has such a tie)
   torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
@@ -1474,8 +1479,8 @@ def test_hf_families(chip, tmp_path, family):
   config = getattr(transformers, name + "Config")(hidden_size=128, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
                                                   vocab_size=256, max_position_embeddings=64, rope_theta=1e4, tie_word_embeddings=False, **extra)
   model = getattr(transformers, name + "ForCausalLM")(config)
-  for p in model.parameters():  # biases start at 0 and norms at 1: make them count
-    if p.ndim == 1: p.data.normal_(1, 0.2) if torch.all(p == 1) else p.data.normal_(0, 0.5)
+  for name, p in model.named_parameters():  # biases start at 0 and norms at 1: make them count
+    if p.ndim == 1 or "bias" in name: p.data.normal_(1, 0.2) if torch.all(p == 1) else p.data.normal_(0, 0.5)
   model = model.to(torch.bfloat16).float()
   model.save_pretrained(tmp_path)
   ids = [3, 1, 4, 1, 5, 9, 2, 6]
