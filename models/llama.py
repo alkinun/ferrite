@@ -1,11 +1,11 @@
 # A Llama-family model on ferrite (SmolLM-135M: RMSNorm, RoPE, SwiGLU, grouped-query attention, a KV cache): the real
 # weights, greedy generation, each step checked against the same model in numpy (the same bf16 weights, float32 math).
-# The model is written once, for ferrite Tensors and numpy arrays alike, as test/gpt2.py is. Its KV cache has a fixed
+# The model is written once, for ferrite Tensors and numpy arrays alike, as models/gpt2.py is. Its KV cache has a fixed
 # size and a token's place is data, not a shape, so on ferrite every decode step launches the same kernels: after the
 # first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
 # starts), a token each a step.
-#   TTSIM=/path/to/libttsim.so python3 test/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
-#   ... python3 test/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]   # token accuracy, Tenstorrent's way
+#   TTSIM=/path/to/libttsim.so python3 models/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
+#   ... python3 models/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]   # token accuracy, Tenstorrent's way
 # (numpy: the weight values the chip holds in mode's formats, with exact products, in numpy alone: no chip)
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors (or another
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).

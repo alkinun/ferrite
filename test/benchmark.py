@@ -15,7 +15,7 @@
 import bz2, glob, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 from types import SimpleNamespace
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.join(os.path.dirname(__file__), "..", "models")]
 from ferrite import bh, pci
 import gpt2, llama
 

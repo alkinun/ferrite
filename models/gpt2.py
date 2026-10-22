@@ -2,7 +2,7 @@
 # same bf16 weights, float32 math). The model is written once, for ferrite Tensors and numpy arrays alike. Its KV cache
 # has a fixed size and a token's place is data, not a shape, so every decode step launches the same kernels: after the
 # first two, each is a replay (tensor.jit).
-#   TTSIM=/path/to/libttsim.so python3 test/gpt2.py path/to/model.safetensors "prompt" [tokens] [bfp8]
+#   TTSIM=/path/to/libttsim.so python3 models/gpt2.py path/to/model.safetensors "prompt" [tokens] [bfp8]
 # The weights are Hugging Face's openai-community/gpt2 model.safetensors; the tokenizer is tiktoken's "gpt2". bfp8: the
 # weight matrices in bfp8 on the chip (numpy then has them as the chip does).
 import json, math, os, struct, sys, time

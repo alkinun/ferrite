@@ -39,28 +39,28 @@ tie, 0.36 apart in numpy's logits). Both decode with a KV cache, each token repl
 costs the host 0.1 ms, and both can keep their weight matrices in bfp8 (add `bfp8`), at about half the bytes (SmolLM's
 MLP in bfp4 too, as Tenstorrent's own code keeps it: add `bfp4`).
 
-    TTSIM=... python3 test/gpt2.py model.safetensors "The meaning of life is" 8
+    TTSIM=... python3 models/gpt2.py model.safetensors "The meaning of life is" 8
     The meaning of life is not[ferrite: ' to'] the same as the meaning of death
-    TTSIM=... python3 test/llama.py SmolLM-135M "The meaning of life is" 6
+    TTSIM=... python3 models/llama.py SmolLM-135M "The meaning of life is" 6
     The meaning of life is a question that has been asked
 
 Llama-3.1-8B-Instruct runs whole on the simulator at Tenstorrent's performance precision (MLP weights in bfp4, the rest
 in bfp8), each token the one numpy picks. Mixtures of experts run with their experts chosen on the chip: one kernel of
 a RISC-V core takes each token's best experts, matmuls read the chosen experts' weights where they lie, and a prompt's
 tokens are grouped by expert, so a decode step replays with whatever experts its tokens pick. Qwen3-30B-A3B's first two
-blocks, with its real weights, pick numpy's token at every place of a prompt and decode as numpy does. `test/llama.py`
+blocks, with its real weights, pick numpy's token at every place of a prompt and decode as numpy does. `models/llama.py`
 reads Llama's, Mistral's, Qwen2's and Qwen3's checkpoints, and Mixtral's, Qwen2-MoE's, Qwen3-MoE's and gpt-oss's (its
 MXFP4 experts too), each checked against transformers' own model. Two chips (ttsim's two-chip build) find their
 Ethernet links and copy a tensor from one's DRAM to the other's across one, kernels on both chips driving it, with no
 code on the Ethernet tiles (`Tensor.to`).
 
-Serving: `test/serve.py` is an OpenAI-compatible server (`/v1/completions`, `/v1/chat/completions`, whole or streamed)
+Serving: `models/serve.py` is an OpenAI-compatible server (`/v1/completions`, `/v1/chat/completions`, whole or streamed)
 for these models, from a folder or a Hugging Face model id; a thinking model's reasoning (Qwen3's) comes apart from its
 answer. Requests decode together, each in a slot of one KV cache, every step one replayed call for all of them, and a
 prompt goes to the slot that already holds the longest start of it, so a shared prefix is not prefilled again.
 SmolLM-135M answers "The meaning of life is" over HTTP as above.
 
-    TTSIM=... python3 test/serve.py SmolLM-135M 8000
+    TTSIM=... python3 models/serve.py SmolLM-135M 8000
     curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 6, "temperature": 0}'
 
 Training: a small GPT (GPT-2's blocks, fp32, Adam) learns this README and LESSONS.md a character at a time, each step
@@ -97,7 +97,9 @@ is on a real card waits for one; `COMPARE.md` has the numbers and what carries o
   tile's five cores: BRISC's moves tiles in and out, and one for each TRISC feeds the unpack, math or pack thread.
 - `ferrite/bh.py`: Blackhole's facts as data: addresses, limits, instruction and config encodings.
 - `adapters/tinygrad_ferrite.py`: tinygrad on ferrite, and PyTorch through tinygrad's frontend.
-- `test/`: every step on the simulator (`test_sim.py`), and the models.
+- `models/`: GPT-2 and the Llama-family models (`gpt2.py`, `llama.py`), written once for ferrite and numpy, and the
+  OpenAI-compatible server for them (`serve.py`).
+- `test/`: every step on the simulator (`test_sim.py`), training, and the benchmarks.
 
 ## Docs
 

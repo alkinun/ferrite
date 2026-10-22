@@ -7,6 +7,7 @@ from ferrite.chip import Chip
 from ferrite.tensor import Tensor
 from ferrite.hello import hello
 from ferrite.runtime import DATA, KERNELS, TIMES, Runtime, compile_kernel
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "models"))  # (gpt2, llama, serve)
 import benchmark, gpt2, llama, serve, train
 from types import SimpleNamespace
 
@@ -1159,7 +1160,7 @@ def test_torch_frontend(chip):
 
 def test_tinygrad_llm(chip):
   # tinygrad's own LLM code (tinygrad/llm's Transformer, which runs Llama 3 and Qwen 3) on the FERRITE device: two blocks
-  # in SmolLM's shapes from the same bf16 weights as ferrite's numpy Llama (test/llama.py), against it, a prompt's logits
+  # in SmolLM's shapes from the same bf16 weights as ferrite's numpy Llama (models/llama.py), against it, a prompt's logits
   # and then a decode step's from tinygrad's own KV cache (fp16, so on the host: the adapter carries no fp16). Its blocks
   # are tinygrad functions, precompiled: the adapter inlines them, their own buffers made fresh each call
   if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
@@ -1192,7 +1193,7 @@ def test_tinygrad_llm(chip):
 @pytest.mark.parametrize("n, dtype, size", [(16, "bf16", 0), (40, "bf16", 0), (40, "bfp8", 0), (16, "bf16", 64)])
 def test_gpt2_layer(chip, n, dtype, size):
   # a GPT-2 small block (768 wide, 12 heads of 64, MLP 3072) on n tokens (40: two tile rows, so attention spans tiles),
-  # against the same code (test/gpt2.py) in numpy, float64, with the same weights: bf16, or the matrices cast to bfp8 on
+  # against the same code (models/gpt2.py) in numpy, float64, with the same weights: bf16, or the matrices cast to bfp8 on
   # the chip (numpy then has them as the chip does); with size, its keys and values put into a KV cache of that many
   # places, attention reading all of them, the empty ones masked. Matrices as GPT-2 initialises them (normal, 0.02 wide),
   # biases and norms about 0 and 1 but 0.1 wide, so that they count; the attention is causal and not uniform (scores of
@@ -1223,7 +1224,7 @@ def test_gpt2_model(chip):
   # (a token at a time from the KV cache, the last a replay), the next token's 50257 logits against the same model in
   # numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and a pick numpy rates as good: first
   # " not" (407) by numpy, and " to" just 0.36 behind, closer than bf16's rounding through 12 blocks can tell apart (the
-  # residual reaches 3000, where bf16 steps by 16). About 90 s on ttsim; test/gpt2.py generates text
+  # residual reaches 3000, where bf16 steps by 16). About 90 s on ttsim; models/gpt2.py generates text
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   weights = gpt2.load(os.environ["GPT2"])
   t, w, ids = gpt2.upload(rt, weights), gpt2.arrays(weights), [464, 3616, 286, 1204, 318]  # (tiktoken's gpt2 encoding)
@@ -1238,7 +1239,7 @@ def test_gpt2_model(chip):
     assert (i or want.argmax() == 407) and err < 2 and want[got.argmax()] >= want.max() - 2 * err, (i, err, got.argmax())
     ids.append(int(want.argmax()))
 
-def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's shapes (as test/llama.py names them), its config
+def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's shapes (as models/llama.py names them), its config
   c = SimpleNamespace(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)
   shapes = {"input_layernorm": (1, 576, 1), "post_attention_layernorm": (1, 576, 1), "q_proj": (576, 576, 0), "k_proj": (576, 192, 0),
             "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
@@ -1248,7 +1249,7 @@ def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's 
 
 def test_llama_frequencies():
   # Llama 3.1's RoPE scaling (rope_type llama3: long wavelengths slowed by 8, short ones kept, those between blended):
-  # test/llama.py's frequencies are Hugging Face's, in float32 to the bit
+  # models/llama.py's frequencies are Hugging Face's, in float32 to the bit
   m, transformers = pytest.importorskip("transformers.modeling_rope_utils"), pytest.importorskip("transformers")
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   hf = transformers.LlamaConfig(hidden_size=4096, num_attention_heads=32, rope_theta=500000.0, rope_scaling=rope, max_position_embeddings=131072)
@@ -1325,7 +1326,7 @@ def test_tokenizer(tmp_path):
 def test_llama_layer(chip, n):
   # a Llama block (RMSNorm, RoPE, grouped-query attention, a SwiGLU MLP) in SmolLM-135M's shapes (576 wide, 9 query heads
   # sharing 3 key and value heads, MLP 1536) on n tokens, its keys and values put into a cache of n places, against the
-  # same code (test/llama.py) in numpy, float64, with the same bf16 weights and rotary tables. Every intermediate is bf16
+  # same code (models/llama.py) in numpy, float64, with the same bf16 weights and rotary tables. Every intermediate is bf16
   # here, so the block's change to x must match to within 3% of its size
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(12)
   c, w = smol(rng, 1)
@@ -1431,7 +1432,7 @@ def test_moe(chip):
   assert all(np.abs(got - want).max() < 0.06 * np.abs(want).max() for got, want in alone), [np.abs(g - w).max() / np.abs(w).max() for g, w in alone]
 
 def test_qwen3_moe(chip, tmp_path):
-  # Qwen3's mixture of experts as test/llama.py reads Hugging Face's files for it (transformers 5's config, RoPE's
+  # Qwen3's mixture of experts as models/llama.py reads Hugging Face's files for it (transformers 5's config, RoPE's
   # parameters in one place; a config cut to its first blocks reads only them): a dense block, then one with a router and experts (a tensor each, stacked into one batch
   # by fuse) weighted by their probabilities among all (norm_topk_prob off, transformers' default), RMSNorms on each
   # head of q and k, heads whose width the config gives (4 of 32 in a model 64 wide), and an output layer of its own.
@@ -1475,7 +1476,7 @@ FAMILIES = {"qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mist
 
 @pytest.mark.parametrize("family", FAMILIES)
 def test_hf_families(chip, tmp_path, family):
-  # test/llama.py reads other families' checkpoints as Hugging Face saves them: Qwen3's dense one (q and k normed per
+  # models/llama.py reads other families' checkpoints as Hugging Face saves them: Qwen3's dense one (q and k normed per
   # head), Qwen2's (biases on q, k and v), Mistral's, Qwen2-MoE's (a shared expert, gated by a sigmoid, beside the
   # chosen ones), Mixtral's (its experts' w1, w3 and w2 its gate, up and down) and gpt-oss's (attention sinks, a sliding
   # window every other block, YaRN, biases on the router and the experts, a clamped GLU; each of them alone off takes
@@ -1556,7 +1557,7 @@ for ch, (_, back) in links_a.items():
   assert y.rt is rts[1] and y.tolist() == t.tolist() and (y * 2).to(rts[0], back, ch).tolist() == (t * 2).tolist(), ch
 import sys, numpy as np  # a model split across the two chips: its first block on chip 0, its second and its head on chip 1
 from types import SimpleNamespace
-sys.path.insert(0, "test")
+sys.path.insert(0, "models")
 import gpt2, llama
 c, rng = SimpleNamespace(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
 draw = lambda mean, std, shape: gpt2.bf16_floats(gpt2.bf16_bits(rng.normal(mean, std, shape)))
@@ -1773,7 +1774,7 @@ def test_batched_decode(chip):
       s.append(int(want.argmax()))
 
 def test_serve(chip, tmp_path):
-  # test/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
+  # models/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
   # longest ago) decode together, numpy's greedy tokens for each, then the last two again alone, the last first (the slot used longer ago holds the
   # other), each in the slot that holds it already, so a token of each is prefilled and the rest come from the cache:
   # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
@@ -1801,7 +1802,7 @@ def test_serve(chip, tmp_path):
   together = [serve.Request(tok, p, 6, 0) for p in prompts]
   for r in together: engine.waiting.put(r)
   together = [done(r) for r in together]
-  def greedy(prompt, n):  # numpy's tokens for the same prompt, as test/llama.py decodes
+  def greedy(prompt, n):  # numpy's tokens for the same prompt, as models/llama.py decodes
     kv, ids = llama.kv_cache(c, 64, np.zeros), list(prompt)
     logits = llama.forward(ids, list(range(len(ids))), w, c, kv)[0]
     for i in range(n - 1): ids.append(int(logits.argmax())); logits = llama.forward(ids[-1:], [len(ids) - 1], w, c, kv)[0]
@@ -1893,7 +1894,7 @@ def test_fetch(tmp_path, monkeypatch):
 def test_llama_model(chip):
   # a Llama-family model's real weights (SmolLM-135M: 30 blocks, grouped-query attention, tied embeddings): after "The
   # meaning of life is", the next token's 49152 logits against the same model in numpy (whose fp32 version matches Hugging
-  # Face's to 2e-5), then a token decoded with the KV cache. About a minute on ttsim; test/llama.py generates text
+  # Face's to 2e-5), then a token decoded with the KV cache. About a minute on ttsim; models/llama.py generates text
   rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
   c, weights = llama.load(os.environ["LLAMA"])
   w, t = llama.arrays(weights), llama.upload(rt, weights)

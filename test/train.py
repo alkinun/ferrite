@@ -1,4 +1,4 @@
-# A small GPT trained on ferrite: GPT-2's blocks (test/gpt2.py), tiny, in fp32, learning ferrite's own README and
+# A small GPT trained on ferrite: GPT-2's blocks (models/gpt2.py), tiny, in fp32, learning ferrite's own README and
 # LESSONS a character at a time with Adam, checked against PyTorch two ways: every step's loss and gradients against
 # PyTorch's on ferrite's own weights (each step is right), and the loss curve against PyTorch training the same model on
 # the same text from the same weights by itself (the two runs drift apart, as any two fp32 runs do: see train()).
@@ -6,7 +6,7 @@
 import math, os, sys, time
 from types import SimpleNamespace
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.join(os.path.dirname(__file__), "..", "models")]
 from ferrite import tensor
 from ferrite.tensor import Tensor
 import gpt2

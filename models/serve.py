@@ -2,7 +2,7 @@
 # that decodes together: each sequence has a slot of one KV cache, and every step is one replayed call for all the
 # slots. A prompt goes to the free slot whose last sequence began the same way, so what they share (a system prompt, a
 # conversation so far) is not prefilled again: a prefix cache with nothing to copy.
-#   TTSIM=/path/to/libttsim.so python3 test/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt]   # a folder or a model id
+#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt]   # a folder or a model id
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
 import json, os, queue, shutil, sys, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

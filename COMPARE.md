@@ -21,7 +21,7 @@ dispatching at no cost here). ferrite reads each input from DRAM about once, TT-
 ## End to end: SmolLM-135M
 
 The whole model, on the same simulator: Tenstorrent's own LLM code (tt-metal's `models/tt_transformers`, built and run
-as its `simple_text_demo` does, decode traced) against ferrite's (`test/llama.py`, decode replayed by `tensor.jit`).
+as its `simple_text_demo` does, decode traced) against ferrite's (`models/llama.py`, decode replayed by `tensor.jit`).
 Both prefill "The meaning of life is" (SmolLM's ids 504 2455 282 1029 314), then decode a token at a time from a KV
 cache, and both write the same tokens, " a question that has been".
 
