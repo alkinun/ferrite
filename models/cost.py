@@ -16,13 +16,14 @@ BYTES = {"bf16": 2.0, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}  # a value's, wit
 MODES = {"bf16": {}, "bfp8": {"*": "bfp8"},  # each kind of matrix's format, Tenstorrent's performance precision's, and with
          "bfp4": {"*": "bfp8", "gate_up": "bfp4"},  # every expert matrix in bfp4 (Qwen3.6 on a card). The embedding stays
          "experts": {"*": "bfp8", "gate_up": "bfp4", "down": "bfp4"}}  # bf16 (a token's row is gathered), and so do the routers
-LAUNCHES = {"attention": 12, "experts": 18, "deltanet": 27, "deltanet verify": 65, "rest": 11, "draft": 45}  # a decode step's
+LAUNCHES = {"attention": 12, "experts": 18, "deltanet": 27, "deltanet verify": 57, "rest": 11, "draft": 45}  # a decode step's
 # for several slots: an attention block's (with its norms), a mixture of experts' more, a Gated DeltaNet block's (and one
 # taking a token and a draft at once), the rest (the embedding's gather, the step's masks, the final norm and the output
 # layer), the multi-token prediction layer's call. Counted on ttsim at Qwen3.6's shapes, four slots (cmp/qwen36/launches.py).
-CONTROL = {"deltanet": (17600, 17400), "attention": (17900, 11100), "rest": (3500, 1200)}  # a decode step's RISC-V work as ttsim
-# counts it, in cycles: a Gated DeltaNet block's (with its experts), an attention block's (with its experts), the rest's,
-# so many and so many more a token (cmp/qwen36/control.py at Qwen3.6's shapes, one slot and eight: its moves, most of it)
+CONTROL = {"deltanet": (17600, 17400), "attention": (17900, 11100), "rest": (3500, 1200),  # a decode step's RISC-V work as
+           "deltanet verify": (43300, 19200), "attention verify": (31500, 9800), "rest verify": (6100, 800)}  # ttsim counts it,
+# and a verify step's: a Gated DeltaNet block's (with its experts), an attention block's (with its experts), the rest's, so
+# many cycles and so many more a token (cmp/qwen36/control.py at Qwen3.6's shapes, one slot and eight: moves, most of it)
 WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 banks of 4 GiB, a GiB of it for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # its 512 GB/s, and the share of it a decode step reaches (a guess)
@@ -81,8 +82,8 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   linear = sum(llama.linear(c, l) for l in range(c.layers))
   launches = (c.layers - linear) * LAUNCHES["attention"] + linear * LAUNCHES["deltanet verify" if speculative else "deltanet"]
   launches += s.moe * LAUNCHES["experts"] + LAUNCHES["rest"]
-  cycles = lambda kind, blocks: blocks * (CONTROL[kind][0] + CONTROL[kind][1] * n)
-  control = (cycles("attention", c.layers - linear) + cycles("deltanet", linear) + cycles("rest", 1)) / bh.AICLK
+  cycles = lambda kind, blocks: blocks * (lambda a, b: a + b * n)(*CONTROL[kind + " verify" if speculative else kind])
+  control = (cycles("attention", c.layers - linear + c.mtp * speculative) + cycles("deltanet", linear) + cycles("rest", 1 + speculative)) / bh.AICLK
   if speculative:  # the drafting call: the layer over two places a user, and the output layer again
     reads += s.draft + c.mtp * touched(2 * users) * s.expert + c.vocab * d * BYTES["bfp8"] + 2 * users * one.draft
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)

@@ -138,35 +138,38 @@ def delta(h, p, c, state, phases, live=None, accept=None):
     past, S = f.now(state[2] + accept.reshape(1, seqs, 1) * (past - state[2])), f.now(state[3] + f.repeat(a, c.vh) * (S - state[3]))
   x = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32")
   keep = lambda old, new: new if live is None else old + cols * (new - old)
-  if m == 1 and not isinstance(state[0], Row):  # a token of each: the conv over each place's inputs where they lie (its
-    y = f.now(sum((past[j:j + 1, :, :] * taps[j:j + 1, :, :] for j in range(c.conv - 1)), x[:, :width] * taps[c.conv - 1:, :, :]))
-    for j in range(c.conv - 1):  # sequences' rows, as x's), then each place's the next's, in turn: none written over unread
-      f.assign(state[0][j:j + 1, :, :], keep(state[0][j:j + 1, :, :], past[j + 1:j + 2, :, :] if j < c.conv - 2 else x[:, :width]))
-  else:
+  big = lambda old, new: new if live is None else old + f.repeat(live, c.vh) * (new - old)
+  unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # each head's query and key to length 1
+  def pieces(x, y, mm):  # q, k, v, beta and g of mm tokens of each sequence (x's and the conv's y), a batch entry a sequence's head
+    def each(t, d):  # (tokens, heads of d side by side) as (a sequence's heads, its tokens, d)
+      if mm == 1 and seqs > 1: return t.reshape(seqs * t.shape[-1] // d, 1, d)
+      heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
+      return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, mm * d)).reshape(seqs * heads.shape[0], mm, d)
+    q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))  # a key head for r value heads
+    b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
+    g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus, each head's log decay
+    return q, k, each(y[:, 2 * qk:], c.vd), f.sigmoid(each(b, 1)), g
+  if (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
+    # A decode step's token, or a verify step's token and then its draft, each as a decode step's: the conv over each
+    # place's inputs where they lie (its sequences' rows, as x's), then each place's inputs the next's, in turn (none
+    # written over unread); q and k as columns, each transposed before it is repeated; a first token's states kept apart
+    out, conv = [], past
+    for i in range(m):
+      xi, into = x[i::m, :], state[:2] if i == m - 1 else state[2:]
+      y = f.now(sum((conv[j:j + 1, :, :] * taps[j:j + 1, :, :] for j in range(c.conv - 1)), xi[:, :width] * taps[c.conv - 1:, :, :]))
+      for j in range(c.conv - 1):
+        f.assign(into[0][j:j + 1, :, :], keep(into[0][j:j + 1, :, :], conv[j + 1:j + 2, :, :] if j < c.conv - 2 else xi[:, :width]))
+      q, k, v, beta, g = pieces(xi, f.silu(y).reshape(seqs, width), 1)
+      o, S2 = step(f.repeat(f.t(q), r), f.repeat(f.t(k), r), v, beta, g, S)
+      out.append(f.now(o))  # read from S before S is written over
+      f.assign(into[1], big(into[1], S2))
+      conv, S = into
+  else:  # a prompt's tokens (or a sequence's own, of several's), a chunk of at most 64 at a time
     rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))  # each sequence's conv inputs: the last ones, then
     y = sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))  # this call's, computed before the last are written over
     f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
     if accept is not None: f.assign(state[2], keep(state[2], f.swap(rows[:, 1:c.conv, :])))
-  y = f.silu(y).reshape(n, width)
-  def each(t, d):  # (tokens, heads of d side by side) as (a sequence's heads, its tokens, d): a batch entry a head
-    if m == 1 and seqs > 1: return t.reshape(seqs * t.shape[-1] // d, 1, d)
-    heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
-    return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, m * d)).reshape(seqs * heads.shape[0], m, d)
-  unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # each head's query and key to length 1
-  q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))  # a key head for r value heads
-  v, zba = each(y[:, 2 * qk:], c.vd), x[:, width:]
-  z, b, a = zba[:, :vw], zba[:, vw:vw + c.vh], zba[:, vw + c.vh:] + p["dt_bias"]
-  g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus, each head's log decay
-  beta, big = f.sigmoid(each(b, 1)), lambda old, new: new if live is None else old + f.repeat(live, c.vh) * (new - old)
-  if m <= 2:  # a decode step's token, or a verify step's token and its draft: one at a time, q and k as columns (each
-    out = []  # transposed before it is repeated)
-    for i in range(m):
-      o, S2 = step(*(f.repeat(f.t(t[:, i:i + 1, :]), r) for t in (q, k)), *(t[:, i:i + 1, :] for t in (v, beta, g)), S)
-      out.append(f.now(o))  # read from S before S is written over
-      if i == 0 and accept is not None: f.assign(state[3], big(state[3], S2))  # (after the first token alone)
-      if i < m - 1: S = state[3] if accept is not None else f.now(S2)
-    f.assign(state[1], big(state[1], S2))
-  else:
+    q, k, v, beta, g = pieces(x, f.silu(y).reshape(n, width), m)
     q, k, out = f.repeat(q, r), f.repeat(k, r), []
     for s in range(0, m, 64):
       o, S2, S1 = chunk(*(t[:, s:s + 64, :] for t in (q, k, v, beta, g)), S)
@@ -176,7 +179,7 @@ def delta(h, p, c, state, phases, live=None, accept=None):
       S = state[1]
   o = out[0] if len(out) == 1 else f.cat(*out)  # each head's tokens again
   o = o if seqs == 1 else f.split(o.reshape(n, vw), c.vh) if m == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
-  o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(z, c.vh))  # each head RMS-normed and gated by z
+  o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(x[:, width:width + vw], c.vh))  # each head RMS-normed and gated by z
   return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"))
 
 def step(q, k, v, beta, g, S):
