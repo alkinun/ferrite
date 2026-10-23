@@ -1167,46 +1167,50 @@ void kmain(volatile unsigned *a) {{
 def topk_kernel(k, cols):
   """Each row's k largest of its cols (at most 256) and their columns, the first of equals first, args [first unit,
   units, the values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows].
-  BRISC alone, a unit one tile row of x: its tiles come in, and each row is scanned once, its k best so far kept in
-  order, each new one larger than the last moving up past the smaller ones (an equal one stays behind, so the first of
-  equals comes first). bf16 compares as an integer once its sign orders it (negatives flipped, -0 as 0). The values' tile (bf16) and
-  the indices' (int32) are written whole: zeros past the rows and the k columns, but a dimension of 1 fills its tile
-  with copies, as every tensor's does."""
+  BRISC alone, a unit one row of a tile row of x, 32 to a tile row, so a decode step's few rows go to as many workers:
+  the tile row's tiles come in (once for a worker's units of it), and the row is scanned once, its k best so far kept
+  in order, each new one larger than the last moving up past the smaller ones (an equal one stays behind, so the first
+  of equals comes first). bf16 compares as an integer once its sign orders it (negatives flipped, -0 as 0). Each unit
+  writes its row of the values' tile (bf16) and the indices' (int32), both faces, zeros past the k columns and all
+  zeros past x's rows, so a tile is written whole by its 32 units and no two write the same bytes; but a dimension of
+  1 fills its tile with copies, as every tensor's does (k of 1 the row with its column, one row of x every row)."""
   ct = -(-cols // 32)
   return compile_kernel(f"""
 #define X {DATA:#x}
 #define VALUES {DATA + ct * 2048:#x}
-#define IDS {DATA + (ct + 1) * 2048:#x}
+#define IDS {DATA + ct * 2048 + 64:#x}
 {ROWS}
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
 static unsigned key(unsigned v) {{ return v == 0x8000 ? 0x8000 : v & 0x8000 ? 0xFFFF & ~v : v | 0x8000; }}  // bf16's order
 void kmain(volatile unsigned *a) {{
   unsigned short *x = (unsigned short *)X;
-  volatile unsigned short *values = (volatile unsigned short *)VALUES;
-  volatile unsigned *ids = (volatile unsigned *)IDS;
-  unsigned rows = a[8], tr = (rows + 31) / 32;
+  volatile unsigned short *values = (volatile unsigned short *)VALUES;  // this unit's row of each tile: its 16 in the left
+  volatile unsigned *ids = (volatile unsigned *)IDS;                   // face, then its 16 in the right
+  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u;
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned t = a[0] + u, first = t / tr * a[5] + t % tr * a[6] + a[7];  // x's tile row t % tr of matrix t / tr
-    for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, 2048), X + j * 2048, 2048);
-    copy({ZEROS:#x}, VALUES, 2048), copy({ZEROS:#x}, IDS, 4096);  // zeros past the rows and the k columns
-    noc_wait();
-    unsigned n = rows == 1 ? 1 : rows - t % tr * 32 < 32 ? rows - t % tr * 32 : 32;  // x's rows in this tile row
-    for (unsigned r = 0; r < n; r++) {{  // its k best so far, in order
-      unsigned top[{k}], col[{k}], kept = 0;
+    unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, first = t / tr * a[5] + t % tr * a[6] + a[7];  // row r of x's tile row t % tr of matrix t / tr
+    unsigned n = rows == 1 ? 1 : rows - t % tr * 32 < 32 ? rows - t % tr * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here; the row r holds
+    for (unsigned c = 0; c < 32; c++) values[c] = 0, ids[c] = 0;
+    if (s < n) {{
+      if (t != held) {{
+        for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, 2048), X + j * 2048, 2048);
+        noc_wait();
+        held = t;
+      }}
+      unsigned top[{k}], col[{k}], kept = 0;  // its k best so far, in order
       for (unsigned c = 0; c < {cols}; c++) {{
-        unsigned v = key(x[c / 32 * 1024 + at(r, c % 32)]);
+        unsigned v = key(x[c / 32 * 1024 + at(s, c % 32)]);
         if (kept == {k} && v <= top[{k} - 1]) continue;  // no better than the last kept (an equal one, later, stays behind)
         unsigned i = kept < {k} ? kept++ : {k} - 1;
         for (; i > 0 && top[i - 1] < v; i--) top[i] = top[i - 1], col[i] = col[i - 1];
         top[i] = v, col[i] = c;
       }}
-      for (unsigned j = 0; j < {k}; j++) values[at(r, j)] = x[col[j] / 32 * 1024 + at(r, col[j] % 32)], ids[at(r, j)] = col[j];
+      for (unsigned j = 0; j < {k}; j++) values[j] = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], ids[j] = col[j];
+      for (unsigned c = 1; {k} == 1 && c < 32; c++) values[c] = values[0], ids[c] = ids[0];  // (k of 1: copies along the row)
     }}
-    for (unsigned r = 0; {k} == 1 && r < n; r++)  // k of 1 fills the tile with copies of its column, one row of x with copies of its row
-      for (unsigned c = 1; c < 32; c++) values[at(r, c)] = values[at(r, 0)], ids[at(r, c)] = ids[at(r, 0)];
-    if (rows == 1) row_down(VALUES, 2), row_down(IDS, 4);
-    noc_write(VALUES, BANK(t), AT(a[2], t, 2048), 2048);
-    noc_write(IDS, BANK(t), AT(a[3], t, 4096), 4096);
+    unsigned face = r / 16 * 512 + r % 16 * 16;  // the row's run in the left face, in datums; the right face's 256 on
+    noc_write(VALUES, BANK(t), AT(a[2], t, 2048) + face * 2, 32), noc_write(VALUES + 32, BANK(t), AT(a[2], t, 2048) + (face + 256) * 2, 32);
+    noc_write(IDS, BANK(t), AT(a[3], t, 4096) + face * 4, 64), noc_write(IDS + 64, BANK(t), AT(a[3], t, 4096) + (face + 256) * 4, 64);
     noc_wait();
   }}
 }}""")
