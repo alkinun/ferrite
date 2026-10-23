@@ -1500,15 +1500,16 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows, then the
   labels' address, tile strides and offset]. BRISC alone, a unit one row of a tile row of a part of x, 32 to a tile
   row, so a decode step's few rows go to as many workers: the part's tile row comes in (once for a worker's units of
-  it), and the row is scanned once, its k best so far kept in order, each new one larger than the last moving up past
-  the smaller ones (an equal one stays behind, so the first of equals comes first). bf16 or fp32 compares as an integer
-  once its sign orders it (negatives flipped, -0 as 0). parts: each row cut into so many parts of cols columns, whole
-  tiles, each part's k best side by side in the results ((batch, rows, parts k)), each index its column in the whole
-  row. labels: each index taken from an int32 tensor of x's shape at the column picked, read 64 bytes about it (a part's
-  best indices, for a topk over the parts' best). Each unit writes its row of each of the results' tiles (bf16 or fp32,
-  and int32), both faces, zeros past the k columns and all zeros past x's rows, so a tile is written whole by its 32
-  units and no two write the same bytes; but a dimension of 1 fills its tile with copies, as every tensor's does (one
-  k of 1 the row with its column, one row of x every row)."""
+  it), and the row is scanned once, run by run, its k best so far a heap with the worst at its root (of equal values,
+  the later column), which a better value replaces: once the worst is a float of no sign, a value is checked against it
+  as a signed integer, else by its key (bf16 or fp32 as an unsigned integer once its sign orders it, negatives flipped,
+  -0 as 0); then sorted, best first. parts: each row cut into so many parts of cols columns, whole tiles, each part's k
+  best side by side in the results ((batch, rows, parts k)), each index its column in the whole row. labels: each index
+  taken from an int32 tensor of x's shape at the column picked, read 64 bytes about it (a part's best indices, for a
+  topk over the parts' best). Each unit writes its row of each of the results' tiles (bf16 or fp32, and int32), both
+  faces, zeros past the k columns and all zeros past x's rows, so a tile is written whole by its 32 units and no two
+  write the same bytes; but a dimension of 1 fills its tile with copies, as every tensor's does (one k of 1 the row with
+  its column, one row of x every row)."""
   ct, kt, item, bits = -(-cols // 32), -(-k // 32), ITEMSIZE[dtype], 8 * ITEMSIZE[dtype]  # x's tiles a part, the results' a part
   tb = 1024 * item
   assert parts == 1 or (k % 32 == 0 and cols % 32 == 0), "parts of whole tiles, side by side in whole tiles"
@@ -1520,7 +1521,20 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
 #define LABELS {DATA + ct * tb + tb + 4096:#x}
 {ROWS}
 typedef {"unsigned short" if item == 2 else "unsigned"} datum;
+typedef {"short" if item == 2 else "int"} signed_datum;
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
+// The k best so far as a heap, the worst at the root (of equal keys, the later column), so a better value takes its place
+static int worse(const unsigned *top, const unsigned *col, unsigned i, unsigned j) {{ return top[i] < top[j] || (top[i] == top[j] && col[i] > col[j]); }}
+static void swap(unsigned *top, unsigned *col, unsigned i, unsigned j) {{ unsigned t = top[i], c = col[i]; top[i] = top[j], col[i] = col[j], top[j] = t, col[j] = c; }}
+static void down(unsigned *top, unsigned *col, unsigned i, unsigned n) {{
+  for (unsigned m = i;; i = m) {{
+    unsigned l = 2 * i + 1;
+    if (l < n && worse(top, col, l, m)) m = l;
+    if (l + 1 < n && worse(top, col, l + 1, m)) m = l + 1;
+    if (m == i) return;
+    swap(top, col, i, m);
+  }}
+}}
 static unsigned key(unsigned v) {{  // the order of the floats, as unsigned integers
   const unsigned sign = 1u << {bits - 1}, all = {(1 << bits) - 1:#x};
   return v == sign ? sign : v & sign ? all & ~v : v | sign;
@@ -1541,13 +1555,21 @@ void kmain(volatile unsigned *a) {{
         noc_wait();
         held = t;
       }}
-      for (unsigned c = 0; c < {cols}; c++) {{
-        unsigned v = key(x[c / 32 * 1024 + at(s, c % 32)]);
-        if (kept == {k} && v <= top[{k} - 1]) continue;  // no better than the last kept (an equal one, later, stays behind)
-        unsigned j = kept < {k} ? kept++ : {k} - 1;
-        for (; j > 0 && top[j - 1] < v; j--) top[j] = top[j - 1], col[j] = col[j - 1];
-        top[j] = v, col[j] = c;
+      const signed_datum *row = (const signed_datum *)x + (s / 16 * 2) * 256 + s % 16 * 16;  // its run of 16 in face 0 of tile 0
+      unsigned last = 0;  // the worst kept's key, and while it is a float of no sign, its bits: a later value is no better
+      int raw = -1;       // than it unless above it as a signed integer, one compare where the key takes four
+      for (unsigned c0 = 0; c0 < {cols}; c0 += 16) {{  // the row's run of 16 in each face of each tile, in order
+        const signed_datum *run = row + c0 / 32 * 1024 + c0 % 32 / 16 * 256;
+        for (unsigned c = c0, end = c0 + 16 < {cols} ? c0 + 16 : {cols}; c < end; c++) {{
+          signed_datum d = run[c - c0];
+          if (kept == {k} && (raw >= 0 ? d <= raw : key((datum)d) <= last)) continue;  // no better than the worst kept
+          unsigned v = key((datum)d), i;
+          if (kept < {k}) for (top[i = kept++] = v, col[i] = c; i && worse(top, col, i, (i - 1) / 2); i = (i - 1) / 2) swap(top, col, i, (i - 1) / 2);
+          else top[0] = v, col[0] = c, down(top, col, 0, {k});  // (it takes the worst's place)
+          if (kept == {k}) last = top[0], raw = last >= {1 << (bits - 1):#x}u ? (int)(last & {(1 << (bits - 1)) - 1:#x}) : -1;
+        }}
       }}
+      for (unsigned n = kept; n > 1; n--) swap(top, col, 0, n - 1), down(top, col, 0, n - 1);  // the worst to the end in turn: best first
       {f"""for (unsigned j = 0; j < {k}; j++) {{  // each pick's label: the 64 bytes about it
         unsigned c = col[j], lt = b * a[10] + i * a[11] + c / 32 + a[12], o = at(s, c % 32) * 4;
         noc_get(BANK(lt), AT(a[9], lt, 4096) + o / 64 * 64, LABELS + j * 64, 64);
