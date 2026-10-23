@@ -463,8 +463,10 @@ into one launch, except across a reshape. The kernel is BRISC alone: it fetches 
 slots, by tile number mod a prime), takes a whole tile by one NoC read where it can, and copies runs four datums at a
 time (bf16 two a word).
 
-**Rows by index.** `gather(ids)` copies rows out of a table (the embedding); `put(ids, rows)` writes rows into a tensor
-in place, a unit per row put (a KV cache's token at its place, the place data rather than a shape).
+**Rows by index.** `gather(ids)` copies rows out of a table (the embedding), a result tile's 64 runs read as 64-byte
+blocks all in flight before one wait; `put(ids, rows)` writes rows into a tensor in place, a unit per row put (a KV
+cache's token at its place, the place data rather than a shape). A NoC read's latency, which ttsim hides, is then paid
+once a tile rather than once a run.
 
 ### Dtypes
 

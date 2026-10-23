@@ -1429,33 +1429,32 @@ def gather_kernel(dtype):
   result's tile columns, rows, the int32 row of their indices' address and tile offset]. BRISC alone: for each result
   tile, the indices' tile in, then each row's two 16-datum runs (left and right face) from wherever that row sits in
   the tensor's tiles. A NoC read from DRAM must keep its address's low 6 bits, so each run comes in as the 64-byte
-  block holding it and is copied into place from there. One row fills its tile: it comes in once and is doubled up
-  inside L1 by NoC copies from the tile to itself."""
+  block holding it, all of a tile's in flight at once, and is copied into place from there. One row fills its tile: it
+  comes in once and is doubled up inside L1 by NoC copies from the tile to itself."""
   tb, fb, run = tile_bytes(dtype), tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a tile, a face, a face's row
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
-#define BLOCK {DATA + tb:#x}
-#define IDS {DATA + tb + 64:#x}
+#define IDS {DATA + tb:#x}
+#define BLOCKS {DATA + tb + 4096:#x}
 {ROWS}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // index r of this tile's 32, in row 0
+static unsigned place(unsigned n, unsigned f) {{ return (n % 32 / 16 * 2 + f) * {fb} + n % 16 * {run}; }}  // row n's run in face f, in its tile
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] == 1 ? 1 : 32, it = a[9] + i;  // it: the indices' tile
+    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] - i * 32 < 32 ? a[7] - i * 32 : 32, it = a[9] + i;  // it: the indices' tile
     noc_get(BANK(it), AT(a[8], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")});
     copy({ZEROS:#x}, SLOT, {tb});  // the rows past the end stay zero
     noc_wait();
-    for (unsigned r = 0; r < rows; r++) {{
-      unsigned row = i * 32 + r;
-      for (unsigned face = r / 16 * 2; face < r / 16 * 2 + 2; face++) {{
-        volatile unsigned *to = (volatile unsigned *)(SLOT + face * {fb} + r % 16 * {run});
-        if (row >= a[7]) continue;
-        unsigned n = id(r), from = n / 32 * a[4] + j + a[5], at = (n % 32 / 16 * 2 + face % 2) * {fb} + n % 16 * {run};
-        noc_get(BANK(from), AT(a[3], from, {tb}) + at / 64 * 64, BLOCK, 64);
-        noc_wait();
-        for (unsigned k = 0; k < {run // 4}; k++) to[k] = ((volatile unsigned *)(BLOCK + at % 64))[k];
-      }}
+    for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{  // row r's run in face f: its block into BLOCKS's 2 r + f
+      unsigned n = id(r), from = n / 32 * a[4] + j + a[5];
+      noc_get(BANK(from), AT(a[3], from, {tb}) + place(n, f) / 64 * 64, BLOCKS + (2 * r + f) * 64, 64);
     }}
-    if (rows == 1) row_down(SLOT, {ITEMSIZE[dtype]});
+    noc_wait();
+    for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{
+      volatile unsigned *to = (volatile unsigned *)(SLOT + (r / 16 * 2 + f) * {fb} + r % 16 * {run}), *by = (volatile unsigned *)(BLOCKS + (2 * r + f) * 64 + place(id(r), f) % 64);
+      for (unsigned k = 0; k < {run // 4}; k++) to[k] = by[k];
+    }}
+    if (a[7] == 1) row_down(SLOT, {ITEMSIZE[dtype]});
     noc_write(SLOT, BANK(t), AT(a[2], t, {tb}), {tb});
     noc_wait();
   }}
@@ -1466,11 +1465,11 @@ def put_kernel(dtype):
   address, tile strides for batch and row, and tile offset, the int32 row of the n rows' places' address and tile offset,
   n, the tensor's tile columns and tile rows]. BRISC alone: a unit is a row of x in one of the tensor's matrices and tile
   columns, so the work goes as the rows put, not as the tensor's tiles. Each worker reads the places (32 to a tile) and
-  chains the rows that land in each tile row, first to last; the unit of a tile row's first row reads its tile once,
-  each row's tile of x once for every row in it, copies the rows' two runs (left and right face) in order, so a later
-  row to the same place stays, and writes the tile back: no two workers write one tile. 32 rows that fill a tile in
-  order (a prompt's, from a tile's first place) make it their tile of x as it is. A place past the tensor's rows is left
-  out.
+  chains the rows that land in each tile row, first to last; the unit of a tile row's first row reads its tile once
+  (in flight with its first row's tile of x), each row's tile of x once for every row in it, copies the rows' two runs
+  (left and right face) in order, so a later row to the same place stays, and writes the tile back: no two workers
+  write one tile. 32 rows that fill a tile in order (a prompt's, from a tile's first place) make it their tile of x as
+  it is. A place past the tensor's rows is left out.
   Into a block float (a KV cache in bfp8 or bfp4), x is bf16 and each run of 16 is rounded as a cast rounds it: to its
   largest exponent, bfp8's 7 bits of magnitude half up (as the packer does), bfp4's 3 to the nearest (as bfp4_kernel
   does), a 0 without its sign (which the unpacker would read as -inf)."""
@@ -1525,11 +1524,12 @@ void kmain(volatile unsigned *a) {{
     unsigned to = b * a[3] + ti * a[4] + j + a[5], held = ~0u, whole = i0 % 32 == 0 && i0 + 32 <= n;
     for (unsigned k = 0; whole && k < 32; k++) whole = place[i0 + k] == 32 * ti + k;
     if (whole) {{ unsigned from = b * a[7] + i0 / 32 * a[8] + j + a[9]; {whole} }}
-    else {{ noc_get(BANK(to), AT(a[2], to, {t}), TILE, {t}); noc_wait(); }}
+    else noc_get(BANK(to), AT(a[2], to, {t}), TILE, {t});  // (in flight with the first row's tile of x)
     for (unsigned i = i0; i != ~0u; i = next[i]) {{
       if (whole && i < i0 + 32) continue;
       unsigned r = place[i], from = b * a[7] + i / 32 * a[8] + j + a[9];
-      if (from != held) {{ noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}); noc_wait(); held = from; }}
+      if (from != held) noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}), held = from;
+      noc_wait();
       {copy}
     }}
     noc_write(TILE, BANK(to), AT(a[2], to, {t}), {t});
