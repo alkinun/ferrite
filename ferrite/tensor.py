@@ -452,20 +452,25 @@ class Tensor:
     out.fidelity = fidelity
     return out
 
-  def attend(self, k, v, mask, fidelity=None):
+  def attend(self, k, v, mask, places, window=0, fidelity=None):
     """softmax(self @ k^T + mask) @ v, attention, by one kernel whose scores never leave the chip (attention_kernel):
     self a batch of queries (bf16), k and v the keys and values for each (bf16 or a block float: a KV cache; a repeat
-    read in place, a matrix for each of its rep), the mask (a batch of 1 or of self's) as wide as k is long. The kernel
+    read in place, a matrix for each of its rep), the mask (a batch of 1 or of self's) as wide as k is long, and places
+    (int32, a column: each row's last key; with a window, its first window - 1 before) where the mask may be other than
+    0: the kernel reads the keys the places reach, and the mask only where some row sees a tile of keys in part. It
     gives p v in fp32 with each row's sum of p beside it; one over the other, cast to bf16, is the result. No gradient."""
-    ht, kt, ra, rep = -(-self.cols // 32), -(-k.rows // 32), -(-self.rows // 32), k.rep
+    ht, kt, rep = -(-self.cols // 32), -(-k.rows // 32), k.rep
     assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
     assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows == mask.cols
-    assert mask.rows == self.rows and mask.batch in (1, self.batch) and mask.dtype == "bf16", f"{self.shape} by {k.shape}, {mask.shape}"
-    q, mask, wt, phases = _plain(self.realize()), _plain(mask.realize()), k.dtype if k.dtype in BFP else None, fidelity or FIDELITY
+    assert mask.rows == places.rows == self.rows and mask.batch in (1, self.batch) and places.batch in (1, self.batch) and places.cols == 1
+    assert mask.dtype == "bf16" and places.dtype == "int32", f"{self.shape} by {k.shape}, {mask.shape} {mask.dtype}, {places.shape} {places.dtype}"
+    q, mask, places = (_plain(t.realize()) for t in (self, mask, places))
+    wt, phases, edge = k.dtype if k.dtype in BFP else None, fidelity or FIDELITY, k.rows % 32
     k, v = k.realize(), v.realize()
     out = Tensor(self.rt, self.rows, self.cols + 1, batch=self.batch, dtype="fp32")
-    out._run(_cached(("attend", ht, kt, ra, rep, wt, phases, k.rows % 32), lambda: attention_kernel(ht, kt, ra, rep, wt, phases, k.rows % 32)),
-             *out._where(), *q._where(), *k._where(), *v._where(), *mask._where(), units=self.batch * -(-ra // 2), name="attention")
+    key = ("attend", ht, kt, self.rows, rep, wt, phases, edge, window)
+    out._run(_cached(key, lambda: attention_kernel(*key[1:])), *out._where(), *q._where(), *k._where(), *v._where(), *mask._where(),
+             *places._where(), units=self.batch * -(-self.rows // 256), name="attention")
     sums = out._view(out.rows, 1, out.batch, ht, out.bstride)  # each row's, in all 32 columns of its tile: a column as it lies
     return (out[:, :, :self.cols] / sums).cast("bf16")
 

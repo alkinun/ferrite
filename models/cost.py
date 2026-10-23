@@ -20,8 +20,8 @@ LAUNCHES = {"attention": 13, "experts": 18, "deltanet": 27, "deltanet verify": 5
 # for several slots: an attention block's (with its norms), a mixture of experts' more, a Gated DeltaNet block's (and one
 # taking a token and a draft at once), the rest (the embedding's gather, the step's masks, the final norm and the output
 # layer), the multi-token prediction layer's call. Counted on ttsim at Qwen3.6's shapes, four slots (cmp/qwen36/launches.py).
-CONTROL = {"deltanet": (20600, 12400), "attention": (18300, 7600), "rest": (2900, 1200),  # a decode step's RISC-V work as
-           "deltanet verify": (44200, 13600), "attention verify": (30400, 6400), "rest verify": (6100, 800)}  # ttsim counts it,
+CONTROL = {"deltanet": (20600, 12400), "attention": (18400, 7600), "rest": (2900, 1200),  # a decode step's RISC-V work as
+           "deltanet verify": (44200, 13600), "attention verify": (30500, 6400), "rest verify": (6100, 800)}  # ttsim counts it,
 # and a verify step's: a Gated DeltaNet block's (with its experts), an attention block's (with its experts), the rest's, so
 # many cycles and so many more a token (cmp/qwen36/control.py at Qwen3.6's shapes, one slot and eight: moves, most of it)
 WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
@@ -71,12 +71,13 @@ def session(c, use, speculative=False):
 
 def touched(c, tokens): return c.experts * (1 - (1 - c.k / c.experts) ** tokens) if c.experts else 0  # a block's experts some token picks
 
-def attention(c, entries, queries, rows, kv):  # the bytes an attention block reads, as ferrite's kernel reads them
-  # (Tensor.attend): for every two tile rows of 32 queries of each of `entries` heads (or key heads, a token's query heads
-  # side by side), its head's keys twice (a sweep for each row's largest, one for the rest) and its values once; and for
-  # each tile row the mask's tiles twice
+def attention(c, entries, queries, rows, kv, span=1):  # the bytes an attention block reads, as ferrite's kernel reads
+  # them (Tensor.attend): for every eight tile rows of 32 queries of each of `entries` heads (or key heads, a token's
+  # query heads side by side), its head's keys twice (a sweep for each row's largest, one for the rest) and its values
+  # once; and for each tile row, twice, the mask's tiles some row sees in part: those of the `span` places a unit's
+  # queries are at
   tiles = -(-queries // 32)
-  return entries * (-(-tiles // 2) * 3 * rows * llama.head(c) * BYTES[kv] + tiles * 2 * -(-rows // 32) * 2048)
+  return entries * (-(-tiles // 8) * 3 * rows * llama.head(c) * BYTES[kv] + tiles * 2 * (-(-span // 32) + (span > 1)) * 2048)
 
 def step(c, s, use, card, users, speculative=False, cards=1):
   """A decode step for `users` sessions at once, a token each, or a token and a draft each then the next drafts (two
@@ -86,7 +87,7 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   n, one, d = users * (1 + speculative), session(c, use, speculative), c.dim
   blocks = sum(not llama.linear(c, l) for l in range(c.layers))
   reads = s.every + s.moe * touched(c, n) * s.expert + users * one.state * (1.5 if speculative else 1)  # states read and written, twice
-  reads += blocks * attention(c, c.kv * users, c.heads // c.kv * (1 + speculative), use["context"], use["kv"])  # when speculating
+  reads += blocks * attention(c, c.kv * users, c.heads // c.kv * (1 + speculative), use["context"], use["kv"], 1 + speculative)  # when speculating
   flops = 2 * n * s.values + n * sum(4 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))
   linear = sum(llama.linear(c, l) for l in range(c.layers))
   launches = (c.layers - linear) * LAUNCHES["attention"] + linear * LAUNCHES["deltanet verify" if speculative else "deltanet"]
@@ -95,7 +96,7 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   control = (cycles("attention", c.layers - linear + c.mtp * speculative) + cycles("deltanet", linear) + cycles("rest", 1 + speculative)) / bh.AICLK
   if speculative:  # the drafting call: the layer over two places a user, and the output layer again
     reads += s.draft + c.mtp * touched(c, 2 * users) * s.expert + c.vocab * d * BYTES["bfp8"]
-    reads += c.mtp * attention(c, c.kv * users, 2 * c.heads // c.kv, use["context"], use["kv"])
+    reads += c.mtp * attention(c, c.kv * users, 2 * c.heads // c.kv, use["context"], use["kv"], 2)
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)
     launches += LAUNCHES["draft"]
   seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + max(launches * card["launch"], control)
@@ -104,7 +105,7 @@ def step(c, s, use, card, users, speculative=False, cards=1):
 def prompt(c, s, use, card, chunk, cards=1):
   """A prompt that fills a session (use's context), prefilled chunk tokens at a time as serve.py's engine takes it: each
   chunk reads every matrix but the experts and the embedding, the experts its tokens pick, and its session's rows up to
-  the power of 2 that holds its last place (`attention`: a key head's for every two tile rows of 32 queries of each of
+  the power of 2 that holds its last place (`attention`: a key head's for every eight tile rows of 32 queries of each of
   its query heads), and computes its tokens' matmuls (the output layer's for its last alone) and their scores over those
   rows; with a multi-token prediction layer, that layer's over each place too. Its seconds (each chunk waiting on DRAM
   or on the matmuls, whichever is longer; launches and control left out) and tokens/s."""
@@ -114,7 +115,7 @@ def prompt(c, s, use, card, chunk, cards=1):
   for at in range(0, n, chunk):
     m = min(chunk, n - at)
     rows = min(n, 1 << max(5, (at + m - 1).bit_length()))
-    reads = s.every + s.moe * touched(c, m) * s.expert + blocks * attention(c, c.heads, m, rows, use["kv"])
+    reads = s.every + s.moe * touched(c, m) * s.expert + blocks * attention(c, c.heads, m, rows, use["kv"], min(m, 256))
     flops = 2 * m * (s.values - c.vocab * d) + 2 * c.vocab * d + blocks * 4 * m * c.heads * hd * rows
     if c.mtp:
       reads += s.draft + c.mtp * touched(c, m) * s.expert + c.vocab * d * BYTES["bfp8"]

@@ -142,6 +142,12 @@ first (NOTES, "Bring-up on a p150").
   shares its keys and values. At Qwen3.6's shapes a decode step's attention reads 1.7 times its cache rows where the
   softmax and the matmul read 2.5, with a fifth of the RISC-V work, and a prompt's chunk 59 times where they read 117
   (NOTES, "Attention").
+- [x] **Attention by places, a prompt's in units of eight tile rows**: each unit reads the tiles of keys its rows'
+  places reach, and the mask only where some row sees a tile in part, so each slot of a step reads its own rows however
+  long the others' are; a prompt's unit takes 256 queries of a head, their running maximums in L1 and their sums made
+  as products by a tile of ones. At Qwen3.6's shapes a decode step's attention reads 1.5 times its rows where 1.7, and
+  a prompt's chunk 17 times where 59; the cost model's eight users make 237 tokens/s a card where 224, and a 32K-token
+  prompt takes 2.1 s where 6.9 (NOTES, "Attention").
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the

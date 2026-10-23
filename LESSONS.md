@@ -262,6 +262,10 @@ append a correction.
     trips for them where the truth was the keys read again in each of the softmax's three passes and its result read
     once for each column tile of the next matmul. Each core's count of read responses (`NIU_READS`) settled it in one
     run at small sizes, and `test_attend` now counts the new kernel's reads exactly. (NOTES: "Attention")
+43. **Test the machine before blaming the code.** Failures that came only with heavy work beside them (gpt-oss's logits
+    wrong in two runs of six, one training readback wrong, a whole suite that died) fit a CPU that is unstable under
+    load: plain Python with no simulator segfaults on this host one run in five. A minute of the same work pinned to
+    each core, on the first day, would have said so. (NOTES: "Still unknown or untested")
 
 ## Working method
 

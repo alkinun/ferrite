@@ -620,31 +620,38 @@ def test_softmax_and_layernorm(chip):
       assert all(abs(gv - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for gv, v, gm, bt in zip(g, row, gamma, beta))
 
 def test_attend(chip):
-  # attention in one kernel (Tensor.attend), softmax(q k^T + mask) v against numpy's within 1%: several tile rows of
-  # queries, a key and value head serving two query heads (a repeat, read in place), 256-wide heads with a mask for all,
-  # a KV cache in bfp8, keys that end partway through a tile, three tile rows of queries (units of two and of one). Two
-  # launches, the attention and the division, and nothing read but the inputs: each unit (two tile rows of a head's
-  # queries) its query tiles, each key tile once a sweep (two), each value tile once, each mask tile twice
+  # attention in one kernel (Tensor.attend), softmax(q k^T + mask) v against numpy's within 1%, each row's mask hiding
+  # the keys past its place (and one case's those a window before it too): several tile rows of queries, a key and
+  # value head serving two query heads (a repeat, read in place), 256-wide heads with one mask for all, a KV cache in
+  # bfp8, keys that end partway through a tile, three tile rows of queries, a sliding window, ten tile rows (units of
+  # eight and of two). Two launches, the attention and the division, and nothing read but what the places reach: rows
+  # whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of keys twice (a
+  # sweep each) and of values once, and the mask's tiles only where some row sees a tile of keys in part, its last two,
+  # twice
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(43)
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
-  for e, rows, hd, keys, rep, fmt, mb in ((2, 40, 64, 64, 1, "bf16", 2), (4, 8, 64, 96, 2, "bf16", 4), (2, 33, 256, 128, 1, "bf16", 1),
-                                          (4, 8, 64, 64, 2, "bfp8", 4), (3, 70, 64, 40, 1, "bf16", 1)):
+  for e, rows, hd, keys, rep, fmt, shared, window, lo in ((2, 40, 64, 64, 1, "bf16", False, 0, 0), (4, 8, 64, 96, 2, "bf16", False, 0, 0),
+                                                          (2, 33, 256, 128, 1, "bf16", True, 0, 0), (4, 8, 64, 64, 2, "bfp8", False, 0, 0),
+                                                          (3, 70, 64, 40, 1, "bf16", True, 0, 0), (2, 40, 128, 200, 1, "bf16", False, 50, 60),
+                                                          (2, 8, 64, 256, 1, "bf16", False, 0, 200), (2, 300, 64, 320, 2, "bf16", True, 0, 0)):
     q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
-    mask = np.where(rng.random((mb, rows, keys)) < 0.3, np.float32(-1e9), np.float32(0))
+    places = rng.integers(lo, keys, (1 if shared else e, rows, 1))
+    mask = np.where((np.arange(keys) > places) | ((np.arange(keys) <= places - window) if window else False), np.float32(-1e9), np.float32(0))
     tq, tk, tv, tm = (Tensor.of(rt, x.tolist()) for x in (q, k, v, mask))
     if fmt != "bf16": (tk, tv), k, v = (x.cast(fmt).realize() for x in (tk, tv)), gpt2.bfp(k), gpt2.bfp(v)
     if rep > 1: tk, tv = tk.repeat_interleave(rep), tv.repeat_interleave(rep)
+    tp = Tensor.of(rt, places.tolist(), "int32")
     rt.wait()
     before, launches = reads(), rt.launches
-    out = tq.attend(tk, tv, tm).realize()
+    out = tq.attend(tk, tv, tm, tp, window).realize()
     rt.wait()
     read, got = reads() - before, value(out)
     s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.01)
     assert kernels(rt, launches) == 2
-    if (e, rows, keys) == (2, 40, 64):  # 2 units of 2 x 2 query tiles, 2 + 2 key tiles (each of 2), 2 x 2 values, 2 x (2 + 2)
-      assert read == 2 * (4 + 8 + 4 + 8) + 16, read  # masks; and the division's 8 result tiles, each reading p v's and the sums'
+    if lo == 200:  # 2 units: 1 + 2 + 2 x 8 x 2 + 8 x 2 + 2 x 2, and the division's 4 result tiles, each reading p v's and the sums'
+      assert read == 2 * (1 + 2 + 32 + 16 + 4) + 8, read
 
 def test_reduce_axes(chip):
   # sum and max down the rows (one row) and through the batch (one matrix), as along each row: one launch each, the
@@ -1394,7 +1401,7 @@ def test_llama_layer(chip, n):
   on = lambda a: Tensor.of(rt, a.tolist())
   cache, np_cache = on(np.zeros((6, n, 64))), np.zeros((6, n, 64))
   places = Tensor.of(rt, [list(range(n))], "int32")
-  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn)), on(mask), cache, places)
+  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn)), (on(mask), places.reshape(1, n, 1), 0), cache, places)
   want = llama.layer(x, p, c, (np.float64(cos), np.float64(sin), turn), np.float64(mask), np_cache, range(n))
   change = np.abs(want - x).max()
   assert change > 0.5 and np.abs(np.array(got.tolist()) - want).max() < 0.03 * change, (np.abs(np.array(got.tolist()) - want).max(), change)
@@ -2257,8 +2264,8 @@ def test_cost(tmp_path):
   # COMPARE's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
   # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; the probe's numbers,
   # read from its file, give the rates. A prompt's chunk reads the experts its tokens pick, nearly all of every block's
-  # at 256 tokens, so Qwen3.6's 4K-token prompt takes over four times as long in chunks of 256 as of 2,048; at 32K places
-  # its attention's reads (a key head's rows for every two tile rows of 32 queries of each query head) take most of it
+  # at 256 tokens, so Qwen3.6's 4K-token prompt takes over six times as long in chunks of 256 as of 2,048; at 32K places
+  # its attention's reads (a key head's rows for every eight tile rows of 32 queries of each query head) make it slower
   qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
           "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
           "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
@@ -2285,7 +2292,7 @@ def test_cost(tmp_path):
   measured = cost.probed(card, str(tmp_path / "probe.json"))
   assert measured["bandwidth"] == 420e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
   slow, fast, long = (cost.prompt(c, s, use | {"kv": "bfp8", "context": n}, card, chunk) for n, chunk in ((4096, 256), (4096, 2048), (32768, 2048)))
-  assert slow.rate * 4 < fast.rate and long.rate * 3 < fast.rate, (slow.rate, fast.rate, long.rate)
+  assert slow.rate * 6 < fast.rate and long.rate * 1.5 < fast.rate, (slow.rate, fast.rate, long.rate)
   assert "a prompt of 8192 tokens" in cost.report(str(tmp_path / "qwen"), "experts", context="8192", kv="bfp8")
 
 def test_fetch(tmp_path, monkeypatch):
