@@ -16,8 +16,8 @@ BYTES = {"bf16": 2.0, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}  # a value's, wit
 MODES = {"bf16": {}, "bfp8": {"*": "bfp8"},  # each kind of matrix's format, Tenstorrent's performance precision's, and with
          "bfp4": {"*": "bfp8", "gate_up": "bfp4"},  # every expert matrix in bfp4 (Qwen3.6 on a card). The embedding stays
          "experts": {"*": "bfp8", "gate_up": "bfp4", "down": "bfp4"}}  # bf16 (a token's row is gathered), and so do the routers
-LAUNCHES = {"attention": 13, "experts": 18, "deltanet": 27, "deltanet verify": 57, "rest": 11, "draft": 46}  # a decode step's
-# for several slots: an attention block's (with its norms), a mixture of experts' more, a Gated DeltaNet block's (and one
+LAUNCHES = {"attention": 18, "experts": 18, "deltanet": 27, "deltanet verify": 57, "rest": 11, "draft": 46}  # a decode step's
+# for several slots: an attention block's (with its norms, and its attention in parts at a long cache), a mixture of experts' more, a Gated DeltaNet block's (and one
 # taking a token and a draft at once), the rest (the embedding's gather, the step's masks, the final norm and the output
 # layer), the multi-token prediction layer's call. Counted on ttsim at Qwen3.6's shapes, four slots (cmp/qwen36/launches.py).
 CONTROL = {"deltanet": (20600, 12400), "attention": (18400, 7600), "rest": (2900, 1200),  # a decode step's RISC-V work as

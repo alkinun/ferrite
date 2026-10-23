@@ -624,18 +624,23 @@ def test_attend(chip):
   # the keys past its place (and one case's those a window before it too): several tile rows of queries, a key and
   # value head serving two query heads (a repeat, read in place), 256-wide heads with one mask for all, a KV cache in
   # bfp8, keys that end partway through a tile, three tile rows of queries, a sliding window, ten tile rows (units of
-  # eight and of two). Two launches, the attention and the division, and nothing read but what the places reach: rows
+  # eight and of two). And with each unit's keys shared out among parts (a decode step's: rows of one place, a 1,024-key
+  # cache in bfp8 in the four parts the workers allow), rows that see none of some part's keys, parts with no keys at all
+  # (places below 32).
+  # Without parts, two launches, the attention and the division, and nothing read but what the places reach: rows
   # whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of keys twice (a
   # sweep each) and of values once, and the mask's tiles only where some row sees a tile of keys in part, its last two,
   # twice
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(43)
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
-  for e, rows, hd, keys, rep, fmt, shared, window, lo in ((2, 40, 64, 64, 1, "bf16", False, 0, 0), (4, 8, 64, 96, 2, "bf16", False, 0, 0),
-                                                          (2, 33, 256, 128, 1, "bf16", True, 0, 0), (4, 8, 64, 64, 2, "bfp8", False, 0, 0),
-                                                          (3, 70, 64, 40, 1, "bf16", True, 0, 0), (2, 40, 128, 200, 1, "bf16", False, 50, 60),
-                                                          (2, 8, 64, 256, 1, "bf16", False, 0, 200), (2, 300, 64, 320, 2, "bf16", True, 0, 0)):
+  for e, rows, hd, keys, rep, fmt, shared, window, lo, hi, parts in (
+      (2, 40, 64, 64, 1, "bf16", False, 0, 0, 64, 1), (4, 8, 64, 96, 2, "bf16", False, 0, 0, 96, 1), (2, 33, 256, 128, 1, "bf16", True, 0, 0, 128, 1),
+      (4, 8, 64, 64, 2, "bfp8", False, 0, 0, 64, 1), (3, 70, 64, 40, 1, "bf16", True, 0, 0, 40, 1), (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 1),
+      (2, 8, 64, 256, 1, "bf16", False, 0, 200, 256, 1), (2, 300, 64, 320, 2, "bf16", True, 0, 0, 320, 1),
+      (4, 8, 64, 1024, 2, "bfp8", False, 0, 0, 1024, None), (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 3), (4, 8, 64, 256, 1, "bf16", False, 0, 0, 30, 8)):
     q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
-    places = rng.integers(lo, keys, (1 if shared else e, rows, 1))
+    places = rng.integers(lo, hi, (1 if shared else e, rows, 1))
+    if parts is None: places = places[:, :1, :].repeat(rows, 1)  # (a decode step's: a slot's query heads, at its one place)
     mask = np.where((np.arange(keys) > places) | ((np.arange(keys) <= places - window) if window else False), np.float32(-1e9), np.float32(0))
     tq, tk, tv, tm = (Tensor.of(rt, x.tolist()) for x in (q, k, v, mask))
     if fmt != "bf16": (tk, tv), k, v = (x.cast(fmt).realize() for x in (tk, tv)), gpt2.bfp(k), gpt2.bfp(v)
@@ -643,13 +648,13 @@ def test_attend(chip):
     tp = Tensor.of(rt, places.tolist(), "int32")
     rt.wait()
     before, launches = reads(), rt.launches
-    out = tq.attend(tk, tv, tm, tp, window).realize()
+    out = tq.attend(tk, tv, tm, tp, window, parts=parts).realize()
     rt.wait()
     read, got = reads() - before, value(out)
     s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.01)
-    assert kernels(rt, launches) == 2
+    assert parts != 1 or kernels(rt, launches) == 2
     if lo == 200:  # 2 units: 1 + 2 + 2 x 8 x 2 + 8 x 2 + 2 x 2, and the division's 4 result tiles, each reading p v's and the sums'
       assert read == 2 * (1 + 2 + 32 + 16 + 4) + 8, read
 

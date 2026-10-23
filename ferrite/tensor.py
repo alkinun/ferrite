@@ -2,7 +2,7 @@
 # in bank i % 8). Their ops build a tree that realizing turns into kernels (compiler.py): as much of it as one kernel
 # holds fused into one launch, and what one kernel cannot hold (a matmul's operands, a move, a cast below the root, a
 # reduction of another shape) realized first.
-import array, collections, math
+import array, collections, functools, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
 from ferrite.compiler import attention_kernel, bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
@@ -452,27 +452,37 @@ class Tensor:
     out.fidelity = fidelity
     return out
 
-  def attend(self, k, v, mask, places, window=0, fidelity=None):
+  def attend(self, k, v, mask, places, window=0, fidelity=None, parts=None):
     """softmax(self @ k^T + mask) @ v, attention, by one kernel whose scores never leave the chip (attention_kernel):
     self a batch of queries (bf16), k and v the keys and values for each (bf16 or a block float: a KV cache; a repeat
     read in place, a matrix for each of its rep), the mask (a batch of 1 or of self's) as wide as k is long, and places
     (int32, a column: each row's last key; with a window, its first window - 1 before) where the mask may be other than
     0: the kernel reads the keys the places reach, and the mask only where some row sees a tile of keys in part. It
-    gives p v in fp32 with each row's sum of p beside it; one over the other, cast to bf16, is the result. No gradient."""
-    ht, kt, rep = -(-self.cols // 32), -(-k.rows // 32), k.rep
+    gives p v in fp32 with each row's sum of p beside it; one over the other, cast to bf16, is the result. parts: each
+    unit's keys shared out among so many workers, unless said as many as the workers allow when units are few (a decode
+    step's: a key head's of each slot), at most 8 and each of 8 tiles of keys at least (combining them costs a few
+    launches); each part's result weighted by exp of its rows' largest score less the largest of all its parts', and
+    summed. No gradient."""
+    ht, kt, rep, ra = -(-self.cols // 32), -(-k.rows // 32), k.rep, -(-self.rows // 32)
     assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
     assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows == mask.cols
     assert mask.rows == places.rows == self.rows and mask.batch in (1, self.batch) and places.batch in (1, self.batch) and places.cols == 1
     assert mask.dtype == "bf16" and places.dtype == "int32", f"{self.shape} by {k.shape}, {mask.shape} {mask.dtype}, {places.shape} {places.dtype}"
+    units = self.batch * -(-ra // 8)
+    P = parts or (max(1, min(8, kt // 8, len(self.rt.cores) // units)) if ra <= 2 else 1)
     q, mask, places = (_plain(t.realize()) for t in (self, mask, places))
     wt, phases, edge = k.dtype if k.dtype in BFP else None, fidelity or FIDELITY, k.rows % 32
     k, v = k.realize(), v.realize()
-    out = Tensor(self.rt, self.rows, self.cols + 1, batch=self.batch, dtype="fp32")
-    key = ("attend", ht, kt, self.rows, rep, wt, phases, edge, window)
+    out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
+    key = ("attend", ht, kt, self.rows, rep, wt, phases, edge, window, P)
     out._run(_cached(key, lambda: attention_kernel(*key[1:])), *out._where(), *q._where(), *k._where(), *v._where(), *mask._where(),
-             *places._where(), units=self.batch * -(-self.rows // 256), name="attention")
-    sums = out._view(out.rows, 1, out.batch, ht, out.bstride)  # each row's, in all 32 columns of its tile: a column as it lies
-    return (out[:, :, :self.cols] / sums).cast("bf16")
+             *places._where(), units=units * P, name="attention")
+    part = lambda p, at, cols: out._view(out.rows, cols, self.batch, p * out.bstride + at, out.bstride * P)  # part p's, from tile at
+    if P == 1: return (part(0, 0, self.cols) / part(0, ht, 1)).cast("bf16")  # (the sums a column as it lies: 32 in its tile)
+    largest = [part(p, ht + 1, 1) for p in range(P)]
+    top = functools.reduce(Tensor.maximum, largest)
+    weighted = lambda at, cols: functools.reduce(Tensor.__add__, [(m - top).exp() * part(p, at, cols) for p, m in enumerate(largest)])
+    return (weighted(0, self.cols) / weighted(ht, 1)).cast("bf16")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
   def conv2d(self, w, padding=0):
