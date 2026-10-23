@@ -1,4 +1,4 @@
-# What a model costs to serve on Blackhole cards (ROADMAP, Next), from its config alone (llama.config): what a card
+# What a model costs to serve on Blackhole cards (ROADMAP, Stage 2), from its config alone (llama.config): what a card
 # holds of it (its weights in the formats it runs in; each session's KV cache rows and Gated DeltaNet states), what a
 # decode step reads, computes and launches (its weights, the experts its tokens pick, its sessions' rows and states),
 # and so how many sessions a card keeps, tokens/s for a user and for a card, and dollars a million tokens. The card's

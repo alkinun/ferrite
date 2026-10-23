@@ -16,8 +16,9 @@ Ethernet ports for the big ones. A stage is done when its checks pass on the car
   from ten providers, at $0.05 to $0.25 a million input tokens and $0.70 to $1.80 output, 46 to 186 tokens/s a user. It
   fits one card with its experts in bfp4 (about 22 GB) or two in bfp8 (37 GB): a card or a pair is a whole server, with
   no links between them, and a box of them is that many copies, one failing while the others serve.
-- **The edge, on paper.** A card costs about $0.13 an hour to own and run, and at 8 users would make 350 to 500
-  output tokens/s: cents a million tokens, where the cheapest provider charges $0.70. Against an H100 rented at $2 an
+- **The edge, on paper.** A card costs about $0.13 an hour to own and run, and at 8 users would make 230 to 320
+  output tokens/s (the cost model, sessions of 32K and 8K tokens): about $0.15 a million tokens, where the cheapest
+  provider charges $0.70. Against an H100 rented at $2 an
   hour, a card has per dollar an hour about twice the memory bandwidth (what a generated token costs), four times the
   compute (an uncached prompt token) and six times the memory (sessions' caches between an agent's turns), and a
   provider can start with one card where a GPU wants filling. So: the cheapest, at a speed within the others' range,
@@ -81,88 +82,28 @@ DeepSeek V4.1 Flash runs on a box of linked p150s and is served beside Qwen3.6.
 
 ## Next
 
-The work in order, each step with its test on ttsim, ticked here as it lands. When the card comes, its bring-up goes
-first (NOTES, "Bring-up on a p150").
+The work in order, each step with its test on ttsim. A step leaves this list once it lands; git's log and NOTES keep
+what it did and what it measured.
 
-- [x] **Qwen3.6's blocks** in `models/llama.py`: Gated DeltaNet (a chunk of tokens at a time, the state carried between
-  chunks, a decode step a chunk of one), gated attention with partial RoPE, its experts with the shared one; real
-  blocks within 0.22% of transformers in numpy and within about 1% a block on ttsim (NOTES, "Qwen3.5's and Qwen3.6's
-  language models").
-- [x] **Sessions**: several sequences at once, each with its own states; each session's cache rows and DeltaNet states
-  kept on the host between its turns and brought back for the next; the server's slots for them, and tool calls in
-  Qwen's template (NOTES, "Serving").
-- [x] **Speculative decoding** with its multi-token prediction layer, a rejected draft's DeltaNet states put back
-  (NOTES, "Qwen3.5's and Qwen3.6's language models", "Serving"); how many drafts the real layer gets right waits for
-  the whole model.
-- [x] **The cost model**: what a model reads and holds a token and how many sessions a card keeps, and with the probe's
-  numbers, tokens/s and dollars a million tokens (`models/cost.py`; NOTES, "The cost model").
-- [x] **Attention over a session's own rows** in a batched step, a key head's rows read once for all its query heads,
-  where they were read once a query head: eight times for Qwen3.6 (NOTES, "A Llama-family model"). Its two moves a
-  block cost more than they save at short contexts on ttsim, a datum at a time (NOTES, "Next for the compiler", 6).
-- [x] **Fewer launches a Gated DeltaNet block**: a decode or verify step's tokens one at a time by the recurrent rule,
-  and its small weights in fp32, 86 launches a block to 20 (27 for several slots), a verify step's 130 to 50; a
-  Qwen3.6 step is 1,701 launches (NOTES, "Qwen3.5's and Qwen3.6's language models").
-- [x] **A put by the rows it writes**: the KV cache's `put` visited every tile of the cache to find a step's rows, 2.5M
-  of a 32-user SmolLM step's 3.4M ttsim cycles at 1,056 places a user; it now works as the rows it writes, 159k
-  (NOTES, "Rows by index").
-- [x] **Qwen3.6's KV cache in bfp8** (`serve.py`'s last argument): 25 sessions a card where 14 were, 283 tokens/s a card
-  at eight users. The format alone keeps Llama-3.1-8B's token accuracy (top-1 99.6% against 100%) and moves Qwen3.6's
-  real blocks' logits 0.7%, a quarter of what bfp8 weights do (NOTES, "Qwen3.5's and Qwen3.6's language models"); the
-  whole model's token accuracy waits for the whole model, as its experts' formats do.
-- [x] **Usage as OpenRouter bills it**: each response's usage counts the prompt's cached tokens (those its slot or a
-  saved session held, not prefilled), and a stream ends with it. OpenRouter sends an agent's next requests back to the
-  provider that cached its last, when cached tokens cost less there (NOTES, "Serving").
-- [x] **The sampling parameters OpenRouter passes**: top_k, min_p, the presence, frequency and repetition penalties, and
-  log probabilities (logprobs, top_logprobs), on the host from each token's logits, a token's sampling 1.3 ms where its
-  whole sort of Qwen3.6's vocabulary was 6 (NOTES, "Serving").
-- [x] **tool_choice**: none, required or a named function, as a shape the answer keeps to: a token drawn is taken if
-  the text it makes still fits, else drawn again without it (NOTES, "Serving").
-- [x] **Structured outputs**: answers to a JSON schema (response_format) as a shape, its prefix parsed as it comes; no
-  start of one leads nowhere, and whitespace and numbers are bounded, which a shape's model would otherwise run on in
-  (NOTES, "Serving").
-- [x] **Less control a Gated DeltaNet block**: its conv's inputs laid out as the step's tokens are, a decode step's
-  conv one kernel over them, so a token of a step adds 17k ttsim cycles to a block where it added 26k, and an
-  eight-user step's control is 4.3 ms where it was 5.9 (NOTES, "Qwen3.5's and Qwen3.6's language models", "The cost
-  model"); most of the rest is each slot's heads moved into batch entries and out.
-- [x] **Cheaper moves**: a run four datums at a time and bf16's two to a word, a one-row tile's zeros its row's alone,
-  and the tile cache's record kept between launches: a 32-user SmolLM step's moves 405k ttsim cycles where 586k, a
-  Qwen3.6 step's control for eight users 3.3 ms where 3.7 (NOTES, "Next for the compiler", 6). What is left is each
-  result tile's own work: the zero tile, the fetch, a row's copies down the tile, the write home.
-- [x] **Attention over what a slot holds**: a step's attention reads each slot's first rows alone, up to the power of 2
-  that holds the longest sequence's (a replay recorded for each), and a prompt's chunk its own slot's up to its last
-  place, where every call read every slot whole: a slot can be as long as Qwen3.6's 262K places without every step
-  paying for them (NOTES, "Serving").
-- [x] **The cost of a prompt and of attention** (`models/cost.py`'s `prompt` and `scores`): a chunk of a prompt reads
-  the experts its tokens pick, nearly all of every block's at the server's 256 tokens; and attention's scores go
-  through DRAM six times, as much again as the cache rows a step reads (2.0 GB of an eight-user step's 11.5: 226
-  tokens/s a card where the model said 268), and a chunk reads each key head's rows once a query head and 128 queries:
-  a 32K-token prompt of Qwen3.6 takes 6.7 s, where its experts and rows alone would take 1.1 (NOTES, "The cost model").
-- [x] **Attention in one kernel** (`Tensor.attend`): softmax(q kᵀ + mask) v with its scores kept in L1, two sweeps
-  over a frame of keys at a time, the output added onto in L1 by the packer in fp32; a unit of two tile rows of queries
-  shares its keys and values. At Qwen3.6's shapes a decode step's attention reads 1.7 times its cache rows where the
-  softmax and the matmul read 2.5, with a fifth of the RISC-V work, and a prompt's chunk 59 times where they read 117
-  (NOTES, "Attention").
-- [x] **Attention by places, a prompt's in units of eight tile rows**: each unit reads the tiles of keys its rows'
-  places reach, and the mask only where some row sees a tile in part, so each slot of a step reads its own rows however
-  long the others' are; a prompt's unit takes 256 queries of a head, their running maximums in L1 and their sums made
-  as products by a tile of ones. At Qwen3.6's shapes a decode step's attention reads 1.5 times its rows where 1.7, and
-  a prompt's chunk 17 times where 59; the cost model's eight users make 237 tokens/s a card where 224, and a 32K-token
-  prompt takes 2.1 s where 6.9 (NOTES, "Attention").
-- [x] **A KV cache in bfp4** (`put` writes it, attention reads it in place, bit for bit the bf16 one by the same
-  values): 42 sessions a card where bfp8 keeps 25, and 284 tokens/s a card at eight users where 237, if the whole
-  model's token accuracy holds with it, which tonight's run of it says (NOTES, "Qwen3.5's and Qwen3.6's language
-  models").
-- [x] **A prompt's Gated DeltaNet in pieces at once**: all that the state does not enter done for every piece of 64
-  tokens at once, then the state through the pieces in turn, so a 256-token chunk of a real block is 349 launches where
-  it was 816 (NOTES, "Qwen3.5's and Qwen3.6's language models").
-- [x] **A decode step's attention on many workers** (flash decoding): a unit's keys shared out among up to 8 parts on
-  workers of their own, each part's p v, sums and largest scores combined after, so one user's long session is read
-  by 16 workers where it was 2 (NOTES, "Attention").
-- [x] **A 429 when every slot is busy**: a request holds a slot from its arrival to its end, and one that finds none
-  free is refused at once, as OpenRouter asks (it tries the next provider, and does not count it against uptime),
-  where it waited in a queue (NOTES, "Serving").
-- [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
-  matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
-  and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the
-  model is about 27 GB, still one card); the whole model is 72 GB in bf16, and the token accuracy waits for it on a
-  disk with room.
+Since the stages were set: Qwen3.6's blocks, sessions kept on the host, speculative decoding and the cost model;
+attention in one kernel, by the places its rows reach, in parts for a decode step's few units (flash decoding); a KV
+cache in bfp8 or bfp4; fewer launches and less control in Gated DeltaNet, cheaper moves, a put by the rows it writes;
+and in the server what OpenRouter passes and expects: sampling parameters and log probabilities, tool_choice,
+structured outputs, cached tokens in the usage, an early 429 when every slot is busy.
+
+- [ ] **One card or two**: the whole model's token accuracy in numpy, Tenstorrent's way (`cmp/qwen36/accuracy.py`).
+  bf16 is top-1 99.6%, top-5 100% against the reference; one card's layouts cost 6 to 8 points of top-1: every expert
+  matrix in bfp4 (21.7 GB) 92.0% and 94.2%, the experts' gate and up in bfp4 and down in bfp8 (27.2 GB) 93.8% and
+  96.0%, where Tenstorrent's own performance mode runs Llama-3.1-8B at 90% top-1. Every matrix in bfp8 (two cards) and the KV cache in bfp4 wait on a rerun: their first runs came out NaN, it
+  seems from this host's instability (NOTES, "Still unknown or untested").
+- [ ] **How often the drafts are right** (`cmp/qwen36/drafts.py`, after the accuracy runs): speculative decoding pays
+  above about 45% at one user and 55% at eight (NOTES, "The cost model").
+- [ ] **The card's bring-up**, when it comes, on a host that no longer crashes: NOTES' "Bring-up on a p150", steps 0
+  to 12, then the probe's numbers into the cost model (Stage 1).
+- [ ] **Qwen3.6 on the card**: its weights uploaded in the layout the accuracy chose, a decode step's tokens/s and
+  cost a million measured against the cost model's (Stage 2's last check), and served on the host to a client of our
+  own before OpenRouter's (Stage 3).
+- [ ] **Gated DeltaNet's turns in one kernel**: a prompt's state goes through its pieces of 64 at 35 launches a piece,
+  some 1,330 a block for a chunk of 2,048 tokens (NOTES, "Qwen3.5's and Qwen3.6's language models").
+- [ ] **Attention in one sweep**: the keys read once, not twice, the output rescaled in L1 as a row's largest grows,
+  and a prompt's unit sharing its key head's rows among that head's query heads (NOTES, "Attention").
