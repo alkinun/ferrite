@@ -5,7 +5,7 @@
 import array, collections, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
-from ferrite.compiler import bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
+from ferrite.compiler import attention_kernel, bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
 from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
@@ -451,6 +451,23 @@ class Tensor:
     out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x), max(self.batch, x.batch), dtype)
     out.fidelity = fidelity
     return out
+
+  def attend(self, k, v, mask, fidelity=None):
+    """softmax(self @ k^T + mask) @ v, attention, by one kernel whose scores never leave the chip (attention_kernel):
+    self a batch of queries (bf16), k and v the keys and values for each (bf16 or a block float: a KV cache; a repeat
+    read in place, a matrix for each of its rep), the mask (a batch of 1 or of self's) as wide as k is long. The kernel
+    gives p v in fp32 with each row's sum of p beside it; one over the other, cast to bf16, is the result. No gradient."""
+    ht, kt, ra, rep = -(-self.cols // 32), -(-k.rows // 32), -(-self.rows // 32), k.rep
+    assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
+    assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows == mask.cols
+    assert mask.rows == self.rows and mask.batch in (1, self.batch) and mask.dtype == "bf16", f"{self.shape} by {k.shape}, {mask.shape}"
+    q, mask, wt, phases = _plain(self.realize()), _plain(mask.realize()), k.dtype if k.dtype in BFP else None, fidelity or FIDELITY
+    k, v = k.realize(), v.realize()
+    out = Tensor(self.rt, self.rows, self.cols + 1, batch=self.batch, dtype="fp32")
+    out._run(_cached(("attend", ht, kt, ra, rep, wt, phases, k.rows % 32), lambda: attention_kernel(ht, kt, ra, rep, wt, phases, k.rows % 32)),
+             *out._where(), *q._where(), *k._where(), *v._where(), *mask._where(), units=self.batch * -(-ra // 2), name="attention")
+    sums = out._view(out.rows, 1, out.batch, ht, out.bstride)  # each row's, in all 32 columns of its tile: a column as it lies
+    return (out[:, :, :self.cols] / sums).cast("bf16")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
   def conv2d(self, w, padding=0):

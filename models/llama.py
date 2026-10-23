@@ -112,8 +112,11 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
     if sinks is not None: sinks = f.expand(sinks.reshape(c.kv, 1, rep), (c.kv, n, rep)).reshape(c.kv * slots, t * rep, 1)
   if (m := mask.shape[-1]) < k.shape[-2]: k, v = k[:, :m, :], v[:, :m, :]  # (views of a sequence's first rows)
   if not slots: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a head for each query's, in place
-  s = f.mm(q, f.t(k), attention) * (1 / math.sqrt(hd))
-  o = f.mm(f.softmax(s + mask) if sinks is None else f.sink_softmax(s + mask, sinks), v, attention)
+  if sinks is None and isinstance(q, Tensor) and hd % 32 == 0 and hd >= 64:  # one kernel, its scores on the chip
+    o = (q * (1 / math.sqrt(hd))).attend(k, v, mask, attention)
+  else:
+    s = f.mm(q, f.t(k), attention) * (1 / math.sqrt(hd))
+    o = f.mm(f.softmax(s + mask) if sinks is None else f.sink_softmax(s + mask, sinks), v, attention)
   if slots: o = o.reshape(c.kv, n, rep * hd)  # each key head's query heads side by side again
   if gated: o = o * f.sigmoid(f.split(qkv[:, (c.heads + 2 * c.kv) * hd:], o.shape[0]))
   o = f.mm(f.merge(o), p["o_proj"], phases("o"))

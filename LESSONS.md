@@ -257,6 +257,11 @@ append a correction.
     which no text can follow, a number begun as "-e" or "1.", and whitespace and digits that never end. Each start of
     a shape must lead somewhere and each run must end; 480 random answers to four schemas now all parse and stop.
     (NOTES: "Serving")
+42. **Check a model of traffic against the counters.** The cost model's account of attention was wrong twice, in
+    opposite directions, each read off the code: scores written to DRAM that the softmax kernel never wrote, then six
+    trips for them where the truth was the keys read again in each of the softmax's three passes and its result read
+    once for each column tile of the next matmul. Each core's count of read responses (`NIU_READS`) settled it in one
+    run at small sizes, and `test_attend` now counts the new kernel's reads exactly. (NOTES: "Attention")
 
 ## Working method
 

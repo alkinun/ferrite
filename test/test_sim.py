@@ -619,6 +619,33 @@ def test_softmax_and_layernorm(chip):
       sd = math.sqrt(sum((v - mean) ** 2 for v in row) / cols + 1e-5)
       assert all(abs(gv - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for gv, v, gm, bt in zip(g, row, gamma, beta))
 
+def test_attend(chip):
+  # attention in one kernel (Tensor.attend), softmax(q k^T + mask) v against numpy's within 1%: several tile rows of
+  # queries, a key and value head serving two query heads (a repeat, read in place), 256-wide heads with a mask for all,
+  # a KV cache in bfp8, keys that end partway through a tile, three tile rows of queries (units of two and of one). Two
+  # launches, the attention and the division, and nothing read but the inputs: each unit (two tile rows of a head's
+  # queries) its query tiles, each key tile once a sweep (two), each value tile once, each mask tile twice
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(43)
+  reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
+  for e, rows, hd, keys, rep, fmt, mb in ((2, 40, 64, 64, 1, "bf16", 2), (4, 8, 64, 96, 2, "bf16", 4), (2, 33, 256, 128, 1, "bf16", 1),
+                                          (4, 8, 64, 64, 2, "bfp8", 4), (3, 70, 64, 40, 1, "bf16", 1)):
+    q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
+    mask = np.where(rng.random((mb, rows, keys)) < 0.3, np.float32(-1e9), np.float32(0))
+    tq, tk, tv, tm = (Tensor.of(rt, x.tolist()) for x in (q, k, v, mask))
+    if fmt != "bf16": (tk, tv), k, v = (x.cast(fmt).realize() for x in (tk, tv)), gpt2.bfp(k), gpt2.bfp(v)
+    if rep > 1: tk, tv = tk.repeat_interleave(rep), tv.repeat_interleave(rep)
+    rt.wait()
+    before, launches = reads(), rt.launches
+    out = tq.attend(tk, tv, tm).realize()
+    rt.wait()
+    read, got = reads() - before, value(out)
+    s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
+    p = np.exp(s - s.max(-1, keepdims=True))
+    close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.01)
+    assert kernels(rt, launches) == 2
+    if (e, rows, keys) == (2, 40, 64):  # 2 units of 2 x 2 query tiles, 2 + 2 key tiles (each of 2), 2 x 2 values, 2 x (2 + 2)
+      assert read == 2 * (4 + 8 + 4 + 8) + 16, read  # masks; and the division's 8 result tiles, each reading p v's and the sums'
+
 def test_reduce_axes(chip):
   # sum and max down the rows (one row) and through the batch (one matrix), as along each row: one launch each, the
   # padding past the last tile row masked (every value negative, so an unmasked 0 would win a max, and padding rows
@@ -2230,8 +2257,8 @@ def test_cost(tmp_path):
   # COMPARE's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
   # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; the probe's numbers,
   # read from its file, give the rates. A prompt's chunk reads the experts its tokens pick, nearly all of every block's
-  # at 256 tokens, so Qwen3.6's 4K-token prompt takes over four times as long in chunks of 256 as of 2,048; at 32K
-  # places its attention's DRAM, the scores and the rows read again, takes most of a 2,048-token chunk
+  # at 256 tokens, so Qwen3.6's 4K-token prompt takes over four times as long in chunks of 256 as of 2,048; at 32K places
+  # its attention's reads (a key head's rows for every two tile rows of 32 queries of each query head) take most of it
   qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
           "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
           "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,

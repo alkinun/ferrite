@@ -158,6 +158,7 @@ TENSIX_CFG_FIELDS = {
   "UNP0_add_dest_addr_cntr": (50, 8, 1), "UNP0_Ystride_1": (56, 16, 16), "UNP0_ZW_1": (57, 0, 32), "UNP1_ZW_1": (59, 0, 32),
   "SEC0_format": (64, 0, 4), "SEC0_x_dim": (64, 16, 16), "SEC0_y_dim": (65, 0, 8), "SEC0_z_dim": (65, 16, 8), "Exp_section_size": (68, 16, 16),
   "L1_Dest_addr": (69, 0, 32), "Disable_zero_compress": (70, 0, 1), "Pack_out_format": (70, 4, 4), "Pack_in_format": (70, 8, 4),
+  "Pack_L1_Acc": (71, 19, 1),  # the packer adds what it packs to what L1 holds there
   "SEC0_out_format": (72, 0, 4), "SEC0_Haloize_mode": (72, 8, 1),
   "SEC0_uncompressed": (73, 0, 1), "SEC0_base": (76, 0, 32), "SEC0_dest_addr": (84, 0, 16),
   "SEC0_tile_x_dim": (86, 0, 16), "SEC0_offset": (92, 0, 16),
