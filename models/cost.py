@@ -31,8 +31,8 @@ CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 ban
             launch=1e-6, pcie=25e9,  # a launch on the card (NOTES, "Next for the compiler"), and PCIe 4.0 x16's bytes/s
             price=1299, host=600, years=3, watts=300, host_watts=75, kwh=0.15)  # the p150a at its launch, a share of a host,
             # three years; the card's power and its host's share, at $0.15 a kWh
-USE = dict(context=32768, kv="bf16", accept=0.0)  # each session's places (its slot's: a token reads them all, those its session
-# has not filled yet too) and its KV cache's format; the share of drafts taken
+USE = dict(context=32768, kv="bf16", accept=0.0)  # each session's places, its slot's, all of them filled (a step reads each slot's
+# rows up to the power of 2 that holds the longest session's), and its KV cache's format; the share of drafts taken
 
 def probed(card, path):  # the probe's numbers (python3 -m ferrite.probe 8 path) in place of the specification's
   p = json.load(open(path))

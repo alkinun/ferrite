@@ -91,7 +91,8 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, acc
 def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   """A block's attention over its cache (layer). For several sequences (slots: as many tokens of each, in turn), each
   over its own part of the cache, which a batch of each key head and sequence views in place, its query heads' rows
-  (a token's each) side by side: no key head repeated, no token reading another sequence's rows."""
+  (a token's each) side by side: no key head repeated, no token reading another sequence's rows. Each reads as many of
+  its rows, from its first, as its mask is wide (around's length)."""
   f, gated, hd, rep = fns(h), getattr(c, "gated", False), head(c), c.heads // c.kv
   nh = c.heads + 2 * c.kv + (c.heads if gated else 0)  # (Qwen3.5's output gate: a head's each, after v's)
   qkv = f.mm(h, p["qkv_proj"], phases("qkv"))
@@ -109,7 +110,8 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
     k, v, t = f.parts(k, slots), f.parts(v, slots), n // slots
     q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv * slots, t * rep, hd)
     if sinks is not None: sinks = f.expand(sinks.reshape(c.kv, 1, rep), (c.kv, n, rep)).reshape(c.kv * slots, t * rep, 1)
-  else: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a head for each query's, in place
+  if (m := mask.shape[-1]) < k.shape[-2]: k, v = k[:, :m, :], v[:, :m, :]  # (views of a sequence's first rows)
+  if not slots: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a head for each query's, in place
   s = f.mm(q, f.t(k), attention) * (1 / math.sqrt(hd))
   o = f.mm(f.softmax(s + mask) if sinks is None else f.sink_softmax(s + mask, sinks), v, attention)
   if slots: o = o.reshape(c.kv, n, rep * hd)  # each key head's query heads side by side again
@@ -365,26 +367,27 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
     w[pre + "experts.gate_up"], w[pre + "experts.down"] = stack([join(g, u) for g, u in zip(gates, ups)]), stack(expert("down_proj"))
   return w
 
-def around(w, c, places, size, slots=None):
+def around(w, c, places, size, slots=None, length=None):
   """For tokens at places: their caches' rows, the rotary tables' rows, and attention's masks over a cache of size rows,
   a sliding window's too (or None). For several sequences (slots), the next tokens of each in turn: each one's rows
-  in its own part of the caches (size / slots rows), the masks laid out as attention lays out their scores."""
+  in its own part of the caches (size / slots rows), the masks laid out as attention lays out their scores. length:
+  the masks over a sequence's first length rows alone, the most attention then reads of it."""
   f, window = fns(w["norm"]), getattr(c, "sliding", None)
   rotary = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"])
-  if not slots: return places, rotary, gpt2.mask(places, size), window and gpt2.mask(places, size, window)
+  if not slots: return places, rotary, gpt2.mask(places, length or size), window and gpt2.mask(places, length or size, window)
   numpy, (part, rep) = not isinstance(places, Tensor), (size // slots, c.heads // c.kv)
   n = len(places) if numpy else places.cols
   rows = np.asarray(places) + firsts(None, n, slots, part) if numpy else places + firsts(places.rt, n, slots, part)
   column = f.expand(np.asarray(places).reshape(1, n, 1) if numpy else places.reshape(1, n, 1), (1, n, rep)).reshape(1, n * rep, 1)
   column = f.expand(column, (c.kv, n * rep, 1)).reshape(c.kv * slots, n // slots * rep, 1)  # (a key head's and sequence's rows)
-  return rows, rotary, gpt2.masked(column, part), window and gpt2.masked(column, part, window)
+  return rows, rotary, gpt2.masked(column, length or part), window and gpt2.masked(column, length or part, window)
 
 @functools.cache
 def firsts(rt, n, slots, part):  # n tokens' sequences' first rows, n / slots tokens each in turn: a row of int32 on the chip
   row = [i // (n // slots) * part for i in range(n)]
   return np.asarray(row) if rt is None else Tensor.of(rt, [row], "int32")
 
-def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accept=None, hidden=False):
+def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accept=None, hidden=False, length=None):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (a
   block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids
   and places are rows: lists for numpy, int32 tensors for ferrite. slots: several sequences decoding together (a
@@ -392,10 +395,12 @@ def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accep
   each a part of every block's), each token reading only its own sequence's; then the logits are every token's.
   every: every token's logits, not only the last's. w is looked up a block at a time (arrays makes numpy's weights as
   they are looked up). live, accept: with slots, for Gated DeltaNet's states (delta). hidden: (the logits, every
-  token's hidden state, normed: what the multi-token prediction layer takes, draft)."""
+  token's hidden state, normed: what the multi-token prediction layer takes, draft). length: attention reads only each
+  sequence's first length rows (a multiple of 32, past every place of this call's), so a call costs what its sequences
+  hold, not their caches' size."""
   f = fns(w["norm"])
   x, size = f.rows(w["embed"], ids), next(k.shape[-2] for k in caches if not isinstance(k, list))  # an attention block's places
-  rows, rotary, mask, window = around(w, c, places, size, slots)
+  rows, rotary, mask, window = around(w, c, places, size, slots, length)
   sliding = lambda l: window is not None and (not getattr(c, "layer_types", None) or c.layer_types[l] == "sliding_attention")
   prefill = slots is None and x.shape[-2] > 1
   for l in range(c.layers):
@@ -406,16 +411,16 @@ def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accep
   logits = f.mm(h if slots or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases)
   return (logits, h) if hidden else logits
 
-def draft(ids, places, h, w, c, caches, slots=None):
+def draft(ids, places, h, w, c, caches, slots=None, length=None):
   """Qwen3.5's multi-token prediction layer (block c.layers, which forward does not run), as vLLM runs it: for each
   token at places, h its hidden state (forward's) and ids the token after it, the logits of the token after that. That
   token's embedding and h, each RMS-normed, side by side through fc, then the block (its keys and values into its
-  cache, caches[c.layers], at places), its norm, and the model's output layer. slots: forward's."""
+  cache, caches[c.layers], at places), its norm, and the model's output layer. slots, length: forward's."""
   f, d, l = fns(h), c.dim, c.layers
   e, h = rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), rms(h, w["mtp.pre_fc_norm_hidden"], c)
   fc = w["mtp.fc"]
   x = f.mm(e, fc[:d, :], None) + f.mm(h, fc[d:, :], None)
-  rows, rotary, mask, _ = around(w, c, places, caches[l].shape[-2], slots)
+  rows, rotary, mask, _ = around(w, c, places, caches[l].shape[-2], slots, length)
   p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
   x = layer(x, p, c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, slots=slots)
   return f.mm(rms(x, w["mtp.norm"], c), w["embed.T"], None)

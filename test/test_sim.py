@@ -1995,7 +1995,8 @@ def test_shapes(tmp_path):
 
 def test_serve(chip, tmp_path):
   # models/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
-  # longest ago) decode together, numpy's greedy tokens for each, then the last two again alone, the last first (the slot used longer ago holds the
+  # longest ago) decode together, numpy's greedy tokens for each (every call reading 32 rows of each 64-row slot: the
+  # power of 2 that holds the longest sequence's), then the last two again alone, the last first (the slot used longer ago holds the
   # other), each in the slot that holds it already, so a token of each is prefilled and the rest come from the cache:
   # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
   # reaches (on any other it would spoil what its slot holds); a long prompt is prefilled a chunk between steps, so

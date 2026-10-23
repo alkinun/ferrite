@@ -128,6 +128,10 @@ first (NOTES, "Bring-up on a p150").
   and the tile cache's record kept between launches: a 32-user SmolLM step's moves 405k ttsim cycles where 586k, a
   Qwen3.6 step's control for eight users 3.3 ms where 3.7 (NOTES, "Next for the compiler", 6). What is left is each
   result tile's own work: the zero tile, the fetch, a row's copies down the tile, the write home.
+- [x] **Attention over what a slot holds**: a step's attention reads each slot's first rows alone, up to the power of 2
+  that holds the longest sequence's (a replay recorded for each), and a prompt's chunk its own slot's up to its last
+  place, where every call read every slot whole: a slot can be as long as Qwen3.6's 262K places without every step
+  paying for them (NOTES, "Serving").
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the
