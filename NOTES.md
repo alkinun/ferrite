@@ -482,7 +482,9 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
 shared one; a vocabulary of 248,320). Real blocks are within 0.22% of transformers in numpy and about 1% a block on
 ttsim. Token accuracy in numpy over the whole model: bf16 top-1 99.6%, top-5 100%; every expert matrix in bfp4, the rest
 and the KV cache in bfp8 (21.7 GB, one card) 92.0% and 94.2%; the experts' gate and up in bfp4 and the rest in bfp8
-(27.2 GB) 93.8% and 96.0%. Tenstorrent's performance mode runs Llama-3.1-8B at 90% top-1. The multi-token prediction
+(27.2 GB) 93.8% and 96.0%; the experts' gate and up in bfp4 and the rest in bf16 98.2% and 99.6%, so the experts' down
+projection in bfp4 costs most of it. Every matrix in bfp8 (two cards) and a bfp4 KV cache are not measured yet: their
+runs on this host came out NaN ("Still unknown"). Tenstorrent's performance mode runs Llama-3.1-8B at 90% top-1. The multi-token prediction
 layer's draft is the model's own greedy pick at 94.3% of the places past the prompt (92.5% over all 1,022), in numpy
 in bf16 over the same text.
 
@@ -614,7 +616,8 @@ reset`, untested).
   bandwidth, the best `DEPTH`. The cost model guesses all of them.
 - **This host's CPU (an i7-12700KF) is unstable under load**: plain Python segfaults about one run in five, on some
   CPUs and not others (`journalctl -k` names the CPU). A run that dies or goes wrong under load may be the host: a
-  whole-suite run that died, two of Qwen3.6's accuracy layouts that came out NaN, gpt-oss-20b's two bf16 runs far from
-  numpy with heavy work beside them, one `test_train` readback under ttsim-chaos.
+  whole-suite run that died; Qwen3.6's accuracy runs that came out NaN under full load (`gpt2.bfp` overflowing on
+  weights that round cleanly on one core; one of three sound on a rerun); gpt-oss-20b's two bf16 runs far from numpy
+  with heavy work beside them; one `test_train` readback under ttsim-chaos.
 </content>
 </invoke>
