@@ -407,10 +407,15 @@ mask tiles only where some row sees the keys in part):
   its output tile in L1 in fp32: the packer adds to what is there (`Pack_L1_Acc`, config word 71 bit 19), switched in
   and out by `repack`. One fused kernel divides the output by the sums: two launches.
 - One sweep (flash attention's) would need the output rescaled in L1 whenever a row's largest grows, which the packer
-  cannot do, so the keys are read twice and the values once. Within 1% of numpy.
+  cannot do, so the keys are swept twice and the values once. A unit's keys that fit L1 stay there from the first sweep
+  for the second (`attention_store`: a bf16 cache's in free slots; a block float's in regions of whole key rows, at most
+  64 tiles each, below B8 past the slots in use and past the frames' regions, 104 rows of Qwen3.6's 256-wide heads in
+  bfp8), the unpacker switched to each row's region: each key is read once. Within 1% of numpy. A decode step's
+  attention at Qwen3.6's shapes reads 1.13 times the cache's keys and values at 8 slots of 2,048 places where it read
+  1.65, and 1.04 at 32 of 1,024.
 
 A decode step has few units (a key head's per slot), so when they are few each unit's keys are shared out among up to 8
-**parts** on workers of their own (flash decoding), each part's p v, sums and largest coming home for a few fused kernels
+**parts** on workers of their own (flash decoding), or as many more as keep each part's keys in L1, each part's p v, sums and largest coming home for a few fused kernels
 to combine, each weighted by exp of its largest less the largest of all. A part with no keys takes one tile hidden by a
 tile of -1e9; a row's largest is held at -1e4 at least, so a row that sees none of a part's keys gets weight 0; each
 part's largest is rounded to bf16 in Dst so its p and its weight agree. `llama.attention` uses it for heads of 64 and

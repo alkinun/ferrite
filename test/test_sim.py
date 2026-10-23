@@ -647,9 +647,9 @@ def test_attend(chip):
   # cache in bfp8 in the four parts the workers allow), rows that see none of some part's keys, parts with no keys at all
   # (places below 32).
   # Without parts, two launches, the attention and the division, and nothing read but what the places reach: rows
-  # whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of keys twice (a
-  # sweep each) and of values once, and the mask's tiles only where some row sees a tile of keys in part, its last two,
-  # twice
+  # whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of keys and of values
+  # once (the keys kept in L1 between the sweeps), and the mask's tiles only where some row sees a tile of keys in part,
+  # its last two, twice
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(43)
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   for e, rows, hd, keys, rep, fmt, shared, window, lo, hi, parts in (
@@ -674,8 +674,8 @@ def test_attend(chip):
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.01)
     assert parts != 1 or kernels(rt, launches) == 2
-    if lo == 200:  # 2 units: 1 + 2 + 2 x 8 x 2 + 8 x 2 + 2 x 2, and the division's 4 result tiles, each reading p v's and the sums'
-      assert read == 2 * (1 + 2 + 32 + 16 + 4) + 8, read
+    if lo == 200:  # 2 units: 1 + 2 + 8 x 2 + 8 x 2 + 2 x 2, and the division's 4 result tiles, each reading p v's and the sums'
+      assert read == 2 * (1 + 2 + 16 + 16 + 4) + 8, read
 
 def test_reduce_axes(chip):
   # sum and max down the rows (one row) and through the batch (one matrix), as along each row: one launch each, the
