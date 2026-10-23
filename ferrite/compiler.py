@@ -1047,7 +1047,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 
 ROWS = BANKS + """
-static void copy(unsigned from, unsigned to, unsigned n) { noc_get(noc_me() & 63, noc_me() >> 6, from, to, n); }
+static void copy(unsigned from, unsigned to, unsigned n) {  // (this tile's coordinates read once a launch: an NIU register read)
+  static unsigned me;
+  if (!me) me = noc_me();
+  noc_get(me & 63, me >> 6, from, to, n);
+}
 static void row_down(unsigned tile, unsigned item) {  // a tile of item-byte values: row 0 of faces 0 and 1 down their 16 rows,
   unsigned face = 256 * item;                         // then faces 0-1 onto 2-3
   l1_settle(tile);
@@ -1442,6 +1446,18 @@ static volatile datum *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
   return (volatile datum *)(CACHE + s * {tb});
 }}
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
+// n datums from s to d, steps dd and ss apart: four at a time along a line of both, and bf16's two to a word
+static void run(volatile datum *d, volatile datum *s, unsigned n, unsigned dd, unsigned ss) {{
+  if (dd == 1 && ss == 1) {{
+    if (sizeof(datum) == 2 && !(((unsigned)d | (unsigned)s) & 3)) {{
+      volatile unsigned *dw = (volatile unsigned *)d, *sw = (volatile unsigned *)s;
+      for (; n >= 8; n -= 8, dw += 4, sw += 4) dw[0] = sw[0], dw[1] = sw[1], dw[2] = sw[2], dw[3] = sw[3];
+      d = (volatile datum *)dw, s = (volatile datum *)sw;
+    }}
+    for (; n >= 4; n -= 4, d += 4, s += 4) d[0] = s[0], d[1] = s[1], d[2] = s[2], d[3] = s[3];
+  }}
+  for (; n; n--, d += dd, s += ss) *d = *s;
+}}
 // The places [from, to) of tile k along an axis n long whose element is inside [lo, hi); a dimension of 1 fills its tile
 static int from(int k, int n, int lo) {{ return n == 1 || lo <= 32 * k ? 0 : lo - 32 * k; }}
 static int to(int k, int n, int lo, int hi) {{
@@ -1479,9 +1495,10 @@ void kmain(volatile unsigned *a) {{
             for (unsigned c = 0; c < 16; c++) out[f * 256 + r * 16 + c] = tile[(f % 2 * 2 + f / 2) * 256 + c * 16 + r];
       }}
     }} else {{
-      copy({ZEROS:#x}, OUT, {tb});  // padding and what lies outside the bounds stay 0
-      noc_wait();
-      if (rows == 1 && r1) r1 = 1;  // a single row: made once, doubled below
+      if (rows == 1 && r1) {{  // a single row: made once, doubled below (so only its row starts as zeros)
+        for (unsigned c = 0; c < 16; c++) out[c] = 0, out[256 + c] = 0;
+        r1 = 1;
+      }} else {{ copy({ZEROS:#x}, OUT, {tb}); noc_wait(); }}  // padding and what lies outside the bounds stay 0
       int lines0 = down ? c0 : r0, lines1 = down ? (cols == 1 && c1 ? 1 : c1) : r1, k0 = down ? r0 : c0, k1 = down ? r1 : c1;
       for (int line = lines0; line < lines1; line++) {{
         int r = down ? k0 : line, c = down ? line : k0;
@@ -1493,9 +1510,7 @@ void kmain(volatile unsigned *a) {{
           if (step == 1 || step == (int)xc) {{  // a run along x's row or down its column, to the end of a face's line, or x's
             unsigned in_row = step == 1, n = k1 - k, m = 16 - k % 16, f = 16 - (in_row ? xj : xi) % 16, left = in_row ? xc - xj : xr - xi;
             n = n < m ? n : m; n = n < f ? n : f; n = n < left ? n : left;
-            volatile datum *d = out + at(r, c), *s = tile + at(xi % 32, xj % 32);
-            unsigned dd = down ? 16 : 1, ss = in_row ? 1 : 16;
-            for (volatile datum *end = d + n * dd; d != end; d += dd, s += ss) *d = *s;
+            run(out + at(r, c), tile + at(xi % 32, xj % 32), n, down ? 16 : 1, in_row ? 1 : 16);
             k += n;
             if (down) r += n; else c += n;
             if (in_row && (xj += n) == xc) {{ xj = 0; xi++; }}
