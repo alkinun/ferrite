@@ -124,9 +124,10 @@ first (NOTES, "Bring-up on a p150").
   conv one kernel over them, so a token of a step adds 17k ttsim cycles to a block where it added 26k, and an
   eight-user step's control is 4.3 ms where it was 5.9 (NOTES, "Qwen3.5's and Qwen3.6's language models", "The cost
   model"); most of the rest is each slot's heads moved into batch entries and out.
-- [ ] **Cheaper moves**: half of a four-slot Qwen3.6 step on ttsim is moves (78k of the cut's 162k cycles), most of them
-  each slot's heads moved into batch entries and out; move_kernel spends about 1.5k cycles a result tile, most of it
-  bookkeeping, however few datums the tile takes (NOTES, "Next for the compiler", 6).
+- [x] **Cheaper moves**: a run four datums at a time and bf16's two to a word, a one-row tile's zeros its row's alone,
+  and the tile cache's record kept between launches: a 32-user SmolLM step's moves 405k ttsim cycles where 586k, a
+  Qwen3.6 step's control for eight users 3.3 ms where 3.7 (NOTES, "Next for the compiler", 6). What is left is each
+  result tile's own work: the zero tile, the fetch, a row's copies down the tile, the write home.
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the
