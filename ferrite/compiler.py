@@ -1561,10 +1561,10 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows, then the
   labels' address, tile strides and offset]. BRISC alone, a unit one row of a tile row of a part of x, 32 to a tile
   row, so a decode step's few rows go to as many workers: the part's tile row comes in (once for a worker's units of
-  it), and the row is scanned once, run by run, its k best so far a heap with the worst at its root (of equal values,
-  the later column), which a better value replaces: once the worst is a float of no sign, a value is checked against it
-  as a signed integer, else by its key (bf16 or fp32 as an unsigned integer once its sign orders it, negatives flipped,
-  -0 as 0); then sorted, best first. parts: each row cut into so many parts of cols columns, whole tiles, each part's k
+  it), and the row is scanned once (once for a worker's units of it too: one row of x is all 32 units'), run by run,
+  its k best so far a heap with the worst at its root (of equal values, the later column), which a better value
+  replaces: once the worst is a float of no sign, a value is checked against it as a signed integer, else by its key
+  (bf16 or fp32 as an unsigned integer once its sign orders it, negatives flipped, -0 as 0); then sorted, best first. parts: each row cut into so many parts of cols columns, whole tiles, each part's k
   best side by side in the results ((batch, rows, parts k)), each index its column in the whole row. labels: each index
   taken from an int32 tensor of x's shape at the column picked, read 64 bytes about it (a part's best indices, for a
   topk over the parts' best). Each unit writes its row of each of the results' tiles (bf16 or fp32, and int32), both
@@ -1604,13 +1604,14 @@ void kmain(volatile unsigned *a) {{
   datum *x = (datum *)X;
   volatile datum *values = (volatile datum *)VALUES;  // a result tile of each: this unit's row in it, at its place
   volatile unsigned *ids = (volatile unsigned *)IDS;
-  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u;
-  for (unsigned u = 0; u < a[1]; u++) {{
+  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, done = ~0u, top[{k}], col[{k}], kept = 0;  // done: the row whose k best
+  for (unsigned u = 0; u < a[1]; u++) {{                                                                // top and col hold (copies' too)
     unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, i = t % tr, p = t / tr % {parts}, b = t / tr / {parts};  // row r of x's
     unsigned first = b * a[5] + i * a[6] + p * {ct} + a[7];                                                    // tile row i, part p, matrix b
     unsigned n = rows == 1 ? 1 : rows - i * 32 < 32 ? rows - i * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here; the row r holds
-    unsigned face = r / 16 * 512 + r % 16 * 16, top[{k}], col[{k}], kept = 0;  // the row's run in the left face, in datums; its k best
-    if (s < n) {{
+    unsigned face = r / 16 * 512 + r % 16 * 16;  // the row's run in the left face, in datums
+    if (s < n && t * 32 + s != done) {{
+      done = t * 32 + s, kept = 0;
       if (t != held) {{
         for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, {tb}), X + j * {tb}, {tb});
         noc_wait();
