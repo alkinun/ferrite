@@ -6,7 +6,7 @@ import array, collections, functools, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
 from ferrite.compiler import attention_kernel, bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
-from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, transpose_kernel
+from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, touched_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
@@ -391,6 +391,19 @@ class Tensor:
     order._run(_cached(("group", rows, k, n), lambda: group_kernel(rows, k, n)), order.addr, tiles.addr, places.addr, x.addr, x.stride, x.offset,
                units=1, name="group")
     return order, tiles, places
+  def touched(self, n, weights):
+    """A mixture of experts' choices (int32, rows x k, values below n) as the experts some row picks, each once: experts,
+    a column of min(rows k, n), those picked in increasing order then n (none); and weights, (that many, rows, 1), each
+    entry's weight from each row (bf16, weights' at the choice, 0 for a row that did not pick it). A decode step's few
+    tokens then go through each picked expert once, every token an entry's rows (a matmul by index=experts, which skips
+    none), weighted and summed over the entries. By one kernel of BRISC's alone, an entry a unit (touched_kernel)."""
+    assert self.dtype == "int32" and weights.dtype == "bf16" and self.shape == weights.shape and self.batch == 1 and self.cols <= 32
+    x, w, rows, k = _plain(self.realize()), _plain(weights.realize()), self.rows, self.cols
+    slots = min(rows * k, n)
+    experts, out = Tensor(self.rt, slots, 1, dtype="int32"), Tensor(self.rt, rows, 1, batch=slots)
+    experts._run(_cached(("touched", rows, k, n), lambda: touched_kernel(rows, k, n)), experts.addr, out.addr, x.addr, x.stride, x.offset,
+                 w.addr, w.stride, w.offset, units=slots, name="touched")
+    return experts, out
   def to(self, rt, ch, back):
     """This tensor in DRAM of another chip's (rt's), copied across the Ethernet link at this chip's channel ch, whose other
     end is that chip's channel back (Chip.links): a worker on each chip (link_kernel), the sender's tiles a chunk at a
@@ -425,7 +438,8 @@ class Tensor:
     fp32's take all four. x may be a block float (a weight cast once: bfp8, read at about half a bf16's bytes, or bfp4, a
     quarter) when self is bf16. index: an int32 (rows, k) tensor picking, for each batch entry b of the result, which of
     x's matrices to multiply by, index's (b // k, b % k), read on the chip from where they lie: a mixture of experts'
-    choice, so a replayed step reads the experts its tokens chose (self: a batch of 1, or of rows times k)."""
+    choice, so a replayed step reads the experts its tokens chose (self: a batch of 1, or of rows times k); an entry
+    picking none (x.batch or more) is zeros, with nothing read and nothing multiplied."""
     fidelity = fidelity or FIDELITY
     if index is not None:
       assert index.dtype == "int32" and self.dtype == "bf16" and self.cols == x.rows and self.batch in (1, index.rows * index.cols), \

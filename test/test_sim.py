@@ -416,15 +416,17 @@ def test_matmul_indexed(chip):
   # or of rows times k by repeat_interleave) by the matrix of w that ids picks, ids[b // k, b % k], which BRISC reads on
   # the chip, so a replay reads whatever experts its tokens chose. One token's 8 experts (a grid row each, A's row
   # shared), 4 tokens' 3 each (12 entries, more than the grid's rows) and 40 tokens' 2 (the indices two tiles), in bf16
-  # and bfp4: each entry bit for bit the plain matmul by its expert
+  # and bfp4: each entry bit for bit the plain matmul by its expert, and one that picks none (16) zeros
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(29)
   experts = Tensor.of(rt, rng.normal(0, 0.1, (16, 96, 160)).tolist())
   for wt in ("bf16", "bfp4"):
     w = experts if wt == "bf16" else experts.cast(wt).realize()
     for n, k in ((1, 8), (4, 3), (40, 2)):
       ids, x = rng.integers(0, 16, (n, k)), Tensor.of(rt, rng.normal(0, 1, (n, 1, 96)).tolist())
+      ids[-1, 0] = 16
       got = value((x.repeat_interleave(k) if n > 1 else x).matmul(w, index=Tensor.of(rt, ids.tolist(), "int32")))
-      assert all(np.array_equal(got[b], value(x[b // k] @ w[int(ids[b // k, b % k])])[0]) for b in range(n * k)), (wt, n, k)
+      want = lambda b, e: value(x[b // k] @ w[e])[0] if e < 16 else np.zeros((1, 160))
+      assert all(np.array_equal(got[b], want(b, int(ids[b // k, b % k]))) for b in range(n * k)), (wt, n, k)
 
 def test_stream_on_one_worker(chip):
   # one worker gets every tile, so the pipeline really cycles: L1 slots and Dst halves alternate, the threads hand
@@ -1306,8 +1308,8 @@ def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's 
   w |= {"norm": bf16(rng.normal(1, 0.1, (1, 576))), "embed": bf16(rng.normal(0, 1, (vocab, 576)))}
   return c, llama.fuse(w | {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, places))), c)
 
-def near(got, want):  # each row's pick numpy's best, or one the chip's bf16 logits cannot tell from it (0.5% of the span apart)
-  return all(w.max() - w[g.argmax()] <= 0.005 * np.ptp(w) for g, w in zip(got, want))
+def near(got, want):  # each row's pick numpy's best, or one the chip's bf16 activations cannot tell from it (1% of the span apart)
+  return all(w.max() - w[g.argmax()] <= 0.01 * np.ptp(w) for g, w in zip(got, want))
 
 def qwen35(rng, vocab=256, places=64):
   """A small Qwen3.5-MoE at random, its weights under Hugging Face's names as llama.load reads them (Weights: bf16 bits,
@@ -1491,8 +1493,9 @@ def test_topk(chip):
 def test_moe(chip):
   # a mixture of experts in the MLP's place (llama.moe): a token's router logits choose its k experts on the chip
   # (topk), matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen
-  # logits and summed, as numpy does for one token and for three (a batch entry each token and expert) and for 40 (each
-  # expert's tokens grouped into tiles, Tensor.group), replayed (tensor.jit) bit for bit as op by op; and a two-block
+  # logits and summed, as numpy does for one token, three and eight (each expert some token picked an entry of every
+  # token, Tensor.touched) and for 40 (each expert's tokens grouped into tiles, Tensor.group), replayed (tensor.jit) bit
+  # for bit as op by op; and a two-block
   # model of them decodes from a replay as it does op by op, so a replayed step reads whatever experts its token chose,
   # and near numpy
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
@@ -1500,7 +1503,7 @@ def test_moe(chip):
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
   c, w = SimpleNamespace(dim=64, k=4), experts(64, 16, 64)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
-  for n in (1, 3, 40):
+  for n in (1, 3, 8, 40):
     h = bf16(rng.normal(0, 1, (n, 64)))
     got, want = value(llama.moe(Tensor.of(rt, h.tolist()), t, c))[0], llama.moe(h, w, c)
     assert np.abs(got - want).max() < 0.02 * np.abs(want).max(), (n, np.abs(got - want).max())

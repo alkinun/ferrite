@@ -319,7 +319,13 @@ wrap at 64. A result tile is K steps into one Dst half, which sums in fp32.
   in shares and multicasts it to all, and B streams.
 - **B's matrices picked on the chip** (`matmul(..., index=)`): batch entry b is row b // k of A by the matrix of B its
   int32 index picks. BRISC fetches the indices first (up to 2400 tokens a call) and offsets B's tile addresses: a
-  mixture of experts' matmul, the experts the chip's own choice, so a replayed step reads the ones its tokens chose.
+  mixture of experts' matmul, the experts the chip's own choice, so a replayed step reads the ones its tokens chose. An
+  index past B's matrices picks none: all four cores read it and skip the entry's steps, so its result is the zero Dst
+  half packed, with nothing read or multiplied.
+- **A's row shared by a batch**: one tile row of A that every matrix of a batch of more than the grid's rows reads (a
+  decode step's tokens through each expert) is read once, in shares by the grid's first row, and multicast to the grid
+  before the first tile. A row or column kept in L1 is tagged by its own matrix, so a batch whose entries share one
+  (a repeat's) does not fetch it again.
 - **Split K**: a matmul of one tile row with few result tiles cuts K into 2, 4 or 8 parts as a batch and sums them
   lazily, each part rounded to bf16 first.
 - **Reads in flight** (`DEPTH`, 4): step k's reads carry NoC transaction ID k % 4 + 1, B streams through 4 slots, and
@@ -465,9 +471,14 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
 - **Several sequences at once** (`forward`'s `slots`): their caches side by side in one, a key head's query heads of
   each sequence one batch entry, so a key head's rows are read once for all its query heads.
 - **A mixture of experts** (`moe`): each token's k best experts by `topk` on the chip (a kernel of BRISC's, a row a
-  worker), their SwiGLUs by matmuls that pick the experts' weights where they lie, weighted and summed. A prompt's
-  tokens are grouped by expert (`Tensor.group`, a counting sort on BRISC) so each expert's weights are read once for
-  every 32 of its tokens. Nothing comes back to the host, so a decode step replays.
+  worker), their SwiGLUs by matmuls that pick the experts' weights where they lie, weighted and summed. A decode step's
+  tokens go through each expert some token picked once, every token an entry's rows (`Tensor.touched`: the experts
+  picked in order, then none, and each entry's weight from each token, 0 where it picked another), weighted before the
+  down projection and the entries summed, so each touched expert's weights are read once and the tokens' row once. A
+  prompt's tokens are grouped by expert (`Tensor.group`, a counting sort on BRISC) so each expert's weights are read
+  once for every 32 of its tokens, the tiles past those used picking none. Whichever makes fewer tile rows. Nothing
+  comes back to the host, so a decode step replays. A synthetic block of 32 experts (2048 wide, 8 picked, bfp4) at 8
+  tokens reads 67 MB where a batch entry for each token and choice read 162.
 - **Gated DeltaNet** (`delta`, Qwen3.5 and 3.6): one matmul makes q, k, v, z, b and a; a causal conv of 4 taps (its last
   3 inputs kept) and SiLU; each value head keeps a 128 x 128 state, S = e^g S + beta k (v - e^g S^T k)^T, read by its
   query, RMS-normed and gated by SiLU(z), in fp32. A decode or verify step takes its tokens by the recurrent rule

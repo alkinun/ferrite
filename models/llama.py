@@ -274,25 +274,28 @@ def numpy_experts(h, p, ids, w, phases, limit=None):  # each token's chosen expe
 
 def chip_experts(h, p, ids, w, phases, limit=None):
   """numpy_experts on the chip, by matmuls that pick each expert's weights where they lie (index=). For a few tokens (a
-  decode step) a batch entry for each token and expert, the token's row by its expert's matrices; for more choices
-  than twice the experts (a prompt), each expert's tokens grouped into whole tiles (Tensor.group), a batch entry for
-  each tile, so its weights are read once for every 32 of its tokens rather than once for each. Either replays. An
-  expert's biases are gathered by the same picks."""
+  decode step) each expert some token picked is one entry with every token its rows (Tensor.touched), its SwiGLU
+  weighted by each token's weight for that expert (0 where the token picked it not), and the entries summed: each such
+  expert's weights read once, and the tokens' rows once a worker. For more (a prompt), each expert's tokens grouped
+  into whole tiles (Tensor.group), a batch entry for each tile, so its weights are read once for every 32 of its tokens,
+  and each token's k outputs gathered back, weighted and summed. Whichever makes the fewer tile rows; either replays,
+  an entry that picks no expert costing nothing but its zeros. An expert's biases are gathered by the same picks."""
   gate_up, down = p["experts.gate_up"], p["experts.down"]
-  (n, k), m, dim = ids.shape[1:], down.rows, down.cols
-  if n * k > 2 * gate_up.batch:  # the entries: each expert's tiles of tokens, or each token's row k times
-    order, picks, places = ids.group(gate_up.batch)
+  (n, k), m, e = ids.shape[1:], down.rows, gate_up.batch
+  dense = -(-n // 32) * min(n * k, e) <= -(-n * k // 32) + min(n * k, e)  # (each way's tile rows a matrix)
+  if dense: (picks, weights), x = ids.touched(e, w), h
+  else:
+    order, picks, places = ids.group(e)
     x = h.gather(order).split(picks.rows, 0)
-  else: x, picks = h.reshape(n, 1, dim) if n == 1 else h.reshape(n, 1, dim).repeat_interleave(k), ids
-  entries = picks.rows * picks.cols
-  row = picks.reshape(1, entries) if {"experts.gate_up_bias", "experts.down_bias"} & set(p) else None  # the picks as a row, to gather biases by
-  plus = lambda y, name: y + p[name].gather(row).reshape(entries, 1, p[name].cols) if name in p else y  # each entry's expert's bias
+  entries = picks.rows
+  row = picks.reshape(1, entries).minimum(e - 1) if {"experts.gate_up_bias", "experts.down_bias"} & set(p) else None  # the picks as a row
+  bias = lambda name: p[name].gather(row).reshape(entries, 1, p[name].cols)  # each entry's expert's bias (none's: the last's, weighted 0)
+  plus = lambda y, name, by=1: y + bias(name) * by if name in p else y
   x = plus(x.matmul(gate_up, fidelity=phases[0], index=picks), "experts.gate_up_bias")
-  y = plus(glu(x[:, :, :m], x[:, :, m:], limit).matmul(down, fidelity=phases[1], index=picks), "experts.down_bias")
-  if picks is ids:  # each token's k entries one after another: each choice's entries a view, every k-th, weighted and summed
-    w = w.reshape(n * k, 1, 1)
-    return sum((y[j::k, :, :] * w[j::k, :, :] for j in range(1, k)), y[0::k, :, :] * w[0::k, :, :]).reshape(n, dim)
-  y, run = y.reshape(order.cols, dim), places.cols // k  # choice j's places
+  g = glu(x[:, :, :m], x[:, :, m:], limit)
+  if dense: return plus((g * weights).matmul(down, fidelity=phases[1], index=picks), "experts.down_bias", weights).sum(0)
+  y = plus(g.matmul(down, fidelity=phases[1], index=picks), "experts.down_bias").reshape(order.cols, down.cols)
+  run = places.cols // k  # choice j's places
   terms = [y.gather(places[:, :, j * run:j * run + n]) * w[:, :, j:j + 1] for j in range(k)]
   return sum(terms[1:], terms[0])
 

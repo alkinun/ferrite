@@ -609,8 +609,8 @@ static void share(unsigned l1, unsigned n, unsigned rect, unsigned tiles, unsign
   while (sent < {total}) send();
 }}"""
 
-def _unpacker(body, cfg):  # TRISC0: the backend config and semaphores, then unpacking, each tile once BRISC has fetched it
-  return TRISC + f"""
+def _unpacker(body, cfg, decls=""):  # TRISC0: the backend config and semaphores, then unpacking, each tile once BRISC has fetched it
+  return TRISC + decls + f"""
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
 static unsigned needed, relayed, stepped;
 static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // the unpack reports, for BRISC
@@ -636,8 +636,8 @@ static unsigned landed(void) {{  // until the next matmul step's tiles are in: B
   while (relayed < needed) relay();  // every report taken, whichever thread unpacked
 }}"""
 
-def _math(slots, body, dst=False):  # TRISC1; dst: it unpacks into Dst itself, so it waits for BRISC's fetches too
-  return TRISC + f"""
+def _math(slots, body, dst=False, decls=""):  # TRISC1; dst: it unpacks into Dst itself, so it waits for BRISC's fetches too
+  return TRISC + decls + f"""
 static unsigned needed;
 static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  // until BRISC has fetched the next tiles
 {KMAIN}
@@ -805,6 +805,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     blocks = -(-w // bq)
     gx_n = len(grid[0]) if nb > 1 else min(len(grid[0]), blocks)
     if nb * blocks > 1: bcast = (gx_n, -(-blocks // gx_n))
+  # One tile row of A that every matrix of a bigger batch reads (a decode step's tokens, through each expert some token
+  # picked): read once, in shares by the grid's first row and multicast to the whole grid, rather than once a worker (a
+  # worker outside the grid reads it itself). Every grid worker takes part, so the batch has a unit for each
+  shared = (grid and not mc and not bcast and len(matmuls) == 1 and not reducing and rt == 1 and nb > 1 and rows_at[0] is not None
+            and size(ops[matmuls[0]]["x"])[0] == 1 and nb * w >= len(grid[0]) * len(grid[1]))
   if not mc and not bcast:
     bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
     while bp > 1 and (base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE or ops[matmuls[0]]["how"] == 2 and ops[matmuls[0]]["kt"] > B8_SLOTS):
@@ -862,9 +867,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     if isinstance(r, int) or swept(r): return f"{FRAMES + (r if isinstance(r, int) else inputs + r[1])} + fr * {frame}"
     return FRAMES + 2 * frame + r[1]
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
-  def matrix(r, base):  # the batch's part of r's tile number: matrix b's, or a repeat's b / rep
-    if size(r)[0] == 1: return ""
-    return f"b / {reps[r]} * a[{base + 1}] + " if reps and isinstance(r, int) and reps[r] > 1 else f"b * a[{base + 1}] + "
+  def which(r):  # which of r's matrices goes with the result's b: b, a repeat's b / rep, or 0 of a batch of 1
+    if size(r)[0] == 1: return "0"
+    return f"b / {reps[r]}" if reps and isinstance(r, int) and reps[r] > 1 else "b"
+  def matrix(r, base):  # the batch's part of r's tile number
+    return "" if size(r)[0] == 1 else f"{which(r)} * a[{base + 1}] + "
   def where(r, base):  # which tile of r (an input or the result, its [address, strides, offset] at a[base]) goes with b, i_, j
     s = size(r)
     i, j = "i_" if ext(s, 1) > 1 else 0, "j" if ext(s, 2) > 1 else 0
@@ -889,12 +896,20 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
             f"reached(kept_done[k]); get(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
   if kept: decls += "static unsigned narrow_done;  // events once the line before's last read of a kept slot is done\n"
   if any(not narrow(r) for r in kept): decls += f"static unsigned kept_done[{L}];\n"
+  picked = [ops[j]["ids"] for j in matmuls if ops[j]["ids"] is not None]  # B's matrices picked by an int32 tensor, in L1 below OUTS
+  indices = ""
+  if picked:
+    (r,), k, ib = picked, shapes[picked[0]][2], tile_bytes("int32")
+    it = -(-shapes[r][1] // 32)  # (their tiles)
+    assert shapes[r][0] == 1 and k <= 32 and OUTS - it * ib >= B8 + 3 * B8_SLOTS * tile_bytes("bfp8"), "the indices in a column of tiles below OUTS"
+    indices = (f"#define IDS {OUTS - it * ib:#x}\nstatic unsigned ids(unsigned b) {{ unsigned t = b / {k}, j = b % {k};  // index (t, j)\n"
+               f"  return ((volatile unsigned *)IDS)[t / 32 * 1024 + (t % 32 / 16 * 2 + j / 16) * 256 + t % 16 * 16 + j % 16]; }}\n")
   passes = []
   for p, (reductions, swept_ops, once) in enumerate(plans):
     c = [[], [], [], []]  # each program's C for a tile
     c[B] += ["reached(frame_done[fr]);"] + [fetch(p, r) for r in sorted(reads[p])] + ["ready();"]
     c[U].append("fetched();")
-    if dst: c[M].append("fetched();")
+    if dst or picked: c[M].append("fetched();")  # (a picked matmul's math reads the indices, there once the first frame is)
     for j in once + swept_ops:
       op, me_j = ops[j], ("op", j)
       cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
@@ -907,6 +922,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
         x, y = arg(op["x"]), arg(op["y"])
         bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
         in_batch = f"ids(b) * a[{y + 1}] + " if op["ids"] is not None else matrix(op["y"], y)  # B's matrix: picked, or the batch's
+        b_which = "ids(b)" if op["ids"] is not None else which(op["y"])  # (and which: a row or column kept in L1 is tagged by its own)
+        live = f"if (ids(b) < {shapes[op['y']][0]}) " if op["ids"] is not None else ""  # an entry picking no matrix: zeros, nothing read
         b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
         on = tt(haloize(1) * bt + (bfp_b(wt, b8) if how == 2 else []))  # unpacker 0 transposing faces, reading a block float
         off = tt(haloize(0) * bt + (bfp_b(wt, 0) if how == 2 else []))
@@ -935,34 +952,34 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
                       f"{get_b} await({FLAGS_B}, {gy_n}, jj + 1); if (jj == 0) await(0, {gx_n}, 1); }} "
                       f"for (unsigned m = 0; m < {kt}; m++) kept_step(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
         elif kept_b is not None:  # A's bp rows and B's column in L1
-          c[B].append(f"{cond}{{ unsigned na = fresh(i_ % {bp}, b * {rt} + i_), nb = fresh(15, b * {w} + j); "
+          c[B].append(f"{cond}{live}{{ unsigned na = fresh(i_ % {bp}, {which(op['x'])} * {rt} + i_), nb = fresh(15, {b_which} * {w} + j); "
                       f"for (unsigned m = 0; m < {kt}; m++) step({how}, a[{y}], {b_tile}, nb ? {0 if how == 2 else kept_b} + m : KEPT, "
                       f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); tagged(0); }}")
         if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
           column = 0 if how == 2 else buf if mc else kept_b  # a block-float B's from the start of its region
           c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
-                      f"{on} for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
+                      f"{on} {live}for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
         elif rows_at[q] is None:  # A's tile streams in beside B's, each step
-          c[B].append(f"{cond}{{ for (unsigned m = 0; m < {kt}; m++) "
+          c[B].append(f"{cond}{{ {live}for (unsigned m = 0; m < {kt}; m++) "
                       f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, {1 + DEPTH} + steps % {DEPTH}); tagged(0); }}")
-          c[U].append(f"{cond}{{ {on} for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
+          c[U].append(f"{cond}{{ {on} {live}for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
                       f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
         elif j == line_b:  # B's line in L1 across passes: fetched in the first pass that computes it, once the line before
           line = f"{lines_at} + k * {kt}"  # has been done with it; A's row kept as below
           if p == computed[0]:
-            c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, b * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
+            c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, {which(op['x'])} * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
                         f"step({how}, a[{y}], {b_tile}, {line} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
           else: c[B].append(f"for (unsigned m = 0; m < {kt}; m++) kept_step();")
           c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, line)])} {on} "
                       f"for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
         else:
-          new = "0" if bcast else f"fresh({q}, b * {rt} + i_)"  # bcast: A's row is in already
-          c[B].append(f"{cond}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
+          new = "0" if bcast or shared else f"fresh({q}, {which(op['x'])} * {rt} + i_)"  # (bcast's, shared's: A's row is in already)
+          c[B].append(f"{cond}{live}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
                       f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
-          c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} for (unsigned m = 0; m < {kt}; m++) {{ "
+          c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} {live}for (unsigned m = 0; m < {kt}; m++) {{ "
                       f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
         c[M].append(f"{cond}{{ {tt(math_begin(True) + walk(True) * bt)} "  # a transposed B's walk, then the modes back
-                    f"for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases'], bt))} }} "
+                    f"{live}for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases'], bt))} }} "
                     f"{tt(walk(False) * bt + sfpu(op['posts'], slots))} {math_end(j)} h ^= {DST_HALF}; }}")
         continue
       drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
@@ -1036,17 +1053,23 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     first = (f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, end = (gx + 1) * {kt} / {gx_n};\n"
              f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
              f"      share(SLOT({rows_at[0]} + e), (end - e) * {tile_bytes(dtype)}, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
-  picked = [ops[j]["ids"] for j in matmuls if ops[j]["ids"] is not None]  # B's matrices picked by an int32 tensor: its
-  if picked:  # tiles, 32 tokens each, come in first, where nothing else goes (past the slots and a block float's buffers)
-    (r,), k, ib = picked, shapes[picked[0]][2], tile_bytes("int32")
-    n = -(-shapes[r][1] // 32)
-    assert shapes[r][0] == 1 and k <= 32 and OUTS - n * ib >= B8 + 3 * B8_SLOTS * tile_bytes("bfp8"), "the indices in a column of tiles below OUTS"
-    decls += (f"#define IDS {OUTS - n * ib:#x}\nstatic unsigned ids(unsigned b) {{ unsigned t = b / {k}, j = b % {k};  // index (t, j)\n"
-              f"  return ((volatile unsigned *)IDS)[t / 32 * 1024 + (t % 32 / 16 * 2 + j / 16) * 256 + t % 16 * 16 + j % 16]; }}\n")
-    first = (f"  for (unsigned i = 0; i < {n}; i++) {{ unsigned t = a[{arg(r) + 3}] + i * a[{arg(r) + 2}];  // the indices' tile row i\n"
+  if shared:  # before its first tile, each grid worker waits for A's row, which the grid's first row reads and multicasts
+    (xs, ys), kt, x = grid, ops[matmuls[0]]["kt"], arg(ops[matmuls[0]]["x"])
+    decls, tail = _array("grid_x", xs) + _array("grid_y", ys) + "\n", f"unflag({len(xs)}, 0);"
+    get_a = lambda e, end: f"for (unsigned m = {e}; m < {end}; m++) get(a[{x}], m + a[{x + 3}], {rows_at[0]} + m);"
+    first = (f"  {{ unsigned me = noc_me(), gx = {len(xs)}, gy = {len(ys)};\n"
+             f"    for (unsigned i = 0; i < {len(xs)}; i++) if (grid_x[i] == (me & 63)) gx = i;\n"
+             f"    for (unsigned i = 0; i < {len(ys)}; i++) if (grid_y[i] == me >> 6) gy = i;\n"
+             f"    if (gy == {len(ys)}) {{ {get_a(0, kt)} noc_wait(); }}\n"
+             f"    else {{ unsigned e = gx * {kt} / {len(xs)}, end = (gx + 1) * {kt} / {len(xs)};\n"
+             f"      if (gy == 0) {{ {get_a('e', 'end')} share(SLOT({rows_at[0]} + e), (end - e) * {tile_bytes(dtype)}, "
+             f"{bh.noc_rect((xs[0], ys[0]), (xs[-1], ys[-1]))}, {len(xs) * len(ys) - 1}, gx, 1); }}\n"
+             f"      await(0, {len(xs)}, 1); }}\n  }}\n")
+  if picked:  # the indices' tiles, 32 tokens each, come in first, where nothing else goes (past the slots and a block float's buffers)
+    first = (f"  for (unsigned i = 0; i < {it}; i++) {{ unsigned t = a[{arg(r) + 3}] + i * a[{arg(r) + 2}];  // the indices' tile row i\n"
              f"    noc_get(BANK(t), AT(a[{arg(r)}], t, {ib}), IDS + i * {ib}, {ib}); }}\n  noc_wait();\n" + first)
-  brisc = _brisc(total, first + program(B), dtype, out, decls, tail, b8, wt)
-  image = compile_kernel(brisc, _unpacker(program(U), config), _math(slots, program(M), dst), _packer(program(P)))
+  brisc = _brisc(total, first + program(B), dtype, out, decls + indices, tail, b8, wt)
+  image = compile_kernel(brisc, _unpacker(program(U), config, indices), _math(slots, program(M), dst, indices), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
 
 def attention_kernel(ht, kt, rows, rep, wt=None, phases=4, edge=0, window=0, parts=1):
@@ -1423,7 +1446,7 @@ void kmain(volatile unsigned *a) {{
   for (unsigned i = 0; i < {-(-rows // 32)}; i++) {{ unsigned u = a[7] + i * a[6]; noc_get(BANK(u), AT(a[5], u, 4096), IDS + i * 4096, 4096); }}
   for (unsigned e = 0; e < {n}; e++) fill[e] = 0;
   for (unsigned s = 0; s < {32 * t}; s++) order[s] = 0;
-  for (unsigned i = 0; i < {t}; i++) tiles[i] = 0;
+  for (unsigned i = 0; i < {t}; i++) tiles[i] = {n};  // (none: a matmul picking by them skips the tiles past those used)
   for (unsigned s = 0; s < {k * rp}; s++) places[s] = 0;
   noc_wait();
   for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) fill[choice(r, j)]++;
@@ -1439,12 +1462,62 @@ void kmain(volatile unsigned *a) {{
     row_down(OUT, 4), send(a[2], i);
   }}
   for (unsigned i = 0; i < {-(-t // 32)}; i++) {{
-    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = i * 32 + r < {t} ? tiles[i * 32 + r] : 0;
+    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = i * 32 + r < {t} ? tiles[i * 32 + r] : {n};
     send(a[3], i);
   }}
   for (unsigned i = 0; i < {k * rp // 32}; i++) {{
     for (unsigned c = 0; c < 32; c++) out[at(0, c)] = places[i * 32 + c];
     row_down(OUT, 4), send(a[4], i);
+  }}
+}}""")
+
+def touched_kernel(rows, k, n):
+  """A mixture of experts' choices as the experts some row picks (Tensor.touched), args [first unit, units, the
+  experts' address, the weights', then the choices' address, tile stride for rows and tile offset, then the choices'
+  weights' (bf16) the same]. BRISC alone, a unit an entry: each worker reads the choices (rows x k, values below n) and
+  their weights once, marks the experts picked, and lists them in increasing order, then n (none) past them; entry s
+  writes its tile of each of its weights' tile rows, row r the weight row r gave expert s of the list (0 if it picked
+  it not), across the row, and the entries' first of each 32 their tile of the experts' column, each its expert across
+  its row, as a column's tile holds it."""
+  tr, slots = -(-rows // 32), min(rows * k, n)
+  return compile_kernel(f"""
+#define IDS {DATA:#x}
+#define WEIGHTS {DATA + tr * 4096:#x}
+#define LIST {DATA + tr * 6144:#x}
+#define OUT {(DATA + tr * 6144 + 4 * n + 4 * slots + 63) // 64 * 64:#x}
+{ROWS}
+static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
+static unsigned choice(unsigned r, unsigned j) {{ return ((volatile unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
+static unsigned weight(unsigned r, unsigned j) {{ return ((volatile unsigned short *)WEIGHTS)[r / 32 * 1024 + at(r % 32, j)]; }}
+void kmain(volatile unsigned *a) {{
+  volatile unsigned *list = (volatile unsigned *)LIST, *mark = list + {slots};
+  if (!a[1]) return;
+  for (unsigned i = 0; i < {tr}; i++) {{
+    unsigned u = a[6] + i * a[5], v = a[9] + i * a[8];
+    noc_get(BANK(u), AT(a[4], u, 4096), IDS + i * 4096, 4096), noc_get(BANK(v), AT(a[7], v, 2048), WEIGHTS + i * 2048, 2048);
+  }}
+  for (unsigned e = 0; e < {n}; e++) mark[e] = 0;
+  noc_wait();
+  for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) mark[choice(r, j)] = 1;
+  unsigned count = 0;
+  for (unsigned e = 0; e < {n}; e++) if (mark[e]) list[count++] = e;
+  for (; count < {slots}; count++) list[count] = {n};
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned s = a[0] + u, e = list[s];
+    for (unsigned i = 0; i < {tr}; i++) {{  // its weights' tile row i: each row's weight for e, across the row
+      volatile unsigned *out = (volatile unsigned *)OUT;
+      for (unsigned r = 0; r < 32; r++) {{
+        unsigned w = 0;
+        for (unsigned j = 0; j < {k} && i * 32 + r < {rows}; j++) if (choice(i * 32 + r, j) == e) w = weight(i * 32 + r, j);
+        for (unsigned c = 0; c < 32; c += 2) out[at(r, c) / 2] = w | w << 16;
+      }}
+      unsigned t = s * {tr} + i;
+      noc_write(OUT, BANK(t), AT(a[3], t, 2048), 2048), noc_wait();
+    }}
+    if (s % 32) continue;
+    volatile unsigned *out = (volatile unsigned *)OUT;  // the experts' tile of entries s to s + 31, each across its row
+    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = s + r < {slots} ? list[s + r] : {n};
+    noc_write(OUT, BANK(s / 32), AT(a[2], s / 32, 4096), 4096), noc_wait();
   }}
 }}""")
 
