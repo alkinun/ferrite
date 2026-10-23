@@ -158,6 +158,9 @@ first (NOTES, "Bring-up on a p150").
 - [x] **A decode step's attention on many workers** (flash decoding): a unit's keys shared out among up to 8 parts on
   workers of their own, each part's p v, sums and largest scores combined after, so one user's long session is read
   by 16 workers where it was 2 (NOTES, "Attention").
+- [x] **A 429 when every slot is busy**: a request holds a slot from its arrival to its end, and one that finds none
+  free is refused at once, as OpenRouter asks (it tries the next provider, and does not count it against uptime),
+  where it waited in a queue (NOTES, "Serving").
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the

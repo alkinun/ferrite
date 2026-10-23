@@ -2070,7 +2070,8 @@ def test_serve(chip, tmp_path):
   # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
   # template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and streamed, or not
   # at all when it is told not to think; usage counts the prompt's tokens its slot held (cached), and ends a stream; an
-  # answer to a JSON schema (response_format) is one
+  # answer to a JSON schema (response_format) is one; and with both slots held by streams, a request gets a 429 at once
+  # (OpenRouter's ask: it tries the next provider), and is served once they end
   import urllib.request
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -2132,6 +2133,11 @@ def test_serve(chip, tmp_path):
   chances = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "logprobs": 2}))["choices"][0]["logprobs"]  # greedy: each
   assert len(chances["tokens"]) == 6 and all(p == max(top.values()) <= 0 for p, top in zip(chances["token_logprobs"], chances["top_logprobs"]))  # the most likely
   assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
+  holding = [post({"prompt": "Hi there", "max_tokens": 20, "temperature": 0, "stream": True}) for _ in range(2)]  # both slots, held from the
+  with pytest.raises(urllib.error.HTTPError) as e: post({"prompt": "Hi", "max_tokens": 2})                    # headers on
+  assert e.value.code == 429 and json.load(e.value)["error"]["code"] == 429, "every slot busy: a 429 at once, not a wait"
+  for h in holding: streamed(h)
+  assert json.load(post({"prompt": "Hi", "max_tokens": 2}))["usage"]["completion_tokens"] == 2, "their slots free again once they end"
   http.shutdown()
   hi = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
   assert serve.chat("... <|im_start|> ...", hi) == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
@@ -2268,6 +2274,7 @@ def test_chat_tools(tmp_path):
   assert "Let me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>" in serve.chat(qwen, again + messages[3:], tools=tools)
   class Stand:  # an engine that answers every request with `said`, a few characters at a time
     tok, places, waiting = bytes_tokenizer(tmp_path), 4096, queue.Queue()
+    def offer(self, r): self.waiting.put(r); return True  # (room for every request)
     def run(self):
       while r := self.waiting.get():
         for i in range(0, len(said), 7): r.out.put(said[i:i + 7])

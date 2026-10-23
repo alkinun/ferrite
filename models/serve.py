@@ -19,7 +19,8 @@ class Request:
   it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot. cached: its
   prompt's tokens that its slot, or a session saved on the host, held already, which were not prefilled. logprobs: for
   each token made, its log probability and those of the logprobs most likely (probs), from the model's logits as they
-  are; marks: how many it had at each piece of text. shape: what its text must keep to (pick), or None."""
+  are; marks: how many it had at each piece of text. shape: what its text must keep to (pick), or None. room: the slot it
+  holds from its offer to its end (Engine.offer), if it was offered."""
   def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None, top_k=0, min_p=0.0,
                presence=0.0, frequency=0.0, repetition=1.0, logprobs=None, shape=None):
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
@@ -27,6 +28,7 @@ class Request:
     self.top_k, self.min_p, self.presence, self.frequency, self.repetition, self.logprobs = top_k, min_p, presence, frequency, repetition, logprobs
     self.shape = shape
     self.made, self.said, self.out, self.finish, self.gone, self.cached, self.probs, self.marks = [], "", queue.Queue(), None, False, 0, [], []
+    self.room = None
 
   def pick(self, logits):
     """The next token: the logits less the penalties (presence and frequency by the tokens made so far, repetition by
@@ -91,7 +93,9 @@ class Request:
   def say(self, text):
     if len(text) > len(self.said): self.marks.append(len(self.probs)); self.out.put(text[len(self.said):]); self.said = text
 
-  def end(self): self.out.put(None)
+  def end(self):
+    if self.room: self.room.release(); self.room = None  # (its slot free for the next offer)
+    self.out.put(None)
 
 class Engine:
   """Sequences decoding together on the chip, a slot of `places` rows of one KV cache each (and Gated DeltaNet's states
@@ -122,9 +126,16 @@ class Engine:
     self.drafts, self.taken = [0] * slots, [1.0] * slots  # each slot's draft, and whether its last was taken (its states then go on from both)
     self.drafted = self.agreed = 0  # (drafts compared with the model's pick, and taken: what speculation saves shows here)
     self.waiting, self.prefilled = queue.Queue(), 0  # (tokens prefilled in all: what the prefix cache saves shows here)
+    self.room = threading.BoundedSemaphore(slots)  # a slot for each offered request, from its offer to its end
     self.saved = collections.OrderedDict()  # tokens -> (each block's bytes: a KV cache's rows, or Gated DeltaNet's states)
 
   def on(self, row, dtype="int32"): return Tensor.of(self.rt, [row], dtype)
+
+  def offer(self, r):  # r queued if a slot is free for it, held until r ends; else False, at once, rather than a wait
+    if not self.room.acquire(blocking=False): return False
+    r.room = self.room
+    self.waiting.put(r)
+    return True
 
   def length(self, last):  # the rows of each slot a call reads when its sequences' last place is last
     return min(self.places, 1 << max(5, last.bit_length()))
@@ -138,7 +149,7 @@ class Engine:
     return min(next((i for i, (a, b) in enumerate(zip(held, ids)) if a != b), min(len(held), len(ids))), len(ids) - 1)
 
   def admit(self, r):  # into the free slot that holds the most of its prompt, or one that takes the saved session that does
-    if r.gone: return
+    if r.gone: return r.end()
     free = [u for u, b in enumerate(self.busy) if b is None]
     u = max(free, key=lambda u: (self.reach(self.held[u], r.ids), -self.used[u]))
     best = max(self.saved, key=lambda k: self.reach(k, r.ids), default=())
@@ -247,7 +258,7 @@ class Engine:
         self.advance()
     except BaseException:
       for r in self.busy + list(self.waiting.queue):
-        if r: r.finish = "error"; r.out.put(None)
+        if r: r.finish = "error"; r.end()
       raise
 
 def chat(template, messages, thinking=True, effort="medium", tools=None):  # messages as the prompt the model was trained on, for the kinds of
@@ -497,7 +508,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
                     q.get("frequency_penalty") or 0.0, q.get("repetition_penalty") or 1.0, top, shape)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens: a slot holds {engine.places - 2}"}})
-      engine.waiting.put(r)
+      if not engine.offer(r): return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})  # (OpenRouter asks for one at
+      # once under load, rather than a wait: it tries the request's next provider, and does not count it against uptime)
       head = {"id": f"ferrite-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       seen = {"text": "", "reasoning_content": "", "content": ""}
       def parts(text):  # a chat's text as a thinking model's reasoning and answer, apart, and only the answer's text before its tool calls
