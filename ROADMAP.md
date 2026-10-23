@@ -132,11 +132,14 @@ first (NOTES, "Bring-up on a p150").
   that holds the longest sequence's (a replay recorded for each), and a prompt's chunk its own slot's up to its last
   place, where every call read every slot whole: a slot can be as long as Qwen3.6's 262K places without every step
   paying for them (NOTES, "Serving").
-- [x] **The cost of a prompt** (`models/cost.py`'s `prompt`): a chunk of a prompt reads the experts its tokens pick,
-  nearly all of every block's at the server's 256 tokens, so a 32K-token prompt of Qwen3.6 waits 8.3 s on DRAM; in
-  chunks of 2,048 it takes 1.1 s, 30,000 tokens/s a card (NOTES, "The cost model").
-- [ ] **Long prompts in big chunks**: a chunk's attention by blocks of queries, so its scores fit beside the model at
-  any context (4.3 GB at 2,048 tokens and 32K places), and the server's chunks 2,048 tokens for a mixture of experts.
+- [x] **The cost of a prompt and of attention** (`models/cost.py`'s `prompt` and `scores`): a chunk of a prompt reads
+  the experts its tokens pick, nearly all of every block's at the server's 256 tokens; and attention's scores go
+  through DRAM six times, as much again as the cache rows a step reads (2.0 GB of an eight-user step's 11.5: 226
+  tokens/s a card where the model said 268), and a chunk reads each key head's rows once a query head and 128 queries:
+  a 32K-token prompt of Qwen3.6 takes 6.7 s, where its experts and rows alone would take 1.1 (NOTES, "The cost model").
+- [ ] **Attention in one kernel** (flash attention): each block of queries goes over its rows with its scores, their
+  running maximum and sum, and its output in L1, reading each key and value head's rows once a block; no scores in
+  DRAM, a step's or a prompt's. Then the server's chunks of 2,048 tokens for a mixture of experts.
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the

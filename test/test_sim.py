@@ -2230,7 +2230,8 @@ def test_cost(tmp_path):
   # COMPARE's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
   # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; the probe's numbers,
   # read from its file, give the rates. A prompt's chunk reads the experts its tokens pick, nearly all of every block's
-  # at 256 tokens, so Qwen3.6's 32K-token prompt takes over five times as long in chunks of 256 as of 2,048
+  # at 256 tokens, so Qwen3.6's 4K-token prompt takes over four times as long in chunks of 256 as of 2,048; at 32K
+  # places its attention's DRAM, the scores and the rows read again, takes most of a 2,048-token chunk
   qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
           "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
           "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
@@ -2256,8 +2257,8 @@ def test_cost(tmp_path):
                                                    "upload over PCIe": 20.0, "read back over PCIe": 12.0}))
   measured = cost.probed(card, str(tmp_path / "probe.json"))
   assert measured["bandwidth"] == 420e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
-  slow, fast = (cost.prompt(c, s, use | {"kv": "bfp8"}, card, chunk) for chunk in (256, 2048))
-  assert slow.seconds > 5 * fast.seconds and fast.rate > 25e3, (slow.seconds, fast.seconds, fast.rate)
+  slow, fast, long = (cost.prompt(c, s, use | {"kv": "bfp8", "context": n}, card, chunk) for n, chunk in ((4096, 256), (4096, 2048), (32768, 2048)))
+  assert slow.rate * 4 < fast.rate and long.rate * 3 < fast.rate, (slow.rate, fast.rate, long.rate)
   assert "a prompt of 8192 tokens" in cost.report(str(tmp_path / "qwen"), "experts", context="8192", kv="bfp8")
 
 def test_fetch(tmp_path, monkeypatch):

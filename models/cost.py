@@ -71,14 +71,21 @@ def session(c, use, speculative=False):
 
 def touched(c, tokens): return c.experts * (1 - (1 - c.k / c.experts) ** tokens) if c.experts else 0  # a block's experts some token picks
 
+def scores(c, entries, queries, rows):  # the bytes an attention block's scores move through DRAM, as ferrite computes them: a
+  # tile of 32 queries by 32 rows for each of `entries` heads (or key heads, their query heads' rows side by side) is
+  # written by the first matmul and read by the softmax, with the mask's, then the softmax's written and read by the
+  # second matmul once for each block of 4 of its result's column tiles (a head's 256 values: twice)
+  return (4 + -(-llama.head(c) // 128)) * entries * -(-queries // 32) * -(-rows // 32) * 2048
+
 def step(c, s, use, card, users, speculative=False, cards=1):
   """A decode step for `users` sessions at once, a token each, or a token and a draft each then the next drafts (two
   calls): the bytes it reads, its flops, launches, control and seconds (waiting on DRAM or on the matmuls, whichever is
   longer, then on the launches or the kernels' own RISC-V work, if the card's counts as ttsim's does, whichever is
   more: the small kernels that do it read little), and tokens/s a user."""
   n, one, d = users * (1 + speculative), session(c, use, speculative), c.dim
+  attention = sum(not llama.linear(c, l) for l in range(c.layers))
   reads = s.every + s.moe * touched(c, n) * s.expert + n * one.kv + users * one.state * (1.5 if speculative else 1)  # states read and written, twice
-                                                                                                             # when speculating
+  reads += attention * scores(c, c.kv * users, c.heads // c.kv * (1 + speculative), use["context"])                # when speculating; scores
   flops = 2 * n * s.values + n * sum(4 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))
   linear = sum(llama.linear(c, l) for l in range(c.layers))
   launches = (c.layers - linear) * LAUNCHES["attention"] + linear * LAUNCHES["deltanet verify" if speculative else "deltanet"]
@@ -87,6 +94,7 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   control = (cycles("attention", c.layers - linear + c.mtp * speculative) + cycles("deltanet", linear) + cycles("rest", 1 + speculative)) / bh.AICLK
   if speculative:  # the drafting call: the layer over two places a user, and the output layer again
     reads += s.draft + c.mtp * touched(c, 2 * users) * s.expert + c.vocab * d * BYTES["bfp8"] + 2 * users * one.draft
+    reads += c.mtp * scores(c, c.kv * users, 2 * c.heads // c.kv, use["context"])
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)
     launches += LAUNCHES["draft"]
   seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + max(launches * card["launch"], control)
@@ -95,9 +103,10 @@ def step(c, s, use, card, users, speculative=False, cards=1):
 def prompt(c, s, use, card, chunk, cards=1):
   """A prompt that fills a session (use's context), prefilled chunk tokens at a time as serve.py's engine takes it: each
   chunk reads every matrix but the experts and the embedding, the experts its tokens pick, and its session's rows up to
-  the power of 2 that holds its last place (once a query head), and computes its tokens' matmuls (the output layer's for
-  its last alone) and their scores over those rows; with a multi-token prediction layer, that layer's over each place
-  too. Its seconds (each chunk waiting on DRAM or on the matmuls, whichever is longer; launches and control left out),
+  the power of 2 that holds its last place (each key head's once for each of its query heads and each block of 4 tiles
+  of 32 queries, as the matmuls' blocks read them), moves its scores through DRAM, and computes its tokens' matmuls (the
+  output layer's for its last alone) and their scores over those rows; with a multi-token prediction layer, that
+  layer's over each place too. Its seconds (each chunk waiting on DRAM or on the matmuls, whichever is longer; launches and control left out),
   tokens/s, and the most bytes a chunk's scores take (each attention block's, and their softmax)."""
   hd, d, n = llama.head(c), c.dim, use["context"]
   blocks = sum(not llama.linear(c, l) for l in range(c.layers)) + c.mtp
@@ -105,7 +114,7 @@ def prompt(c, s, use, card, chunk, cards=1):
   for at in range(0, n, chunk):
     m = min(chunk, n - at)
     rows = min(n, 1 << max(5, (at + m - 1).bit_length()))
-    reads = s.every + s.moe * touched(c, m) * s.expert + blocks * c.heads * hd * 2 * BYTES[use["kv"]] * rows  # (a key head's once a query head)
+    reads = s.every + s.moe * touched(c, m) * s.expert + blocks * (-(-m // 128) * c.heads * hd * 2 * BYTES[use["kv"]] * rows + scores(c, c.heads, m, rows))
     flops = 2 * m * (s.values - c.vocab * d) + 2 * c.vocab * d + blocks * 4 * m * c.heads * hd * rows
     if c.mtp:
       reads += s.draft + c.mtp * touched(c, m) * s.expert + c.vocab * d * BYTES["bfp8"]
