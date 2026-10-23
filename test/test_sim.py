@@ -1893,6 +1893,9 @@ def test_llama_precision(chip):
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
   assert [llama.precision(big, "tt")[k] for k in (("attention", "decode"), ("attention", "prefill"), ("kv", None))] == [(None, 2), (None, 4), ("bfp8", None)]
+  experts = llama.precision(big, "experts")  # (Qwen3.6 on one card: every MLP matrix in bfp4 at one phase, the rest bfp8 at two)
+  assert [experts[k] for k in (("gate_up", 31), ("down", 0), ("qkv", 5), ("head", None), ("kv", None))] == [("bfp4", 1), ("bfp4", 1), ("bfp8", 2), ("bfp8", 2), ("bfp8", None)]
+  assert llama.weight_format("layers.3.shared_expert.down_proj", experts) == llama.weight_format("layers.3.experts.down", experts) == "bfp4"
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(5)
   c, w = smol(rng, 2)
   c.precision = llama.precision(c, "tt")

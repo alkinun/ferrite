@@ -3,7 +3,7 @@
 # one replayed call for all the slots. A prompt goes to the free slot whose last sequence began the same way, or takes
 # a session saved on the host that did, so what they share (a system prompt, an agent's conversation so far) is not
 # prefilled again.
-#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt] [bf16|bfp8|bfp4]   # a folder or a
+#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]   # a folder or a
 #   model id; the weights' formats (llama.precision), then the KV cache's
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
 import collections, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid

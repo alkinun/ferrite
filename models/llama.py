@@ -5,13 +5,14 @@
 # first two, each is a replay (tensor.jit). Several sequences can decode together, their caches side by side (forward's
 # slots), a token each a step, each reading only its own. Qwen3.5's and Qwen3.6's language models too: three Gated
 # DeltaNet blocks (delta) to each attention block, whose state is a few fixed-size tensors rather than a cache that grows.
-#   TTSIM=/path/to/libttsim.so python3 models/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt]
+#   TTSIM=/path/to/libttsim.so python3 models/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt|experts]
 #   ... python3 models/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]   # token accuracy, Tenstorrent's way
 # (numpy: the weight values the chip holds in mode's formats, with exact products, in numpy alone: no chip)
 # The folder holds Hugging Face's HuggingFaceTB/SmolLM-135M config.json, tokenizer.json and model.safetensors (or another
 # Llama's: SmolLM2-360M's, or Llama-3.1-8B-Instruct's, whose weights come in several model-*.safetensors with an index).
 # bfp8: the weight matrices in bfp8 on the chip, bfp4: the MLP's gate and up in bfp4 and the rest in bfp8 (numpy then has
-# them as the chip does), tt: TT's performance precision, formats and fidelity phases both (precision).
+# them as the chip does), tt: TT's performance precision, formats and fidelity phases both, experts: every MLP matrix in bfp4
+# (precision).
 import functools, json, math, os, re, sys, time, unicodedata
 from types import SimpleNamespace
 import numpy as np
@@ -51,17 +52,22 @@ def precision(c, mode="bf16", kv=None):
   """Each matmul's weights' format and fidelity phases, {(op, block): (format, phases)}: op qkv, o, gate_up or down by
   block, head (block None), and attention, whose B is the cache (block "decode" or "prefill", format None). bf16, bfp8, or
   bfp4 (the MLP's gate and up in bfp4, the rest in bfp8): four phases, exact products. tt: tt_transformers' performance
-  mode at tt-metal 9f98dee9: the MLP's gate and up in bfp4 at one phase, the other
-  matrices and the output layer in bfp8 at two, attention at two phases in decode and four in prefill; and for
-  Llama-3.1-8B (32 blocks 4096 wide) its last block's gate and up in bfp8 at two, as its
-  model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has them; the KV cache (kv, None) in bfp8. kv: the KV
-  cache's format, bf16 unless said (tt's bfp8)."""
-  tt, fmt = mode == "tt", lambda op: "bfp4" if op == "gate_up" else "bfp8"
-  p = {(op, l): (fmt(op), 1 if op == "gate_up" else 2) if tt else (fmt(op) if mode == "bfp4" else mode, 4)
-       for l in range(c.layers + getattr(c, "mtp", 0)) for op in ("qkv", "o", "gate_up", "down")}
-  if tt and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
-  p["head", None] = ("bfp8", 2) if tt else ("bfp8" if mode == "bfp4" else mode, 4)
-  return p | {("attention", "decode"): (None, 2 if tt else 4), ("attention", "prefill"): (None, 4), ("kv", None): (kv or ("bfp8" if tt else "bf16"), None)}
+  mode at tt-metal 9f98dee9: the MLP's gate and up in bfp4 at one phase, the other matrices and the output layer in bfp8
+  at two, attention at two phases in decode and four in prefill; and for Llama-3.1-8B (32 blocks 4096 wide) its last
+  block's gate and up in bfp8 at two, as its model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has
+  them. experts: every MLP matrix (a mixture's experts' and shared expert's, gate, up and down) in bfp4 at one phase,
+  which multiplies all of a bfp4 value's bits, the rest and the output layer in bfp8 at two: Qwen3.6-35B-A3B on one card
+  (21.7 GB). kv: the KV cache's format (None at block None), bf16 unless said (tt's and experts' bfp8)."""
+  four = {"bfp4": ("gate_up",), "tt": ("gate_up",), "experts": ("gate_up", "down")}.get(mode, ())  # the ops in bfp4
+  fast = mode in ("tt", "experts")  # one phase for a bfp4 B and two for a bfp8 one, else four
+  def entry(op):
+    if mode in ("bf16", "bfp8"): return mode, 4
+    f = "bfp4" if op in four else "bfp8"
+    return f, (1 if f == "bfp4" else 2) if fast else 4
+  p = {(op, l): entry(op) for l in range(c.layers + getattr(c, "mtp", 0)) for op in ("qkv", "o", "gate_up", "down")}
+  if mode == "tt" and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
+  p["head", None] = entry("head")
+  return p | {("attention", "decode"): (None, 2 if mode == "tt" else 4), ("attention", "prefill"): (None, 4), ("kv", None): (kv or ("bfp8" if fast else "bf16"), None)}
 
 def rms(x, w, c):  # RMSNorm, scaled by w (Qwen3.5's by 1 + w: n w + n, exact where 1 + w would round in bf16)
   f = fns(x)
