@@ -1,4 +1,4 @@
-# The numbers ttsim cannot give, measured on a card (ROADMAP, Stage 1; NOTES.md, "Bring-up"):
+# The numbers ttsim cannot give, measured on a card (NOTES.md, "Bring-up on a p150"):
 # what a launch costs and how it grows with the rectangle, DRAM bandwidth by reads in flight, NoC latency, the rates of
 # the Tensix units a kernel feeds (MVMUL alone, a matmul step with its unpacks at 1, 2 and 4 fidelity phases, the packer,
 # the SFPU), BRISC's scalar work for a mixture of experts (topk, group), and PCIe both ways. Each decides something:

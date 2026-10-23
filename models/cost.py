@@ -1,4 +1,4 @@
-# What a model costs to serve on Blackhole cards (ROADMAP, Stage 2), from its config alone (llama.config): what a card
+# What a model costs to serve on Blackhole cards, from its config alone (llama.config): what a card
 # holds of it (its weights in the formats it runs in; each session's KV cache rows and Gated DeltaNet states), what a
 # decode step reads, computes and launches (its weights, the experts its tokens pick, its sessions' rows and states),
 # and so how many sessions a card keeps, tokens/s for a user and for a card, and dollars a million tokens. The card's
@@ -28,7 +28,7 @@ WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 banks of 4 GiB, a GiB of it for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # its 512 GB/s, and the share of it a decode step reaches (a guess)
             tflops=664e12, phases=2,  # bfp8 matmuls at one fidelity phase (16 cycles a step), and the phases they take
-            launch=1e-6, pcie=25e9,  # a launch on the card (NOTES, "Next for the compiler"), and PCIe 4.0 x16's bytes/s
+            launch=1e-6, pcie=25e9,  # a launch on the card (a guess), and PCIe 4.0 x16's bytes/s
             price=1299, host=600, years=3, watts=300, host_watts=75, kwh=0.15)  # the p150a at its launch, a share of a host,
             # three years; the card's power and its host's share, at $0.15 a kWh
 USE = dict(context=32768, kv="bf16", accept=0.0)  # each session's places, its slot's, all of them filled (a step reads each slot's

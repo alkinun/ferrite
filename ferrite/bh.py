@@ -45,7 +45,7 @@ TAG_AICLK, TAG_GDDR_STATUS, TAG_TENSIX_COLS, TAG_GDDR_ENABLED = 14, 22, 34, 36  
 TAG_FIRMWARE = 28  # the firmware bundle's version, a byte each: major, minor, patch, build (umd's FLASH_BUNDLE_VERSION)
 
 # Ethernet tiles: 14 on NoC0's row y=1, each with one 400 GbE link (a QSFP-DD port is two), Tenstorrent's Ethernet firmware
-# on its first core keeping the link up (ISA EthernetTile/, tt-metal eth_fw_api.h and dev_mem_map.h; NOTES, "Two cards")
+# on its first core keeping the link up (ISA EthernetTile/, tt-metal eth_fw_api.h and dev_mem_map.h; NOTES, "Ethernet links")
 ETH = [(1, 1), (16, 1), (2, 1), (15, 1), (3, 1), (14, 1), (4, 1), (13, 1), (5, 1), (12, 1), (6, 1), (11, 1), (7, 1), (10, 1)]  # channel n's tile
 TAG_ETH_ENABLED = 35  # telemetry: a bit for each channel not harvested (tt-umd's channel numbers, as ETH's)
 ETH_FIRMWARE = 0x70000  # a tile's L1 from here up is the firmware's

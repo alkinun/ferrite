@@ -1,5 +1,5 @@
 # A small GPT trained on ferrite: GPT-2's blocks (models/gpt2.py), tiny, in fp32, learning ferrite's own README and
-# LESSONS a character at a time with Adam, checked against PyTorch two ways: every step's loss and gradients against
+# NOTES a character at a time with Adam, checked against PyTorch two ways: every step's loss and gradients against
 # PyTorch's on ferrite's own weights (each step is right), and the loss curve against PyTorch training the same model on
 # the same text from the same weights by itself (the two runs drift apart, as any two fp32 runs do: see train()).
 #   TTSIM=/path/to/libttsim.so python3 test/train.py [steps]
@@ -11,7 +11,7 @@ from ferrite import tensor
 from ferrite.tensor import Tensor
 import gpt2
 
-def text(): return "".join(open(os.path.join(os.path.dirname(__file__), "..", name)).read() for name in ("README.md", "LESSONS.md"))
+def text(): return "".join(open(os.path.join(os.path.dirname(__file__), "..", name)).read() for name in ("README.md", "NOTES.md"))
 
 def init(c, seed=0):
   """GPT-2's weights by its names, as float32 numpy: N(0, 0.02) (the position embedding 0.01), the projections back
@@ -53,7 +53,7 @@ def train(rt, steps, log=None, data=None):
   The two runs part, though each step is right: Adam's first step moves every weight by LR times the sign of its
   gradient, so a weight whose gradient is below the matmul's error (about 2^-12) moves either way, and the runs go on from there.
   Returns, each step: ferrite's loss, PyTorch's on the same weights, the gradients' worst error (relative to each
-  weight's largest), and PyTorch's own run's loss. data: the text (README and LESSONS unless given)."""
+  weight's largest), and PyTorch's own run's loss. data: the text (README and NOTES unless given)."""
   import torch
   data = data or text()
   chars = sorted(set(data))

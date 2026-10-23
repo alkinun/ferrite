@@ -1074,7 +1074,7 @@ def test_mnist_cnn(chip):
 
 def test_train(chip):
   # training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning to count
-  # in fp32 with Adam (test/train.py learns README and LESSONS, which change with every edit: once, a new text put one
+  # in fp32 with Adam (test/train.py learns README and NOTES, which change with every edit: once, a new text put one
   # gradient past the bound). Every step's loss and gradients against PyTorch's on the same weights (to 1e-3, and 2e-3
   # of the largest: the matmul's 2^-11, compounded), the step recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1
   # together, so a replay sends them in parts); the loss falling; and the first step the same as PyTorch's own
@@ -1896,7 +1896,7 @@ def test_llama_precision(chip):
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.01 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
 
 def test_token_accuracy(chip):
-  # llama.accuracy, Tenstorrent's token accuracy (COMPARE, Measurement): a prompt prefilled, then each step fed the
+  # llama.accuracy, Tenstorrent's token accuracy (test/benchmark.py's B2): a prompt prefilled, then each step fed the
   # reference's token whatever the model picked. Against a reference made the same way from numpy (its five most likely
   # at each place) the chip's picks are numpy's top-1 throughout, and a reference that is wrong at one place costs top-1
   # exactly that step; in numpy (rt None, the weights as numpy arrays) the picks and scores are the same
@@ -1915,10 +1915,10 @@ def test_token_accuracy(chip):
   assert llama.accuracy(None, w, c, prompt, after, top5, 8) == (top1, five, picks), "in numpy (rt None), the same"
 
 def test_benchmark_bytes():
-  # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token; COMPARE, Measurement): the bytes a
+  # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token): the bytes a
   # decode token reads, each weight in the format TT's performance precision gives it (llama.weight_format, as upload
   # casts it; benchmark.weights has them from the model's sizes, as test_llama_precision checks). Llama-3.1-8B's sizes
-  # give COMPARE's 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
+  # give 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
   c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=32, vocab=128256, ffn=14336, places=736)
   c.precision = llama.precision(c, "tt")
   t = benchmark.weights(c)
@@ -2303,7 +2303,7 @@ def test_cost(tmp_path):
   # among them) and 2.95B a token, about 21.7 GB with its experts in bfp4, its KV cache rows 20 KB a token (10 attention
   # blocks of 2 key and value heads of 256) and Gated DeltaNet states 66 MB a session (30 blocks of 32 heads' 128 x 128
   # in fp32 and the conv's last 3 inputs), each to the byte; Llama-3.1-8B in Tenstorrent's performance precision reads
-  # COMPARE's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
+  # benchmark.py's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
   # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; the probe's numbers,
   # read from its file, give the rates. A prompt's chunk reads the experts its tokens pick, nearly all of every block's
   # at 256 tokens, so Qwen3.6's 4K-token prompt takes over six times as long in chunks of 256 as of 2,048; at 32K places

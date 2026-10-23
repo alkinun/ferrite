@@ -1,4 +1,4 @@
-# How fast a bf16 matmul runs on every worker (ROADMAP, Stage 1), its B (the weights) bf16 or a block float. On a card
+# How fast a bf16 matmul runs on every worker, its B (the weights) bf16 or a block float. On a card
 # the time is wall time; on ttsim it is simulated cycles, the RISC-V work on the critical path (queued Tensix
 # instructions cost ttsim nothing, and its DRAM answers at once), not silicon's speed. So it also counts what the
 # workers read from DRAM, against reading each input once: on silicon a big matmul waits on DRAM more than on its

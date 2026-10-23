@@ -1,4 +1,4 @@
-# An OpenAI-compatible server for a Llama-family model on ferrite (ROADMAP, Stage 3). Requests join and leave a batch
+# An OpenAI-compatible server for a Llama-family model on ferrite. Requests join and leave a batch
 # that decodes together: each sequence has a slot of one KV cache (and of Gated DeltaNet's states), and every step is
 # one replayed call for all the slots. A prompt goes to the free slot whose last sequence began the same way, or takes
 # a session saved on the host that did, so what they share (a system prompt, an agent's conversation so far) is not

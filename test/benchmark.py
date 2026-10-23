@@ -1,5 +1,15 @@
-# Stage 1's benchmarks (COMPARE.md: B1, B2 and B3, each measured as its Measurement section says) on ferrite or on TT-NN,
-# on the same card, with the versions of everything that took part. Prints them and writes them to benchmark-<stack>.json.
+# Three benchmarks on ferrite or on TT-NN, on the same card, with the versions of everything that took part (ferrite's,
+# tt-metal's and the UMD it pins, tt-kmd's, the card's firmware, the host's), and the lines of code as cloc counts them.
+# Prints them and writes them to benchmark-<stack>.json.
+#   B1, a matmul: (4096 x 4096) @ (4096 x 4096) in bf16, sums in fp32, at two fidelity phases and at four; the median of 5
+#     measurements, each 20 runs back to back after 3 warm-up runs, from the first launch to the last result.
+#   B2, decode: Llama-3.1-8B-Instruct at TT's performance precision (llama.precision's tt), for one user and for 32: after
+#     the reference file's first 512 tokens, 200 greedy steps, tokens/s over the steps after each stack's warm-up (until
+#     its step replays); the effective DRAM bandwidth (the bytes a token reads, bytes_per_token, times tokens/s, over the
+#     card's 512 GB/s: 6.20 GB a token, so 41.3 tokens/s is half); and Tenstorrent's token accuracy (llama.accuracy: the
+#     prompt, then 500 steps fed the file's next token, top-1 and top-5 against the reference model's five most likely).
+#   B3, long prefill: the time to first token for B2's model with prompts of 4,096 and 32,768 tokens, after a warm-up.
+# table compares them, B1's and B2's speed against ferrite being no more than 1.5 times slower than TT-NN.
 #   python3 test/benchmark.py ferrite path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py ttnn path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py table benchmark-ferrite.json benchmark-ttnn.json   # the two side by side, as markdown
@@ -37,7 +47,7 @@ def lines(folder, keep):  # code lines as cloc counts them, in the files git tra
   try: return json.loads(out)["SUM"]["code"]
   except (ValueError, KeyError): return f"not counted: cloc found no code in {folder}"
 
-def tenstorrent(path):  # Tenstorrent's code as COMPARE counts it: no tests, models, docs (Markdown included), CI or editor
+def tenstorrent(path):  # Tenstorrent's code as we count it: no tests, models, docs (Markdown included), CI or editor
   parts = path.split("/")  # settings (dot folders), or third-party code but the UMD tt-metal pins
   return (not {"tests", "test", "models", "docs"} & set(parts) and not any(p.startswith(".") for p in parts) and not path.endswith(".md")
           and all(parts[i + 1] == "umd" for i, p in enumerate(parts[:-1]) if p == "third_party"))
@@ -73,7 +83,7 @@ def weights(c):  # each weight as llama.upload makes it, its rows, columns and f
                                                  ("o_proj", (c.heads * hd, c.dim)), ("gate_up_proj", (c.dim, 2 * c.ffn)), ("down_proj", (c.ffn, c.dim)))}
   return {k: SimpleNamespace(rows=r, cols=n, dtype=llama.weight_format(k, getattr(c, "precision", None))) for k, (r, n) in shapes.items()}
 
-def bytes_per_token(t, c, context):  # what a decode token reads (COMPARE, Measurement): every weight at its stored size
+def bytes_per_token(t, c, context):  # what a decode token reads (B2): every weight at its stored size
   # but the embedding's and RoPE's tables, a row of each, and the KV cache at the decode's mean context
   size = {"bf16": 2, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}
   rows = {"embed": c.dim, "cos": t["cos"].cols, "sin": t["sin"].cols}
@@ -212,7 +222,7 @@ def ttnn(folder, prompt, after, top5, book, s):
 
 def table(ferrite, ttnn):
   """The two stacks' results side by side, as markdown: each benchmark's numbers, and for B1 and B2 the gate's ratio
-  (ROADMAP, Stage 1: ferrite no more than 1.5 times slower than TT-NN: a time at most 1.5 times, a speed at least two thirds)."""
+  (ferrite no more than 1.5 times slower than TT-NN: a time at most 1.5 times, a speed at least two thirds)."""
   show = lambda v: ", ".join(f"{k} {x:.4g}" if isinstance(x, float) else f"{k} {x}" for k, x in v.items()) if isinstance(v, dict) else str(v)
   rows = ["| | ferrite | TT-NN | TT-NN's speed over ferrite's |", "|---|---|---|---|"]
   for key in [k for k in {**ferrite, **ttnn} if k.startswith("B")]:
