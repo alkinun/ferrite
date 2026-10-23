@@ -5,7 +5,7 @@
 import array, collections, functools, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
-from ferrite.compiler import attention_kernel, bfp4_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
+from ferrite.compiler import attention_kernel, bfp4_kernel, delta_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
 from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, touched_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
@@ -504,6 +504,26 @@ class Tensor:
     top = functools.reduce(Tensor.maximum, largest)
     weighted = lambda at, cols: functools.reduce(Tensor.__add__, [(m - top).exp() * part(p, at, cols) for p, m in enumerate(largest)])
     return (weighted(0, self.cols) / weighted(ht, 1)).cast("bf16")
+
+  def delta(self, tokens, live=None, first=None, accept=None):
+    """Gated DeltaNet's recurrence for a token of each sequence, or a token and its draft (a verify step's), in place:
+    self the states (sequences times value heads, a key's width by a value's; fp32), each S = e^g S + beta k (v - e^g
+    S^T k)^T a token, and each head's output S^T q after it, by one kernel (delta_kernel) reading each state once.
+    tokens: each token's (q, k, v, beta, g): q and k (key heads, sequences, a key's width), v (value heads, sequences, a
+    value's width), a key head for every vh / kh value heads, beta and g (sequences, value heads); live (a row of
+    sequences, 0 for one whose states stay as they were; all live unless said); all fp32. A token and its draft: first,
+    the states after a first token alone, which accept (a row of sequences) says to go on from (0) or self (1), and which
+    take the states after this step's token; self after its draft. Returns the outputs, (value heads, a sequence's
+    tokens in turn, a value's width) in fp32; no gradient."""
+    m, (q, k, v, beta, g) = len(tokens), tokens[0]
+    vh, kh, n = beta.cols, q.batch, beta.rows
+    assert self.dtype == "fp32" and all(t.dtype == "fp32" for x in tokens for t in x) and vh % kh == 0 and self.batch == n * vh and (first is None) == (m == 1)
+    assert all(x[0].shape == x[1].shape == (kh, n, self.rows) and x[2].shape == (vh, n, self.cols) and x[3].shape == x[4].shape == (1, n, vh) for x in tokens)
+    live = live if live is not None else self._number(1.0, "fp32").expand(1, 1, n).realize()
+    o = Tensor.frombytes(self.rt, n * m, self.cols, bytes(4 * vh * n * m * self.cols), vh, "fp32")  # (its padding rows 0, as no unit writes them)
+    key = ("delta", -(-self.rows // 32), -(-self.cols // 32), vh, vh // kh, m)
+    ins = [self.realize(), o] + [_plain(t.realize()) for t in (live, *((first, accept) if m > 1 else ()), *(t for x in tokens for t in x))]
+    return o._run(_cached(key, lambda: delta_kernel(*key[1:])), *[x for t in ins for x in t._where()], units=n * vh, name="delta")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
   def conv2d(self, w, padding=0):

@@ -416,6 +416,26 @@ tile of -1e9; a row's largest is held at -1e4 at least, so a row that sees none 
 part's largest is rounded to bf16 in Dst so its p and its weight agree. `llama.attention` uses it for heads of 64 and
 wider, but gpt-oss's (its sinks).
 
+### Gated DeltaNet's step
+
+`Tensor.delta` (`compiler.delta_kernel`): a decode step's recurrence, S = e^g S + beta k (v - e^g S^T k)^T and the output
+S^T q after it, for each value head of each sequence (a unit), in fp32 on the SFPU, each state read once and written
+once; or a verify step's token and its draft, from the states after both of the last step's tokens or after its first
+alone (BRISC reads the one its accept says), both tokens' new states written, one read and two writes where eleven
+passes were. BRISC reads the head's S (kt x vt tiles) into a frame (two alternate between units), each token's row
+runs of its key's and query's values and its value's, and its beta and g, and live: it stores each key and query
+value in column 0 of a zero tile's row, the value's runs land in row 0 of zero tiles, each scalar in place 0. The math thread fills Dst from L1
+itself (fp32) and folds those across their rows and columns (`across_rows`, `across_cols`) into broadcast tiles: a
+column tile of the key and of the query, a row tile of the value, e^g and beta everywhere, k . q from the column tiles'
+products folded down. The recurrence is separable by column: for each column tile j, one SFPU pass over its kt tiles
+sums u = S^T k and w = S^T q down the column (two Dst accumulators), d = beta (v - e^g u) stays in Dst, the output's
+tile is e^g w + d (k . q), and the column's new tiles e^g S + k d (a first of two tokens' packed into L1 too, the
+second's S); programs read up to five Dst places at once (fills at fixed rows, a result in a half by a variant for
+each). BRISC sends the output's row runs into its tile and the new
+tiles over the old, but a dead sequence's. A decode step's Gated DeltaNet block is then the qkv matmul, the conv,
+its inputs' shift, q's and k's norms, beta and g, this kernel, the output's norm and gate and the output matmul: no
+moves.
+
 ### Shapes and movement
 
 **Padding.** A tensor is padded to whole tiles with zeros, except that a dimension of 1 fills its tile with copies (a
@@ -481,15 +501,17 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
   tokens reads 67 MB where a batch entry for each token and choice read 162.
 - **Gated DeltaNet** (`delta`, Qwen3.5 and 3.6): one matmul makes q, k, v, z, b and a; a causal conv of 4 taps (its last
   3 inputs kept) and SiLU; each value head keeps a 128 x 128 state, S = e^g S + beta k (v - e^g S^T k)^T, read by its
-  query, RMS-normed and gated by SiLU(z), in fp32. A decode or verify step takes its tokens by the recurrent rule
-  (`step`); a prompt goes in pieces of 64 (`chunk`, the UT transform: (I + L)^-1 = (I + P)(I + P^2)(I + P^4)..., P = -L, no
-  loop over tokens), everything the state does not enter done for every piece at once, then the state through the pieces in turn.
-  The states are written back in place (`assign`), so a replay carries them.
+  query, RMS-normed and gated by SiLU(z), in fp32. A decode step's token, or a verify step's token and its draft, goes
+  through the recurrent rule in one kernel of each head (`Tensor.delta`, `step` numpy's), q and k from the conv's row
+  as it lies; a prompt goes in pieces of 64 (`chunk`, the UT transform: (I + L)^-1 = (I + P)(I + P^2)(I + P^4)..., P =
+  -L, no loop over tokens), everything the state does not enter done for every piece at once, then the state through
+  the pieces in turn. The states are written back in place (`assign`), so a replay carries them.
 - **Gated attention** (Qwen3.5 and 3.6): each head's output times sigmoid(gate), RoPE on a quarter of each head, q and k
   RMS-normed per head, RMSNorms by 1 + w.
 - **Speculative decoding** (`draft`, `forward`'s accept): the multi-token prediction layer is a block past the last;
   from a place's hidden state and the next token it gives a draft. A verify step takes a token and its draft and keeps
-  the DeltaNet states twice, after both and after the first; the next step's accept row says which it goes on from.
+  the DeltaNet states twice, after both and after the first; the next step's accept row says which it goes on from,
+  the kernel reading that one alone and writing both.
 - **Token accuracy** (`llama.accuracy`), Tenstorrent's way: the reference file's (tt_transformers'
   `tests/reference_outputs/<model>.refpt`) first 512 tokens as the prompt, then 500 steps fed the file's next token;
   top-1 where the pick is the reference model's best, top-5 where it is among its five. In numpy it runs as one prefill

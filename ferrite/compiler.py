@@ -647,14 +647,14 @@ static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  /
 {body}
 }}"""
 
-def _packer(body):  # TRISC2
+def _packer(body, slots=2):  # TRISC2; slots: output slots, each refilled once its last result has gone home
   return TRISC + f"""
-static unsigned outputs, relayed, used[2];
+static unsigned outputs, relayed, used[{slots}];
 static void relay(void) {{ for (; SEM({SEM_PACKED}); SYNC[PACKED] = ++relayed) SEM({SEM_PACKED}) = 1; }}  // packed results, for BRISC
 // The next result is packed into slot (output slot s: one per frame, or one for all) and goes home as tile t. Once the
-// last result packed there has gone home, tell BRISC in RING; at most two wait to go home, one per output slot.
+// last result packed there has gone home, and RING has room (at most four wait to go home), tell BRISC in RING.
 static void output(unsigned s, unsigned slot, unsigned t) {{
-  while (peek(SENT) < used[s]) relay();
+  while (peek(SENT) < used[s] || peek(SENT) + 4 <= outputs) relay();
   SYNC[RING + outputs % 4 * 2] = slot; SYNC[RING + outputs % 4 * 2 + 1] = t;
   used[s] = ++outputs;
 }}
@@ -1208,6 +1208,165 @@ def attention_kernel(ht, kt, rows, rep, wt=None, phases=4, edge=0, window=0, par
   packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer                     # made by the SFPU
   return compile_kernel(_brisc("expect", brisc, "bf16", "fp32", "static unsigned expect;", b8=2 * ht if wt else 0, wt=wt or "bfp8", outs=oacc),
                         _unpacker(f"posted += {len(made)};" + unpacker, cfg), _math(slots, math), _packer("static unsigned needed;" + packer))
+
+def delta_kernel(kt, vt, vh, rep, m=1):
+  """Gated DeltaNet's recurrence for m tokens of each sequence (Tensor.delta), its state read once, in fp32: args [first
+  unit, units, then the states', the output's (a head a matrix, a sequence's m tokens rows in turn) and live's (a
+  sequence a column) DRAM address, tile strides for batch and row, and tile offset; with m of 2 (a verify step's token
+  and its draft) then the states' after a first token and accept's (a sequence a column); then each token's q's, k's
+  and v's (a head a matrix, a sequence a row), beta's and g's (a sequence a row, a value head a column)]. A unit is a
+  value head of a sequence (vh to a sequence): its
+  state S (32 kt rows by 32 vt columns), with m of 2 the one accept says (after both tokens of the last step, or after
+  its first alone); each token's q's and k's rows of head unit's / rep and v's of its own. BRISC reads S's tiles and
+  the rows' runs, and puts each key and query value in column 0 of a zero tile's row, each value in row 0 of one, each
+  scalar in place 0; the math thread folds them across rows and columns into broadcast tiles (the SFPU's). The rule
+  is separable by column: for each column tile j of S, and each token in turn, one SFPU pass sums u = S^T k and w = S^T
+  q down the column's tiles, then d = beta (v - e^g u), the token's output e^g w + d (k . q), and the column's new
+  tiles e^g S + k d, the next token's S. Each token's states go home (the last's to the states, a first of two's to
+  the others), a dead sequence's not."""
+  per = 2 * kt + vt + 2  # a token's slots in a frame: the key's and query's column tiles, the value's row tiles, g, beta
+  F = kt * vt + m * per  # a frame's: S's tiles, then each token's
+  S_ = lambda i, j: f"(F0 + ({i}) * {vt} + ({j}))"
+  K_, Q_, V_ = (lambda t: lambda i: f"(F0 + {kt * vt + t * per} + ({i}))", lambda t: lambda i: f"(F0 + {kt * vt + t * per + kt} + ({i}))",
+                lambda t: lambda j: f"(F0 + {kt * vt + t * per + 2 * kt} + ({j}))")
+  G_, B_ = lambda t: f"(F0 + {kt * vt + t * per + 2 * kt + vt})", lambda t: f"(F0 + {kt * vt + t * per + 2 * kt + vt + 1})"
+  mine = 2 * kt + vt + 3  # a token's broadcast tiles, packed: keys', queries', values', then e^g, beta, k . q everywhere
+  KC, QC, VV, E, BT, KQ = (lambda t, o=o: 1 + 2 * F + t * mine + o for o in (0, kt, 2 * kt, 2 * kt + vt, 2 * kt + vt + 1, 2 * kt + vt + 2))
+  COL = 1 + 2 * F + m * mine  # a first of two's new tiles of the column, the second's S
+  OUT = COL + kt * (m - 1)  # an output slot for each Dst half
+  STAGE = slot_base("fp32") + (OUT + 2) * 4096  # BRISC's: each token's key's and query's values, then the scalars' 64-byte blocks
+  scalars = 3 * m + 2  # (each token's beta and g, live, accept, and a spare)
+  assert STAGE + m * 256 * kt + 64 * scalars <= OUTS and OUT + 2 <= UNPACKABLE, "a unit's tiles in L1"
+  R2, R3, R4, R5, R6, R7 = 128, 192, 256, 320, 384, 448  # Dst rows (fp32: a tile's 64): fills, the two sums, e^g, d
+  load = lambda r, at: ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=at)
+  store = lambda r, at, last=True: ins("SFPSTORE", vd=r, mod0=3, addr_mode=3 if last else 2, imm10=at)
+  sfpu_body = lambda words: [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100), Loop(32, words)]
+  programs = {  # each at Dst row 0 (aim(0)), its result into row r
+    "kq first": lambda r: [load(0, R2), load(1, R3), mul(2, 0, 1), store(2, R4)],
+    "kq": lambda r: [load(0, R2), load(1, R3), load(2, R4), mad(2, 0, 1, 2), store(2, R4)],
+    "sums first": lambda r: [load(0, R2), load(1, R3), load(2, R6), mul(3, 1, 0), mul(4, 2, 0), store(3, R4, False), store(4, R5)],
+    "sums": lambda r: [load(0, R2), load(1, R3), load(2, R6), load(3, R4), load(4, R5), mad(3, 1, 0, 3), mad(4, 2, 0, 4), store(3, R4, False), store(4, R5)],
+    "d": lambda r: [load(0, R2), load(1, R3), load(2, R6), load(3, R4), mad(4, 2, 3, 1, neg=1), mul(5, 0, 4), store(5, R7)],  # beta (v - e u)
+    "out": lambda r: [load(0, R6), load(1, R5), load(2, R7), load(3, R2), mul(4, 0, 1), mad(5, 2, 3, 4), store(5, r)],  # e w + d (k . q)
+    "state": lambda r: [load(0, R2), load(1, R3), load(2, R6), load(3, R7), mul(4, 2, 0), mad(5, 1, 3, 4), store(5, r)],  # e S + k d
+    "copy": lambda r: [load(0, R4), store(0, r)]}
+  run = lambda name: tt(sfpu_body(programs[name](0)))
+  to_h = lambda name: f"if (h) {{ {tt(sfpu_body(programs[name](DST_HALF)))} }} else {{ {tt(sfpu_body(programs[name](0)))} }}"
+  free = tt([ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)])  # fills wait for the SFPU to be done with their rows
+  fills = lambda *pairs: free + " " + tt([w for slot, row in pairs for w in fill(slot, row)] + FILLED)
+  half = tt([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)])  # a Dst half free for a result
+  done = f"{tt(MATH_END)} h ^= {DST_HALF};"
+  at = lambda row: tt([aim(row)])
+  folds = lambda *kinds: " ".join(f"{k}();" for k in kinds)  # (each fold a function: its words once in the program)
+  def result(words, slot=None, home=None, keep=None):  # (math's, pack's) words for a result in the Dst half h: packed into
+    math = f"{half} {words} {done}" + (" posted++;" if slot is not None else "")  # slot (an intermediate, its L1 kept until
+    if home is None: return math, f"{tt(pack('h', slot, SEM_L1))} h ^= {DST_HALF};"  # it has gone home, if it goes: keep,
+    to, keep = (slot, keep) if slot is not None else (f"{OUT} + h / {DST_HALF}", f"h / {DST_HALF}")  # its output slot's
+    return math, f"output({keep}, {to}, {home}); {tt(pack('h', to, SEM_PACKED, *([SEM_L1] if slot is not None else [])))} h ^= {DST_HALF};"
+  loop = lambda var, n, pair: tuple(f"for (unsigned {var} = 0; {var} < {n}; {var}++) {{ {w} }}" for w in pair)  # (math's, pack's), n times
+  steps = []
+  for t in range(m):  # each token's broadcast tiles, and its k . q
+    steps += [loop("i", kt, result(f"{at('h')} {fills((K_(t)('i'), 'h'))} {folds('sum2')}", f"{KC(t)} + i")),
+              loop("i", kt, result(f"{at('h')} {fills((Q_(t)('i'), 'h'))} {folds('sum2')}", f"{QC(t)} + i")),
+              loop("j", vt, result(f"{at('h')} {fills((V_(t)('j'), 'h'))} {folds('sum1')}", f"{VV(t)} + j")),
+              result(f"{at('h')} {fills((G_(t), 'h'))} {folds('sum2', 'sum1')} {tt(sfpu(['fexp'], {}))}", E(t)),
+              result(f"{at('h')} {fills((B_(t), 'h'))} {folds('sum2', 'sum1')}", BT(t)),
+              (f"drain(); {at(0)} {fills((KC(t), R2), (QC(t), R3))} {run('kq first')} for (unsigned i = 1; i < {kt}; i++) "
+               f"{{ {fills((f'{KC(t)} + i', R2), (f'{QC(t)} + i', R3))} {run('kq')} }} {at(R4)} {folds('sum1')} {at(0)}", ""),
+              result(f"{free} {to_h('copy')}", KQ(t)), ("drain();", "")]
+  column = []  # each column tile j of S, through each token in turn
+  for t in range(m):
+    col = (lambda i: S_(i, 'j')) if t == 0 else (lambda i: f"{COL} + ({i})")
+    column += [("drain();" if t else "", ""),
+               (f"{fills((col(0), R2), (KC(t), R3), (QC(t), R6))} {run('sums first')} "
+                f"for (unsigned i = 1; i < {kt}; i++) {{ {fills((col('i'), R2), (f'{KC(t)} + i', R3), (f'{QC(t)} + i', R6))} {run('sums')} }} "
+                f"{at(R4)} {folds('sum1')} {at(R5)} {folds('sum1')} {at(0)} {fills((BT(t), R2), (f'{VV(t)} + j', R3), (E(t), R6))} {run('d')}", ""),
+               result(f"{fills((KQ(t), R2))} {to_h('out')}", home=f"{1 << 30:#x} | unit << 8 | {t} << 6 | j"),
+               loop("i", kt, result(f"{fills((col('i'), R2), (f'{KC(t)} + i', R3))} {to_h('state')}", f"{COL} + i" if t < m - 1 else None,
+                                    f"{(m - 1 - t) << 31:#x} | unit << 8 | (i * {vt} + j)", "2 + i"))]
+  steps.append(loop("j", vt, (" ".join(c for c, _ in column), " ".join(c for _, c in column))))
+  math, packs = [w for w, _ in steps], [w for _, w in steps]
+  units = lambda body: f"""  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned unit = a[0] + u, F0 = 1 + (u & 1) * {F};
+    {body}
+  }}"""
+  # BRISC: the frames' zero tiles first; for each unit, once its frame is free, its tiles, rows and values, the values
+  # put in place; meanwhile, results go home as they are packed
+  tile = lambda i, b, r, c: f"({b}) * A[({i}) + 1] + ({r}) * A[({i}) + 2] + ({c}) + A[({i}) + 3]"  # tile (b, r, c) of the tensor at A[i]
+  first, tokens = 14 if m > 1 else None, 22 if m > 1 else 14  # (where in args: the states after a first token, then each token's)
+  run_at = lambda r: f"((({r}) % 32) / 16 * 2 + f) * 1024 + (({r}) % 16) * 64"  # row r's run in face f of an fp32 tile, in bytes
+  sc = lambda k: f"STAGE + {m * 256 * kt} + 64 * ({k})"  # scalar k's 64-byte block
+  scalar = lambda i, row, col, k: (f"{{ unsigned t = {tile(i, 0, f'({row}) / 32', f'({col}) / 32')}, o = (({row}) % 32 / 16 * 2 + ({col}) % 32 / 16) * 1024 + "
+                                   f"(({row}) % 16 * 16 + ({col}) % 16) * 4; noc_get(BANK(t), AT(A[{i}], t, 4096) + o / 64 * 64, {sc(k)}, 64); word[{k}] = o % 64 / 4; }}")
+  value = lambda k: f"((volatile unsigned *)({sc(k)}))[word[{k}]]"
+  zeros = [w for t in range(m) for w in [K_(t)(i) for i in range(kt)] + [Q_(t)(i) for i in range(kt)] + [V_(t)(j) for j in range(vt)] + [G_(t), B_(t)]]
+  brisc = SYNC_WORDS + ROWS + f"""
+#define SLOT(i) ({slot_base("fp32"):#x} + (i) * 4096)
+#define STAGE {STAGE:#x}
+static const unsigned *A;
+static unsigned fetched, events, frame_done[2], sent, alive[4], word[{scalars}];
+static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
+static void send(void) {{  // the results packed so far go home: an output's row runs, a live sequence's state's tiles
+  for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
+    unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1), unit = t >> 8 & 0x3FFFFF, s = unit / {vh}, h = unit % {vh};
+    if (t >> 30 & 1) for (unsigned f = 0; f < 2; f++) {{  // the output's tile of the head's token: its row's runs
+      unsigned r = s * {m} + (t >> 6 & 3), o = {tile(6, 'h', 'r / 32', 't & 63')}, off = {run_at('r')};
+      noc_put(SLOT(slot) + off, BANK(o), AT(A[6], o, 4096) + off, 64);
+    }} else if (alive[unit % 4]) {{  // the states', or the first token's
+      unsigned at = t >> 31 ? {first or 2} : 2, o = unit * A[at + 1] + (t & 255) / {vt} * A[at + 2] + (t & 255) % {vt} + A[at + 3];
+      noc_put(SLOT(slot), BANK(o), AT(A[at], o, 4096), 4096);
+    }}
+    noc_wait();
+  }}
+}}
+static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
+void kmain(volatile unsigned *args) {{
+  A = (const unsigned *)args;
+  for (unsigned F0 = 1; F0 < {1 + 2 * F}; F0 += {F}) {{ {" ".join(f"copy({ZEROS:#x}, SLOT({z}), 4096);" for z in zeros)} }}
+  noc_wait();
+  for (unsigned u = 0; u < A[1]; u++) {{
+    unsigned unit = A[0] + u, F0 = 1 + (u & 1) * {F}, s = unit / {vh}, h = unit % {vh}, hk = h / {rep};
+    reached(frame_done[u & 1]);
+    {scalar(10, 0, 's', 0)} {scalar(first + 4, 0, 's', 1) if m > 1 else ""}
+    noc_wait();
+    alive[unit % 4] = {value(0)} != 0;
+    unsigned from = {f"{value(1)} ? 2 : {first}" if m > 1 else "2"};  // (the states the last step's draft, taken or not, says)
+    for (unsigned i = 0; i < {kt}; i++) for (unsigned j = 0; j < {vt}; j++) {{
+      unsigned t = unit * A[from + 1] + i * A[from + 2] + j + A[from + 3];
+      noc_get(BANK(t), AT(A[from], t, 4096), SLOT(F0 + i * {vt} + j), 4096);
+    }}
+    for (unsigned n = 0; n < {m}; n++) {{  // each token's: its rows, as they are (the key's and query's staged), and scalars
+      unsigned x = {tokens} + 20 * n;  // (its q's, then k's, v's, beta's and g's)
+      for (unsigned i = 0; i < {kt}; i++) for (unsigned f = 0; f < 2; f++) {{
+        unsigned q = {tile('x', 'hk', 's / 32', 'i')}, k = {tile('x + 4', 'hk', 's / 32', 'i')}, off = {run_at('s')};
+        noc_get(BANK(k), AT(A[x + 4], k, 4096) + off, STAGE + n * {256 * kt} + (i * 2 + f) * 64, 64);
+        noc_get(BANK(q), AT(A[x], q, 4096) + off, STAGE + n * {256 * kt} + {128 * kt} + (i * 2 + f) * 64, 64);
+      }}
+      for (unsigned j = 0; j < {vt}; j++) for (unsigned f = 0; f < 2; f++) {{  // the value's into row 0 of its tiles
+        unsigned v = {tile('x + 8', 'h', 's / 32', 'j')}, off = {run_at('s')};
+        noc_get(BANK(v), AT(A[x + 8], v, 4096) + off, SLOT(F0 + {kt * vt + 2 * kt} + n * {per} + j) + f * 1024, 64);
+      }}
+      {scalar('x + 12', 's', 'h', '2 + 2 * n')} {scalar('x + 16', 's', 'h', '3 + 2 * n')}
+    }}
+    noc_wait();
+    for (unsigned n = 0; n < {m}; n++) {{  // each key and query value in column 0 of its row, beta and g in place 0
+      volatile unsigned *k = (volatile unsigned *)(STAGE + n * {256 * kt}), *q = k + {32 * kt};
+      for (unsigned i = 0; i < {kt}; i++) for (unsigned r = 0; r < 32; r++) {{
+        unsigned d = (r / 16 * 2) * 256 + r % 16 * 16, at = F0 + {kt * vt} + n * {per} + i;
+        ((volatile unsigned *)SLOT(at))[d] = k[i * 32 + r], ((volatile unsigned *)SLOT(at + {kt}))[d] = q[i * 32 + r];
+      }}
+      ((volatile unsigned *)SLOT(F0 + {kt * vt + 2 * kt + vt + 1} + n * {per}))[0] = {value('2 + 2 * n')};
+      ((volatile unsigned *)SLOT(F0 + {kt * vt + 2 * kt + vt} + n * {per}))[0] = {value('3 + 2 * n')};
+    }}
+    l1_settle(SLOT(F0));
+    ready(); frame_done[u & 1] = ++events;
+  }}
+  while (sent < A[1] * {vt * m * (kt + 1)}) send();
+}}"""
+  cfg = kernel_config("fp32", "fp32")
+  fold = "".join(f"__attribute__((noinline)) static void {k}(void) {{ {tt(ACROSS[FOLDS[k]](k))} }}\n" for k in ("sum1", "sum2"))  # down a tile's columns, along its rows
+  return compile_kernel(brisc, _unpacker(units("fetched();"), cfg), _math({}, units("fetched(); " + " ".join(math) + " " + tt(REPORT)), True, fold),
+                        _packer(units(" ".join(packs)), 2 + kt))
 
 ROWS = BANKS + """
 static void copy(unsigned from, unsigned to, unsigned n) {  // (this tile's coordinates read once a launch: an NIU register read)

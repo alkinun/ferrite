@@ -32,7 +32,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                            tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)),
                            parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to,
                            pad=lambda a, rows: np.pad(a, ((0, 0), (0, rows), (0, 0))), empty=lambda shape: np.empty(shape, np.float32),
-                           down=lambda a: a.sum(-2, keepdims=True))
+                           down=lambda a: a.sum(-2, keepdims=True), delta=numpy_delta)
   sink_softmax = lambda a, sink: (e := (a - (m := a.max(2).maximum(sink))).exp()) / (e.sum(2) + (sink - m).exp())  # one more logit, left out
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid,
                          repeat=Tensor.repeat_interleave, mm=lambda a, b, phases, dtype=None: a.matmul(b, dtype, fidelity=phases), topk=Tensor.topk,  # numpy's
@@ -42,7 +42,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                          swap=lambda a: a.permute(1, 0, 2),
                          assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
                          pad=lambda a, rows: a.pad(((0, 0), (0, rows), (0, 0))), empty=lambda shape: Tensor(x.rt, shape[1], shape[2], batch=shape[0], dtype="fp32"),
-                         expand=lambda a, shape: a.expand(*shape), down=lambda a: a.sum(1))
+                         expand=lambda a, shape: a.expand(*shape), down=lambda a: a.sum(1), delta=Tensor.delta)
 
 @functools.cache
 def triangle(rt, n, lower=False):  # ones on and above the diagonal (or on and below it), n x n in fp32, on the chip once
@@ -139,61 +139,71 @@ def delta(h, p, c, state, phases, live=None, accept=None):
   value's), which a token decays by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T
   k)^T, and reads with its query. A speculative step's state also keeps both after its first token alone ([...,
   conv's, S]), and its accept row (1 or 0 a sequence) says which the next step goes on from: after both tokens, or
-  after the first when its second, a draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay
-  (-exp(A_log)), dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it), a decode or verify
-  step's tokens one at a time (step), else a prompt's in pieces of 64 (chunk)."""
+  after the first when its second, a draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side),
+  conv (its taps), decay (-exp(A_log)), dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it),
+  a decode step's token, or a verify step's token and its draft, by the recurrent rule in one kernel of each head
+  (f.delta, step's), else a prompt's in pieces of 64 (chunk)."""
   f, (past, S) = fns(h), state[:2]
   past = past.get() if isinstance(past, Row) else past  # (a sequence's, of several's)
   n, seqs, qk, vw, r = h.shape[-2], past.shape[1], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
   m, width, taps = n // seqs, 2 * qk + vw, p["conv"]  # each sequence's tokens; the conv's channels, and its taps (a batch entry each)
-  live, cols = (None, None) if live is None else (live.reshape(seqs, 1, 1), live.reshape(1, seqs, 1))  # (the sequences as rows)
-  if accept is not None:  # where a speculative step goes on from, computed before it is written over
-    past = f.now(state[2] + accept.reshape(1, seqs, 1) * (past - state[2]))
-    S = f.now(state[3] + f.repeat(accept.reshape(seqs, 1, 1), c.vh) * (S - state[3]))
+  alive, (live, cols) = live, (None, None) if live is None else (live.reshape(seqs, 1, 1), live.reshape(1, seqs, 1))  # (the sequences as rows)
   x = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32")
   keep = lambda old, new: new if live is None else old + cols * (new - old)
   big = lambda old, new: new if live is None else old + f.repeat(live, c.vh) * (new - old)
-  def pieces(x, y, mm):  # q, k, v, beta and g of mm tokens of each sequence (x's and the conv's y), a batch entry a sequence's
-    def each(t, d):       # head; a token's q and k as columns (step's), else rows
-      if mm == 1 and seqs > 1: return t.reshape(seqs * t.shape[-1] // d, 1, d)
-      heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
-      return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, mm * d)).reshape(seqs * heads.shape[0], mm, d)
-    unit = lambda t, total: t * f.rsqrt(total(t * t) + 1e-6)  # each head's query and key to length 1 (down a column, or along a row)
-    if mm == 1: q, k = (unit(y[:, a:a + qk].reshape(seqs * c.kh, c.kd, 1), f.down) for a in (0, qk))
-    else: q, k = (unit(each(y[:, a:a + qk], c.kd), lambda t: f.mean(t) * c.kd) for a in (0, qk))
-    q = q * c.kd ** -0.5  # (a key head for r value heads)
-    b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
-    g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus, each head's log decay
-    return q, k, each(y[:, 2 * qk:], c.vd), f.sigmoid(each(b, 1)), g
+  def gates(x, y):  # a token's q and k (each key head's, to length 1, q scaled), v, beta and g, from its x's row and its conv's y's
+    unit, a = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6), x[:, width + vw + c.vh:] + p["dt_bias"]
+    return (unit(f.split(y[:, :qk], c.kh)) * c.kd ** -0.5, unit(f.split(y[:, qk:2 * qk], c.kh)), f.split(y[:, 2 * qk:], c.vh),
+            f.sigmoid(x[:, width + vw:width + vw + c.vh]), p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))))  # (softplus: g)
   if (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
-    # A decode step's token, or a verify step's token and then its draft, each as a decode step's: the conv over each
-    # place's inputs where they lie (its sequences' rows, as x's), then each place's inputs the next's, in turn (none
-    # written over unread); q and k as columns, each a move from y's row; a first token's states kept apart
-    out, conv = [], past
+    # A decode step's token, or a verify step's token and then its draft: the conv over each one's last inputs and its
+    # own where they lie (its sequences' rows, as x's; a verify step's from those after the last step's draft or its
+    # token alone, as accept says), which then move up a place (none written over unread: the first's into the inputs
+    # kept apart); each token's gates from its rows as they are (split); then the recurrence and its outputs in one kernel
+    # of each head (f.delta: a verify step's from the states accept says, its token's into those kept apart)
+    conv, tokens = past if accept is None else f.now(state[2] + accept.reshape(1, seqs, 1) * (past - state[2])), []
     for i in range(m):
-      xi, into = x[i::m, :], state[:2] if i == m - 1 else state[2:]
-      y = f.now(sum((conv[j:j + 1, :, :] * taps[j:j + 1, :, :] for j in range(c.conv - 1)), xi[:, :width] * taps[c.conv - 1:, :, :]))
+      xi, into = x if m == 1 else x[i::m, :], state[0] if i == m - 1 else state[2]
+      y = f.now(f.silu(sum((conv[j:j + 1, :, :] * taps[j:j + 1, :, :] for j in range(c.conv - 1)), xi[:, :width] * taps[c.conv - 1:, :, :])))
       for j in range(c.conv - 1):
-        f.assign(into[0][j:j + 1, :, :], keep(into[0][j:j + 1, :, :], conv[j + 1:j + 2, :, :] if j < c.conv - 2 else xi[:, :width]))
-      q, k, v, beta, g = pieces(xi, f.silu(y).reshape(seqs, width), 1)
-      o, S2 = step(f.repeat(q, r), f.repeat(k, r), v, beta, g, S)
-      out.append(f.now(o))  # read from S before S is written over
-      f.assign(into[1], big(into[1], S2))
-      conv, S = into
-    o = out[0] if m == 1 else f.cat(*out)  # each head's tokens again
+        f.assign(into[j:j + 1, :, :], keep(into[j:j + 1, :, :], conv[j + 1:j + 2, :, :] if j < c.conv - 2 else xi[:, :width]))
+      tokens.append(gates(xi, y.reshape(seqs, width)))
+      conv = into
+    o = f.delta(S, tokens, alive, *((state[3], accept) if m == 2 else ()))
   else:  # a prompt's tokens (or a sequence's own, of several's), its pieces of 64 at once and the state through them in turn
     rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))  # each sequence's conv inputs: the last ones, then
     y = sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))  # this call's, computed before the last are written over
     f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
-    if accept is not None: f.assign(state[2], keep(state[2], f.swap(rows[:, 1:c.conv, :])))
-    q, k, v, beta, g = pieces(x, f.silu(y).reshape(n, width), m)
-    o, S2, S1 = chunk(f.repeat(q, r), f.repeat(k, r), v, beta, g, S)
-    o = f.now(o)  # (each head's tokens) read from the state before it is written over, as the state after its first token is
-    if accept is not None: f.assign(state[3], big(state[3], S1))
+    def each(t, d):  # a batch entry a sequence's head
+      heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
+      return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, m * d)).reshape(seqs * heads.shape[0], m, d)
+    y = f.silu(y).reshape(n, width)
+    unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # each head's query and key to length 1, along a row
+    q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))
+    b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
+    g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus, each head's log decay
+    o, S2, _ = chunk(f.repeat(q, r), f.repeat(k, r), each(y[:, 2 * qk:], c.vd), f.sigmoid(each(b, 1)), g, S)
+    o = f.now(o)  # (each head's tokens) read from the state before it is written over
     f.assign(state[1], big(state[1], S2))
-  o = o if seqs == 1 else f.split(o.reshape(n, vw), c.vh) if m == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
+    o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(x[:, width:width + vw], c.vh))  # each head RMS-normed and gated by z
   return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"))
+
+def numpy_delta(S, tokens, live=None, first=None, accept=None):
+  """fns' delta in numpy (Tensor.delta's): step for each sequence's value heads, a token at a time (each token's q and
+  k of their key heads, (key heads, sequences, a key's width), v (value heads, sequences, a value's width), beta and g
+  (sequences, value heads)), from S, or with a token and its draft from first or S as accept says (1: S), the states
+  updated in place where live: first's after the token, S's after the draft. The outputs, (value heads, a sequence's
+  tokens in turn, a value's width)."""
+  (n, vh), d = tokens[0][3].shape, tokens[0][2].shape[-1]
+  each = lambda a: np.repeat(np.ones(n) if a is None else np.asarray(a).reshape(n), vh).reshape(n * vh, 1, 1) != 0
+  column = lambda t: np.repeat(t, vh // t.shape[0], 0).transpose(1, 0, 2).reshape(n * vh, -1, 1)
+  state, out = S if len(tokens) == 1 else np.where(each(accept), S, first), []
+  for (q, k, v, beta, g), into in zip(tokens, [S] if len(tokens) == 1 else [first, S]):
+    o, state = step(column(q), column(k), v.transpose(1, 0, 2).reshape(n * vh, 1, d), beta.reshape(n * vh, 1, 1), g.reshape(n * vh, 1, 1), state)
+    into[...] = np.where(each(live), state, into)
+    out.append(o.reshape(n, vh, d))
+  return np.stack(out, 2).transpose(1, 0, 2, 3).reshape(vh, n * len(tokens), d)
 
 def step(q, k, v, beta, g, S):
   """One token's gated delta rule, recurrent (transformers' torch_recurrent_gated_delta_rule), its query and key as
