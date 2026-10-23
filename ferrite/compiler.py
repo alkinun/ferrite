@@ -390,6 +390,15 @@ def mask_rows(kind, m, d=0):
     if k < 4: p += [w for o in (0, 2, 16, 18) for w in (CC_ON, at_least(15, 16 * k, 6),
                                                      ins("SFPSTORE", vd=identity, mod0=3, addr_mode=2, imm10=d + r // 16 * 32 + r % 16 + o))]
   return p + [CC_OFF]
+def mask_rows_at(m, d=0):
+  """mask_rows("sum", m, d) for a C expression m, the rows the last tile holds (1 to 31), known when the kernel runs:
+  each group of 4 rows' words pushed with the immediates its place gives them."""
+  p, identity = masking("sum")
+  cut, store = at_least(15, 0, 6), ins("SFPSTORE", vd=identity, mod0=3, addr_mode=2, imm10=0)
+  imm12, imm10 = bh.TENSIX_OPS["SFPIADD"][1]["imm12"][0], bh.TENSIX_OPS["SFPSTORE"][1]["imm10"][0]
+  return (f"{tt(p)} for (unsigned r = 0; r < 32; r += 4) if ({m} < r + 4) {{ unsigned k = {m} > r ? {m} - r : 0; "
+          f"for (unsigned o = 0; o < 4; o++) {{ push_word({CC_ON:#x}); push_word({cut:#x} | (-16 * k & 0xFFF) << {imm12}); "
+          f"push_word({store:#x} | ({d} + r / 16 * 32 + r % 16 + o % 2 * 2 + o / 2 * 16) << {imm10}); }} }} {tt([CC_OFF])}")
 MASK = {1: mask_rows, 2: mask_columns}  # the padding past the last tile along an axis
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
@@ -679,7 +688,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
-  offset (Tensor's)]. A unit is a tile of the result, or a block of them (one matmul and nothing that reduces: up to 4
+  offset (Tensor's), then the rows the result's last tile row holds (0: 32)]: rows past them are zeros whatever the
+  shapes say, so one kernel serves every row count in the same tiles. A unit is a tile of the result, or a block of them (one matmul and nothing that reduces: up to 4
   x 4, or given a grid, a worker's block of it), or, if the expression reduces along an axis, a whole line of tiles
   along it (a row, a column, or one tile position through the batch), so the reduction can stay on chip.
 
@@ -882,7 +892,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     if j != root: return tt(MATH_END)
     at_end = lambda ax: f"{('i_', 'j')[ax - 1]} == {ext(size(me), ax) - 1}"
     edge = [f"if ({at_end(2)}) {{ {tt(mask_columns('sum', cols % 32))} }}"] * (cols > 1 and cols % 32 > 0)
-    edge += [f"if ({at_end(1)}) {{ {tt(mask_rows('sum', rows % 32))} }}"] * (rows > 1 and rows % 32 > 0)
+    edge += [f"if ({at_end(1)} && a[{arg(len(shapes))}]) {{ {mask_rows_at(f'a[{arg(len(shapes))}]')} }}"] * (rows > 1)  # (an argument)
     return " ".join(edge + [tt(MATH_END)])
   def pslot(r):  # where the packer puts r: its slot, or for a result in another dtype, one at OUTS
     return ("fr" if swept(me) else 0) if out != dtype and r == me else slot(r)
@@ -1086,10 +1096,19 @@ def attention_store(ht, rows, wt, parts):
   bases = [b for lo, hi in windows for b in range(lo, hi - size + 1, size)]
   return bases, len(bases) * per
 
+def attention_parts(ht, rows, wt, kt, units, workers):
+  """The parts Tensor.attend shares each unit's kt tiles of keys among unless told: for units of one or two tile rows
+  of queries (a decode step's), as many as the workers allow, at most 8 and each of 8 tiles at least (combining them
+  costs a few launches), or as many more as keep each part's keys in L1 (attention_store); else one."""
+  if -(-rows // 32) > 2: return 1
+  room = lambda P: attention_store(ht, rows, wt, P)[1]
+  P = max(1, min(8, kt // 8, workers // units))
+  return max(P, min(8, -(-kt // room(2)))) if -(-kt // P) > room(P) else P
+
 def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=False):
   """Attention in one kernel, its scores kept on the chip: softmax(q k^T + mask) v for a batch of heads, args [first
   unit, units, then the result's, q's, k's, v's and the places' DRAM address, tile strides for batch and row, and tile
-  offset, then the keys' tiles kt]. q is (E, rows, 32 ht), k and v (E / rep, 32 kt, 32 ht), bf16 or the block float wt
+  offset, then the keys' tiles kt and q's rows]. q is (E, rows, 32 ht), k and v (E / rep, 32 kt, 32 ht), bf16 or the block float wt
   (a KV cache, each of its matrices read for rep of q's), and the places (E or 1, rows, 1, int32): each row's last
   key, and with a window the first is window - 1 before it, the mask hiding (-1e9) the keys outside them. A unit is up
   to eight tile rows of one head's queries, which share each tile of keys and values. BRISC reads its rows' places
@@ -1156,7 +1175,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
            each(f"noc_get(BANK({tile(18, 'e', 'i0 + r', 0)}), AT(a[18], {tile(18, 'e', 'i0 + r', 0)}, 4096), {places:#x} + r * 4096, 4096);") +
            " noc_wait(); " +
            each(f"volatile unsigned *t = (volatile unsigned *)({places:#x} + r * 4096); "
-                f"for (unsigned q = 0; q < 32 && (i0 + r) * 32 + q < {rows}; q++) {{ unsigned p = t[q / 16 * 512 + q % 16 * 16]; lo = p < lo ? p : lo; hi = p > hi ? p : hi; }}") +
+                f"for (unsigned q = 0; q < 32 && (i0 + r) * 32 + q < a[23]; q++) {{ unsigned p = t[q / 16 * 512 + q % 16 * 16]; lo = p < lo ? p : lo; hi = p > hi ? p : hi; }}") +
            f" volatile unsigned *g = {rng}; unsigned k0 = {f'lo + 1 > {window} ? (lo + 1 - {window}) / 32 : 0' if window else '0'}, "
            f"k1 = hi / 32 < a[22] - 1 ? hi / 32 : a[22] - 1, f0 = {f'hi + 1 > {window} ? (hi + 1 - {window} + 31) / 32 : 0' if window else '0'}, f1 = (lo + 1) / 32; " +
            (f"unsigned n_ = k1 - k0 + 1, a0 = k0 + n_ * part / {parts}, a1 = k0 + n_ * (part + 1) / {parts}, empty = a0 == a1; "  # this part's

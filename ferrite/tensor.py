@@ -5,7 +5,7 @@
 import array, collections, functools, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
-from ferrite.compiler import attention_kernel, attention_store, bfp4_kernel, copy_kernel, delta_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
+from ferrite.compiler import attention_kernel, attention_parts, attention_store, bfp4_kernel, copy_kernel, delta_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
 from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, touched_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
@@ -257,12 +257,14 @@ class Tensor:
     _fit(self)
     inputs = []
     e, dtype = _tree(self, inputs)
-    key = (e, tuple(u.shape for u in inputs), dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs))
+    shapes = tuple(u.shape for u in inputs)
+    if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)  # (one kernel for them all)
+    key = (e, shapes, dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs))
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
-    args = [v for t in [self] + inputs for v in t._where()]
+    args = [v for t in [self] + inputs for v in t._where()] + [self.rows % 32 if self.rows > 1 else 0]
     return self._run(kernel, *args, units=units, name=name)
   def assign(self, x):
     """x's value in this tensor, in place, as an optimizer updates a weight: x is computed into its DRAM and becomes a
@@ -483,25 +485,22 @@ class Tensor:
     first window - 1 before): the mask hides the rest, made on the chip where some row sees a tile of keys in part, and
     the kernel reads only the keys the places reach. It gives p v in fp32 with each row's sum of p beside it; one over
     the other, cast to bf16, is the result. parts: each unit's keys shared out among so many workers, unless said as
-    many as the workers allow when units are few (a decode step's: a key head's of each slot), at most 8 and each of 8
-    tiles of k's at least (combining them costs a few launches), or as many more as keep each part's share of k in L1
-    for its second sweep; each part's result weighted by exp of its rows' largest score less the largest of all its
-    parts', and summed. A part's first key rows, as many as fit (attention_store), are read once, the rest once a sweep.
-    The kernel takes k's length as an argument: one serves every length its parts allow. No gradient."""
+    attention_parts has it (when units are few, a decode step's: a key head's of each slot); each part's result weighted
+    by exp of its rows' largest score less the largest of all its parts', and summed. A part's first key rows, as many
+    as fit (attention_store), are read once, the rest once a sweep. The kernel takes k's length and q's rows as
+    arguments: one serves every length its parts allow, and every row count in the same tiles. No gradient."""
     ht, kt, rep, ra = -(-self.cols // 32), -(-k.rows // 32), k.rep, -(-self.rows // 32)
     assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
     assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows
     assert places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32", f"{self.shape} by {k.shape}, {places.shape}"
     units, wt = self.batch * -(-ra // 8), k.dtype if k.dtype in BFP else None
-    room = lambda P: attention_store(ht, self.rows, wt, P)[1]  # (the key rows a unit's part keeps in L1)
-    P = parts or (max(1, min(8, kt // 8, len(self.rt.cores) // units)) if ra <= 2 else 1)
-    if not parts and ra <= 2 and -(-kt // P) > room(P): P = max(P, min(8, -(-kt // room(2))))
+    P = parts or attention_parts(ht, self.rows, wt, kt, units, len(self.rt.cores))
     q, places = (_plain(t.realize()) for t in (self, places))
     k, v = k.realize(), v.realize()
     out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
-    key = ("attend", ht, self.rows, rep, wt, fidelity or FIDELITY, window, P, room(P) > 0)
+    key = ("attend", ht, 32 * ra, rep, wt, fidelity or FIDELITY, window, P, attention_store(ht, self.rows, wt, P)[1] > 0)  # (rows an argument)
     out._run(_cached(key, lambda: attention_kernel(*key[1:])), *out._where(), *q._where(), *k._where(), *v._where(), *places._where(), kt,
-             units=units * P, name="attention")
+             self.rows, units=units * P, name="attention")
     part = lambda p, at, cols: out._view(out.rows, cols, self.batch, p * out.bstride + at, out.bstride * P)  # part p's, from tile at
     if P == 1: return (part(0, 0, self.cols) / part(0, ht, 1)).cast("bf16")  # (the sums a column as it lies: 32 in its tile)
     largest = [part(p, ht + 1, 1) for p in range(P)]
@@ -665,6 +664,11 @@ def _parts(t):  # an fp32 matmul's operand as bf16 (hi, lo), no lo for a bf16 on
   return t.bfloat16(), (t - t._unary("ftob")).bfloat16()  # lo: t less itself rounded as the cast to bf16 rounds, in one kernel
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
 def _plain(t): return (t + 0).realize() if t.rep > 1 else t  # a repeat copied, for a kernel that reads tiles by their place
+def _rows_free(e):  # whether e's kernel needs no input's exact rows, but the result's last tile's, an argument (fused_kernel's):
+  if isinstance(e, int): return True  # not if it reduces along rows, or a matmul reads B transposed (its rows become columns)
+  if e[0] in FOLDS and FOLDS[e[0]] == 1 or e[0] == "T" or e[0] == "matmul" and isinstance(e[2], tuple) and (e[2][0].lstrip("I").startswith("T") or len(e[2]) > 2):
+    return False  # or picks B's matrices by an index (whose rows count)
+  return all(_rows_free(x) for x in e[1:] if isinstance(x, tuple))
 def _bf16x3(a, b):  # hi@hi + (hi@lo + lo@hi) in fp32, from two operands' parts
   (ah, al), (bh, bl) = a, b
   out, lo = ah.matmul(bh, "fp32", 4), [p.matmul(q, "fp32", 4) for p, q in ((ah, bl), (al, bh)) if p is not None and q is not None]

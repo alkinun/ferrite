@@ -645,7 +645,7 @@ def test_attend(chip):
   # places for all, a KV cache in bfp8, keys that end partway through a tile, three tile rows of queries, a sliding
   # window, ten tile rows (units of eight and of two). And with each unit's keys shared out among parts (a decode step's:
   # rows of one place, a 1,024-key cache in bfp8 in the four parts the workers allow), rows that see none of some part's
-  # keys, parts with no keys at all (places below 32). One kernel serves both lengths of the same shapes.
+  # keys, parts with no keys at all (places below 32). One kernel serves other lengths and row counts in the same tiles.
   # Without parts, two launches, the attention and the division, and nothing read but what the places reach: rows
   # whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of keys and of values
   # once (the keys kept in L1 between the sweeps)
@@ -656,7 +656,7 @@ def test_attend(chip):
       (4, 8, 64, 64, 2, "bfp8", False, 0, 0, 64, 1), (3, 70, 64, 40, 1, "bf16", True, 0, 0, 40, 1), (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 1),
       (2, 8, 64, 256, 1, "bf16", False, 0, 200, 256, 1), (2, 300, 64, 320, 2, "bf16", True, 0, 0, 320, 1),
       (4, 8, 64, 1024, 2, "bfp8", False, 0, 0, 1024, None), (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 3), (4, 8, 64, 256, 1, "bf16", False, 0, 0, 30, 8),
-      (2, 40, 64, 160, 1, "bf16", False, 0, 100, 160, 1)):
+      (2, 40, 64, 160, 1, "bf16", False, 0, 100, 160, 1), (2, 50, 64, 72, 1, "bf16", False, 0, 30, 72, 1)):
     q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
     places = rng.integers(lo, hi, (1 if shared else e, rows, 1))
     if parts is None: places = places[:, :1, :].repeat(rows, 1)  # (a decode step's: a slot's query heads, at its one place)
@@ -669,7 +669,7 @@ def test_attend(chip):
     before, launches, made = reads(), rt.launches, len(tensor.kernels)
     out = tq.attend(tk, tv, tp, window, parts=parts).realize()
     rt.wait()
-    assert keys != 160 or len(tensor.kernels) == made, "the first case's kernels, at another length"
+    assert (rows, keys) not in ((40, 160), (50, 72)) or len(tensor.kernels) == made, "the first case's kernels: other lengths, rows"
     read, got = reads() - before, value(out)
     s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
     p = np.exp(s - s.max(-1, keepdims=True))
@@ -712,7 +712,8 @@ def test_reduce_axes(chip):
 def test_any_shape(chip):
   # 45 x 70 is two tile rows by three tile columns, the last of each cut short; a dimension of 1 broadcasts. Results go
   # home with zero padding (a matmul of two results needs that, or the padding of K adds in), and row reductions mask
-  # their last tile's padding (with every value negative, an unmasked 0 would be the max and add up in softmax)
+  # their last tile's padding (with every value negative, an unmasked 0 would be the max and add up in softmax). One
+  # kernel serves every row count in the same tiles (a prompt's chunks of any length): its last tile's rows an argument
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(0)
   def make(rows, cols, lo=-2.0, hi=2.0):
     a = bf16(rng.uniform(lo, hi, (rows, cols)))
@@ -731,6 +732,13 @@ def test_any_shape(chip):
   close(tnarrow.sum(2) + tx, narrow.sum(1, keepdims=True) + x, 2**-6)
   (a, ta), (b, tb) = make(45, 50, -1, 1), make(50, 70, -1, 1)
   close(ta.exp() @ tb.exp(), bf16(np.exp(a)) @ bf16(np.exp(b)), 2**-6)
+  for n in (37, 50, 64):
+    z, tz = make(n, 70)
+    made, out = len(tensor.kernels), (tz * 2.0 - 1.0).realize()
+    whole = value(out._view(64, 70, 1, 0))  # (its last tile's rows past n too)
+    assert n == 37 or len(tensor.kernels) == made, "the first one's kernel"
+    close(whole[0, :n], z * 2 - 1, 2**-7)
+    assert not whole[0, n:].any(), n
 
 def test_views_transpose_gelu(chip):
   # views are read in place: tile-aligned slices as inputs to elementwise ops and to matmuls, like a GPT-2 layer's

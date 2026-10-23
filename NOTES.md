@@ -446,7 +446,11 @@ moves.
 
 **Padding.** A tensor is padded to whole tiles with zeros, except that a dimension of 1 fills its tile with copies (a
 row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. A result's padding is zeroed in Dst
-before its last tiles are packed, so a matmul can sum over a padded K. `(R, 1) @ (1, C)` is broadcasting.
+before its last tiles are packed, so a matmul can sum over a padded K. `(R, 1) @ (1, C)` is broadcasting. The rows its
+last tile holds are an argument (the mask's words pushed with them), so unless a kernel reduces along rows, reads a
+B transposed or picks matrices by an index, one kernel serves every row count in the same tiles, and attention's
+takes its query rows the same way: a prompt's last chunk, whatever its length, compiles nothing new past its tile
+rows (a kernel takes about 0.2 s of clang).
 
 **Batches and views.** A batch is matrices one after another; a batch of 1 repeats. Every kernel takes each input as
 (address, batch stride, row stride, offset), so a view (`x[b]`, slices on tile boundaries, any forward step through the
@@ -683,7 +687,8 @@ reset`, untested).
 - **This host's CPU (an i7-12700KF) is unstable under load**: plain Python segfaults about one run in five, on some
   CPUs and not others (`journalctl -k` names the CPU). A run that dies or goes wrong under load may be the host: a
   whole-suite run that died; Qwen3.6's accuracy runs that came out NaN under full load (`gpt2.bfp` overflowing on
-  weights that round cleanly on one core; one of three sound on a rerun); gpt-oss-20b's two bf16 runs far from numpy
-  with heavy work beside them; one `test_train` readback under ttsim-chaos.
+  weights that round cleanly on one core; one of three sound on a rerun, the bfp4 KV cache's not in three, one of them
+  on the cores the crashes never name: the memory, more likely than a core); gpt-oss-20b's two bf16 runs far from
+  numpy with heavy work beside them; one `test_train` readback under ttsim-chaos.
 </content>
 </invoke>
