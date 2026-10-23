@@ -396,8 +396,9 @@ first.
 `Tensor.attend` (`compiler.attention_kernel`): softmax(q kᵀ + mask) v in one kernel, its scores kept in L1. A unit is up
 to eight tile rows of one head's queries. BRISC first reads the unit's places (each row's last key; with a sliding
 window, its first), works out the tiles of keys they reach and which some row sees only in part, and tells the TRISCs.
-The unit then sweeps those tiles twice, a frame at a time (a tile row of keys, in the second sweep the values too, and
-mask tiles only where some row sees the keys in part):
+The unit then sweeps those tiles twice, a frame at a time (a tile row of keys, in the second sweep the values too), and
+for a tile some row sees only in part BRISC writes the mask's tiles into the frame from the places, -1e9 where a row
+must not look. The keys' length is an argument, so one kernel serves every length, and a server one replay for all.
 
 - Each tile of scores is made in Dst: the mask's tile (or the zero tile) added first, then the queries by the keys, read
   transposed, `MVMUL` accumulating onto it.
@@ -491,8 +492,8 @@ bf16, bfp8, bfp4, or `tt`, Tenstorrent's performance precision); `llama.arrays` 
 q, k and v are one matrix, gate and up another (`fuse`). RoPE is one kernel for q, k and v (`x cos + (x @ turn) sin`).
 The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and Hugging Face's tokens over the same file.
 
-- **A KV cache of a fixed size**: each token's keys and values `put` at its place and its mask built on the chip from
-  the places, so a decode step is the same launches every token and replays. A prompt goes in chunks.
+- **A KV cache of a fixed size**: each token's keys and values `put` at its place, and attention's mask built on the
+  chip from the places, so a decode step is the same launches every token and replays. A prompt goes in chunks.
 - **Several sequences at once** (`forward`'s `slots`): their caches side by side in one, a key head's query heads of
   each sequence one batch entry, so a key head's rows are read once for all its query heads.
 - **A mixture of experts** (`moe`): each token's k best experts by `topk` on the chip (a kernel of BRISC's, a row a
@@ -537,9 +538,12 @@ in bf16 over the same text.
 `models/serve.py`, an OpenAI-compatible server.
 
 - **Slots.** The engine's KV cache has `slots` slots of `places` rows, and each step is one replayed call for every slot,
-  a free one running on its last row, which no sequence reaches. Attention reads each slot's rows up to the power of 2
-  (32 at least) that holds the longest sequence's, a replay recorded for each such length. A prompt is prefilled a
-  chunk between steps (2,048 tokens for a mixture of experts, whose chunks read nearly all its experts; 256 otherwise).
+  a free one running on its last row, which no sequence reaches, its attention seeing the slot's first row alone (one
+  tile read) and its Gated DeltaNet states left as they are. Attention in one kernel reads only the rows each
+  sequence's place reaches, so one replay serves every length; otherwise (gpt-oss's sinks, heads narrower than 64)
+  attention reads each slot's rows up to the power of 2 (32 at least) that holds the longest sequence's, a replay
+  recorded for each such length. A prompt is prefilled a chunk between steps (2,048 tokens for a mixture of experts,
+  whose chunks read nearly all its experts; 256 otherwise).
 - **The prefix cache.** A prompt goes to the free slot holding the longest start of it, and only the rest is prefilled.
 - **Sessions on the host.** Gated DeltaNet's states are for exactly the tokens they took in, so a session (its tokens,
   its slot's cache rows and its states) is saved on the host when its prompt is in and when it ends, up to `keep` bytes,
@@ -574,7 +578,7 @@ in bf16 over the same text.
 `models/cost.py`: what a model costs to serve, from its config alone. A card holds the weights in a mode's formats, a
 GiB for kernels and activations, and sessions (KV cache rows, Gated DeltaNet states). A decode step for n users reads
 every matrix but the experts and the embedding, the experts its tokens pick (E (1 - (1 - k/E)^tokens) a block), the
-states, and what attention's kernel reads (keys twice, values once, the mask where needed); it waits on DRAM or the
+states, and what attention's kernel reads (keys twice, values once); it waits on DRAM or the
 matmuls, whichever is longer, then on its launches (`LAUNCHES`, counted on ttsim) or the RISC-V work ttsim counts
 (`CONTROL`), whichever is more. A prompt's chunks read the experts their tokens pick and their attention's keys and
 values for every eight tile rows of each query head. The card is its specification (512 GB/s at a 0.7 reach, a guess;

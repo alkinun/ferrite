@@ -473,35 +473,32 @@ class Tensor:
     out.fidelity = fidelity
     return out
 
-  def attend(self, k, v, mask, places, window=0, fidelity=None, parts=None):
+  def attend(self, k, v, places, window=0, fidelity=None, parts=None):
     """softmax(self @ k^T + mask) @ v, attention, by one kernel whose scores never leave the chip (attention_kernel):
     self a batch of queries (bf16), k and v the keys and values for each (bf16 or a block float: a KV cache; a repeat
-    read in place, a matrix for each of its rep), the mask (a batch of 1 or of self's) as wide as k is long, and places
-    (int32, a column: each row's last key; with a window, its first window - 1 before) where the mask may be other than
-    0: the kernel reads the keys the places reach, and the mask only where some row sees a tile of keys in part. It
-    gives p v in fp32 with each row's sum of p beside it; one over the other, cast to bf16, is the result. parts: each
-    unit's keys shared out among so many workers, unless said as many as the workers allow when units are few (a decode
-    step's: a key head's of each slot), at most 8 and each of 8 tiles of keys at least (combining them costs a few
-    launches), or as many more as keep each part's keys in L1 for its second sweep; each part's result weighted by exp
-    of its rows' largest score less the largest of all its parts', and summed. A unit's keys that fit L1 are read once
-    (attention_store), else once a sweep. No gradient."""
+    read in place, a matrix for each of its rep), and places (int32, a column: each row's last key; with a window, its
+    first window - 1 before): the mask hides the rest, made on the chip where some row sees a tile of keys in part, and
+    the kernel reads only the keys the places reach. It gives p v in fp32 with each row's sum of p beside it; one over
+    the other, cast to bf16, is the result. parts: each unit's keys shared out among so many workers, unless said as
+    many as the workers allow when units are few (a decode step's: a key head's of each slot), at most 8 and each of 8
+    tiles of k's at least (combining them costs a few launches), or as many more as keep each part's share of k in L1
+    for its second sweep; each part's result weighted by exp of its rows' largest score less the largest of all its
+    parts', and summed. A part's first key rows, as many as fit (attention_store), are read once, the rest once a sweep.
+    The kernel takes k's length as an argument: one serves every length its parts allow. No gradient."""
     ht, kt, rep, ra = -(-self.cols // 32), -(-k.rows // 32), k.rep, -(-self.rows // 32)
     assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
-    assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows == mask.cols
-    assert mask.rows == places.rows == self.rows and mask.batch in (1, self.batch) and places.batch in (1, self.batch) and places.cols == 1
-    assert mask.dtype == "bf16" and places.dtype == "int32", f"{self.shape} by {k.shape}, {mask.shape} {mask.dtype}, {places.shape} {places.dtype}"
+    assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows
+    assert places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32", f"{self.shape} by {k.shape}, {places.shape}"
     units, wt = self.batch * -(-ra // 8), k.dtype if k.dtype in BFP else None
     room = lambda P: attention_store(ht, self.rows, wt, P)[1]  # (the key rows a unit's part keeps in L1)
     P = parts or (max(1, min(8, kt // 8, len(self.rt.cores) // units)) if ra <= 2 else 1)
     if not parts and ra <= 2 and -(-kt // P) > room(P): P = max(P, min(8, -(-kt // room(2))))
-    keep = -(-kt // P) <= room(P)
-    q, mask, places = (_plain(t.realize()) for t in (self, mask, places))
-    phases, edge = fidelity or FIDELITY, k.rows % 32
+    q, places = (_plain(t.realize()) for t in (self, places))
     k, v = k.realize(), v.realize()
     out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
-    key = ("attend", ht, kt, self.rows, rep, wt, phases, edge, window, P, keep)
-    out._run(_cached(key, lambda: attention_kernel(*key[1:])), *out._where(), *q._where(), *k._where(), *v._where(), *mask._where(),
-             *places._where(), units=units * P, name="attention")
+    key = ("attend", ht, self.rows, rep, wt, fidelity or FIDELITY, window, P, room(P) > 0)
+    out._run(_cached(key, lambda: attention_kernel(*key[1:])), *out._where(), *q._where(), *k._where(), *v._where(), *places._where(), kt,
+             units=units * P, name="attention")
     part = lambda p, at, cols: out._view(out.rows, cols, self.batch, p * out.bstride + at, out.bstride * P)  # part p's, from tile at
     if P == 1: return (part(0, 0, self.cols) / part(0, ht, 1)).cast("bf16")  # (the sums a column as it lies: 32 in its tile)
     largest = [part(p, ht + 1, 1) for p in range(P)]

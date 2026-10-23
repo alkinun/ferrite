@@ -190,6 +190,7 @@ class Engine:
     self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)), slots, self.spec)
     self.slot = [llama.slot(c, self.kv, u, slots) for u in range(slots)]  # the caches as slot u's alone
     self.linear = any(llama.linear(c, l) for l in range(c.layers))  # (its states then say where a slot can go on from)
+    self.whole = llama.attends(c, t)  # (attention in one kernel reads only the rows its places reach: a replay for every length)
     self.held, self.busy = [[] for _ in range(slots)], [None] * slots
     self.used = [0] * slots  # when each slot last took a request: of those sharing as much, the one used longest ago goes
     self.replays, self.made, self.hidden = {}, {}, {}  # (a call's replay for each length it reads, what its last call made
@@ -209,7 +210,7 @@ class Engine:
     return True
 
   def length(self, last):  # the rows of each slot a call reads when its sequences' last place is last
-    return min(self.places, 1 << max(5, last.bit_length()))
+    return self.places if self.whole else min(self.places, 1 << max(5, last.bit_length()))
 
   def replay(self, f, n):  # f's replay (jit) for calls reading n rows of each slot; what each call makes, kept (made)
     if (f, n) not in self.replays:

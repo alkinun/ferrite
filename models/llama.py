@@ -76,6 +76,9 @@ def rms(x, w, c):  # RMSNorm, scaled by w (Qwen3.5's by 1 + w: n w + n, exact wh
 
 def head(c): return getattr(c, "head_dim", None) or c.dim // c.heads  # a head's width: Qwen3's says it, Llama's is dim / heads
 
+def attends(c, w):  # whether attention is one kernel (Tensor.attend: heads of 64 columns or more, no sinks) for the weights w
+  return head(c) % 32 == 0 and head(c) >= 64 and not any(k.endswith("sinks") for k in w)
+
 def rope(x, cos, sin, turn):  # Hugging Face's form: x cos + (-x2, x1) sin, x1 and x2 a head's halves, (-x2, x1) as x @ turn
   return x * cos + (x @ turn) * sin
 
@@ -100,7 +103,7 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   """A block's attention over its cache (layer). For several sequences (slots: as many tokens of each, in turn), each
   over its own part of the cache, which a batch of each key head and sequence views in place, its query heads' rows
   (a token's each) side by side: no key head repeated, no token reading another sequence's rows. Each reads as many of
-  its rows, from its first, as its mask is wide (around's length)."""
+  its rows, from its first, as its mask is wide (around's length); in one kernel (attends), those its places reach."""
   f, gated, hd, rep = fns(h), getattr(c, "gated", False), head(c), c.heads // c.kv
   mask, places, window = mask if isinstance(mask, tuple) else (mask, None, 0)  # (around's on the chip: with its places)
   nh = c.heads + 2 * c.kv + (c.heads if gated else 0)  # (Qwen3.5's output gate: a head's each, after v's)
@@ -121,8 +124,8 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
     if sinks is not None: sinks = f.expand(sinks.reshape(c.kv, 1, rep), (c.kv, n, rep)).reshape(c.kv * slots, t * rep, 1)
   if (m := mask.shape[-1]) < k.shape[-2]: k, v = k[:, :m, :], v[:, :m, :]  # (views of a sequence's first rows)
   if not slots: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a head for each query's, in place
-  if sinks is None and places is not None and hd % 32 == 0 and hd >= 64:  # one kernel, its scores on the chip
-    o = (q * (1 / math.sqrt(hd))).attend(k, v, mask, places, window, attention)
+  if places is not None and attends(c, p):  # one kernel, its scores on the chip
+    o = (q * (1 / math.sqrt(hd))).attend(k, v, places, window, attention)
   else:
     s = f.mm(q, f.t(k), attention) * (1 / math.sqrt(hd))
     o = f.mm(f.softmax(s + mask) if sinks is None else f.sink_softmax(s + mask, sinks), v, attention)
@@ -405,9 +408,11 @@ def fuse(w, c):  # each block's q, k and v projections as one matrix, and its ga
 def around(w, c, places, size, slots=None, length=None):
   """For tokens at places: their caches' rows, the rotary tables' rows, and attention's masks over a cache of size rows,
   a sliding window's too (or None). For several sequences (slots), the next tokens of each in turn: each one's rows
-  in its own part of the caches (size / slots rows), the masks laid out as attention lays out their scores. length:
+  in its own part of the caches (size / slots rows), the masks laid out as attention lays out their scores, and a
+  token on its part's last row (a free slot's, which no sequence reaches) seeing only the part's first. length:
   the masks over a sequence's first length rows alone, the most attention then reads of it. On the chip each mask goes
-  with its rows' places, a column, and its window (Tensor.attend's), so attention reads only the rows they reach."""
+  with its rows' places, a column, and its window, which attention in one kernel (Tensor.attend) takes in the mask's
+  place, reading only the rows they reach."""
   f, window, numpy = fns(w["norm"]), getattr(c, "sliding", None), not isinstance(places, Tensor)
   rotary = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"])
   if not slots: rows, width, column = places, length or size, np.asarray(places)[:, None] if numpy else places.reshape(1, places.cols, 1)
@@ -415,7 +420,8 @@ def around(w, c, places, size, slots=None, length=None):
     part, rep = size // slots, c.heads // c.kv
     n = len(places) if numpy else places.cols
     rows = np.asarray(places) + firsts(None, n, slots, part) if numpy else places + firsts(places.rt, n, slots, part)
-    column = f.expand(np.asarray(places).reshape(1, n, 1) if numpy else places.reshape(1, n, 1), (1, n, rep)).reshape(1, n * rep, 1)
+    seen = np.where(np.asarray(places) < part - 1, places, 0) if numpy else (places < part - 1).where(places, 0)  # (a free slot's
+    column = f.expand(seen.reshape(1, n, 1), (1, n, rep)).reshape(1, n * rep, 1)                                     # token sees its first)
     column, width = f.expand(column, (c.kv, n * rep, 1)).reshape(c.kv * slots, n // slots * rep, 1), length or part  # (a key head's and sequence's rows)
   masks = lambda win: gpt2.masked(column, width, win) if numpy else (gpt2.masked(column, width, win), column, win or 0)
   return rows, rotary, masks(None), window and masks(window)
@@ -435,7 +441,7 @@ def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accep
   they are looked up). live, accept: with slots, for Gated DeltaNet's states (delta). hidden: (the logits, every
   token's hidden state, normed: what the multi-token prediction layer takes, draft). length: attention reads only each
   sequence's first length rows (a multiple of 32, past every place of this call's), so a call costs what its sequences
-  hold, not their caches' size."""
+  hold, not their caches' size (attention in one kernel reads only what they hold, whatever the length)."""
   f = fns(w["norm"])
   x, size = f.rows(w["embed"], ids), next(k.shape[-2] for k in caches if not isinstance(k, list))  # an attention block's places
   rows, rotary, mask, window = around(w, c, places, size, slots, length)
