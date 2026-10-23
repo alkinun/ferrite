@@ -1,4 +1,4 @@
-# Three benchmarks on ferrite or on TT-NN, on the same card, with the versions of everything that took part (ferrite's,
+# Four benchmarks on ferrite or on TT-NN, on the same card, with the versions of everything that took part (ferrite's,
 # tt-metal's and the UMD it pins, tt-kmd's, the card's firmware, the host's), and the lines of code as cloc counts them.
 # Prints them and writes them to benchmark-<stack>.json.
 #   B1, a matmul: (4096 x 4096) @ (4096 x 4096) in bf16, sums in fp32, at two fidelity phases and at four; the median of 5
@@ -9,10 +9,15 @@
 #     card's 512 GB/s: 6.20 GB a token, so 41.3 tokens/s is half); and Tenstorrent's token accuracy (llama.accuracy: the
 #     prompt, then 500 steps fed the file's next token, top-1 and top-5 against the reference model's five most likely).
 #   B3, long prefill: the time to first token for B2's model with prompts of 4,096 and 32,768 tokens, after a warm-up.
+#   B4, serving: B2's model behind serve.py's server, 32 agents at once over HTTP (load), each four turns that share a
+#     system prompt and grow by their answers and a tool's result; tokens/s a user and for the card, the time to first
+#     token, and the prompt tokens the server had cached. ferrite's alone: TT-NN serves through vLLM, not here, but load
+#     takes any OpenAI-compatible server's URL (python3 test/benchmark.py load URL [agents]).
 # table compares them, B1's and B2's speed against ferrite being no more than 1.5 times slower than TT-NN.
 #   python3 test/benchmark.py ferrite path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py ttnn path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py table benchmark-ferrite.json benchmark-ttnn.json   # the two side by side, as markdown
+#   python3 test/benchmark.py load http://localhost:8000 [agents]   # B4's load against a server already running
 # The folder holds Hugging Face's files for the model; the reference file is tt_transformers'
 # tests/reference_outputs/<model>.refpt. B3's prompts are the start of A Tale of Two Cities, which tt_transformers keeps
 # beside them (tests/tale-of-two-cities.txt.bz2; BOOK=path for another place).
@@ -22,7 +27,7 @@
 # counts tt-kmd's lines of code too. On ttsim (TTSIM set for ferrite, TT_METAL_SIMULATOR for TT-NN) the times are its
 # clock, not silicon's, and --quick shrinks every size and the model to two blocks: only a check of the script. TT's
 # script does not run on ttsim (its prefill warm-up uses an SFPU mode ttsim lacks), so there only TT-NN's B1 does.
-import bz2, glob, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import bz2, glob, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, threading, time, urllib.request
 from types import SimpleNamespace
 import numpy as np
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.join(os.path.dirname(__file__), "..", "models")]
@@ -30,8 +35,10 @@ from ferrite import bh, pci
 import gpt2, llama
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-SIZES = {False: SimpleNamespace(n=4096, runs=(3, 5, 20), steps=200, accuracy=500, users=32, lengths=(4096, 32768), blocks=None),
-         True: SimpleNamespace(n=256, runs=(1, 2, 2), steps=8, accuracy=8, users=2, lengths=(64, 128), blocks=2)}
+SIZES = {False: SimpleNamespace(n=4096, runs=(3, 5, 20), steps=200, accuracy=500, users=32, lengths=(4096, 32768), blocks=None,
+                               turns=SimpleNamespace(system=1500, task=400, tool=200, out=256, n=4)),  # (B4's: words, an answer's tokens, turns)
+         True: SimpleNamespace(n=256, runs=(1, 2, 2), steps=8, accuracy=8, users=2, lengths=(64, 128), blocks=2,
+                               turns=SimpleNamespace(system=24, task=6, tool=6, out=8, n=2))}
 
 def git(folder):  # a checkout's commit, and whether it has changes
   run = lambda *a: subprocess.run(["git", "-C", folder, *a], capture_output=True, text=True).stdout.strip()
@@ -73,6 +80,41 @@ def timed(run, wait, clock, runs):  # seconds a run: after runs[0] warm-up runs,
     wait()
     times.append((clock() - start) / runs[2])
   return statistics.median(times)
+
+def load(url, agents, turns, text):
+  """B4: agents at once against an OpenAI-compatible server at url (/v1/completions, streamed, greedy, no stop), each
+  turns.n turns of turns.out tokens: a system prompt they all share (text's first turns.system words), then its own task
+  (turns.task words, from its own part of text), each next turn its prompt so far, its answer and a tool's result
+  (turns.tool more words). Tokens/s a user (each turn's tokens after its first over their time, the median), tokens/s
+  for all of them (every token over the wall time), the time to first token (the median and the 90th percentile), and
+  the share of prompt tokens the server had cached, from its usage."""
+  words, done, failed = text.split(), [], []
+  piece = lambda at, n: " " + " ".join(words[at:at + n])
+  def agent(a):
+    at = turns.system + a * (turns.task + turns.n * turns.tool)  # (its part of the text)
+    prompt = piece(0, turns.system) + piece(at, turns.task)
+    try:
+      for k in range(turns.n):
+        body = json.dumps({"prompt": prompt, "max_tokens": turns.out, "temperature": 0, "stream": True}).encode()
+        start, stamps, answer, usage = time.perf_counter(), [], "", None
+        with urllib.request.urlopen(urllib.request.Request(url + "/v1/completions", body, {"Content-Type": "application/json"}), timeout=3600) as r:
+          for line in r:
+            if not line.startswith(b"data: {"): continue
+            chunk = json.loads(line[6:])
+            usage = chunk.get("usage") or usage
+            if chunk["choices"] and chunk["choices"][0]["text"]: stamps.append(time.perf_counter()); answer += chunk["choices"][0]["text"]
+        done.append((start, stamps, usage))
+        prompt += answer + piece(at + turns.task + k * turns.tool, turns.tool)
+    except Exception as e: failed.append(f"agent {a}: {type(e).__name__}: {e}")
+  threads = [threading.Thread(target=agent, args=(a,)) for a in range(agents)]
+  for t in threads: t.start()
+  for t in threads: t.join()
+  assert not failed, failed
+  first = sorted(stamps[0] - start for start, stamps, _ in done)
+  return {"agents": agents, "turns": len(done), "tokens/s a user": statistics.median((u["completion_tokens"] - 1) / (s[-1] - s[0]) for _, s, u in done if s[-1] > s[0]),
+          "tokens/s": sum(u["completion_tokens"] for *_, u in done) / (max(s[-1] for _, s, _ in done) - min(start for start, *_ in done)),
+          "seconds to first token": statistics.median(first), "seconds to first token, 90th percentile": first[int(0.9 * (len(first) - 1))],
+          "prompt tokens cached": sum(u["prompt_tokens_details"]["cached_tokens"] for *_, u in done) / sum(u["prompt_tokens"] for *_, u in done)}
 
 def weights(c):  # each weight as llama.upload makes it, its rows, columns and format, from the model's sizes alone
   hd = llama.head(c)
@@ -154,6 +196,15 @@ def ferrite(folder, prompt, after, top5, book, s):
   for n in s.lengths:  # a prompt ferrite cannot run yet is published as such
     try: out[f"B3 prefill, {n} tokens"] = dict(zip(("seconds to first token", "chunk"), prefill(t, c, ids[:n])))
     except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run yet": f"{type(e).__name__}: {e}"}
+  import serve  # B4: a slot for each agent, as many places as two tokens a word and every answer take
+  places = -(-(2 * (s.turns.system + s.turns.task + s.turns.n * s.turns.tool) + s.turns.n * s.turns.out) // 32) * 32
+  engine = serve.Engine(rt, t | llama.upload(rt, {k: w for k, w in llama.load(folder, places)[1].items() if k in ("cos", "sin")}), c,
+                        llama.Tokenizer(folder), s.users, places, 256)
+  threading.Thread(target=engine.run, daemon=True).start()
+  httpd = serve.server(engine, os.path.basename(folder.rstrip("/")), port=0)
+  threading.Thread(target=httpd.serve_forever, daemon=True).start()
+  out[f"B4 serving, {s.users} agents"] = load(f"http://localhost:{httpd.server_address[1]}", s.users, s.turns, book)
+  httpd.shutdown()
   return out
 
 DEMO = "models/tt_transformers/demo/simple_text_demo.py"
@@ -237,6 +288,9 @@ def table(ferrite, ttnn):
 
 def main():
   if sys.argv[1] == "table": return print(table(*(json.load(open(p)) for p in sys.argv[2:4])))
+  if sys.argv[1] == "load":
+    path = os.environ.get("BOOK") or "tale-of-two-cities.txt.bz2"
+    return print(load(sys.argv[2].rstrip("/"), int(sys.argv[3]) if len(sys.argv) > 3 else 32, SIZES[False].turns, bz2.open(path, "rt", encoding="utf-8").read()))
   stack, folder, refpt, s = sys.argv[1], sys.argv[2], sys.argv[3], SIZES["--quick" in sys.argv]
   assert stack in ("ferrite", "ttnn"), "the stack to measure: ferrite or ttnn"
   prompt, after, top5 = llama.reference(refpt)

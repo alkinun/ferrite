@@ -45,7 +45,7 @@ tinygrad runs on ferrite as a device (`adapters/`), and PyTorch through tinygrad
   compiler (`compiler.py`), Blackhole's facts as data (`bh.py`).
 - `models/`: the models, the server, and what one costs to serve on a card.
 - `adapters/`: tinygrad on ferrite.
-- `test/`: every step on the simulator, training against PyTorch, and benchmarks against TT-NN.
+- `test/`: every step on the simulator, training against PyTorch, and benchmarks against TT-NN and of serving.
 
 `NOTES.md` says how it works, where each fact about the chip comes from, how to bring up a card, and what is still
 unknown.

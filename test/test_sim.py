@@ -1905,6 +1905,20 @@ def test_benchmark_table():
   assert rows[2].endswith("| 2.00 (past 1.5) |") and rows[3].endswith("| 1.25 (within 1.5) |") and rows[4].endswith("|  |"), rows
   assert all(r.count("|") == 5 for r in rows) and "MemoryError" in rows[4], rows
 
+def test_benchmark_load(chip, tmp_path):
+  # B4's load (benchmark.load) against serve.py's server for a small model: two agents at once over HTTP, two turns each,
+  # streamed; every turn's tokens come, and the second turns' prompts, each its first prompt and answer and more, are
+  # mostly the server's cached rows (its slot held them)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(37)
+  c, w = smol(rng, 2, places=128)
+  engine = serve.Engine(rt, {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, c, bytes_tokenizer(tmp_path), slots=2, places=128, chunk=32)
+  threading.Thread(target=engine.run, daemon=True).start()
+  httpd = serve.server(engine, "smol", port=0)
+  threading.Thread(target=httpd.serve_forever, daemon=True).start()
+  got = benchmark.load(f"http://localhost:{httpd.server_address[1]}", 2, SimpleNamespace(system=6, task=2, tool=2, out=4, n=2), " ".join(f"w{i}" for i in range(40)))
+  httpd.shutdown()
+  assert got["turns"] == 4 and got["tokens/s"] > 0 and got["seconds to first token"] > 0 and got["prompt tokens cached"] > 0.3, got
+
 def test_chunked_prefill(chip):
   # a long prompt a chunk at a time (llama.prefill, as B3's 32,768 tokens must go: attention's scores a chunk by the cache,
   # not the prompt squared): 70 tokens in chunks of 32, 32 and 6, each chunk's keys and values cached before the next
