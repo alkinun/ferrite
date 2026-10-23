@@ -2009,7 +2009,8 @@ def test_block_float_cache(chip):
   # each run of 16 rounded as cast rounds it (numpy's bfp, bit for bit: one row, rows in two tiles, a prompt's whole
   # tile, the edges), and attention reads it in place, its keys transposed (unpacker 0 transposing faces of block
   # floats) and its values as they are, each key and value head serving two query heads: the matmuls, and attention in
-  # one kernel, bit for bit the bf16 ones by the same values
+  # one kernel, bit for bit the bf16 ones by the same values. A view of it copied as it is (assign) into a tensor of its
+  # own, and from there into another view of it
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(16)
   for fmt in ("bfp8", "bfp4"):
     cache = Tensor.of(rt, np.zeros((4, 96, 64)).tolist()).cast(fmt).realize()  # 2 key heads, then 2 value heads
@@ -2026,6 +2027,10 @@ def test_block_float_cache(chip):
     assert value(s @ cache.values).tolist() == value(s @ same.values).tolist()
     places = Tensor.of(rt, [[[95]] * 5], "int32")
     assert value(q.attend(cache.keys, cache.values, places)).tolist() == value(q.attend(same.keys, same.values, places)).tolist(), fmt
+    back = Tensor(rt, 64, 64, batch=2, dtype=fmt).assign(cache[0:2, :64, :])
+    cache[2:4, 32:96, :].assign(back)
+    want[2:4, 32:96] = want[0:2, :64]
+    assert np.array_equal(value(back), want[0:2, :64]) and np.array_equal(value(cache), want), fmt
 
 def test_batched_decode(chip):
   # four sequences decoding together, a token each a step, from prompts of different lengths: their KV caches side by
@@ -2280,17 +2285,19 @@ def test_serve_sessions(chip, tmp_path, kv):
   # slot's and a prefilling one's states left as they are by the others' steps, a slot whose states are past where a
   # prompt parts from them taken from the start again), each token's logits within 3% of numpy's for its prompt and the
   # tokens it took before, and picked as numpy would (agrees). Then an agent's next turns, once other requests hold both
-  # slots: one whose prompt is the first's prompt and answer and more goes on from the session saved on the host when
-  # the first ended, its new tokens alone prefilled; one that parts from the first after its prompt goes on from the
-  # session saved when that prompt was in; each the same against numpy from nothing. Its KV cache is bfp8, as Qwen3.6's
-  # is served, or bfp4 (numpy's rounded as the chip's), its sessions saved and put back in bf16, which holds their values.
+  # slots: one whose prompt is the first's prompt and answer and more goes on from the session kept when the first
+  # ended, its new tokens alone prefilled; one that parts from the first after its prompt goes on from the session kept
+  # when that prompt was in; each the same against numpy from nothing. Its KV cache is bfp8, as Qwen3.6's is served, its
+  # sessions kept on the chip, or bfp4 (numpy's rounded as the chip's), with no room on the chip for sessions (park 0):
+  # kept on the host, read back and put back in bf16, which holds their values.
   # In bfp4, 3 bits a value, a key the chip rounds the other way than numpy moves by an eighth of its run's largest:
   # numpy's own logits move 2.9% for qkv weights off by bf16's rounding, against 1.0% in bfp8, so its bound is 6%
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
   c, weights = qwen35(rng)
   w, tok, c.precision = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.precision(c, "bf16", kv=kv)
   c.mtp = 0  # (decoding a token a step: test_serve_speculative drafts with it)
-  engine = serve.Engine(rt, llama.upload(rt, {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.4."))}), c, tok, slots=2, places=64, chunk=16)
+  engine = serve.Engine(rt, llama.upload(rt, {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.4."))}), c, tok, slots=2, places=64, chunk=16,
+                        park=0 if kv == "bfp4" else None)
   threading.Thread(target=engine.run, daemon=True).start()
   together = [Kept(tok, p, 6, 0) for p in ([7, 200, 31, 64, 5], [5, 64], list(range(40, 60)))]  # the last longer than a chunk
   served(engine, together)
@@ -2302,6 +2309,7 @@ def test_serve_sessions(chip, tmp_path, kv):
     served(engine, r)
     agrees(r, w, c, tol)
     assert engine.prefilled - before == len(turn) - len(saved) == len(turn) - r.cached, (engine.prefilled - before, r.cached)
+  assert {type(v[-1]) for v in engine.saved.values()} == {bytes if kv == "bfp4" else Tensor}, "kept on the host, or on the chip"
 
 def test_serve_speculative(chip, tmp_path):
   # models/serve.py's engine drafting with Qwen3.5's multi-token prediction layer (qwen35's, at random): each step

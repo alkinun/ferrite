@@ -547,10 +547,13 @@ in bf16 over the same text.
   recorded for each such length. A prompt is prefilled a chunk between steps (2,048 tokens for a mixture of experts,
   whose chunks read nearly all its experts; 256 otherwise).
 - **The prefix cache.** A prompt goes to the free slot holding the longest start of it, and only the rest is prefilled.
-- **Sessions on the host.** Gated DeltaNet's states are for exactly the tokens they took in, so a session (its tokens,
-  its slot's cache rows and its states) is saved on the host when its prompt is in and when it ends, up to `keep` bytes,
-  least recently used going first, and a prompt that begins with a saved session goes on from it in any slot: an
-  agent's next turn prefills only its new tokens.
+- **Sessions kept.** Gated DeltaNet's states are for exactly the tokens they took in, so a session (its tokens, its
+  slot's cache rows and its states) is kept when its prompt is in and when it ends, and a prompt that begins with a kept
+  session goes on from it in any slot: an agent's next turn prefills only its new tokens. It is copied on the chip, its
+  tiles as they are (`assign` of a tensor computed already: `copy_kernel`, BRISC's, a block float's too), into DRAM the
+  caches leave (`park` bytes: by default all that is free when the engine starts but 2 GiB), so keeping one and taking
+  it back are a few launches and no PCIe; past that the least recently used go to the host (`keep` bytes), read back
+  and later written over the BARs, and past that they are gone.
 - **Speculative steps** for a model with a prediction layer: a call verifying every slot's token and draft, then one
   drafting the next (each row's best token, on the chip); a pick is sampled as it would be without a draft, so the tokens
   are the model's own.

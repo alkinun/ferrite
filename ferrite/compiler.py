@@ -1460,6 +1460,25 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+def copy_kernel(dtype):
+  """Tiles as they are, from a tensor or view into another of its shape (assign's of what is computed already: a block
+  float's too), args [first unit, units, then the result's and x's address, tile strides for batch and row, and tile
+  offset, then the tile rows and columns]. BRISC alone, a unit a tile, each read while the one before is written."""
+  tb = tile_bytes(dtype)
+  return compile_kernel(f"""
+{BANKS}
+void kmain(volatile unsigned *a) {{
+  unsigned tr = a[10], tc = a[11];
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned t = a[0] + u, b = t / (tr * tc), i = t / tc % tr, j = t % tc, slot = {DATA:#x} + u % 2 * {tb};
+    unsigned from = b * a[7] + i * a[8] + j + a[9], to = b * a[3] + i * a[4] + j + a[5];
+    noc_get(BANK(from), AT(a[6], from, {tb}), slot, {tb});
+    noc_wait();  // (the tile before's write too, from the other slot)
+    noc_write(slot, BANK(to), AT(a[2], to, {tb}), {tb});
+  }}
+  noc_wait();
+}}""")
+
 def put_kernel(dtype):
   """Rows of x into rows of a tensor, in place (gather's inverse), args [first unit, units, then the tensor's and x's
   address, tile strides for batch and row, and tile offset, the int32 row of the n rows' places' address and tile offset,

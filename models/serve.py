@@ -10,6 +10,8 @@ import codecs, collections, functools, json, math, os, queue, re, shutil, sys, t
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from ferrite import bh
+from ferrite.compiler import tile_bytes
 from ferrite.tensor import Tensor, jit
 import gpt2, llama
 
@@ -170,25 +172,29 @@ class Request:
 class Engine:
   """Sequences decoding together on the chip, a slot of `places` rows of one KV cache each (and Gated DeltaNet's states
   each). Every step runs every slot, one that is free or still prefilling on its last row, which no sequence reaches,
-  and leaving its states as they are, so the step's shapes never change and it is replayed (jit). Its attention reads
-  each slot's first rows alone, as many as the power of 2 (32 at least) that holds the longest sequence's, a replay
-  recorded for each, so a step costs what its sequences hold, not their slots' size. A prompt is prefilled `chunk`
+  seeing its slot's first row alone and leaving its states as they are, so the step's shapes never change and it is
+  replayed (jit). Its attention reads each slot's rows up to its sequence's place (attention in one kernel: one replay
+  for every length), or else as many as the power of 2 (32 at least) that holds the longest sequence's, a replay
+  recorded for each: a step costs what its sequences hold, not their slots' size. A prompt is prefilled `chunk`
   tokens at a time, from what its slot holds of it already, a chunk between steps, so a long one slows the others'
   tokens rather than stopping them.
-  A session (its tokens, its slot's rows of each cache and its states) is saved on the host when its prompt is in and
-  again when its request ends, up to `keep` bytes, the least recently used going first, so an agent's next turn,
-  whose prompt is its last prompt and answer and more, starts where the last left off whichever slot it gets. A KV
-  cache's rows serve any start of what they hold; Gated DeltaNet's states are for exactly what they took in.
+  A session (its tokens, its slot's rows of each cache and its states) is kept when its prompt is in and again when its
+  request ends, so an agent's next turn, whose prompt is its last prompt and answer and more, starts where the last
+  left off whichever slot it gets: copied on the chip, into DRAM the caches leave, up to `park` bytes (by default all
+  that is free when the engine starts but 2 GiB), a few launches and no PCIe either way; past that the least recently
+  used go to the host, up to `keep` bytes, and past that they are gone. A KV cache's rows serve any start of what they
+  hold; Gated DeltaNet's states are for exactly what they took in.
   A model with a multi-token prediction layer (Qwen3.5's) decodes speculatively: each step verifies every slot's next
   token and a draft after it in one call (llama.forward's accept), takes the second token too where the model's pick
   for it is the draft (a pick sampled as it would be: the tokens are the model's own at any temperature), and drafts
   the next in another call (llama.draft); a turned-down draft's Gated DeltaNet states are put back by the next step."""
-  def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=256, keep=4 << 30):
+  def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=256, keep=4 << 30, park=None):
     assert places % 32 == 0, "slots of whole tiles"
     self.rt, self.t, self.c, self.tok, self.places, self.chunk, self.keep = rt, t, c, tokenizer, places, chunk, keep
     self.spec = getattr(c, "mtp", 0) > 0 and "mtp.fc" in t  # (drafts from the multi-token prediction layer)
     self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)), slots, self.spec)
     self.slot = [llama.slot(c, self.kv, u, slots) for u in range(slots)]  # the caches as slot u's alone
+    self.park = max(0, sum(room for _, room in rt.holes) * len(bh.DRAM) - (2 << 30)) if park is None else park
     self.linear = any(llama.linear(c, l) for l in range(c.layers))  # (its states then say where a slot can go on from)
     self.whole = llama.attends(c, t)  # (attention in one kernel reads only the rows its places reach: a replay for every length)
     self.held, self.busy = [[] for _ in range(slots)], [None] * slots
@@ -248,13 +254,22 @@ class Engine:
       self.taken[u] = 1.0
     self.held[u], r.cached = r.ids[:n], n
 
-  def save(self, u):  # slot u's session to the host: its tokens, its rows of each KV cache (whole tiles) and its states (after a
-    key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32  # turned-down draft, those after the token before it)
-    if not key or key in self.saved or not self.keep: return
-    self.saved[key] = [tuple(x.tobytes() for x in (s[:2] if self.taken[u] else s[2:])) if llama.linear(self.c, l) else s[:, :rows, :].tobytes()
+  def save(self, u):  # slot u's session kept, copied on the chip: its tokens, its rows of each KV cache (whole tiles) and its
+    key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32  # states (after a turned-down draft, those after the token before it)
+    if not key or key in self.saved or not self.park + self.keep: return
+    def copy(x):  # (a conv state's row by a move)
+      x = x.get() if isinstance(x, llama.Row) else x
+      return Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
+    self.saved[key] = [tuple(copy(x) for x in (s[:2] if self.taken[u] else s[2:])) if llama.linear(self.c, l) else copy(s[:, :rows, :])
                        for l, s in enumerate(self.slot[u])]
-    size = lambda v: sum(len(b) for x in v for b in (x if isinstance(x, tuple) else [x]))
-    while sum(size(v) for v in self.saved.values()) > self.keep: self.saved.popitem(last=False)
+    each = lambda v: [x for part in v for x in (part if isinstance(part, tuple) else (part,))]  # (a session's tensors, or bytes)
+    size = lambda v: sum(len(x) if isinstance(x, bytes) else x.batch * -(-x.rows // 32) * -(-x.cols // 32) * tile_bytes(x.dtype) for x in each(v))
+    for kind, room in ((Tensor, self.park), (bytes, self.keep)):  # past park bytes on the chip, the least recently used to the host;
+      held = [k for k, v in self.saved.items() if isinstance(each(v)[0], kind)]  # past keep there, gone
+      while sum(size(self.saved[k]) for k in held) > room:
+        k = held.pop(0)
+        if kind is bytes or not self.keep: del self.saved[k]
+        else: self.saved[k] = [tuple(x.tobytes() for x in part) if isinstance(part, tuple) else part.tobytes() for part in self.saved[k]]
 
   def restore(self, u, key=()):  # a saved session into slot u, its tokens what the slot holds (none: its states all 0)
     if key: self.saved.move_to_end(key)
@@ -262,7 +277,10 @@ class Engine:
     for l, s in enumerate(self.slot[u]):
       data = self.saved[key][l] if key else None
       if llama.linear(self.c, l):
-        for i, x in enumerate(s[:2]): x.assign(Tensor.frombytes(self.rt, x.rows, x.cols, data[i] if data else bytes(4 * x.batch * x.rows * x.cols), x.batch, "fp32"))
+        for i, x in enumerate(s[:2]):
+          x.assign(data[i] if data and isinstance(data[i], Tensor) else
+                   Tensor.frombytes(self.rt, x.rows, x.cols, data[i] if data else bytes(4 * x.batch * x.rows * x.cols), x.batch, "fp32"))
+      elif isinstance(data, Tensor): s[:, :rows, :].assign(data)
       elif data: s.put(self.on(list(range(rows))), Tensor.frombytes(self.rt, rows, s.cols, data, s.batch))
     self.held[u], self.taken[u] = list(key), 1.0
 

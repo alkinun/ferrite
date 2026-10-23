@@ -5,7 +5,7 @@
 import array, collections, functools, math
 from ferrite import bh
 from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
-from ferrite.compiler import attention_kernel, attention_store, bfp4_kernel, delta_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
+from ferrite.compiler import attention_kernel, attention_store, bfp4_kernel, copy_kernel, delta_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
 from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, touched_kernel, transpose_kernel
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
@@ -266,12 +266,15 @@ class Tensor:
     return self._run(kernel, *args, units=units, name=name)
   def assign(self, x):
     """x's value in this tensor, in place, as an optimizer updates a weight: x is computed into its DRAM and becomes a
-    view of it. A kernel reads each tile of its elementwise inputs before it writes that tile, but a matmul reads whole
-    rows and columns, so one is computed first, on its own."""
+    view of it; or, computed already (data movement and matmuls first, on their own), its tiles are copied in as they
+    are (copy_kernel). A kernel reads each tile of its elementwise inputs before it writes that tile, but a matmul reads
+    whole rows and columns."""
     assert self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype), "a tensor or view, its own shape and dtype"
-    if any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
-    (x if x.op not in (None, "T", "move") else x + 0).realize(self)  # computed already, or a move: copied in by + 0
-    return self
+    if x.op in ("T", "move") or any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
+    if x.op is not None: x.realize(self); return self
+    x = _plain(x)
+    return self._run(_cached(("copy", self.dtype), lambda: copy_kernel(self.dtype)), *self._where(), *x._where(),
+                     -(-self.rows // 32), -(-self.cols // 32), name="copy")
 
   def _run(self, kernel, *args, units=None, name=""):
     """Queue kernel over units of this tensor (tiles unless told), split evenly over as many workers as have any.
