@@ -6,12 +6,45 @@
 #   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]   # a folder or a
 #   model id; the weights' formats (llama.precision), then the KV cache's
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import collections, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
+import codecs, collections, functools, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ferrite.tensor import Tensor, jit
 import gpt2, llama
+
+class Head:
+  """A row of logits as the chip gives it (heads): its k largest, descending, and their tokens (values, ids), the log of
+  the sum of exp(x t) over the whole row at its t, the request's 1/temperature (lse), and the whole row when a draw
+  wants it (row(): read back then). Head.of makes one from a whole row (numpy's)."""
+  def __init__(self, values, ids, lse, row): self.values, self.ids, self.lse, self.row = np.asarray(values, np.float64), ids, float(lse), row
+  @staticmethod
+  def of(logits, t=1.0, k=64):
+    ids = np.argsort(-logits, kind="stable")[:k]
+    m = float(logits.max())
+    return Head(logits[ids], ids, m * t + math.log(np.exp((np.float64(logits) - m) * t).sum()), lambda: logits)
+
+def scale(r): return 1 / r.temperature if r and r.temperature > 0 else 1.0  # a request's 1/temperature (greedy's: any)
+
+def heads(logits, t=None, k=64):
+  """Each row's head of a batch of logits (fp32, one matrix of rows by the vocabulary), on the chip: its k largest and
+  their tokens, by topk on parts of the row that fit a worker's L1 and then on the parts' best (by their labels); and
+  given t (a column of each row's 1/temperature), the log of the sum of exp(x t) over the row, in fp32, each part's in
+  one kernel and theirs together in another: (values, ids[, lse]), realized, what Head holds. None for a vocabulary that
+  cuts into no such parts (the host then reads whole rows)."""
+  tiles = logits.cols // 32
+  parts = next((p for p in range(1, 126) if tiles % p == 0 and tiles // p <= 96), None) if logits.cols % 32 == 0 else None
+  if parts is None: return None
+  values, ids = logits.topk(-(-k // 32) * 32 if parts > 1 else k, parts)
+  if parts > 1: values, ids = values.topk(k, labels=ids)
+  if t is None: return values.realize(), ids.realize()
+  x = logits.split(parts)
+  m = x.max(2)
+  lse = ((x - m) * t).exp().sum(2).log() + m * t  # each part's
+  if parts > 1: top = lse.max(0); lse = (lse - top).exp().sum(0).log() + top
+  return values.realize(), ids.realize(), lse.realize()
+
+def read(x): return np.frombuffer(x.tobytes(), {"fp32": np.float32, "int32": np.int32}[x.dtype]).reshape(x.rows, x.cols)  # (numpy's, its dtype)
 
 class Request:
   """A prompt's tokens and how to go on from them (pick), until a token in eos, a stop string or max_tokens. Each piece
@@ -28,14 +61,21 @@ class Request:
     self.top_k, self.min_p, self.presence, self.frequency, self.repetition, self.logprobs = top_k, min_p, presence, frequency, repetition, logprobs
     self.shape = shape
     self.made, self.said, self.out, self.finish, self.gone, self.cached, self.probs, self.marks = [], "", queue.Queue(), None, False, 0, [], []
+    self.text, self.utf8 = "", codecs.getincrementaldecoder("utf-8")("replace")  # the text made so far, but a character still coming
     self.room = None
 
-  def pick(self, logits):
-    """The next token: the logits less the penalties (presence and frequency by the tokens made so far, repetition by
-    the prompt's and those made, as vLLM applies them), then drawn (draw). With a shape (a function of the text made: 0
-    if it cannot begin one, 1 if it can, 2 if it is a whole one), the token drawn is taken if the text it makes can
-    still begin one (an end of sequence, if the text is a whole one), else drawn again with that one left out: no mask
-    over 248K tokens a step, and a check or two when the model is in the shape already."""
+  def whole(self): return bool(self.presence or self.frequency or self.repetition != 1 or self.shape or self.logprobs is not None)  # wants
+  # whole rows: penalties move tokens past the head into it, a shape may turn down every one of it, log probabilities are at temperature 1
+
+  def pick(self, head):
+    """The next token, from the head of its logits (Head) when it decides the draw (sample), else from the whole row:
+    the logits less the penalties (presence and frequency by the tokens made so far, repetition by the prompt's and
+    those made, as vLLM applies them), then drawn (draw). With a shape (a function of the text made: 0 if it cannot begin
+    one, 1 if it can, 2 if it is a whole one), the token drawn is taken if the text it makes can still begin one (an end
+    of sequence, if the text is a whole one), else drawn again with that one left out: no mask over 248K tokens a step,
+    and a check or two when the model is in the shape already."""
+    if not self.whole() and (token := self.sample(head)) is not None: return token
+    logits = head.row()
     if self.presence or self.frequency or self.repetition != 1:
       made = np.bincount(self.made, minlength=len(logits))[:len(logits)]
       logits = logits - self.presence * (made > 0) - self.frequency * made
@@ -52,11 +92,36 @@ class Request:
   def fits(self, token):  # whether the text with token keeps to the shape (or, token an end of sequence, the text is whole)
     return self.shape(self.tok.decode(self.made)) == 2 if token in self.eos else self.shape(self.tok.decode(self.made + [token])) > 0
 
+  def sample(self, head):
+    """draw's token from a row's head alone, or None where the head does not decide it: top_k past the head, a nucleus
+    or a min_p cut reaching past it (both known before drawing). With neither top_k, top_p nor min_p, a draw past the
+    head's mass reads the whole row and draws from the rest of it alone, so every token keeps its probability."""
+    if self.temperature == 0: return int(head.ids[0])
+    t, k = 1 / self.temperature, len(head.ids)
+    p, total = np.exp((head.values - head.values[0]) * t), math.exp(head.lse - head.values[0] * t)  # (in the largest's scale)
+    keep = None  # (None: every token)
+    if self.top_k or self.top_p < 1:
+      if self.top_k > k: return None
+      run = np.cumsum(p[:self.top_k or k])
+      if self.top_p < 1 and not self.top_k and run[-1] < self.top_p * total: return None  # (a flatter distribution's nucleus)
+      keep = np.arange(np.searchsorted(run, self.top_p * (run[-1] if self.top_k else total)) + 1 if self.top_p < 1 else len(run))
+    if self.min_p:
+      if keep is None and p[-1] >= self.min_p: return None  # (tokens past the head may be at least min_p of the most likely's)
+      keep = np.flatnonzero(p >= self.min_p) if keep is None else keep[p[keep] >= self.min_p]
+    if keep is None:  # every token: in the head's mass, or in the rest's
+      run, u = np.cumsum(p), self.rng.random() * total
+      if u < run[-1]: return int(head.ids[min(int(np.searchsorted(run, u, side="right")), k - 1)])
+      rest = np.exp((np.float64(head.row()) - head.values[0]) * t)
+      rest[head.ids] = 0
+      cum = np.cumsum(rest)
+      return min(int(np.searchsorted(cum, (u - run[-1]) / max(total - run[-1], 1e-300) * cum[-1], side="right")), len(rest) - 1)
+    w = np.cumsum(p[keep])
+    return int(head.ids[keep[min(int(np.searchsorted(w, self.rng.random() * w[-1], side="right")), len(keep) - 1)]])
+
   def draw(self, logits):
     """Greedy at temperature 0, else sampled at that temperature from the top_k most likely (0: all), the fewest of
-    those whose probabilities sum to top_p, and of those the ones at least min_p of the most likely's. The fewest are
-    sought among the 1,024 most likely first: a sort of a vocabulary of 248K is 5 ms of the host's a token, where a
-    decode step of eight users takes the card 28."""
+    those whose probabilities sum to top_p, and of those the ones at least min_p of the most likely's, from a whole row.
+    The fewest are sought among the 1,024 most likely first: a sort of a vocabulary of 248K is 5 ms of the host's."""
     if self.temperature == 0: return int(logits.argmax())
     p, keep = np.exp((logits - logits.max()) / self.temperature), None  # (None: every token)
     if self.top_k or self.top_p < 1:
@@ -69,25 +134,30 @@ class Request:
     i = min(int(np.searchsorted(np.cumsum(w), self.rng.random() * w.sum(), side="right")), len(w) - 1)
     return i if keep is None else int(keep[i])
 
-  def take(self, logits, room):  # the next token from its logits (room: whether its slot has a place for one more): done?
-    if self.gone: self.finish = "gone"; return True
-    token = self.pick(logits)
+  def take(self, head, room):  # the next token from its logits' Head, or their whole row (numpy's); room: whether its slot
+    if self.gone: self.finish = "gone"; return True  # has a place for one more. Done?
+    head = head if isinstance(head, Head) else Head.of(head, scale(self))
+    token = self.pick(head)
     end = token is None or token in self.eos
     if not end:
       self.made.append(token)
       if self.logprobs is not None:  # (the model's own: its logits before any penalty or temperature, as vLLM gives them)
+        logits = head.row()
         lp = logits - logits.max()
         lp = lp - np.log(np.exp(lp).sum())
         top = np.argpartition(-lp, self.logprobs)[:self.logprobs] if self.logprobs else []
         self.probs.append((token, float(lp[token]), [(int(t), float(lp[t])) for t in sorted(top, key=lambda t: -lp[t])]))
-    text = self.tok.decode(self.made)
-    cut = min((i for i in (text.find(s) for s in self.stop) if i >= 0), default=-1)
+    before = len(self.text)  # (where a stop string could begin in what this token adds)
+    self.text += self.utf8.decode(b"" if end else self.tok.bytes[token])
+    start = max(0, before - max(map(len, self.stop), default=1) + 1)
+    cut = min((i for i in (self.text.find(s, start) for s in self.stop) if i >= 0), default=-1)
     if end or cut >= 0 or len(self.made) == self.max_tokens or not room:
+      text = self.text + self.utf8.decode(b"", True)
       self.say(text if cut < 0 else text[:cut])
       self.finish = "stop" if end or cut >= 0 else "length"
       return True
-    hold = max((k for s in self.stop for k in range(1, len(s)) if text.endswith(s[:k])), default=0)  # a stop string's start
-    self.say(text[:len(text) - hold].rstrip("\ufffd"))  # (or a character whose bytes are still coming)
+    hold = max((k for s in self.stop for k in range(1, len(s)) if self.text.endswith(s[:k])), default=0)  # a stop string's start
+    self.say(self.text[:len(self.text) - hold])
     return False
 
   def say(self, text):
@@ -122,7 +192,8 @@ class Engine:
     self.linear = any(llama.linear(c, l) for l in range(c.layers))  # (its states then say where a slot can go on from)
     self.held, self.busy = [[] for _ in range(slots)], [None] * slots
     self.used = [0] * slots  # when each slot last took a request: of those sharing as much, the one used longest ago goes
-    self.replays, self.hidden = {}, {}  # (a call's replay for each length it reads, and verify's hidden states for each)
+    self.replays, self.made, self.hidden = {}, {}, {}  # (a call's replay for each length it reads, what its last call made
+    # (its logits, and their heads), and verify's hidden states for each)
     self.drafts, self.taken = [0] * slots, [1.0] * slots  # each slot's draft, and whether its last was taken (its states then go on from both)
     self.drafted = self.agreed = 0  # (drafts compared with the model's pick, and taken: what speculation saves shows here)
     self.waiting, self.prefilled = queue.Queue(), 0  # (tokens prefilled in all: what the prefix cache saves shows here)
@@ -140,9 +211,22 @@ class Engine:
   def length(self, last):  # the rows of each slot a call reads when its sequences' last place is last
     return min(self.places, 1 << max(5, last.bit_length()))
 
-  def replay(self, f, n):  # f's replay (jit) for calls reading n rows of each slot
-    if (f, n) not in self.replays: self.replays[f, n] = jit(lambda *xs: f(*xs, length=n))
+  def replay(self, f, n):  # f's replay (jit) for calls reading n rows of each slot; what each call makes, kept (made)
+    if (f, n) not in self.replays:
+      def run(*xs):
+        self.made[f, n] = f(*xs, length=n)
+        return self.made[f, n][0]
+      self.replays[f, n] = jit(run)
     return self.replays[f, n]
+
+  def rows(self, f, n, ts):  # the rows of f's last call reading n rows, as Heads at each row's 1/temperature (ts): the chip's
+    logits, made = self.made[f, n]  # heads read back, and the whole rows once, if a draw wants them
+    whole = functools.cache(lambda: gpt2.values(logits))
+    if made is None: return [Head.of(row, x) for row, x in zip(whole(), ts)]
+    values, ids, lse = (read(x) for x in made)
+    return [Head(values[i], ids[i], lse[i, 0], lambda i=i: whole()[i]) for i in range(len(ts))]
+
+  def column(self, ts): return Tensor.of(self.rt, [[x] for x in ts], "fp32")  # each row's 1/temperature, a column
 
   def reach(self, held, ids):  # how much of a prompt can go on from what held is the state after (its last token runs again)
     if self.linear: return len(held) if len(held) < len(ids) and list(ids[:len(held)]) == list(held) else 0
@@ -190,10 +274,10 @@ class Engine:
     out, h = out if self.spec else (out, None)
     self.held[u] += ids
     self.prefilled += len(ids)
-    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, gpt2.values(out)[0], 1 + self.spec)
+    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, Head.of(gpt2.values(out)[0], scale(r)), 1 + self.spec)
     if self.spec and self.busy[u] is r:  # each place's next token: the prompt's, and past its end the one just taken
       drafts = gpt2.values(llama.draft(self.on((r.ids + r.made)[at + 1:at + len(ids) + 1]), places, h, self.t, self.c, self.slot[u], length=n, every=False))
-      if r.made: self.drafts[u], self.taken[u] = self.guess(u, drafts[-1]), 1.0
+      if r.made: self.drafts[u], self.taken[u] = self.guess(u, int(drafts[-1].argmax())), 1.0
 
   def advance(self):  # one step for every slot: each decoding one's last token in, its next one out
     live = [r if r and r.made else None for r in self.busy]
@@ -201,53 +285,58 @@ class Engine:
     if self.spec: return self.speculate(live)
     ids = [r.made[-1] if r else 0 for r in live]
     places = [len(h) if r else self.places - 1 for h, r in zip(self.held, live)]
-    step = self.replay(self.decode, self.length(max(p for p, r in zip(places, live) if r)))
-    logits = gpt2.values(step(self.on(ids), self.on(places), self.on([float(bool(r)) for r in live], "fp32")))
-    for u, r in enumerate(live):
-      if r: self.held[u].append(r.made[-1]); self.take(u, logits[u])
+    n, ts = self.length(max(p for p, r in zip(places, live) if r)), [scale(r) for r in live]
+    self.replay(self.decode, n)(self.on(ids), self.on(places), self.on([float(bool(r)) for r in live], "fp32"), self.column(ts))
+    for u, (r, head) in enumerate(zip(live, self.rows(self.decode, n, ts))):
+      if r: self.held[u].append(r.made[-1]); self.take(u, head)
 
-  def take(self, u, logits, room=1):  # a slot's request takes its next token; a finished one leaves its slot, its session saved
-    r = self.busy[u]                   # before it ends (so whoever waits on it finds the chip idle)
-    if r.take(logits, len(self.held[u]) + room < self.places): self.save(u); self.busy[u] = None; r.end()
+  def take(self, u, head, room=1):  # a slot's request takes its next token; a finished one leaves its slot, its session saved
+    r = self.busy[u]                 # before it ends (so whoever waits on it finds the chip idle)
+    if r.take(head, len(self.held[u]) + room < self.places): self.save(u); self.busy[u] = None; r.end()
     return self.busy[u] is None
 
-  def decode(self, ids, places, live, length):  # (replay's) a token of every slot
-    return llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, length=length)
+  def decode(self, ids, places, live, t, length):  # (replay's) a token of every slot: their logits, and their heads at t
+    logits = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, length=length).realize()
+    return logits, heads(logits, t)
 
-  def check(self, ids, places, live, accept, length):  # (speculating, replay's) each slot's token and draft taken in, after its
+  def check(self, ids, places, live, accept, t, length):  # (speculating, replay's) each slot's token and draft taken in, after
     logits, self.hidden[length] = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, accept=accept, hidden=True, length=length)
-    return logits  # last step's states (accept): their logits, and their hidden states kept for guesses
+    return logits.realize(), heads(logits, t)  # its last step's states (accept): their logits and heads, and their hidden states kept for guesses
 
   def guesses(self, ids, places, taken, length):  # (replay's) the multi-token prediction layer over each slot's two last places
-    n, d = len(self.busy), self.c.dim             # (the second the first again where its draft was turned down): its logits
-    h = self.hidden[length].reshape(n, 2, d)
+    n, d = len(self.busy), self.c.dim             # (the second the first again where its draft was turned down): its logits,
+    h = self.hidden[length].reshape(n, 2, d)      # and each row's best token
     first = h[:, 0:1, :]
     h = first.cat(first + taken.reshape(n, 1, 1) * (h[:, 1:2, :] - first), axis=1).reshape(2 * n, d).cast("bf16")  # (one or the other, exactly)
-    return llama.draft(ids, places, h, self.t, self.c, self.kv, n, length)
+    logits = llama.draft(ids, places, h, self.t, self.c, self.kv, n, length).realize()
+    return logits, heads(logits, k=1)
 
-  def guess(self, u, logits): return int(logits.argmax())  # slot u's draft, from the multi-token prediction layer's logits
+  def guess(self, u, best): return best  # slot u's draft: the multi-token prediction layer's best token
 
   def speculate(self, live):  # one step for every slot: its token and its draft verified, the draft taken if the model's pick
     n, at = len(live), [len(h) for h in self.held]  # agrees, then the next drafts
     ids = [x for u, r in enumerate(live) for x in ([r.made[-1], self.drafts[u]] if r else [0, 0])]
     places = [p for u, r in enumerate(live) for p in ([at[u], at[u] + 1] if r else [self.places - 1] * 2)]
-    m = self.length(max(at[u] + 1 for u, r in enumerate(live) if r))  # (the drafts' places too)
-    logits = gpt2.values(self.replay(self.check, m)(self.on(ids), self.on(places), self.on([float(bool(r)) for r in live], "fp32"), self.on(self.taken, "fp32")))
+    m, ts = self.length(max(at[u] + 1 for u, r in enumerate(live) if r)), [x for r in live for x in (scale(r),) * 2]  # (the drafts' places too)
+    self.replay(self.check, m)(self.on(ids), self.on(places), self.on([float(bool(r)) for r in live], "fp32"), self.on(self.taken, "fp32"), self.column(ts))
+    rows = self.rows(self.check, m, ts)
     pairs = [[0, 0, self.places - 1, self.places - 1] for _ in range(n)]  # each slot's next tokens and their places, for the drafts
     for u, r in enumerate(live):
       if not r: continue
       self.held[u].append(r.made[-1])
       self.taken[u] = 0.0
-      if self.take(u, logits[2 * u], 2): continue
+      if self.take(u, rows[2 * u], 2): continue
       self.drafted += 1
       if r.made[-1] != self.drafts[u]: pairs[u] = [r.made[-1], r.made[-1], at[u], at[u]]; continue
       self.held[u].append(r.made[-1])
       self.taken[u], self.agreed = 1.0, self.agreed + 1
-      if not self.take(u, logits[2 * u + 1], 2): pairs[u] = [self.drafts[u], r.made[-1], at[u], at[u] + 1]
+      if not self.take(u, rows[2 * u + 1], 2): pairs[u] = [self.drafts[u], r.made[-1], at[u], at[u] + 1]
     if not any(self.busy[u] is r for u, r in enumerate(live) if r): return
-    out = gpt2.values(self.replay(self.guesses, m)(self.on([t for p in pairs for t in p[:2]]), self.on([q for p in pairs for q in p[2:]]), self.on(self.taken, "fp32")))
+    self.replay(self.guesses, m)(self.on([x for p in pairs for x in p[:2]]), self.on([q for p in pairs for q in p[2:]]), self.on(self.taken, "fp32"))
+    logits, made = self.made[self.guesses, m]
+    best = read(made[1])[:, 0] if made else gpt2.values(logits).argmax(1)  # (each row's best token: its draft)
     for u, r in enumerate(live):
-      if r and self.busy[u] is r: self.drafts[u] = self.guess(u, out[2 * u + 1])
+      if r and self.busy[u] is r: self.drafts[u] = self.guess(u, int(best[2 * u + 1]))
 
   def run(self):  # the engine's thread: admit while a slot is free, a chunk of a prompt, a step; on an error, every request ends
     try:
@@ -469,7 +558,7 @@ def answer(text):  # a thinking model's text as its reasoning and its answer (no
   reasoning, _, content = text.partition("</think>")
   return reasoning.removeprefix("<think>").strip(), content.lstrip()
 
-def server(engine, name, template="", eos=(), port=8000, wait=600):
+def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None):
   """An HTTP server for the engine (its thread must be running): /v1/models, and /v1/completions and
   /v1/chat/completions, whole or streamed (server-sent events). A model that thinks (its template has <think>, or
   gpt-oss's channels) gives its reasoning apart from its answer (reasoning_content), unless chat_template_kwargs'
@@ -477,7 +566,9 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
   tools (Qwen3.5's template), the answer's tool calls come as OpenAI's tool_calls, a stream's after its text. Its
   usage counts the prompt's tokens that were cached (prompt_tokens_details), as OpenRouter bills them, and ends a stream
   too, a chunk of its own, as OpenRouter's does. A piece of text not ready in `wait` seconds ends the request: a hung
-  chip is reported, not waited on."""
+  chip is reported, not waited on. A sampling parameter a request leaves out is the model's own (defaults: its
+  generation_config.json's temperature, top_k, top_p, min_p and repetition_penalty, as vLLM takes them), else OpenAI's."""
+  defaults = defaults or {}
   class Handler(BaseHTTPRequestHandler):
     def reply(self, code, body):
       data = json.dumps(body).encode()
@@ -503,9 +594,10 @@ def server(engine, name, template="", eos=(), port=8000, wait=600):
           call = chosen("required", tools) if tools and choice != "none" else None
           fits = form if call is None else (lambda text: max(form(text), call(text)))
         shape = fits and apart and (lambda text: fits(answer(text)[1])) or fits  # (a thinking model's on its answer alone)
-        r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), q.get("temperature", 1.0), q.get("top_p", 1.0),
-                    q.get("stop"), eos, q.get("seed"), max(q.get("top_k") or 0, 0), q.get("min_p") or 0.0, q.get("presence_penalty") or 0.0,
-                    q.get("frequency_penalty") or 0.0, q.get("repetition_penalty") or 1.0, top, shape)
+        given = lambda k, default: q[k] if q.get(k) is not None else defaults.get(k, default)
+        r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), given("temperature", 1.0), given("top_p", 1.0),
+                    q.get("stop"), eos, q.get("seed"), max(given("top_k", 0), 0), given("min_p", 0.0), q.get("presence_penalty") or 0.0,
+                    q.get("frequency_penalty") or 0.0, given("repetition_penalty", 1.0), top, shape)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens: a slot holds {engine.places - 2}"}})
       if not engine.offer(r): return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})  # (OpenRouter asks for one at
@@ -603,11 +695,13 @@ def main():
   engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places, chunk)
   config = lambda f: llama.read_json(os.path.join(folder, f)) if os.path.exists(os.path.join(folder, f)) else {}
   eos = (config("generation_config.json") or config("config.json")).get("eos_token_id")
+  defaults = {k: v for k, v in config("generation_config.json").items() if k in ("temperature", "top_k", "top_p", "min_p", "repetition_penalty")}
   threading.Thread(target=engine.run, daemon=True).start()
   print(f"{os.path.basename(folder.rstrip('/'))} on the chip in {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} places, "
         f"prompts {chunk} tokens at a time, port {port}", flush=True)
   jinja = os.path.join(folder, "chat_template.jinja")  # where transformers 5 keeps it
   template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
-  server(engine, os.path.basename(folder.rstrip("/")), template, eos if isinstance(eos, list) else [eos] if eos is not None else [], port).serve_forever()
+  server(engine, os.path.basename(folder.rstrip("/")), template, eos if isinstance(eos, list) else [eos] if eos is not None else [], port,
+         defaults=defaults).serve_forever()
 
 if __name__ == "__main__": main()

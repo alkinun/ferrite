@@ -361,15 +361,22 @@ class Tensor:
   def mean(self, axis=None):
     s = self.sum(axis)
     return s * (math.prod(s.shape) / math.prod(self.shape))
-  def topk(self, k):
+  def topk(self, k, parts=1, labels=None):
     """tinygrad's along each row, largest first: (values, int32 indices), the first column of equals first (numpy's
     stable argsort's order), by one kernel of BRISC's alone (topk_kernel, a worker a row): a mixture of experts' router,
-    of at most 256 columns and k of at most 32. Exact, so a value its kernels would round apart is compared as stored; no gradient."""
-    assert self.dtype == "bf16" and self.cols <= 256 and k <= min(self.cols, 32), "a bf16 row of at most 256, k of at most 32"
-    x = _plain(self.realize())
-    values, ids = Tensor(self.rt, x.rows, k, batch=x.batch), Tensor(self.rt, x.rows, k, batch=x.batch, dtype="int32")
-    return values._run(_cached(("topk", k, x.cols), lambda: topk_kernel(k, x.cols)), values.addr, ids.addr, *x._where(), x.rows,
-                       units=x.batch * -(-x.rows // 32) * 32, name="topk"), ids
+    or a vocabulary's logits, bf16 or fp32, k of at most 64. parts: each row cut into so many parts of whole tiles, each
+    part's k best side by side, (rows, parts k), each index its column in the whole row: a row too wide for a worker's
+    L1, whose parts' best a second topk picks from given their indices as labels (each pick's label, not its column).
+    Exact, so a value its kernels would round apart is compared as stored; no gradient."""
+    cols = self.cols // parts
+    assert self.dtype in ("bf16", "fp32") and k <= min(cols, 64) and parts * cols == self.cols, "bf16 or fp32, k of at most 64, whole parts"
+    assert labels is None or (labels.dtype == "int32" and labels.shape == self.shape and parts == 1), "labels: int32, x's shape"
+    x, labels = _plain(self.realize()), None if labels is None else _plain(labels.realize())
+    values = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype=x.dtype)
+    ids = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype="int32")
+    key = ("topk", k, cols, x.dtype, parts, labels is not None)
+    return values._run(_cached(key, lambda: topk_kernel(*key[1:])), values.addr, ids.addr, *x._where(), x.rows,
+                       *(labels._where() if labels else ()), units=x.batch * parts * -(-x.rows // 32) * 32, name="topk"), ids
   def group(self, n):
     """A mixture of experts' tokens grouped by expert, from int32 choices (rows x k, values below n), as three int32
     tensors: order, a row of 32 t slots in which each value's choices have a run of whole tiles (t enough for any

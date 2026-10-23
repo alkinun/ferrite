@@ -508,9 +508,21 @@ in bf16 over the same text.
   least recently used going first, and a prompt that begins with a saved session goes on from it in any slot: an
   agent's next turn prefills only its new tokens.
 - **Speculative steps** for a model with a prediction layer: a call verifying every slot's token and draft, then one
-  drafting the next; a pick is sampled as it would be without a draft, so the tokens are the model's own.
+  drafting the next (each row's best token, on the chip); a pick is sampled as it would be without a draft, so the tokens
+  are the model's own.
+- **Heads** (`heads`). The output layer writes its logits in fp32, and each call ends with each row's head on the chip:
+  its 64 largest logits and their tokens, by `topk` on parts of the row a worker's L1 holds (Qwen3.6's 248,320 as 97 of
+  2,560), each part's 64 side by side, then a `topk` of those given their tokens as labels; and the log of the sum of
+  exp(x t) over the row at its request's t = 1/temperature, each part's by one fp32 kernel (two sweeps over a part kept
+  in L1) and theirs by another. The host reads back under 1 KB a row, not the row: greedy is its first token; top_k up
+  to 64, and top_p and min_p whose cut lies inside the head, are exact from it, the sum giving each token's share of the
+  whole row; a draw with none of them that lands past the head's mass reads the whole rows back and draws from the rest
+  of its row alone. Penalties, shapes and logprobs read the whole row. 8 slots' tokens at temperature 0.7 and top_p 0.95
+  take 0.08 ms of the host's a step, where drawing from whole rows took 4.3.
 - **Requests.** Penalties (presence, frequency, repetition, as vLLM applies them), temperature, top_k, top_p, min_p,
-  seed, stop strings, logprobs, on the host from each token's logits (the top 1,024 sorted first). Qwen3.5's and 3.6's
+  seed, stop strings (searched for only where the newest token's text could complete one), logprobs; those a request
+  leaves out are the model's own (its `generation_config.json`'s, as vLLM takes them: Qwen3.6's top_k 20, top_p 0.95),
+  else OpenAI's. Qwen3.5's and 3.6's
   template written out, tool calls back as OpenAI's `tool_calls`; `tool_choice` and `response_format` (a JSON schema,
   parsed as a prefix) are shapes: a drawn token is taken if the text can still fit, else drawn again without it.
   Reasoning comes apart from the answer (`reasoning_content`).

@@ -1451,7 +1451,8 @@ def test_kv_cache(chip):
 def test_topk(chip):
   # Tensor.topk, one kernel of BRISC's: each row's k largest and their columns as numpy's stable argsort has them (the
   # first of equals first, -0 equal to 0), for one row (its results' tiles full of copies of it, as a broadcast reads
-  # them), a k of 1 (copies across), rows past one tile, a batch, columns not a multiple of 32 and 256 of them; and of a
+  # them), a k of 1 (copies across), rows past one tile, a batch, columns not a multiple of 32 and 256 of them; fp32 rows
+  # in parts, each part's 64 or 32 best side by side, and those parts' best given their indices as labels; and of a
   # matmul's softmax not yet computed, which the kernels of its max and of its columns once rounded apart (an index of 8
   # in 8 columns, when topk was passes of max), and none of their DRAM kept after
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(37)
@@ -1470,6 +1471,16 @@ def test_topk(chip):
   values, ids = probs.topk(2)
   got, p = value(ids)[0], value(probs)[0]  # the indices first: probs read first would be computed on its own
   assert np.array_equal(got, np.argsort(-p, -1, kind="stable")[:, :2]) and np.array_equal(value(values)[0], -np.sort(-p, -1)[:, :2])
+  for rows, cols, parts, k in ((5, 2560, 4, 64), (40, 1024, 2, 32)):  # fp32, k of 64, rows in parts side by side, then their best
+    x = rng.normal(0, 3, (rows, cols)).astype(np.float32)
+    x[0, 100] = x[0, cols // 2 + 3] = x[0].max() + 1  # a tie across parts
+    values, ids = Tensor.frombytes(rt, rows, cols, x.tobytes(), dtype="fp32").topk(k, parts)
+    w = cols // parts
+    want = np.concatenate([np.argsort(-x[:, p * w:(p + 1) * w], -1, kind="stable")[:, :k] + p * w for p in range(parts)], 1)
+    assert np.array_equal(value(ids)[0], want) and np.array_equal(value(values)[0], np.take_along_axis(x, want, -1)), (rows, cols, parts, k)
+    values, ids = values.topk(k, labels=ids)
+    want = np.argsort(-x, -1, kind="stable")[:, :k]
+    assert np.array_equal(value(ids)[0], want) and np.array_equal(value(values)[0], np.take_along_axis(x, want, -1)), (rows, cols, parts, k)
   held = []  # and topk and group (Tensor.group) give back all the DRAM they take: what is held is the same each time
   for _ in range(3):
     Tensor.of(rt, rng.normal(0, 1, (40, 16)).tolist()).topk(4)[1].group(16)
@@ -2018,25 +2029,50 @@ def bytes_tokenizer(folder):  # a byte-level vocabulary of the 256 bytes, as tok
   (folder / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {ch: b for ch, b in zip(chars, bs + [b for b in range(256) if b not in bs])}}, "added_tokens": []}))
   return llama.Tokenizer(str(folder))
 
+def test_heads(chip):
+  # serve.heads, a batch of logits' heads on the chip: each row's 64 largest and their tokens, as numpy's stable argsort
+  # has them (a tie the first column's), and the log of the sum of exp(x t) over the whole row at each row's t, within
+  # fp32's rounding: for Qwen3.6's vocabulary (97 parts of 2,560, then their best) and a small one (a part); and each
+  # row's best alone (a draft's)
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3)
+  for vocab in (512, 248320):
+    x, ts = rng.normal(0, 3, (3, vocab)).astype(np.float32), [1.0, 1 / 0.7, 2.0]
+    x[1, 5] = x[1, vocab - 7] = x[1].max() + 1
+    logits = Tensor.frombytes(rt, 3, vocab, x.tobytes(), dtype="fp32")
+    values, ids, lse = serve.heads(logits, Tensor.of(rt, [[t] for t in ts], "fp32"))
+    want, scaled = np.argsort(-x, -1, kind="stable")[:, :64], np.float64(x) * np.array(ts)[:, None]
+    assert np.array_equal(serve.read(ids), want) and np.array_equal(serve.read(values), np.take_along_axis(x, want, -1)), vocab
+    exact = scaled.max(1) + np.log(np.exp(scaled - scaled.max(1, keepdims=True)).sum(1))
+    assert np.allclose(serve.read(lse)[:, 0], exact, rtol=1e-6, atol=0), (serve.read(lse)[:, 0], exact)
+    assert np.array_equal(serve.read(serve.heads(logits, k=1)[1])[:, 0], want[:, 0])
+
 def test_sampling():
-  # serve.Request.pick against a whole sort of the vocabulary: the tokens sampled at top_p are its nucleus (sought among
-  # the 1,024 most likely first, and among all of a flat distribution's), at top_k the k most likely, at min_p those at
-  # least min_p of the most likely's, each one sampled at least once; and at temperature 0 the penalties as vLLM's: by
-  # the tokens made (presence, frequency) and by those and the prompt's (repetition, a positive logit divided by it)
+  # serve.Request.pick from a row's head (serve.Head: its 64 most likely and the log of the whole row's sum of exp, as
+  # serve.heads makes them on the chip) against a whole sort of the vocabulary: the tokens sampled at top_p are its
+  # nucleus (in the head, and past it for a flat distribution's, from the whole row), at top_k the k most likely, at
+  # min_p those at least min_p of the most likely's, each one sampled at least once; with none of them every token at
+  # its probability, those past the head's mass too (from the rest of the row alone); and at temperature 0 the
+  # penalties as vLLM's: by the tokens made (presence, frequency) and by those and the prompt's (repetition, a positive
+  # logit divided by it)
   rng = np.random.default_rng(5)
   for logits in (rng.normal(0, 2, 5000), rng.normal(0, 1e-3, 5000)):  # (the second's nucleus past 1,024 tokens)
-    p, order = np.exp(logits - logits.max()), np.argsort(-logits)
+    p, order, head = np.exp(logits - logits.max()), np.argsort(-logits), serve.Head.of(logits)
     nucleus = set(order[:np.searchsorted(np.cumsum(p[order]) / p.sum(), 0.9) + 1].tolist())
     for keep, kw in ((nucleus, dict(top_p=0.9)), (set(order[:3].tolist()), dict(top_k=3)), (set(np.flatnonzero(p >= 0.2).tolist()), dict(min_p=0.2))):
       r = serve.Request(None, [], seed=1, **kw)
-      got = {r.pick(logits) for _ in range(3000 if len(keep) < 1000 else 20000)}
+      got = {r.pick(head) for _ in range(3000 if len(keep) < 1000 else 20000)}
       assert got <= keep and (len(got) > 0.9 * len(keep) if len(keep) > 1000 else got == keep), (kw, len(got), len(keep))
+  logits = rng.normal(0, 1.5, 400)  # at temperature 0.8: a fifth of the draws past the head's 64
+  p, r = np.exp((logits - logits.max()) / 0.8), serve.Request(None, [], temperature=0.8, seed=2)
+  p, head, tail = p / p.sum(), serve.Head.of(logits, 1 / 0.8), np.argsort(-logits)[64:]
+  share = np.bincount([r.pick(head) for _ in range(20000)], minlength=400) / 20000
+  assert 0.15 < p[tail].sum() and abs(share[tail].sum() - p[tail].sum()) < 0.015 and np.all(np.abs(share - p) < 5 * np.sqrt(p / 20000) + 1e-3)
   logits = np.array([3.0, 2.5, 1.0, -1.0])
   for made, prompt, kw, want in (([0], [], dict(presence=1.0), 1), ([0, 0], [], dict(frequency=0.4), 1), ([0], [], dict(frequency=0.4), 0),
                                  ([], [0], dict(repetition=1.3), 1), ([], [0], dict(repetition=1.1), 0), ([], [3], dict(repetition=10.0), 0)):
     r = serve.Request(None, prompt, temperature=0, **kw)
     r.made = made
-    assert r.pick(logits) == want, (made, prompt, kw)
+    assert r.pick(serve.Head.of(logits)) == want, (made, prompt, kw)
 
 def test_shapes(tmp_path):
   # the shapes an answer keeps to, through Request.pick: tool_choice's (serve.chosen): a model that would greet first
@@ -2089,7 +2125,8 @@ def test_serve(chip, tmp_path):
   # or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP, /v1/completions
   # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
   # template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and streamed, or not
-  # at all when it is told not to think; usage counts the prompt's tokens its slot held (cached), and ends a stream; an
+  # at all when it is told not to think; a sampling parameter left out is the model's own (its generation_config's, here
+  # temperature 0); usage counts the prompt's tokens its slot held (cached), and ends a stream; an
   # answer to a JSON schema (response_format) is one; and with both slots held by streams, a request gets a 429 at once
   # (OpenRouter's ask: it tries the next provider), and is served once they end
   import urllib.request
@@ -2135,14 +2172,14 @@ def test_serve(chip, tmp_path):
   r = serve.Request(tok, [], 9, 0)
   r.gone = True  # its client went
   assert r.take(np.eye(256)[97], True) and (r.made, r.finish) == ([], "gone") and r.out.empty()
-  http = serve.server(engine, "smol", port=0)
+  http = serve.server(engine, "smol", port=0, defaults={"temperature": 0})
   threading.Thread(target=http.serve_forever, daemon=True).start()
   url = f"http://127.0.0.1:{http.server_address[1]}/v1"
   post = lambda body: urllib.request.urlopen(urllib.request.Request(url + "/completions", json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=600)
   r = serve.Request(tok, tok.encode("Hi there"), 6, 0)
   engine.waiting.put(r)
   text = tok.decode(done(r))
-  reply, held = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0})), len(tok.encode("Hi there")) - 1  # (its slot's)
+  reply, held = json.load(post({"prompt": "Hi there", "max_tokens": 6})), len(tok.encode("Hi there")) - 1  # (its slot's; the model's temperature)
   assert reply["choices"][0]["text"] == text and reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 6
   assert reply["usage"]["prompt_tokens_details"]["cached_tokens"] == held, "all but the prompt's last token, which runs again"
   events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}))
@@ -2188,8 +2225,8 @@ def test_serve(chip, tmp_path):
   assert serve.answer("<|channel|>analysis<|message|>Gree") == ("Gree", "") and serve.answer("<|channel|>final<|message|>Hi") == ("", "Hi")
   assert serve.answer("<|channel|>") == serve.answer("<|channel|>analysis") == ("", ""), "a channel's name, a token at a time, is neither"
 
-class Kept(serve.Request):  # a request that keeps the logits each of its tokens came from
-  def take(self, logits, room): self.logits = getattr(self, "logits", []) + [logits]; return super().take(logits, room)
+class Kept(serve.Request):  # a request that keeps the logits each of its tokens came from (its head's whole row)
+  def take(self, head, room): self.logits = getattr(self, "logits", []) + [head.row() if isinstance(head, serve.Head) else head]; return super().take(head, room)
 
 def agrees(r, w, c, tol=0.03):  # a finished request: each token's logits within 3% of numpy's (from nothing, over its prompt
   ids = r.ids + r.made  # and the tokens it took before), each picked as numpy would (near)
@@ -2248,7 +2285,7 @@ def test_serve_speculative(chip, tmp_path):
   c, weights = qwen35(rng)
   w, tok, t = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.upload(rt, weights)
   class Oracle(serve.Engine):
-    def guess(self, u, logits):
+    def guess(self, u, best):
       s = self.busy[u].ids + self.busy[u].made
       return int(llama.forward(s, list(range(len(s))), w, c, llama.kv_cache(c, 64, np.zeros))[0].argmax())
   prompts = ([7, 200, 31, 64, 5], [5, 64], list(range(40, 60)))

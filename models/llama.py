@@ -418,7 +418,7 @@ def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accep
   and places are rows: lists for numpy, int32 tensors for ferrite. slots: several sequences decoding together (a
   batch of users), the next tokens of each in turn, as many each, their caches side by side (kv_cache's sequences:
   each a part of every block's), each token reading only its own sequence's; then the logits are every token's.
-  every: every token's logits, not only the last's. w is looked up a block at a time (arrays makes numpy's weights as
+  every: every token's logits (fp32), not only the last's. w is looked up a block at a time (arrays makes numpy's weights as
   they are looked up). live, accept: with slots, for Gated DeltaNet's states (delta). hidden: (the logits, every
   token's hidden state, normed: what the multi-token prediction layer takes, draft). length: attention reads only each
   sequence's first length rows (a multiple of 32, past every place of this call's), so a call costs what its sequences
@@ -433,7 +433,7 @@ def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accep
     x = layer(x, p, c, rotary, window if sliding(l) else mask, caches[l], rows, l, prefill, live, accept, slots)
   h = rms(x, w["norm"], c)
   phases = (getattr(c, "precision", None) or {}).get(("head", None), (None, None))[1]  # the output layer's
-  logits = f.mm(h if slots or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases)
+  logits = f.mm(h if slots or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases, "fp32")  # (as the matmul sums them)
   return (logits, h) if hidden else logits
 
 def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
@@ -449,7 +449,7 @@ def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
   rows, rotary, mask, _ = around(w, c, places, caches[l].shape[-2], slots, length)
   p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
   x = layer(x, p, c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, slots=slots)
-  return f.mm(rms(x if every else f.rows(x, [x.shape[-2] - 1]), w["mtp.norm"], c), w["embed.T"], None)
+  return f.mm(rms(x if every else f.rows(x, [x.shape[-2] - 1]), w["mtp.norm"], c), w["embed.T"], None, "fp32")
 
 def prefill(ids, w, c, caches, chunk, on=lambda row: row):
   """forward over a prompt from place 0, chunk tokens at a time, as Tenstorrent's prefill takes a long one: each chunk's

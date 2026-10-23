@@ -1313,54 +1313,80 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
-def topk_kernel(k, cols):
-  """Each row's k largest of its cols (at most 256) and their columns, the first of equals first, args [first unit,
-  units, the values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows].
-  BRISC alone, a unit one row of a tile row of x, 32 to a tile row, so a decode step's few rows go to as many workers:
-  the tile row's tiles come in (once for a worker's units of it), and the row is scanned once, its k best so far kept
-  in order, each new one larger than the last moving up past the smaller ones (an equal one stays behind, so the first
-  of equals comes first). bf16 compares as an integer once its sign orders it (negatives flipped, -0 as 0). Each unit
-  writes its row of the values' tile (bf16) and the indices' (int32), both faces, zeros past the k columns and all
-  zeros past x's rows, so a tile is written whole by its 32 units and no two write the same bytes; but a dimension of
-  1 fills its tile with copies, as every tensor's does (k of 1 the row with its column, one row of x every row)."""
-  ct = -(-cols // 32)
+def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
+  """Each row's k largest of its cols and their columns, the first of equals first, args [first unit, units, the
+  values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows, then the
+  labels' address, tile strides and offset]. BRISC alone, a unit one row of a tile row of a part of x, 32 to a tile
+  row, so a decode step's few rows go to as many workers: the part's tile row comes in (once for a worker's units of
+  it), and the row is scanned once, its k best so far kept in order, each new one larger than the last moving up past
+  the smaller ones (an equal one stays behind, so the first of equals comes first). bf16 or fp32 compares as an integer
+  once its sign orders it (negatives flipped, -0 as 0). parts: each row cut into so many parts of cols columns, whole
+  tiles, each part's k best side by side in the results ((batch, rows, parts k)), each index its column in the whole
+  row. labels: each index taken from an int32 tensor of x's shape at the column picked, read 64 bytes about it (a part's
+  best indices, for a topk over the parts' best). Each unit writes its row of each of the results' tiles (bf16 or fp32,
+  and int32), both faces, zeros past the k columns and all zeros past x's rows, so a tile is written whole by its 32
+  units and no two write the same bytes; but a dimension of 1 fills its tile with copies, as every tensor's does (one
+  k of 1 the row with its column, one row of x every row)."""
+  ct, kt, item, bits = -(-cols // 32), -(-k // 32), ITEMSIZE[dtype], 8 * ITEMSIZE[dtype]  # x's tiles a part, the results' a part
+  tb = 1024 * item
+  assert parts == 1 or (k % 32 == 0 and cols % 32 == 0), "parts of whole tiles, side by side in whole tiles"
+  assert DATA + ct * tb + tb + 4096 + 64 * k <= OUTS, "a part's tile row in L1"
   return compile_kernel(f"""
 #define X {DATA:#x}
-#define VALUES {DATA + ct * 2048:#x}
-#define IDS {DATA + ct * 2048 + 64:#x}
+#define VALUES {DATA + ct * tb:#x}
+#define IDS {DATA + ct * tb + tb:#x}
+#define LABELS {DATA + ct * tb + tb + 4096:#x}
 {ROWS}
+typedef {"unsigned short" if item == 2 else "unsigned"} datum;
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
-static unsigned key(unsigned v) {{ return v == 0x8000 ? 0x8000 : v & 0x8000 ? 0xFFFF & ~v : v | 0x8000; }}  // bf16's order
+static unsigned key(unsigned v) {{  // the order of the floats, as unsigned integers
+  const unsigned sign = 1u << {bits - 1}, all = {(1 << bits) - 1:#x};
+  return v == sign ? sign : v & sign ? all & ~v : v | sign;
+}}
 void kmain(volatile unsigned *a) {{
-  unsigned short *x = (unsigned short *)X;
-  volatile unsigned short *values = (volatile unsigned short *)VALUES;  // this unit's row of each tile: its 16 in the left
-  volatile unsigned *ids = (volatile unsigned *)IDS;                   // face, then its 16 in the right
+  datum *x = (datum *)X;
+  volatile datum *values = (volatile datum *)VALUES;  // a result tile of each: this unit's row in it, at its place
+  volatile unsigned *ids = (volatile unsigned *)IDS;
   unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u;
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, first = t / tr * a[5] + t % tr * a[6] + a[7];  // row r of x's tile row t % tr of matrix t / tr
-    unsigned n = rows == 1 ? 1 : rows - t % tr * 32 < 32 ? rows - t % tr * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here; the row r holds
-    for (unsigned c = 0; c < 32; c++) values[c] = 0, ids[c] = 0;
+    unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, i = t % tr, p = t / tr % {parts}, b = t / tr / {parts};  // row r of x's
+    unsigned first = b * a[5] + i * a[6] + p * {ct} + a[7];                                                    // tile row i, part p, matrix b
+    unsigned n = rows == 1 ? 1 : rows - i * 32 < 32 ? rows - i * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here; the row r holds
+    unsigned face = r / 16 * 512 + r % 16 * 16, top[{k}], col[{k}], kept = 0;  // the row's run in the left face, in datums; its k best
     if (s < n) {{
       if (t != held) {{
-        for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, 2048), X + j * 2048, 2048);
+        for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, {tb}), X + j * {tb}, {tb});
         noc_wait();
         held = t;
       }}
-      unsigned top[{k}], col[{k}], kept = 0;  // its k best so far, in order
       for (unsigned c = 0; c < {cols}; c++) {{
         unsigned v = key(x[c / 32 * 1024 + at(s, c % 32)]);
         if (kept == {k} && v <= top[{k} - 1]) continue;  // no better than the last kept (an equal one, later, stays behind)
-        unsigned i = kept < {k} ? kept++ : {k} - 1;
-        for (; i > 0 && top[i - 1] < v; i--) top[i] = top[i - 1], col[i] = col[i - 1];
-        top[i] = v, col[i] = c;
+        unsigned j = kept < {k} ? kept++ : {k} - 1;
+        for (; j > 0 && top[j - 1] < v; j--) top[j] = top[j - 1], col[j] = col[j - 1];
+        top[j] = v, col[j] = c;
       }}
-      for (unsigned j = 0; j < {k}; j++) values[j] = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], ids[j] = col[j];
-      for (unsigned c = 1; {k} == 1 && c < 32; c++) values[c] = values[0], ids[c] = ids[0];  // (k of 1: copies along the row)
+      {f"""for (unsigned j = 0; j < {k}; j++) {{  // each pick's label: the 64 bytes about it
+        unsigned c = col[j], lt = b * a[10] + i * a[11] + c / 32 + a[12], o = at(s, c % 32) * 4;
+        noc_get(BANK(lt), AT(a[9], lt, 4096) + o / 64 * 64, LABELS + j * 64, 64);
+      }}
+      noc_wait();""" if labels else ""}
     }}
-    unsigned face = r / 16 * 512 + r % 16 * 16;  // the row's run in the left face, in datums; the right face's 256 on
-    noc_write(VALUES, BANK(t), AT(a[2], t, 2048) + face * 2, 32), noc_write(VALUES + 32, BANK(t), AT(a[2], t, 2048) + (face + 256) * 2, 32);
-    noc_write(IDS, BANK(t), AT(a[3], t, 4096) + face * 4, 64), noc_write(IDS + 64, BANK(t), AT(a[3], t, 4096) + (face + 256) * 4, 64);
-    noc_wait();
+    for (unsigned q = 0; q < {kt}; q++) {{  // the unit's row of each result tile: its k picks there, 0 past them
+      for (unsigned c = 0; c < 32; c++) {{
+        unsigned j = q * 32 + c, v = 0, id = 0;
+        if (s < n && j < {k}) v = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], id = {f"((volatile unsigned *)(LABELS + j * 64))[at(s, col[j] % 32) % 16]" if labels else f"p * {cols} + col[j]"};
+        if (s < n && {k} * {parts} == 1) v = x[col[0] / 32 * 1024 + at(s, col[0] % 32)], id = {"((volatile unsigned *)LABELS)[at(s, col[0] % 32) % 16]" if labels else "col[0]"};  // (copies across)
+        values[at(r, c)] = v, ids[at(r, c)] = id;
+      }}
+      unsigned o = (b * tr + i) * {parts * kt} + p * {kt} + q;  // the result tile
+      for (unsigned h = 0; h < 2; h++) {{  // its left and right faces' runs, from the same places in L1
+        unsigned d = face + h * 256;
+        noc_write(VALUES + d * {item}, BANK(o), AT(a[2], o, {tb}) + d * {item}, {16 * item});
+        noc_write(IDS + d * 4, BANK(o), AT(a[3], o, 4096) + d * 4, 64);
+      }}
+      noc_wait();
+    }}
   }}
 }}""")
 
