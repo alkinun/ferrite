@@ -181,7 +181,7 @@ class Engine:
     self.prefilled += len(ids)
     if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, gpt2.values(out)[0], 1 + self.spec)
     if self.spec and self.busy[u] is r:  # each place's next token: the prompt's, and past its end the one just taken
-      drafts = gpt2.values(llama.draft(self.on((r.ids + r.made)[at + 1:at + len(ids) + 1]), places, h, self.t, self.c, self.slot[u], length=n))
+      drafts = gpt2.values(llama.draft(self.on((r.ids + r.made)[at + 1:at + len(ids) + 1]), places, h, self.t, self.c, self.slot[u], length=n, every=False))
       if r.made: self.drafts[u], self.taken[u] = self.guess(u, drafts[-1]), 1.0
 
   def advance(self):  # one step for every slot: each decoding one's last token in, its next one out
@@ -587,11 +587,13 @@ def main():
   rt, start = Runtime(chip, chip.tensix[0], chip.tensix[-1]), time.time()
   c, weights = llama.load(folder, places)
   c.precision = llama.precision(c, mode, kv)
-  engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places)
+  chunk = 2048 if c.experts else 256  # a mixture of experts' chunk reads nearly all of every block's experts (cost.prompt)
+  engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places, chunk)
   config = lambda f: llama.read_json(os.path.join(folder, f)) if os.path.exists(os.path.join(folder, f)) else {}
   eos = (config("generation_config.json") or config("config.json")).get("eos_token_id")
   threading.Thread(target=engine.run, daemon=True).start()
-  print(f"{os.path.basename(folder.rstrip('/'))} on the chip in {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} places, port {port}", flush=True)
+  print(f"{os.path.basename(folder.rstrip('/'))} on the chip in {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} places, "
+        f"prompts {chunk} tokens at a time, port {port}", flush=True)
   jinja = os.path.join(folder, "chat_template.jinja")  # where transformers 5 keeps it
   template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
   server(engine, os.path.basename(folder.rstrip("/")), template, eos if isinstance(eos, list) else [eos] if eos is not None else [], port).serve_forever()

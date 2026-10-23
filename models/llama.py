@@ -103,8 +103,8 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
     qkv = qkv * f.where(p["qk_on"], r * p["qk_norm"] + r if getattr(c, "centered", False) else r * p["qk_norm"], 1)
   qkv = f.merge(rope(qkv, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))  # a token's heads side by side again
   heads = f.split(qkv, nh)
-  kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a bfp8 cache does
-  f.put(cache, rows, gpt2.bfp(kv) if isinstance(kv, np.ndarray) and cache_format(c) == "bfp8" else kv)
+  kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values, at once (v's heads do not turn); numpy rounds them as a block-float cache does
+  f.put(cache, rows, gpt2.bfp(kv, cache_format(c)) if isinstance(kv, np.ndarray) and cache_format(c) != "bf16" else kv)
   attention, n = phases("attention", "prefill" if prefill else "decode"), h.shape[-2]
   q, k, v, sinks = heads[:c.heads, :, :], cache[:c.kv, :, :], cache[c.kv:, :, :], p.get("sinks")  # (gpt-oss's sinks: a logit of each head's own, left out)
   if slots:  # (a key head's and sequence's batch entry: its query heads' rows, a token's each, side by side: one move)
@@ -418,11 +418,12 @@ def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accep
   logits = f.mm(h if slots or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], phases)
   return (logits, h) if hidden else logits
 
-def draft(ids, places, h, w, c, caches, slots=None, length=None):
+def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
   """Qwen3.5's multi-token prediction layer (block c.layers, which forward does not run), as vLLM runs it: for each
   token at places, h its hidden state (forward's) and ids the token after it, the logits of the token after that. That
   token's embedding and h, each RMS-normed, side by side through fc, then the block (its keys and values into its
-  cache, caches[c.layers], at places), its norm, and the model's output layer. slots, length: forward's."""
+  cache, caches[c.layers], at places), its norm, and the model's output layer. slots, length: forward's; every: the
+  logits of every place, else of the last alone (a prompt's chunk, whose last draft is all the server takes)."""
   f, d, l = fns(h), c.dim, c.layers
   e, h = rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), rms(h, w["mtp.pre_fc_norm_hidden"], c)
   fc = w["mtp.fc"]
@@ -430,7 +431,7 @@ def draft(ids, places, h, w, c, caches, slots=None, length=None):
   rows, rotary, mask, _ = around(w, c, places, caches[l].shape[-2], slots, length)
   p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
   x = layer(x, p, c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, slots=slots)
-  return f.mm(rms(x, w["mtp.norm"], c), w["embed.T"], None)
+  return f.mm(rms(x if every else f.rows(x, [x.shape[-2] - 1]), w["mtp.norm"], c), w["embed.T"], None)
 
 def prefill(ids, w, c, caches, chunk, on=lambda row: row):
   """forward over a prompt from place 0, chunk tokens at a time, as Tenstorrent's prefill takes a long one: each chunk's

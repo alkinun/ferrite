@@ -5,7 +5,7 @@
 #   TTSIM=/path/to/libttsim.so python3 models/gpt2.py path/to/model.safetensors "prompt" [tokens] [bfp8]
 # The weights are Hugging Face's openai-community/gpt2 model.safetensors; the tokenizer is tiktoken's "gpt2". bfp8: the
 # weight matrices in bfp8 on the chip (numpy then has them as the chip does).
-import json, math, os, struct, sys, time
+import functools, json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -107,10 +107,13 @@ def masked(column, size, window=None):  # mask's, from a column of places: a bat
   if not isinstance(column, Tensor):
     k = np.arange(size)
     return np.where((k > column) | ((k <= column - window) if window else False), np.float32(-1e9), np.float32(0))
-  cols = Tensor.of(column.rt, [list(range(size))], "int32")
+  cols = columns(column.rt, size)
   out = cols > column
   if window: out = out + (cols < column - (window - 1))
   return (out * -1e9).cast("bf16")
+
+@functools.cache
+def columns(rt, size): return Tensor.frombytes(rt, 1, size, np.arange(size, dtype=np.int32).tobytes(), 1, "int32")  # a mask's keys, 0 to size - 1: made once
 
 def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # each block's, by zeros(shape)
 
