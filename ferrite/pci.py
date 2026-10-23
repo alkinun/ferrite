@@ -5,8 +5,10 @@ from ferrite import bh
 
 class Sim:
   """libttsim.so: a virtual Blackhole driven by forwarding config and BAR0 accesses, at PCI address bdf (a multi-chip
-  build has several). The library is one per process: every Sim shares it, its clock and the host memory it reaches."""
-  lib, dma, clocks = None, [], 0  # the library; (bus address, size, host address, buffer); chip cycles run so far
+  build has several). The library is one per process: every Sim shares it, its clock and the host memory it reaches.
+  counts: whether it models NIU_MST_RD_DATA_WORD_RECEIVED, the bytes a core's reads bring in (ttsim-chaos does; ttsim
+  as released stops on it), which Runtime.profile reports."""
+  lib, dma, clocks, counts = None, [], 0, False  # the library; (bus address, size, host address, buffer); chip cycles run so far
   def __init__(self, path, bdf=0):
     Sim.load(path)
     self.lib, self.bdf = Sim.lib, bdf
@@ -26,6 +28,7 @@ class Sim:
       Sim.cbs = (cb(lambda bus, p, n: ctypes.memmove(p, Sim.host(bus, n), n)), cb(lambda bus, p, n: ctypes.memmove(Sim.host(bus, n), p, n)))
       lib.libttsim_set_pci_dma_mem_callbacks(*Sim.cbs)
       lib.libttsim_init()
+      Sim.counts = hasattr(lib, "libttsim_chaos")  # (test/ttsim-chaos.patch's marker)
 
   @staticmethod
   def chips(path):  # the PCI addresses of a build's chips (not necessarily side by side: every slot is asked)
@@ -61,6 +64,7 @@ class Sim:
 class Card:
   """A real card from userspace: config space and BAR0 through sysfs, DMA memory from locked hugepages.
   Needs root, the kernel driver unbound, and the IOMMU off or in passthrough (bus address == physical address)."""
+  counts = True  # its NIUs count the bytes their reads bring in (Sim's)
   def __init__(self, bdf):
     if os.geteuid() != 0: raise PermissionError("a card wants root: its config space, its BARs, and physical addresses for DMA")
     self.sys = f"/sys/bus/pci/devices/{bdf}"

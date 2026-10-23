@@ -160,8 +160,8 @@ multicast along rows and columns.
 | `0x80000` | kernel data (`L1_DATA`) |
 
 The dispatcher's tile: firmware at `0x0`, config at `0x1000` (`[doorbell, ring lo, hi, ring size, status lo, hi,
-workers' rectangle, workers]`), its outbox at `0x1400`, the workers' report count at `0x80000`, command staging from
-`0x80040`.
+workers' rectangle, workers]`), its outbox at `0x1400`, the workers' report count at `0x80000` and the sum of the flits
+their reads brought in beside it, command staging from `0x80040`.
 
 **Boot** (host, once): multicast reset and worker firmware over the rectangle, a mailbox per worker (its index, the
 dispatcher's coordinates), the dispatcher's firmware and config, a TLB aimed at the doorbell, the TRISC reset PCs, then
@@ -183,8 +183,8 @@ of 0 marks the tail unused); pointers are free-running byte counts.
 2. Multicast the arguments to every worker and wait for every acknowledgement.
 3. Fire the go: the same 16 bytes from its outbox (launch number, kernel, arguments, workers) into every mailbox.
 4. Poll the count of reports until every worker has added to it.
-5. Write the launch's times (`profile`), then `[read pointer, launches done]`, into host memory as posted writes on one
-   static VC, which stay in order, so the host never sees a launch done before its times.
+5. Write the launch's times and bytes (`profile`), then `[read pointer, launches done]`, into host memory as posted writes
+   on one static VC, which stay in order, so the host never sees a launch done before its times.
 
 The next command's arguments go into the other buffer while a launch runs.
 
@@ -198,13 +198,19 @@ with nothing else in flight.
 (`noc_setup`). Each launch it polls `go` with a `fence`, sits out if its index is past the launch's workers, takes its
 share of the units, zeroes `SYNC`'s counters, invalidates the instruction caches (Tensix config 185, bits 0-3, then
 `fence`, read back, `fence`), writes the TRISCs' go, runs its program, waits for its transfers and the TRISCs' done,
-marks the launch done in its mailbox, and adds 1 to the dispatcher's count by a NoC atomic increment. A TRISC polls its
+marks the launch done in its mailbox, and adds 1 to the dispatcher's count by a NoC atomic increment (posted, on a static
+VC, as tt-metal's). A TRISC polls its
 go, runs its program, waits until its Tensix thread has run all it pushed (`tensix_idle`), and writes its done. A queued
 launch takes about 150 ttsim cycles.
 
 **Profiles** (`Runtime.profile`). The dispatcher reads its tile's wall clock (`RISCV_DEBUG_REG_WALL_CLOCK_L`, ISA
 `DebugTimestamper.md`) at a launch's go and at its last report, into a ring of 1024 entries in host memory, so every
-launch has its time on the chip's own clock. Launches are named by their ops; `profile(since)` sums them by name.
+launch has its time on the chip's own clock. Where the NIU counts read data (`NIU_MST_RD_DATA_WORD_RECEIVED`, counter 3,
+64-byte flits; ISA `NoC/Counters.md`: a card, and ttsim-chaos, since ttsim as released stops on it), each worker reads it
+at go and at done and adds the difference to a sum beside the dispatcher's count, by a second atomic increment on the
+same static VC before its report, so the sum is whole once the count is; the dispatcher takes its growth before the next
+go, so every launch also has the bytes its workers' reads brought in: DRAM's, other tiles' L1, a tile's copies within
+its own. Launches are named by their ops; `profile(since)` sums them by name.
 
 **Replay** (`tensor.jit`). Its first call runs; its second is recorded (every launch, `Runtime.log`, and the DRAM it
 takes stays taken, `Runtime.pinned`); each later call copies its inputs into the second's and sends the recorded
@@ -555,8 +561,9 @@ silicon's to check.
 `TTSIM_CHAOS_NOC=lo,hi` carries out a Tensix tile's NoC request `lo` to `hi` clocks late (counted outstanding until
 then; static-VC requests keep their order); `TTSIM_CHAOS_TENSIX=p` and `TTSIM_CHAOS_RISCV=p` make a pipe or a core wait
 a turn with probability p; `TTSIM_CHAOS_SEED=n`; `TTSIM_CHAOS_UNHARVESTED=1` runs a p150's 140 Tensix, as firmware
-before 19.5 does. The suite passes under each; it caught missing waits for a frame's reads and a matmul step's, and
-TRISC0 running 16 reports ahead.
+before 19.5 does. It also models the NIU's read-data counter (counter 3, a flit for each 64 bytes a read brings in), and
+exports `libttsim_chaos`, by which `pci.Sim` knows it does (`counts`). The suite passes under each; it caught missing
+waits for a frame's reads and a matmul step's, and TRISC0 running 16 reports ahead.
 
 ## Ethernet links
 

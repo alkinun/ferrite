@@ -174,6 +174,6 @@ def main():
     print(f" ({time.time() - start:.0f}s, logits within {np.abs(got - want).max():.2f})", end="", file=sys.stderr, flush=True)
   print(f"\nferrite picked the same token as numpy {agree} times out of {steps}")
   print("the last token's kernels, by cycles on the chip's clock (Runtime.profile):")
-  for name, n, cycles in rt.profile(since)[:8]: print(f"{cycles:9d} {n:4d}  {name[:90]}")
+  for name, n, cycles, _ in rt.profile(since)[:8]: print(f"{cycles:9d} {n:4d}  {name[:90]}")
 
 if __name__ == "__main__": main()

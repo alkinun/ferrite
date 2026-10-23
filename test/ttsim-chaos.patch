@@ -1,8 +1,8 @@
 diff --git a/src/libttsim.cpp b/src/libttsim.cpp
-index 42fe3c4..ceba2de 100644
+index 42fe3c4..3f864d0 100644
 --- a/src/libttsim.cpp
 +++ b/src/libttsim.cpp
-@@ -18,6 +18,7 @@ extern "C" API_EXPORT void libttsim_init() {
+@@ -18,9 +18,13 @@ extern "C" API_EXPORT void libttsim_init() {
      TTSIM_VERIFY(!s_ttsim_running, ConfigurationError, "sim is already running");
      ttsim_init();
      pcie_init();
@@ -10,7 +10,13 @@ index 42fe3c4..ceba2de 100644
      s_ttsim_running = true;
  }
  
-@@ -126,13 +127,14 @@ static void clock_current_chip() {
++// ttsim-chaos: present, so that a program can tell this build from ttsim as released (it models NIU counter 3 too)
++extern "C" API_EXPORT void libttsim_chaos() {}
++
+ extern "C" API_EXPORT void libttsim_exit() {
+     TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
+     ttsim_exit();
+@@ -126,13 +130,14 @@ static void clock_current_chip() {
          for (;;) {
              for (uint32_t rv32_mask = p_tile->rv32_cores_active; rv32_mask; rv32_mask &= rv32_mask - 1) {
                  uint32_t rv32_index = __builtin_ctz(rv32_mask);
@@ -26,7 +32,7 @@ index 42fe3c4..ceba2de 100644
                      uint32_t inst_rd_ptr = p_tensix->inst_rd_ptr[pipe];
                      if (inst_rd_ptr != p_tensix->inst_wr_ptr[pipe]) {
                          uint32_t inst = p_tensix->inst[pipe][inst_rd_ptr];
-@@ -175,6 +177,7 @@ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
+@@ -175,6 +180,7 @@ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
  #else
          clock_current_chip();
  #endif
@@ -34,11 +40,39 @@ index 42fe3c4..ceba2de 100644
          g_clock++; // single global timebase, advanced once per clock across all chips
      }
  #if NUM_CHIPS > 1
+diff --git a/src/libttsim.map b/src/libttsim.map
+index b850272..bb4ef1c 100644
+--- a/src/libttsim.map
++++ b/src/libttsim.map
+@@ -17,6 +17,7 @@
+         libttsim_tile_rd_bytes; # transitional; will eventually be removed (see docs/libttsim_api.md)
+         libttsim_tile_wr_bytes; # transitional; will eventually be removed (see docs/libttsim_api.md)
+         libttsim_clock;
++        libttsim_chaos; # ttsim-chaos's marker
+     local:
+         *;
+ };
 diff --git a/src/sim.h b/src/sim.h
-index 37259db..54851c6 100644
+index 37259db..63586e3 100644
 --- a/src/sim.h
 +++ b/src/sim.h
-@@ -578,6 +578,11 @@ void libttsim_pci_dma_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size)
+@@ -343,6 +343,7 @@ struct TensixTile {
+     uint32_t niu_mst_atomic_resp_received[NUM_NOCS];
+     uint32_t niu_mst_wr_ack_received[NUM_NOCS];
+     uint32_t niu_mst_rd_resp_received[NUM_NOCS];
++    uint32_t niu_mst_rd_data_word_received[NUM_NOCS]; // ttsim-chaos: counter 3, which ttsim leaves out
+     uint32_t niu_mst_posted_atomic_sent[NUM_NOCS];
+     uint32_t niu_mst_nonposted_wr_req_sent[NUM_NOCS];
+     uint32_t niu_mst_posted_wr_req_sent[NUM_NOCS];
+@@ -393,6 +394,7 @@ struct EthTile {
+     uint32_t niu_mst_atomic_resp_received[NUM_NOCS];
+     uint32_t niu_mst_wr_ack_received[NUM_NOCS];
+     uint32_t niu_mst_rd_resp_received[NUM_NOCS];
++    uint32_t niu_mst_rd_data_word_received[NUM_NOCS]; // ttsim-chaos: counter 3, which ttsim leaves out
+     uint32_t niu_mst_posted_atomic_sent[NUM_NOCS];
+     uint32_t niu_mst_nonposted_wr_req_sent[NUM_NOCS];
+     uint32_t niu_mst_posted_wr_req_sent[NUM_NOCS];
+@@ -578,6 +580,11 @@ void libttsim_pci_dma_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size)
  void ttsim_init();
  void ttsim_exit();
  void ttsim_select_chip(uint32_t chip_id);
@@ -51,7 +85,7 @@ index 37259db..54851c6 100644
  void ttsim_rv32_set_core_active(char tile_type, uint32_t tile_id, uint32_t rv32_id, bool active);
  void ttsim_heartbeat();
 diff --git a/src/tile.cpp b/src/tile.cpp
-index 4d19315..3ac1ee0 100644
+index 4d19315..44861eb 100644
 --- a/src/tile.cpp
 +++ b/src/tile.cpp
 @@ -2,6 +2,8 @@
@@ -173,7 +207,15 @@ index 4d19315..3ac1ee0 100644
  #elif NUM_CHIPS == 2
      constexpr uint32_t LOGICAL_HARVESTING_MASKS[] = {0x2080, 0x110}; // P300
  #elif NUM_CHIPS == 4
-@@ -1386,7 +1480,8 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1350,6 +1444,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+         case NOC_REGS_NIU_MST_ATOMIC_RESP_RECEIVED: return p_tile->niu_mst_atomic_resp_received[noc_instance];
+         case NOC_REGS_NIU_MST_WR_ACK_RECEIVED: return p_tile->niu_mst_wr_ack_received[noc_instance];
+         case NOC_REGS_NIU_MST_RD_RESP_RECEIVED: return p_tile->niu_mst_rd_resp_received[noc_instance];
++        case NOC_REGS_NIU_MST_RD_RESP_RECEIVED + 4: return p_tile->niu_mst_rd_data_word_received[noc_instance]; // ttsim-chaos: NIU_MST_RD_DATA_WORD_RECEIVED
+         case NOC_REGS_NIU_MST_POSTED_ATOMIC_SENT: return p_tile->niu_mst_posted_atomic_sent[noc_instance];
+         case NOC_REGS_NIU_MST_NONPOSTED_WR_REQ_SENT: return p_tile->niu_mst_nonposted_wr_req_sent[noc_instance];
+         case NOC_REGS_NIU_MST_POSTED_WR_REQ_SENT: return p_tile->niu_mst_posted_wr_req_sent[noc_instance];
+@@ -1386,7 +1481,8 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(13):
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(14):
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(15):
@@ -183,7 +225,7 @@ index 4d19315..3ac1ee0 100644
          default:
              return base_noc_regs_rd32(&p_tile->base, tile_type, tile_id, noc_instance, offset);
      }
-@@ -1394,6 +1489,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1394,6 +1490,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
  
  template<char tile_type>
  static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
@@ -191,10 +233,14 @@ index 4d19315..3ac1ee0 100644
      auto *p_tile = get_tile<tile_type>(tile_id);
      uint32_t noc_at_len_be = p_tile->noc_at_len_be[noc_instance][cmd_buf];
      uint32_t txn_id = bits<13,10>(p_tile->noc_packet_tag[noc_instance][cmd_buf]);
-@@ -1617,6 +1713,38 @@ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_b
-     }
- }
- 
+@@ -1614,6 +1711,39 @@ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_b
+         }
+         tile_rd_bytes(src_coordinate, src_addr, &p_tile->sram[dst_addr], noc_at_len_be);
+         p_tile->niu_mst_rd_resp_received[noc_instance]++;
++        p_tile->niu_mst_rd_data_word_received[noc_instance] += (noc_at_len_be + 63) / 64; // ttsim-chaos: its 64-byte flits
++    }
++}
++
 +// ttsim-chaos: a request whose time has come, carried out with its registers as they were at issue (put back after),
 +// then its own counts undone (a multicast's own request count, which noc_cmd_ctrl adds too, among them)
 +template<char tile_type>
@@ -224,13 +270,10 @@ index 4d19315..3ac1ee0 100644
 +        ttsim_select_chip(r.chip_id);
 +        chaos_replay<'T'>(r);
 +        ttsim_select_chip(saved_chip_id);
-+    }
-+}
-+
- template<char tile_type>
- static void noc_regs_wr32(uint32_t tile_id, uint32_t noc_instance, uint32_t offset, uint32_t data) {
-     auto *p_tile = get_tile<tile_type>(tile_id);
-@@ -2497,7 +2625,7 @@ static uint32_t arc_reset_unit_rd32(uint32_t offset) {
+     }
+ }
+ 
+@@ -2497,7 +2627,7 @@ static uint32_t arc_reset_unit_rd32(uint32_t offset) {
      }
  }
  

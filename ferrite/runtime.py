@@ -11,9 +11,9 @@ from ferrite import bh, pci
 # (launches alternate between them, so the next launch's arguments go in while this one runs), the kernels it holds, a
 # tile of zeros (4 KiB, an fp32 tile, for kernels to read and never write), then free space. The dispatcher: its
 # config [doorbell, ring lo, hi, ring size, status lo, hi, the workers' rectangle, how many], an outbox [go, kernel,
-# arguments, workers] [rptr, launches done] (and at +32 a launch's [go, last report] times), the count of the workers'
-# reports, and STAGING for up to STAGE bytes of commands, both above the kernels (loading a kernel writes the
-# dispatcher's tile too).
+# arguments, workers] [rptr, launches done] (and at +32 a launch's [go, last report, bytes read] times), the count of
+# the workers' reports and the sum of what they read, and STAGING for up to STAGE bytes of commands, both above the
+# kernels (loading a kernel writes the dispatcher's tile too).
 MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
 ARGS_SIZE = (KERNELS - ARGS) // 2  # each of the two argument buffers
 SYNC_COUNTS = 8  # SYNC's words that start each launch at 0 (a kernel writes the rest before reading them)
@@ -148,7 +148,9 @@ def start(brisc, trisc0, trisc1, trisc2):  # firmware's first words: BRISC start
 # cores (the kernel may sit where another was), and tells the TRISCs to go; each core runs its program from the
 # kernel's header, and a TRISC then waits for its Tensix thread to finish everything it pushed. Once all four are done
 # BRISC reports: it notes the launch in its own mailbox (for the host, should one hang) and adds 1 to the dispatcher's
-# count with a NoC atomic increment, posted: nothing comes back, and no counter moves at either end.
+# count with a NoC atomic increment, posted: nothing comes back, and no counter moves at either end. Where the NIU counts
+# read data (COUNTED: a card, ttsim-chaos), it first adds the 64-byte flits the launch's reads brought in to the
+# dispatcher's sum the same way, on the same static VC, so the sum is whole once the count is.
 FIRMWARE = f"""
 #define MAILBOX ((volatile unsigned *){MAILBOX:#x})
 #define TRISCS ((volatile unsigned *){TRISCS:#x})
@@ -170,6 +172,9 @@ void brisc_loop(void) {{
     asm volatile("fence" ::: "memory");  // the rest of the mailbox and the arguments came over the NoC before go
     unsigned me = MAILBOX[7], n = MAILBOX[3];
     if (me >= n) continue;
+#ifdef COUNTED
+    unsigned words = NIU(WORDS);
+#endif
     volatile unsigned *a = (volatile unsigned *)MAILBOX[2];
     unsigned units = a[0];
     a[0] = me * units / n; a[1] = (me + 1) * units / n - a[0];
@@ -184,6 +189,11 @@ void brisc_loop(void) {{
     noc_wait();  // whatever the kernel sent is in place before we say it is done
     for (unsigned i = 1; i <= 3; i++) while (TRISCS[i] != seen) asm volatile("fence" ::: "memory");
     MAILBOX[4] = seen;
+#ifdef COUNTED
+    while (NIU(CMD) & 1) {{}}
+    NIU(AT_DATA) = NIU(WORDS) - words;
+    noc_issue({DONE + 4:#x}, MAILBOX[5], {MAILBOX + 24:#x}, noc_me(), ATOMIC, INCREMENT | 1);
+#endif
     while (NIU(CMD) & 1) {{}}
     NIU(AT_DATA) = 1;
     noc_issue({DONE:#x}, MAILBOX[5], {MAILBOX + 24:#x}, noc_me(), ATOMIC, INCREMENT);
@@ -210,9 +220,10 @@ void trisc_loop(unsigned i) {{
 # counted on the acknowledgement counter, and the request counter (up once, down once per worker) is cleared after.
 # One launch runs at a time, but the next one's arguments are written while it runs (into the other argument buffer),
 # so it goes the moment the last worker reports. When it is done, its [go, last report] times on the dispatcher's wall
-# clock go into a ring of TIMES entries in host memory after the commands, then [read pointer, launches done] into the
-# status: a profile of every launch, on the chip's own clock. Both are posted writes on one static VC, so they arrive
-# in that order and the dispatcher never waits on PCIe for them, only for their bytes to have left its outbox.
+# clock and the 64-byte flits its workers read (their sum's growth, taken before the next launch goes) go into a ring of
+# TIMES entries in host memory after the commands, then [read pointer, launches done] into the status: a profile of
+# every launch, on the chip's own clock. Both are posted writes on one static VC, so they arrive in that order and the
+# dispatcher never waits on PCIe for them, only for their bytes to have left its outbox.
 TIMES = 1024
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
@@ -240,7 +251,8 @@ void loop(void) {{
   unsigned ready = 0, ready_n = 0, ready_end = 0;  // a launch whose arguments and go are in place (0: none)
   unsigned running = 0, running_end = 0, reports = 0, began = 0;  // the launch the workers are on, the ring pointer
                                                                   // past it, the reports once it is done, its go's time
-  unsigned long long times = ring + size;  // launch n's [go, last report] at times + n % TIMES * 16
+  unsigned long long times = ring + size;  // launch n's [go, last report, flits read] at times + n % TIMES * 16
+  unsigned words = 0;  // the workers' flits read, through the last launch done
   unsigned staged = 0, first = 0;  // the ring's bytes [first, staged) are in STAGING
   NIU1(TARG_LO) = {OUTBOX:#x}; NIU1(TARG_MID) = 0; NIU1(TARG_HI) = noc_me(); NIU1(RET_LO) = {MAILBOX:#x}; NIU1(RET_MID) = 0;
   NIU1(RET_HI) = CONFIG[6]; NIU1(PACKET_TAG) = 0; NIU1(CTRL) = MCAST; NIU1(LEN) = 16;
@@ -269,7 +281,8 @@ void loop(void) {{
       while (*(volatile unsigned *){DONE:#x} != reports) asm volatile("fence" ::: "memory");
     asm volatile("fence" ::: "memory");
     unsigned done = running && *(volatile unsigned *){DONE:#x} == reports ? running : 0, end = running_end;
-    unsigned took = began, finished = done ? clock() : 0;
+    unsigned took = began, finished = done ? clock() : 0, read = done ? *(volatile unsigned *){DONE + 4:#x} - words : 0;
+    words += read;
     if (done) running = 0;
     if (ready && !running) {{  // a worker is idle here: it finished its last launch
       began = clock();
@@ -278,9 +291,9 @@ void loop(void) {{
     }}
     if (done) {{  // only now, so the host hears late rather than the next launch going late
       while (NIU(OUTGOING)) {{}}  // the last launch's times and status have left the outbox
-      OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished;
+      OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished; OUT[10] = read;
       l1_settle({OUTBOX + 16:#x});
-      noc_issue({OUTBOX + 32:#x}, me, times + done % {TIMES} * 16, {bh.noc_xy(*bh.PCIE)}, POST, 8);  // its times, then
+      noc_issue({OUTBOX + 32:#x}, me, times + done % {TIMES} * 16, {bh.noc_xy(*bh.PCIE)}, POST, 16);  // its times, then
       noc_issue({OUTBOX + 16:#x}, me, status, {bh.noc_xy(*bh.PCIE)}, POST, 8);  // that it is done: in that order
     }}
   }}
@@ -320,7 +333,8 @@ class Runtime:
     self.names = [""] * TIMES  # each of the last TIMES launches' name, for profile
     self.numbers = {}  # (value, dtype) -> a tensor of that one number, uploaded once (tensor.py's constants)
     self.log, self.pinned = None, set()  # while a call is recorded (tensor.jit): its launches, and DRAM it took, never given back
-    worker, dispatcher = compile_rv32(FIRMWARE), compile_rv32(DISPATCHER)
+    self.counts = chip.pci.counts  # whether profile has each launch's bytes read
+    worker, dispatcher = compile_rv32("#define COUNTED\n" * self.counts + FIRMWARE), compile_rv32(DISPATCHER)
     assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
     (dx, dy), n = self.dispatcher, len(self.cores)
     chip.write(*end, 0, worker, start)
@@ -330,7 +344,7 @@ class Runtime:
     chip.write(dx, dy, 0, dispatcher)
     rect = bh.noc_rect(start, end)
     chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
-    chip.write(dx, dy, DONE, bytes(4))
+    chip.write(dx, dy, DONE, bytes(8))
     chip.write(dx, dy, OUTBOX, bytes(64))  # what a dispatcher before this one left there would read as this one's (wait)
     self.doorbell = chip.map(dx, dy, DISPATCH)  # a TLB of its own, so ringing never has to move a window first
     for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
@@ -398,17 +412,18 @@ class Runtime:
     self.chip.pci.write(self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
 
   def profile(self, since):
-    """The launches after launch number `since` by name, once they are done: [(name, launches, cycles)], most cycles
-    first. A launch's cycles run from its go to its last worker's report, on the dispatcher's wall clock: the chip's
-    cycles on a card, ttsim's on the simulator. Only the last TIMES launches are kept."""
+    """The launches after launch number `since` by name, once they are done: [(name, launches, cycles, bytes)], most
+    cycles first. A launch's cycles run from its go to its last worker's report, on the dispatcher's wall clock: the
+    chip's cycles on a card, ttsim's on the simulator. Its bytes are what its workers' NoC reads brought in, in 64-byte
+    flits (DRAM's and other tiles' L1, and a tile's copies within its own), where the NIU counts them (counts), else None.
+    Only the last TIMES launches are kept."""
     self.wait()
     assert self.launches - since <= TIMES, f"{self.launches - since} launches to profile, the last {TIMES} kept"
-    totals = collections.defaultdict(lambda: [0, 0])
+    totals = collections.defaultdict(lambda: [0, 0, 0])
     for n in range(since + 1, self.launches + 1):
-      go, done = struct.unpack_from("<2I", self.times, n % TIMES * 16)
-      totals[self.names[n % TIMES]][0] += 1
-      totals[self.names[n % TIMES]][1] += (done - go) % 2**32
-    return sorted(((name, n, cycles) for name, (n, cycles) in totals.items()), key=lambda r: -r[2])
+      go, done, flits = struct.unpack_from("<3I", self.times, n % TIMES * 16)
+      for i, v in enumerate((1, (done - go) % 2**32, 64 * flits)): totals[self.names[n % TIMES]][i] += v
+    return sorted(((name, n, cycles, read if self.counts else None) for name, (n, cycles, read) in totals.items()), key=lambda r: -r[2])
 
   def args(self):  # where the last launch's arguments are, on each worker it went to (its results, for some kernels)
     return ARGS + self.launches % 2 * ARGS_SIZE

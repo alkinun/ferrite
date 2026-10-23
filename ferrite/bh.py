@@ -74,13 +74,14 @@ NIU_REGS = {  # offsets from NIU. A request: target and return addresses (64 bit
   "TARG_LO": 0x0, "TARG_MID": 0x4, "TARG_HI": 0x8, "RET_LO": 0xC, "RET_MID": 0x10, "RET_HI": 0x14, "PACKET_TAG": 0x18, "CTRL": 0x1C,
   "LEN": 0x20, "AT_DATA": 0x28, "CMD": 0x40, "CLEAR_OUTSTANDING": 0x60, "ID_LOGICAL": 0x148,  # this tile's translated x | y << 6
   "INITIATOR": 0x800,  # four request initiators, each keeping its registers between requests
-  "WR_ACKS": 0x204, "READS": 0x208,  # write acknowledgements and read responses had
+  "WR_ACKS": 0x204, "READS": 0x208, "WORDS": 0x20C,  # write acknowledgements, read responses and their 64-byte flits had
   "OUTSTANDING": 0x240,  # requests in flight with transaction id 0 (the packet tag's bits 10-13), then a word for each of ids 1-15
   "OUTGOING": 0x280}  # writes with transaction id 0 whose data the NIU has yet to read out of L1
 NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING counts them
            "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,  # a write to a rectangle: broadcast, path reserve, static VC
            "POST": 0x02 | 1 << 7,  # a write with no acknowledgement, on a static VC (class 0): two to one place stay in order
-           "ATOMIC": 1, "INCREMENT": 1 << 12 | 31 << 2,  # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of word 0
+           "ATOMIC": 1 | 1 << 7,  # posted, on a static VC (class 0) as tt-metal's: two from one place to another stay in order
+           "INCREMENT": 1 << 12 | 31 << 2,  # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of the 16-byte line's word 0 (| i: word i)
            "MAX_PACKET": 16384}
 NIU_READS = NIU + NIU_REGS["READS"]  # NIU_MST_RD_RESP_RECEIVED: read requests answered, one a request (bench's DRAM reads)
 def noc_xy(x, y): return x | y << 6  # a tile, as a request's *_HI registers and ID_LOGICAL give it

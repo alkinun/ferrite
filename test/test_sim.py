@@ -200,8 +200,25 @@ def test_profile(chip):
   since, start = rt.launches, chip.pci.now()
   for _ in range(4): run()
   rows, elapsed = rt.profile(since), (chip.pci.now() - start) * bh.AICLK
-  assert sorted((name, n) for name, n, _ in rows) == [("add", 4), ("matmul", 4), ("max2 sub exp sum2 recip mul", 4)], rows
-  assert all(cycles > 0 for *_, cycles in rows) and 0.5 * elapsed < sum(cycles for *_, cycles in rows) <= elapsed
+  assert sorted((name, n) for name, n, *_ in rows) == [("add", 4), ("matmul", 4), ("max2 sub exp sum2 recip mul", 4)], rows
+  assert all(cycles > 0 for _, _, cycles, _ in rows) and 0.5 * elapsed < sum(cycles for _, _, cycles, _ in rows) <= elapsed
+
+def test_bytes(chip):
+  # where the NIUs count read data (a card, ttsim-chaos), Runtime.profile has each launch's bytes, its workers' reads in
+  # 64-byte flits: an add reads its two inputs' tiles; a token's bfp4 matmul A's row once (shared by multicast) and B's
+  # tiles each in two reads, exponents and values; a gather, for each result tile, its ids' tile, the zero tile (a copy
+  # within L1) and each row's two runs in their 64-byte blocks
+  if not chip.pci.counts: pytest.skip("ttsim as released does not count read data: TTSIM=path/to/ttsim-chaos's libttsim.so runs it")
+  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(0)
+  x, y = (Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()) for _ in range(2))
+  a, b = Tensor.of(rt, rng.normal(0, 1, (32, 128)).tolist()), Tensor.of(rt, rng.normal(0, 1, (128, 64)).tolist()).cast("bfp4").realize()
+  table, ids = Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()), Tensor.of(rt, [[3, 40, 7]], "int32")
+  for run, want in ((lambda: (x + y).realize(), 8 * 2048), (lambda: (a @ b).realize(), 4 * 2048 + 8 * (64 + 512)),
+                    (lambda: table.gather(ids), 2 * (4096 + 2048 + 3 * 2 * 64))):
+    run(), rt.wait()  # (compiled)
+    since = rt.launches
+    run()
+    assert [r[3] for r in rt.profile(since)] == [want]
 
 def test_jit(chip, monkeypatch):
   # tensor.jit records a function's second call and replays its launches after: each later call copies its inputs in

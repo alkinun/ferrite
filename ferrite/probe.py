@@ -87,7 +87,7 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
   rt.send(*rt.block([(k["empty"], (), workers, "")] * 100))
   rt.wait()
   rows += [("launch, 100 queued: host each", (time.perf_counter() - start) * 1e4, None, "us"),
-           ("launch, 100 queued: chip each", sum(c for _, _, c in rt.profile(since)) / 100, None, "cycles")]
+           ("launch, 100 queued: chip each", sum(c for _, _, c, _ in rt.profile(since)) / 100, None, "cycles")]
   # Tensix: a matmul step with its unpacks, MVMULs alone, packs, an SFPU program (cycles a tile or step)
   for p, kernel in k["steps"].items(): rows.append((f"matmul step, {p} phase{'s' * (p > 1)}, unpacks included", timed(kernel, (n,), 1) / n, 16 * p, "cycles"))
   rows.append(("MVMUL alone", 64 * n / max(timed(k["mvmul"], (n,), 1), 1), 1, "per cycle"))
