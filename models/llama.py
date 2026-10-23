@@ -140,19 +140,21 @@ def delta(h, p, c, state, phases, live=None, accept=None):
   keep = lambda old, new: new if live is None else old + cols * (new - old)
   big = lambda old, new: new if live is None else old + f.repeat(live, c.vh) * (new - old)
   unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # each head's query and key to length 1
-  def pieces(x, y, mm):  # q, k, v, beta and g of mm tokens of each sequence (x's and the conv's y), a batch entry a sequence's head
-    def each(t, d):  # (tokens, heads of d side by side) as (a sequence's heads, its tokens, d)
+  def pieces(x, y, mm):  # q, k, v, beta and g of mm tokens of each sequence (x's and the conv's y), a batch entry a sequence's
+    def each(t, d):       # head; a token's q and k as columns (step's), else rows
       if mm == 1 and seqs > 1: return t.reshape(seqs * t.shape[-1] // d, 1, d)
       heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
       return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, mm * d)).reshape(seqs * heads.shape[0], mm, d)
-    q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))  # a key head for r value heads
+    if mm == 1: q, k = (t * f.rsqrt(f.down(t * t) + 1e-6) for t in (y[:, a:a + qk].reshape(seqs * c.kh, c.kd, 1) for a in (0, qk)))  # to length 1
+    else: q, k = unit(each(y[:, :qk], c.kd)), unit(each(y[:, qk:2 * qk], c.kd))
+    q = q * c.kd ** -0.5  # (a key head for r value heads)
     b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
     g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus, each head's log decay
     return q, k, each(y[:, 2 * qk:], c.vd), f.sigmoid(each(b, 1)), g
   if (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
     # A decode step's token, or a verify step's token and then its draft, each as a decode step's: the conv over each
     # place's inputs where they lie (its sequences' rows, as x's), then each place's inputs the next's, in turn (none
-    # written over unread); q and k as columns, each transposed before it is repeated; a first token's states kept apart
+    # written over unread); q and k as columns, each a move from y's row; a first token's states kept apart
     out, conv = [], past
     for i in range(m):
       xi, into = x[i::m, :], state[:2] if i == m - 1 else state[2:]
@@ -160,7 +162,7 @@ def delta(h, p, c, state, phases, live=None, accept=None):
       for j in range(c.conv - 1):
         f.assign(into[0][j:j + 1, :, :], keep(into[0][j:j + 1, :, :], conv[j + 1:j + 2, :, :] if j < c.conv - 2 else xi[:, :width]))
       q, k, v, beta, g = pieces(xi, f.silu(y).reshape(seqs, width), 1)
-      o, S2 = step(f.repeat(f.t(q), r), f.repeat(f.t(k), r), v, beta, g, S)
+      o, S2 = step(f.repeat(q, r), f.repeat(k, r), v, beta, g, S)
       out.append(f.now(o))  # read from S before S is written over
       f.assign(into[1], big(into[1], S2))
       conv, S = into
