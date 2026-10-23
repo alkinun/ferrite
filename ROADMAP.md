@@ -148,6 +148,10 @@ first (NOTES, "Bring-up on a p150").
   as products by a tile of ones. At Qwen3.6's shapes a decode step's attention reads 1.5 times its rows where 1.7, and
   a prompt's chunk 17 times where 59; the cost model's eight users make 237 tokens/s a card where 224, and a 32K-token
   prompt takes 2.1 s where 6.9 (NOTES, "Attention").
+- [x] **A KV cache in bfp4** (`put` writes it, attention reads it in place, bit for bit the bf16 one by the same
+  values): 42 sessions a card where bfp8 keeps 25, and 284 tokens/s a card at eight users where 237, if the whole
+  model's token accuracy holds with it, which tonight's run of it says (NOTES, "Qwen3.5's and Qwen3.6's language
+  models").
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the

@@ -127,11 +127,11 @@ class Tensor:
   def put(self, ids, x):
     """x's rows into rows ids of each matrix of this tensor, in place: gather's inverse, ids an int32 tensor of one row
     read on the chip. A KV cache of a fixed size takes a token's keys at its place this way, the place data rather than a
-    shape, so a decode step launches the same kernels each token (jit). Into a bfp8 tensor, x is bf16, each of its runs
-    of 16 rounded as cast("bfp8") rounds."""
+    shape, so a decode step launches the same kernels each token (jit). Into a block float (bfp8 or bfp4), x is bf16,
+    each of its runs of 16 rounded as cast rounds them."""
     assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "rows of x, by a row of int32 places"
-    assert (x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype == "bfp8" else self.dtype), \
-      f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"  # into bfp8 (a bfp8 KV cache), bf16 rows rounded on the way
+    assert (x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype), \
+      f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"  # into a block float (a KV cache), bf16 rows rounded on the way
     assert self.rep == 1, "into a tensor of its own, not a repeat"
     x, ids, ct, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
     assert 2 * x.rows + tr <= 2**17, "the places, and the rows of each tile row, in a worker's L1"

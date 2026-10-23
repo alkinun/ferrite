@@ -1231,9 +1231,10 @@ def put_kernel(dtype):
   row to the same place stays, and writes the tile back: no two workers write one tile. 32 rows that fill a tile in
   order (a prompt's, from a tile's first place) make it their tile of x as it is. A place past the tensor's rows is left
   out.
-  Into bfp8 (a bfp8 KV cache), x is bf16 and each run of 16 is rounded as the packer rounds a cast: to its largest
-  exponent, half up, 7 bits of magnitude (a 0 without its sign, which the unpacker would read as -inf)."""
-  bfp = dtype == "bfp8"
+  Into a block float (a KV cache in bfp8 or bfp4), x is bf16 and each run of 16 is rounded as a cast rounds it: to its
+  largest exponent, bfp8's 7 bits of magnitude half up (as the packer does), bfp4's 3 to the nearest (as bfp4_kernel
+  does), a 0 without its sign (which the unpacker would read as -inf)."""
+  bfp = dtype in BFP
   t, s, run = tile_bytes(dtype), tile_bytes("bf16" if bfp else dtype), 16 * ITEMSIZE["bf16" if bfp else dtype]  # bytes in a tile of the tensor, of x, in x's run
   copy = ("for (unsigned f = 0; f < 2; f++) pack(FROM + at(i, f), TILE, r, f);" if bfp else
           f"for (unsigned f = 0; f < 2; f++) for (unsigned k = 0; k < {run // 4}; k++) "
@@ -1249,17 +1250,21 @@ def put_kernel(dtype):
 {BANKS}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // place r of the 32, in row 0
 static unsigned at(unsigned r, unsigned f) {{ return (r % 32 / 16 * 2 + f) * {s // 4} + r % 16 * {run}; }}  // row r's run in face f, in x
-// the run of 16 bf16 values at src as row r's run in face f of the bfp8 tile at tile: its exponent, then its values
+static unsigned nibble(unsigned b, unsigned top) {{  // bf16 b's 3 bits under exponent top, rounded to the nearest, and its sign
+  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0), q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
+  if (q > 7) q = 7;
+  return q ? (b >> 15 & 1) << 3 | q : 0;
+}}
+// the run of 16 bf16 values at src as row r's run in face f of the block-float tile at tile: its exponent, then its values
 static void pack(unsigned src, unsigned tile, unsigned r, unsigned f) {{
   volatile unsigned short *v = (volatile unsigned short *)src;
   unsigned top = 0, n = (r % 32 / 16 * 2 + f) * 16 + r % 16;
   for (unsigned k = 0; k < 16; k++) {{ unsigned e = v[k] >> 7 & 255; if (e > top) top = e; }}
   ((volatile unsigned char *)tile)[n] = top;
   for (unsigned k = 0; k < 16; k++) {{
-    unsigned b = v[k], e = b >> 7 & 255, m = (b & 127) | (e ? 128 : 0), shift = top - e < 8 ? top - e : 8;
-    unsigned q = (m + (1u << shift)) >> (shift + 1);
-    if (q > 127) q = 127;
-    ((volatile unsigned char *)tile)[64 + n * 16 + k] = q ? (b >> 15) << 7 | q : 0;
+    {"if (k % 2) continue; ((volatile unsigned char *)tile)[64 + n * 8 + k / 2] = nibble(v[k], top) | nibble(v[k + 1], top) << 4;" if dtype == "bfp4" else
+     "unsigned b = v[k], e = b >> 7 & 255, m = (b & 127) | (e ? 128 : 0), shift = top - e < 8 ? top - e : 8, q = (m + (1u << shift)) >> (shift + 1); "
+     "if (q > 127) q = 127; ((volatile unsigned char *)tile)[64 + n * 16 + k] = q ? (b >> 15) << 7 | q : 0;"}
   }}
 }}
 void kmain(volatile unsigned *a) {{
