@@ -69,14 +69,15 @@ def session(c, use, speculative=False):
   state = sum(4 * (c.vh * c.kd * c.vd + (c.conv - 1) * (2 * c.kh * c.kd + c.vh * c.vd)) for l in range(c.layers) if llama.linear(c, l))
   return SimpleNamespace(kv=kv, draft=c.mtp * row * use["context"], state=state * (1 + speculative), bytes=kv + c.mtp * row * use["context"] + state * (1 + speculative))
 
+def touched(c, tokens): return c.experts * (1 - (1 - c.k / c.experts) ** tokens) if c.experts else 0  # a block's experts some token picks
+
 def step(c, s, use, card, users, speculative=False, cards=1):
   """A decode step for `users` sessions at once, a token each, or a token and a draft each then the next drafts (two
   calls): the bytes it reads, its flops, launches, control and seconds (waiting on DRAM or on the matmuls, whichever is
   longer, then on the launches or the kernels' own RISC-V work, if the card's counts as ttsim's does, whichever is
   more: the small kernels that do it read little), and tokens/s a user."""
   n, one, d = users * (1 + speculative), session(c, use, speculative), c.dim
-  touched = lambda tokens: c.experts * (1 - (1 - c.k / c.experts) ** tokens) if c.experts else 0  # a block's experts some token picks
-  reads = s.every + s.moe * touched(n) * s.expert + n * one.kv + users * one.state * (1.5 if speculative else 1)  # states read and written, twice
+  reads = s.every + s.moe * touched(c, n) * s.expert + n * one.kv + users * one.state * (1.5 if speculative else 1)  # states read and written, twice
                                                                                                              # when speculating
   flops = 2 * n * s.values + n * sum(4 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))
   linear = sum(llama.linear(c, l) for l in range(c.layers))
@@ -85,11 +86,33 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   cycles = lambda kind, blocks: blocks * (lambda a, b: a + b * n)(*CONTROL[kind + " verify" if speculative else kind])
   control = (cycles("attention", c.layers - linear + c.mtp * speculative) + cycles("deltanet", linear) + cycles("rest", 1 + speculative)) / bh.AICLK
   if speculative:  # the drafting call: the layer over two places a user, and the output layer again
-    reads += s.draft + c.mtp * touched(2 * users) * s.expert + c.vocab * d * BYTES["bfp8"] + 2 * users * one.draft
+    reads += s.draft + c.mtp * touched(c, 2 * users) * s.expert + c.vocab * d * BYTES["bfp8"] + 2 * users * one.draft
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)
     launches += LAUNCHES["draft"]
   seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + max(launches * card["launch"], control)
   return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, control=control, flops=flops, rate=(1 + use["accept"] if speculative else 1) / seconds)
+
+def prompt(c, s, use, card, chunk, cards=1):
+  """A prompt that fills a session (use's context), prefilled chunk tokens at a time as serve.py's engine takes it: each
+  chunk reads every matrix but the experts and the embedding, the experts its tokens pick, and its session's rows up to
+  the power of 2 that holds its last place (once a query head), and computes its tokens' matmuls (the output layer's for
+  its last alone) and their scores over those rows; with a multi-token prediction layer, that layer's over each place
+  too. Its seconds (each chunk waiting on DRAM or on the matmuls, whichever is longer; launches and control left out),
+  tokens/s, and the most bytes a chunk's scores take (each attention block's, and their softmax)."""
+  hd, d, n = llama.head(c), c.dim, use["context"]
+  blocks = sum(not llama.linear(c, l) for l in range(c.layers)) + c.mtp
+  seconds, most = 0.0, 0
+  for at in range(0, n, chunk):
+    m = min(chunk, n - at)
+    rows = min(n, 1 << max(5, (at + m - 1).bit_length()))
+    reads = s.every + s.moe * touched(c, m) * s.expert + blocks * c.heads * hd * 2 * BYTES[use["kv"]] * rows  # (a key head's once a query head)
+    flops = 2 * m * (s.values - c.vocab * d) + 2 * c.vocab * d + blocks * 4 * m * c.heads * hd * rows
+    if c.mtp:
+      reads += s.draft + c.mtp * touched(c, m) * s.expert + c.vocab * d * BYTES["bfp8"]
+      flops += 2 * m * (s.draft / BYTES["bfp8"] + c.k * 3 * d * c.moe + c.vocab * d)
+    seconds += max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards))
+    most = max(most, 2 * c.heads * m * rows * BYTES["bf16"])
+  return SimpleNamespace(seconds=seconds, rate=n / seconds, scores=most)
 
 def hourly(card): return (card["price"] + card["host"]) / (card["years"] * 8766) + (card["watts"] + card["host_watts"]) / 1000 * card["kwh"]
 
@@ -118,9 +141,11 @@ def report(folder, mode="bf16", **keys):
       pays = f"{step(c, s, use, card, users, True, cards).seconds / step(c, s, use, card, users, False, cards).seconds - 1:23.0%}" if speculative else ""
       out.append(f"  {users:8d} {t.reads / 1e9:11.2f} {t.seconds * 1e3:10.1f} {t.launches:10d} {t.control * 1e3:13.1f} {t.rate:17.1f} {users * t.rate:8.0f} "
                  f"{hour / (users * t.rate * 3600) * 1e6:17.3f}{pays}")
-  prompt = 2 * s.values + sum(2 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))  # half the context, on average
-  fill = card["tflops"] / card["phases"] * cards / prompt
-  out.append(f"  a prompt token: {prompt / 1e9:.1f} GFLOP, {fill:,.0f} tokens/s a card were its matmuls never idle, ${hour / (fill * 3600) * 1e6:.4f} a million")
+  out.append(f"  a prompt of {use['context']} tokens, prefilled a chunk at a time:")
+  out.append("     chunk   seconds   tokens/s a card   $ a million in   a chunk's scores, GB")
+  for chunk in (256, 1024, 2048, 4096):
+    p = prompt(c, s, use, card, chunk, cards)
+    out.append(f"  {chunk:8d} {p.seconds:9.2f} {p.rate:17,.0f} {hour / (p.rate * 3600) * 1e6:16.4f} {p.scores / 1e9:22.2f}")
   out.append(f"  a session back from the host: {session(c, use).bytes / card['pcie'] * 1e3:.0f} ms over PCIe at {card['pcie'] / 1e9:.0f} GB/s")
   return "\n".join(out)
 
