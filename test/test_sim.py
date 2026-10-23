@@ -1654,6 +1654,29 @@ def test_qwen3_5_sequences(chip):
   free = llama.slot(c, kv, 1, 3)
   assert not any(np.any(np.frombuffer(s.tobytes(), np.float32)) for l in range(3) for s in free[l]), "the free slot's states stay 0"
 
+def test_delta_pieces(chip):
+  # Gated DeltaNet's prompt in pieces of 64 at once (llama.chunk: all that the state does not enter for every piece, then
+  # the state through them in turn), through the small Qwen3.5 (qwen35): a prompt of 150 tokens (three pieces, the last
+  # padded with tokens that change nothing), every place's logits within 5% of numpy's and its pick numpy's or a near
+  # tie; numpy's chunk, the same as a piece at a time to 1e-6
+  rng = np.random.default_rng(47)
+  c, weights = qwen35(rng, places=256)
+  w = llama.arrays(weights)
+  q, k = rng.normal(0, 0.3, (4, 150, 32)), rng.normal(0, 0.3, (4, 150, 32))
+  k /= np.linalg.norm(k, axis=-1, keepdims=True)
+  v, beta, g, S = rng.normal(0, 1, (4, 150, 48)), rng.uniform(0, 1, (4, 150, 1)), -rng.uniform(0, 0.2, (4, 150, 1)), rng.normal(0, 0.1, (4, 32, 48))
+  o, after, _ = llama.chunk(q, k, v, beta, g, S)
+  for s0 in range(0, 150, 64):  # (a piece at a time: chunk's own pieces, one call each)
+    piece, S, _ = llama.chunk(*(t[:, s0:s0 + 64, :] for t in (q, k, v, beta, g)), S)
+    assert np.abs(piece - o[:, s0:s0 + 64, :]).max() < 1e-6
+  assert np.abs(after - S).max() < 1e-6
+  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  t, on = llama.upload(rt, weights), lambda row: Tensor.of(rt, [row], "int32")
+  ids = [int(i) for i in rng.integers(0, 256, 150)]
+  want = llama.forward(ids, list(range(150)), w, c, llama.kv_cache(c, 256, np.zeros), every=True)
+  got = gpt2.values(llama.forward(on(ids), on(list(range(150))), t, c, llama.kv_cache(c, 256, llama.zeros(rt)), every=True))
+  assert max(np.abs(a - b).max() / np.abs(b).max() for a, b in zip(got, want)) < 0.05 and near(got, want)
+
 def test_speculative(chip):
   # A speculative decode step for Qwen3.5 (qwen35): for each of two slots, the token it knows and a draft after it,
   # verified in one call, a third slot free (live 0). A draft that is the model's own next token is taken and the next

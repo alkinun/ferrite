@@ -152,6 +152,9 @@ first (NOTES, "Bring-up on a p150").
   values): 42 sessions a card where bfp8 keeps 25, and 284 tokens/s a card at eight users where 237, if the whole
   model's token accuracy holds with it, which tonight's run of it says (NOTES, "Qwen3.5's and Qwen3.6's language
   models").
+- [x] **A prompt's Gated DeltaNet in pieces at once**: all that the state does not enter done for every piece of 64
+  tokens at once, then the state through the pieces in turn, so a 256-token chunk of a real block is 349 launches where
+  it was 816 (NOTES, "Qwen3.5's and Qwen3.6's language models").
 - [ ] **One card or two**: its experts in bfp4 against bf16, the token accuracy in numpy over the whole model. Each
   matrix moves as much in bfp4 as Llama-3.1-8B's MLP does in Tenstorrent's performance mode, but on the real blocks 2
   and 3 every MLP matrix in bfp4 moves the logits 16% where gate and up alone move them 8% (with down in bfp8 the

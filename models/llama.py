@@ -30,6 +30,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                            cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None], assign=lambda a, b: a.__setitem__(..., b),
                            tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)),
                            parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to,
+                           pad=lambda a, rows: np.pad(a, ((0, 0), (0, rows), (0, 0))), empty=lambda shape: np.empty(shape, np.float32),
                            down=lambda a: a.sum(-2, keepdims=True))
   sink_softmax = lambda a, sink: (e := (a - (m := a.max(2).maximum(sink))).exp()) / (e.sum(2) + (sink - m).exp())  # one more logit, left out
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid,
@@ -39,6 +40,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                          now=Tensor.realize, cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0),  # at any phases
                          swap=lambda a: a.permute(1, 0, 2),
                          assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
+                         pad=lambda a, rows: a.pad(((0, 0), (0, rows), (0, 0))), empty=lambda shape: Tensor(x.rt, shape[1], shape[2], batch=shape[0], dtype="fp32"),
                          expand=lambda a, shape: a.expand(*shape), down=lambda a: a.sum(1))
 
 @functools.cache
@@ -133,7 +135,7 @@ def delta(h, p, c, state, phases, live=None, accept=None):
   conv's, S]), and its accept row (1 or 0 a sequence) says which the next step goes on from: after both tokens, or
   after the first when its second, a draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay
   (-exp(A_log)), dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it), a decode or verify
-  step's tokens one at a time (step), else a chunk of at most 64 tokens at a time (chunk)."""
+  step's tokens one at a time (step), else a prompt's in pieces of 64 (chunk)."""
   f, (past, S) = fns(h), state[:2]
   past = past.get() if isinstance(past, Row) else past  # (a sequence's, of several's)
   n, seqs, qk, vw, r = h.shape[-2], past.shape[1], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
@@ -172,20 +174,17 @@ def delta(h, p, c, state, phases, live=None, accept=None):
       out.append(f.now(o))  # read from S before S is written over
       f.assign(into[1], big(into[1], S2))
       conv, S = into
-  else:  # a prompt's tokens (or a sequence's own, of several's), a chunk of at most 64 at a time
+    o = out[0] if m == 1 else f.cat(*out)  # each head's tokens again
+  else:  # a prompt's tokens (or a sequence's own, of several's), its pieces of 64 at once and the state through them in turn
     rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))  # each sequence's conv inputs: the last ones, then
     y = sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))  # this call's, computed before the last are written over
     f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
     if accept is not None: f.assign(state[2], keep(state[2], f.swap(rows[:, 1:c.conv, :])))
     q, k, v, beta, g = pieces(x, f.silu(y).reshape(n, width), m)
-    q, k, out = f.repeat(q, r), f.repeat(k, r), []
-    for s in range(0, m, 64):
-      o, S2, S1 = chunk(*(t[:, s:s + 64, :] for t in (q, k, v, beta, g)), S)
-      out.append(f.now(o))
-      if accept is not None and s == 0: f.assign(state[3], big(state[3], S1))
-      f.assign(state[1], big(state[1], S2))
-      S = state[1]
-  o = out[0] if len(out) == 1 else f.cat(*out)  # each head's tokens again
+    o, S2, S1 = chunk(f.repeat(q, r), f.repeat(k, r), v, beta, g, S)
+    o = f.now(o)  # (each head's tokens) read from the state before it is written over, as the state after its first token is
+    if accept is not None: f.assign(state[3], big(state[3], S1))
+    f.assign(state[1], big(state[1], S2))
   o = o if seqs == 1 else f.split(o.reshape(n, vw), c.vh) if m == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(x[:, width:width + vw], c.vh))  # each head RMS-normed and gated by z
   return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"))
@@ -200,25 +199,38 @@ def step(q, k, v, beta, g, S):
   S = e * S + k * vnew
   return f.down(q * S), S
 
-def chunk(q, k, v, beta, g, S):
-  """A chunk's gated delta rule all at once, as transformers' torch_chunk_gated_delta_rule (the DeltaNet paper's UT
-  transform): its output and the state after it, and after its first token alone, from the state before (S) and each
-  token's query, key and value, and beta and g as columns. The chunk's corrections solve (I + L) u = beta v, L strictly lower triangular (how much each
-  token's correction moves the later ones'), and L^64 = 0, so (I + L)^-1 = (I + P)(I + P^2)(I + P^4)...: P = -L, a
-  matmul or two a factor and no loop over tokens."""
-  f, m = fns(q), q.shape[-2]
-  upper = f.tri(m)
-  cum = f.t(f.t(g) @ upper)  # the log decay from the chunk's start through each token
-  decay = f.exp(f.minimum(cum - f.t(cum), 0)) * f.tri(m, True)  # from token j to token i, j <= i, else 0
+def chunk(q, k, v, beta, g, S, size=64):
+  """The gated delta rule over a prompt's tokens, as transformers' torch_chunk_gated_delta_rule (the DeltaNet paper's
+  UT transform) takes them, in pieces of 64: each token's output, the state after the last and after the first alone,
+  from the state before (S) and each token's query, key and value, and beta and g as columns. All that the state does
+  not enter is done for every piece at once, a batch entry a piece (the last padded with tokens of no key, value or
+  decay, which change nothing); then the state goes through the pieces in turn, four matmuls a piece, each piece's
+  output written into its rows. A piece's corrections solve (I + L) u = beta v, L strictly lower triangular (how much
+  each token's correction moves the later ones'), and L^64 = 0, so (I + L)^-1 = (I + P)(I + P^2)(I + P^4)...: P = -L,
+  a matmul or two a factor and no loop over tokens."""
+  f, (h, m, dv) = fns(q), v.shape
+  n, s = -(-m // size), min(m, size)  # pieces, and each one's tokens
+  if n > 1:  # each its own (a repeat or a view copied), padded to whole pieces, then piece i of head j at batch entry j n + i
+    q, k, v, beta, g = (f.parts(f.pad(t, n * s - m) if n * s > m else t + 0, n) for t in (q, k, v, beta, g))
+  upper = f.tri(s)
+  cum = f.t(f.t(g) @ upper)  # the log decay from the piece's start through each token
+  decay = f.exp(f.minimum(cum - f.t(cum), 0)) * f.tri(s, True)  # from token j to token i, j <= i, else 0
   kbeta = k * beta
   P, u, w, span = -((kbeta @ f.t(k)) * decay * (1 - upper)), v * beta, kbeta * f.exp(cum), 1
-  while span < m:
+  while span < s:
     u, w, span = u + P @ u, w + P @ w, 2 * span
-    if span < m: P = P @ P
-  last = cum[:, m - 1:m, :]
-  vnew = u - w @ S  # the corrections, less what the state before already says
-  o = (q * f.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ vnew
-  return o, S * f.exp(last) + f.t(k * f.exp(last - cum)) @ vnew, S * f.exp(cum[:, 0:1, :]) + f.t(k[:, 0:1, :]) @ vnew[:, 0:1, :]
+    if span < s: P = P @ P
+  last = cum[:, s - 1:s, :]
+  now, piece = (f.now, lambda t, i: t[i::n, :, :]) if n > 1 else (lambda t: t, lambda t, i: t)  # (one piece: all of it lazy)
+  qs, a, kl, u, w = now(q * f.exp(cum)), now((q @ f.t(k)) * decay), now(f.t(k * f.exp(last - cum))), now(u), now(w)  # what the
+  out = f.empty((h, n * s, dv)) if n > 1 else None                                                                  # state's turns read
+  for i in range(n):
+    vnew = piece(u, i) - piece(w, i) @ S  # the corrections, less what the state before already says
+    o = piece(qs, i) @ S + piece(a, i) @ vnew
+    if n > 1: f.assign(piece(f.parts(out, n), i), o)
+    if i == 0: first = S * f.exp(piece(cum, 0)[:, 0:1, :]) + f.t(piece(k, 0)[:, 0:1, :]) @ vnew[:, 0:1, :]
+    S = now(S * f.exp(piece(last, i)) + piece(kl, i) @ vnew)
+  return o if n == 1 else out if n * s == m else out[:, :m, :], S, first
 
 def mlp(h, p, phases, pre=""):  # a SwiGLU: silu(h @ gate) * (h @ up), then down; p[pre + "gate_up_proj"] holds gate and up side by side
   f, m = fns(h), p[pre + "down_proj"].shape[-2]
