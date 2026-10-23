@@ -658,7 +658,7 @@ not set. In order, each step needing only the ones before it:
 | 7 | `-k "sfpu or reduc or softmax or any_shape or views or batch or movement"` | run-time slots, BRISC's 2-byte L1 accesses, SFPU encodings, lane flags, `SFPTRANSP`, `Haloize_mode` |
 | 8 | the whole suite, a few times | the waits ttsim never makes happen; a failure that comes and goes points here |
 | 9 | `GPT2=... python3 -m pytest test -k gpt2`, then `models/gpt2.py` | everything at once, and the first timings (`Runtime.profile`; all 0 means `bh.WALL_CLOCK`) |
-| 10 | `python3 -m ferrite.probe`, `python3 -m ferrite.bench` (and `1 768 3072`, `4 bfp8`) | launch cost, DRAM GB/s by reads in flight, NoC latency, MVMUL, unpack, pack and SFPU rates, PCIe; a matmul's TFLOPS and decode's GB/s. `probe 8 probe.json` feeds the cost model |
+| 10 | `python3 -m ferrite.probe`, `python3 -m ferrite.bench` (and `1 768 3072`, `4 bfp8`) | launch cost, DRAM GB/s by request size and reads in flight (block-float tiles as the matmuls read them, a near and a far bank) and a read's latency, NoC latency, MVMUL, unpack, pack and SFPU rates, BRISC's topk and grouping, PCIe; a matmul's TFLOPS and decode's GB/s. `probe 8 probe.json` feeds the cost model (its bandwidth: the slower of bfp8's and bfp4's tiles as the matmuls read them) |
 | 11 | `python3 -m ferrite.probe 256`, and a model of a few GB | uploads; if far under a GB/s, map the windows write-combined (`resource0_wc`) |
 | 12 | `test/benchmark.py ttnn ...`, then `ferrite ...` | ferrite against TT-NN on the same card |
 

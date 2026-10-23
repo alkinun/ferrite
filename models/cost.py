@@ -10,6 +10,7 @@ import json, math, os, sys
 from types import SimpleNamespace
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ferrite import bh
+from ferrite.compiler import DEPTH
 import llama
 
 BYTES = {"bf16": 2.0, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}  # a value's, with its share of its tile's exponents
@@ -36,7 +37,8 @@ USE = dict(context=32768, kv="bf16", accept=0.0)  # each session's places, its s
 
 def probed(card, path):  # the probe's numbers (python3 -m ferrite.probe 8 path) in place of the specification's
   p = json.load(open(path))
-  return card | dict(bandwidth=max(v for k, v in p.items() if k.startswith("DRAM reads") and k.endswith("all workers")) * 1e9, reach=1.0,
+  tiles = [p[f"DRAM reads of {f} tiles in two requests, {DEPTH} in flight: all workers"] for f in ("bfp8", "bfp4")]  # (as the matmuls read them)
+  return card | dict(bandwidth=min(tiles) * 1e9, reach=1.0,
                      tflops=2 * 32**3 / p["matmul step, 1 phase, unpacks included"] * WORKERS * bh.AICLK,
                      launch=p["launch, 100 queued: chip each"] / bh.AICLK, pcie=min(p["upload over PCIe"], p["read back over PCIe"]) * 1e9)
 

@@ -185,9 +185,9 @@ def test_probe(chip):
   before = reads()
   rows = probe.probe(chip, n=4, rounds=2, upload=1 << 16)
   names = [what for what, *_ in rows]
-  assert len(names) == len(set(names)) == 26 and all(value > 0 for _, value, *_ in rows), rows
+  assert len(names) == len(set(names)) == 44 and all(value > 0 for _, value, *_ in rows), rows
   workers = len(chip.tensix) - 1
-  assert reads() - before >= sum(2 * d * (1 + workers) for d in (1, 2, 4, 8)), "the DRAM probes' reads"
+  assert reads() - before >= 2 * workers * 3 * (1 + 2 + 4 + 8 + 16), "the DRAM probes' reads (every worker's, three sizes)"
 
 def test_profile(chip):
   # each launch's [go, last report] on the dispatcher's wall clock lands in host memory, and Runtime.profile adds them
@@ -2414,11 +2414,12 @@ def test_cost(tmp_path):
   card = dict(cost.CARD)
   t = cost.step(c, s, use, card, 4)
   assert math.isclose(cost.hourly(card) / (4 * t.rate * 3600) * 1e6, cost.hourly(card) / (4 / t.seconds) / 3600 * 1e6)
-  (tmp_path / "probe.json").write_text(json.dumps({"DRAM reads, 4 in flight: all workers": 300.0, "DRAM reads, 8 in flight: all workers": 420.0,
+  (tmp_path / "probe.json").write_text(json.dumps({"DRAM reads of bfp8 tiles in two requests, 4 in flight: all workers": 420.0,
+                                                   "DRAM reads of bfp4 tiles in two requests, 4 in flight: all workers": 300.0,
                                                    "matmul step, 1 phase, unpacks included": 16.0, "launch, 100 queued: chip each": 2700.0,
                                                    "upload over PCIe": 20.0, "read back over PCIe": 12.0}))
   measured = cost.probed(card, str(tmp_path / "probe.json"))
-  assert measured["bandwidth"] == 420e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
+  assert measured["bandwidth"] == 300e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
   slow, fast, long = (cost.prompt(c, s, use | {"kv": "bfp8", "context": n}, card, chunk) for n, chunk in ((4096, 256), (4096, 2048), (32768, 2048)))
   assert slow.rate * 6 < fast.rate and long.rate * 1.5 < fast.rate, (slow.rate, fast.rate, long.rate)
   assert "a prompt of 8192 tokens" in cost.report(str(tmp_path / "qwen"), "experts", context="8192", kv="bfp8")

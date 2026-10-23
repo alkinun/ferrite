@@ -1,11 +1,12 @@
-# The numbers ttsim cannot give, measured on a card (NOTES.md, "Bring-up on a p150"):
-# what a launch costs and how it grows with the rectangle, DRAM bandwidth by reads in flight, NoC latency, the rates of
-# the Tensix units a kernel feeds (MVMUL alone, a matmul step with its unpacks at 1, 2 and 4 fidelity phases, the packer,
-# the SFPU), BRISC's scalar work for a mixture of experts (topk, group), and PCIe both ways. Each decides something:
-# DEPTH, the fidelity a matmul can use before its unpacks bound it, how many launches a token can afford, whether a
-# router's choices are cheap enough on a RISC-V core. Small kernels built from the compiler's own pieces, timed by the tile's
-# wall clock. On ttsim the numbers mean nothing (Tensix instructions take no time there, the NoC and DRAM answer at once):
-# it only checks that each probe runs.
+# The numbers ttsim cannot give, measured on a card (NOTES.md, "Bring-up on a p150"): what a launch costs and how it
+# grows with the rectangle, DRAM bandwidth by request size and reads in flight (a block float's tiles as the matmuls
+# read them, one worker's nearest bank and farthest) and a read's latency, NoC latency, the rates of the Tensix units a
+# kernel feeds (MVMUL alone, a matmul step with its unpacks at 1, 2 and 4 fidelity phases, the packer, the SFPU),
+# BRISC's scalar work for a mixture of experts and sampling (topk, group), and PCIe both ways. Each decides something:
+# DEPTH and the weights' layout in DRAM, the fidelity a matmul can use before its unpacks bound it, how many launches a
+# token can afford, whether a router's choices are cheap enough on a RISC-V core. Small kernels built from the
+# compiler's own pieces, timed by the tile's wall clock. On ttsim the numbers mean nothing (Tensix instructions take no
+# time there, the NoC and DRAM answer at once): it only checks that each probe runs.
 #   TTSIM=/path/to/libttsim.so python3 -m ferrite.probe [MiB] [out.json]   # MiB: how much to upload and read back (8); out.json:
 import functools, json, sys, time                                            # the numbers, for models/cost.py
 from ferrite import bh, pci
@@ -18,12 +19,18 @@ from ferrite.tensor import Tensor
 CLOCK = f"#define CLOCK (*(volatile unsigned *){bh.WALL_CLOCK:#x})  // the tile's wall clock, a count a cycle\n"
 EMPTY = "void kmain(volatile unsigned *a) {}"
 
-# BRISC alone: a[3] reads of a 2 KiB tile in flight at once, a[4] rounds of them, worker a[0]'s tiles from DRAM at a[2]
+# BRISC alone: a[3] reads of a[6] bytes in flight at once, a[4] rounds of them, worker a[0]'s from DRAM at a[2], interleaved
+# over the banks as tiles are, or all from the bank at NoC x | y << 6 a[7] if it is not 0; each read as two requests, a[8]
+# bytes and then the rest, if a[8] is not 0 (a block float's tile, its exponents then its values, as getb reads it)
 DRAM_READS = CLOCK + BANKS + f"""
 void kmain(volatile unsigned *a) {{
-  unsigned d = a[3], t0 = CLOCK;
+  unsigned d = a[3], n = a[6], s = a[8], t0 = CLOCK;
   for (unsigned r = 0; r < a[4]; r++) {{
-    for (unsigned i = 0; i < d; i++) {{ unsigned t = a[0] * d + i; noc_get(BANK(t), AT(a[2], t, 2048), {DATA:#x} + i * 2048, 2048); }}
+    for (unsigned i = 0; i < d; i++) {{
+      unsigned t = a[0] * d + i, xy = a[7] ? a[7] : bank[t % {len(bh.DRAM)}], at = a[7] ? a[2] + t * n : AT(a[2], t, n), l1 = {DATA:#x} + i * n;
+      if (s) noc_get(xy & 63, xy >> 6, at, l1, s);
+      noc_get(xy & 63, xy >> 6, at + s, l1 + s, n - s);
+    }}
     noc_wait();
   }}
   a[5] = CLOCK - t0;
@@ -93,23 +100,36 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
   rows.append(("MVMUL alone", 64 * n / max(timed(k["mvmul"], (n,), 1), 1), 1, "per cycle"))
   rows.append(("pack a bf16 tile", timed(k["pack"], (n,), 1) / n, None, "cycles"))
   rows.append(("SFPU exp of a tile", timed(k["exp"], (n,), 1) / n, None, "cycles"))
-  # BRISC's scalar work, a mixture of experts': a token's best 8 of 128 experts (topk), a 256-token prompt's 2048 choices grouped by expert
-  since = rt.launches
-  Tensor.of(rt, [[float(i * 37 % 128) for i in range(128)]]).topk(8)
-  rt.wait()
-  rows.append(("topk, a token's 8 of 128 experts", rt.profile(since)[0][2], None, "cycles"))
-  since = rt.launches
-  Tensor.of(rt, [[(r * 8 + j) * 37 % 128 for j in range(8)] for r in range(256)], "int32").group(128)
-  rt.wait()
-  rows.append(("group, 256 tokens' 8 of 128 experts", rt.profile(since)[0][2], None, "cycles"))
-  # DRAM: one worker, then all, by reads in flight (bandwidth from the slowest worker's cycles)
-  for depth in (1, 2, 4, 8):
-    at = rt.dram_alloc(-(-workers * depth // len(bh.DRAM)) * 2048)
-    one = 2048 * depth * rounds / max(timed(k["dram"], (at, depth, rounds), 1, at=5), 1) * hz / 1e9
-    timed(k["dram"], (at, depth, rounds), workers, at=5)
-    every = 2048 * depth * rounds * workers / max(max(result(c, 5) for c in rt.cores), 1) * hz / 1e9
-    rows += [(f"DRAM reads, {depth} in flight: one worker", one, None, "GB/s"), (f"DRAM reads, {depth} in flight: all workers", every, bh.DRAM_GBPS, "GB/s")]
+  # BRISC's scalar work, a mixture of experts' and sampling's: a token's best 8 of 256 experts (topk), a 256-token prompt's
+  # 2048 choices grouped by expert, a row's 64 largest of a 2,560-wide part of a vocabulary's logits (fp32, serve's heads)
+  for what, run in (("topk, a token's 8 of 256 experts", lambda: Tensor.of(rt, [[float(i * 37 % 256) for i in range(256)]]).topk(8)),
+                    ("group, 256 tokens' 8 of 256 experts", lambda: Tensor.of(rt, [[(r * 8 + j) * 37 % 256 for j in range(8)] for r in range(256)], "int32").group(256)),
+                    ("topk, a row's 64 of 2,560 logits", lambda: Tensor.of(rt, [[float(i * 37 % 2560) for i in range(2560)]], "fp32").topk(64))):
+    since = rt.launches
+    run()
+    rt.wait()
+    rows.append((what, rt.profile(since)[0][2], None, "cycles"))
+  # DRAM (bandwidth from the slowest worker's cycles): every worker by request size and reads in flight, interleaved over
+  # the banks as tiles are; a block float's tiles as the matmuls read them (bfp8's 1,088 bytes, bfp4's 576, each in two
+  # requests); one worker from its nearest bank and from the farthest; one 64-byte read alone (its latency) and gather's
+  # 64 in flight
+  def dram(size, depth, units, bank=0, split=0):  # the slowest of the units' cycles for their rounds, and GB/s
+    at = rt.dram_alloc(-(-units * depth // len(bh.DRAM)) * size if not bank else depth * size)
+    timed(k["dram"], (at, depth, rounds, 0, size, bank, split), units, at=5)
     rt.dram_free(at)
+    cycles = max(max(result(c, 5) for c in rt.cores[:units]), 1)
+    return cycles, size * depth * rounds * units / cycles * hz / 1e9
+  for size in (2048, 8192, 16384):
+    rows += [(f"DRAM reads of {size >> 10} KiB, {d} in flight: all workers", dram(size, d, workers)[1], bh.DRAM_GBPS, "GB/s") for d in (1, 2, 4, 8, 16)]
+  for name, size in (("bfp8", 1088), ("bfp4", 576)):
+    rows += [(f"DRAM reads of {name} tiles in two requests, {d} in flight: all workers", dram(size, d, workers, split=64)[1], bh.DRAM_GBPS, "GB/s") for d in (4, 8)]
+  distance = lambda xy: abs((xy & 63) - first[0]) + abs((xy >> 6) - first[1])
+  near, far = (f(map(bh.noc_xy, *zip(*bh.DRAM)), key=distance) for f in (min, max))
+  for size in (2048, 16384):
+    rows += [(f"DRAM reads of {size >> 10} KiB, 16 in flight: one worker, its {which} bank", dram(size, 16, 1, bank)[1], None, "GB/s")
+             for which, bank in (("nearest", near), ("farthest", far))]
+  rows += [("DRAM read of 64 bytes, alone: one worker", dram(64, 1, 1)[0] / rounds, None, "cycles"),
+           ("DRAM reads of 64 bytes, 64 in flight: all workers", dram(64, 64, workers)[1], bh.DRAM_GBPS, "GB/s")]
   # NoC: a word there and back, between neighbours and across the grid
   for name, j in (("neighbours", 1), ("far apart", workers - 1)):
     cycles = timed(k["ping"], (0, j, bh.noc_xy(*first), bh.noc_xy(*rt.cores[j]), rounds, rt.launches << 16), workers, at=8)
@@ -135,5 +155,5 @@ if __name__ == "__main__":
   sim = isinstance(chip.pci, pci.Sim)
   print("ttsim: these numbers check that each probe runs, they are not silicon's" if sim else f"{chip.pci.sys}: the card")
   rows = probe(chip, upload=(int(sys.argv[1]) if len(sys.argv) > 1 else 8) << 20)
-  for what, value, against, unit in rows: print(f"  {what:48s} {value:12.2f} {unit:9s}" + (f" (bound: {against})" if against is not None else ""))
+  for what, value, against, unit in rows: print(f"  {what:72s} {value:12.2f} {unit:9s}" + (f" (bound: {against})" if against is not None else ""))
   if len(sys.argv) > 2: json.dump({what: value for what, value, _, _ in rows}, open(sys.argv[2], "w"), indent=1)
