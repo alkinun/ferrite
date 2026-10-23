@@ -52,4 +52,4 @@ unknown.
 
 ## License
 
-Apache-2.0 (`LICENSE`), as tt-metal's.
+Apache-2.0 (`LICENSE`).
