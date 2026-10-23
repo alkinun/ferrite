@@ -482,7 +482,9 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
 shared one; a vocabulary of 248,320). Real blocks are within 0.22% of transformers in numpy and about 1% a block on
 ttsim. Token accuracy in numpy over the whole model: bf16 top-1 99.6%, top-5 100%; every expert matrix in bfp4, the rest
 and the KV cache in bfp8 (21.7 GB, one card) 92.0% and 94.2%; the experts' gate and up in bfp4 and the rest in bfp8
-(27.2 GB) 93.8% and 96.0%. Tenstorrent's performance mode runs Llama-3.1-8B at 90% top-1.
+(27.2 GB) 93.8% and 96.0%. Tenstorrent's performance mode runs Llama-3.1-8B at 90% top-1. The multi-token prediction
+layer's draft is the model's own greedy pick at 94.3% of the places past the prompt (92.5% over all 1,022), in numpy
+in bf16 over the same text.
 
 ## Serving
 
@@ -521,7 +523,9 @@ values for every eight tile rows of each query head. The card is its specificati
 664 TFLOPS at one fidelity phase; a microsecond a launch) until the probe measures it (`probe=probe.json`).
 
 For Qwen3.6 on one card (experts bfp4, KV cache bfp8, sessions of 32K tokens): 25 sessions; 93 tokens/s for one user,
-237 a card at eight users, 273 at sixteen; a 32K-token prompt in 2.1 s.
+237 a card at eight users, 273 at sixteen; a 32K-token prompt in 2.1 s. Decoding speculatively with 94% of drafts taken
+(`accept=0.94`; it pays above 44% at one user and 55% at eight): 22 sessions, 125 tokens/s for one user, 61 each and 243
+a card at four, 295 a card at eight.
 
 ## tinygrad on ferrite
 
