@@ -29,7 +29,7 @@ cache, and both write the same tokens, " a question that has been".
 |---|---|---|---|
 | a decode token, replayed | **158k cycles** | **175k** | 1,602k (performance or accuracy mode) |
 | the prompt's prefill, 5 tokens | **180k** | **198k** | 2,108k (performance; 3,064k the first time) |
-| a decode step for 32 users, a token each | **677k** | **695k** | 1,829k (performance) |
+| a decode step for 32 users, a token each | **633k** | **651k** | 1,829k (performance) |
 | a decode token at place 1000 (a cache of 1024) | **196k** | **214k** | 1,602k (performance) |
 | launches a decode token | **358** | **358** | about 1,360 TT-NN operations, each one or more programs |
 | weights read a decode token | 269 MB | 143 MB | 116 MB (performance), 168 MB (accuracy) |
@@ -48,10 +48,10 @@ tiles a head on 9 workers, is 43k of the 196k against 13k at 32 places, and the 
 rate ferrite would reach TT's 1.6M near 37,000 places, far past SmolLM's 2,048.
 
 32 users decoding together (all from the same prompt, each at its own places; `llama.forward`'s slots, TT's batch)
-take ferrite 2.7 times fewer cycles a step than TT, 21k a token against 57k. Batching gains TT more: it computes 32
-rows for one user anyway, so 32 users cost it 14% more than one, and ferrite 4.3 times one. Both read each user's
+take ferrite 2.9 times fewer cycles a step than TT, 20k a token against 57k. Batching gains TT more: it computes 32
+rows for one user anyway, so 32 users cost it 14% more than one, and ferrite 4.0 times one. Both read each user's
 own rows; ferrite moves each block's queries into a batch entry of each key head and user, and the output back, a
-few datums at a time: 449k of its 677k cycles (NOTES, "A Llama-family model").
+few datums at a time: 405k of its 633k cycles (NOTES, "A Llama-family model").
 
 What it could mean on a card: if silicon's RISC-V control work is anything like ttsim's count (in-order cores, about
 an instruction a clock at 1.35 GHz), TT's 1.6M cycles are 1.2 ms of control a token, five times its 0.23 ms of DRAM
@@ -60,7 +60,7 @@ as fast as its weights can be read and TT does not. ttsim's NoC and DRAM answer 
 both, and only a card can say how far apart they are; SmolLM-135M is small, so control is a large share of its time,
 and in a bigger model DRAM is a larger share for both. Both replay a decode step, so the host's part is small: ferrite's
 is 0.1 to 0.2 ms of Python a token (measured), TT's trace was not measured. At 32 users the same reckoning gives
-ferrite 0.50 to 0.51 ms of control a step against its weights' 0.28 (bfp8) or 0.53 ms (bf16), and TT 1.36 ms against
+ferrite 0.47 to 0.48 ms of control a step against its weights' 0.28 (bfp8) or 0.53 ms (bf16), and TT 1.36 ms against
 0.23 ms: about 60 thousand tokens a second against 23 thousand, if control is what ttsim counts.
 
 ### A bigger one: SmolLM2-360M

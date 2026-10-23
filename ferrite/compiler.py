@@ -1436,13 +1436,16 @@ def move_kernel(dtype):
 #define CACHE {DATA + tb:#x}
 typedef {"unsigned short" if ITEMSIZE[dtype] == 2 else "unsigned"} datum;
 {ROWS}
-static unsigned held[{MOVE_SLOTS}];  // tile number + 1 of what each cache slot holds (0: nothing yet)
+// What each cache slot holds, x's tile number and the launch it came in: kept from launch to launch (in .data, which the
+// statics zeroed at each launch are not), so no launch spends a store a slot clearing it, and a launch's own number
+// makes another's tiles none of its own
+__attribute__((section(".data"))) static unsigned held[{MOVE_SLOTS}], came[{MOVE_SLOTS}], launch;
 static volatile datum *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
   unsigned s = t % {MOVE_SLOTS};
-  if (held[s] == t + 1) return (volatile datum *)(CACHE + s * {tb});
+  if (held[s] == t && came[s] == launch) return (volatile datum *)(CACHE + s * {tb});
   noc_get(BANK(t), AT(base, t, {tb}), CACHE + s * {tb}, {tb});
   noc_wait();
-  held[s] = t + 1;
+  held[s] = t, came[s] = launch;
   return (volatile datum *)(CACHE + s * {tb});
 }}
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
@@ -1467,6 +1470,7 @@ static int to(int k, int n, int lo, int hi) {{
 }}
 void kmain(volatile unsigned *a) {{
   unsigned base = a[3], bstride = a[4], stride = a[5], offset = a[6], xr = a[7], xc = a[8], rows = a[9], cols = a[10];
+  launch++;
   unsigned tr = (rows + 31) / 32, tc = (cols + 31) / 32;
   int e0 = a[11], sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18], hi_r = a[19], hi_c = a[20];
   // The datums go in lines along the result's rows, or down its columns when that is where they lie in x as runs (along
