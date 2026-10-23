@@ -26,7 +26,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), topk=topk,
                            silu=lambda a: a / (1 + np.exp(-a)), sigmoid=lambda a: 1 / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0),
                            mm=lambda a, b, phases, dtype=None: a @ b, experts=numpy_experts, where=np.where, minimum=np.minimum, maximum=np.maximum,
-                           sink_softmax=sink_softmax, exp=np.exp, log=np.log, float=lambda a: a, bf16=lambda a: a, now=lambda a: a, swap=lambda a: a.transpose(1, 0, 2),
+                           sink_softmax=sink_softmax, exp=np.exp, log=np.log, bf16=lambda a: a, now=lambda a: a, swap=lambda a: a.transpose(1, 0, 2),
                            cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None], assign=lambda a, b: a.__setitem__(..., b),
                            tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)),
                            parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to,
@@ -35,7 +35,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid,
                          repeat=Tensor.repeat_interleave, mm=lambda a, b, phases, dtype=None: a.matmul(b, dtype, fidelity=phases), topk=Tensor.topk,  # numpy's
                          experts=chip_experts, where=lambda cond, a, b: cond.where(a, b), minimum=Tensor.minimum, maximum=Tensor.maximum,  # products
-                         sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, float=Tensor.float, bf16=Tensor.bfloat16,  # are exact
+                         sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, bf16=Tensor.bfloat16,  # are exact
                          now=Tensor.realize, cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0),  # at any phases
                          swap=lambda a: a.permute(1, 0, 2),
                          assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
@@ -123,9 +123,9 @@ def delta(h, p, c, state, phases, live=None, accept=None):
   leave their states as they were). state: [the conv's last c.conv - 1 inputs (each place's a matrix, its sequences'
   rows), S (c.vh batch entries a sequence)], updated in place; S is each value head's memory (a key's width by a
   value's), which a token decays by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T
-  k)^T, and reads with its query. A speculative step's state also keeps both after its first token alone ([..., conv's, S]), and its accept row (1 or
-  0 a sequence) says which the next step goes on from: after both tokens, or after the first when its second, a
-  draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay
+  k)^T, and reads with its query. A speculative step's state also keeps both after its first token alone ([...,
+  conv's, S]), and its accept row (1 or 0 a sequence) says which the next step goes on from: after both tokens, or
+  after the first when its second, a draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side), conv (its taps), decay
   (-exp(A_log)), dt_bias, norm and o_proj. After the conv, in fp32 (as transformers computes it), a decode or verify
   step's tokens one at a time (step), else a chunk of at most 64 tokens at a time (chunk)."""
   f, (past, S) = fns(h), state[:2]
@@ -134,19 +134,19 @@ def delta(h, p, c, state, phases, live=None, accept=None):
   m, width, taps = n // seqs, 2 * qk + vw, p["conv"]  # each sequence's tokens; the conv's channels, and its taps (a batch entry each)
   live, cols = (None, None) if live is None else (live.reshape(seqs, 1, 1), live.reshape(1, seqs, 1))  # (the sequences as rows)
   if accept is not None:  # where a speculative step goes on from, computed before it is written over
-    a = accept.reshape(seqs, 1, 1)
-    past, S = f.now(state[2] + accept.reshape(1, seqs, 1) * (past - state[2])), f.now(state[3] + f.repeat(a, c.vh) * (S - state[3]))
+    past = f.now(state[2] + accept.reshape(1, seqs, 1) * (past - state[2]))
+    S = f.now(state[3] + f.repeat(accept.reshape(seqs, 1, 1), c.vh) * (S - state[3]))
   x = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32")
   keep = lambda old, new: new if live is None else old + cols * (new - old)
   big = lambda old, new: new if live is None else old + f.repeat(live, c.vh) * (new - old)
-  unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # each head's query and key to length 1
   def pieces(x, y, mm):  # q, k, v, beta and g of mm tokens of each sequence (x's and the conv's y), a batch entry a sequence's
     def each(t, d):       # head; a token's q and k as columns (step's), else rows
       if mm == 1 and seqs > 1: return t.reshape(seqs * t.shape[-1] // d, 1, d)
       heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
       return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, mm * d)).reshape(seqs * heads.shape[0], mm, d)
-    if mm == 1: q, k = (t * f.rsqrt(f.down(t * t) + 1e-6) for t in (y[:, a:a + qk].reshape(seqs * c.kh, c.kd, 1) for a in (0, qk)))  # to length 1
-    else: q, k = unit(each(y[:, :qk], c.kd)), unit(each(y[:, qk:2 * qk], c.kd))
+    unit = lambda t, total: t * f.rsqrt(total(t * t) + 1e-6)  # each head's query and key to length 1 (down a column, or along a row)
+    if mm == 1: q, k = (unit(y[:, a:a + qk].reshape(seqs * c.kh, c.kd, 1), f.down) for a in (0, qk))
+    else: q, k = (unit(each(y[:, a:a + qk], c.kd), lambda t: f.mean(t) * c.kd) for a in (0, qk))
     q = q * c.kd ** -0.5  # (a key head for r value heads)
     b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
     g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus, each head's log decay
