@@ -40,7 +40,7 @@ def fns(x):  # what numpy and ferrite spell differently: gpt2's, and what a Llam
                          sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, bf16=Tensor.bfloat16,  # are exact
                          now=Tensor.realize, cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0),  # at any phases
                          swap=lambda a: a.permute(1, 0, 2),
-                         assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 0),
+                         assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 1),
                          pad=lambda a, rows: a.pad(((0, 0), (0, rows), (0, 0))), empty=lambda shape: Tensor(x.rt, shape[1], shape[2], batch=shape[0], dtype="fp32"),
                          expand=lambda a, shape: a.expand(*shape), down=lambda a: a.sum(1), delta=Tensor.delta)
 
@@ -305,7 +305,7 @@ def chip_experts(h, p, ids, w, phases, limit=None):
   if dense: (picks, weights), x = ids.touched(e, w), h
   else:
     order, picks, places = ids.group(e)
-    x = h.gather(order).split(picks.rows, 0)
+    x = h.gather(order).split(picks.rows, 1)
   entries = picks.rows
   row = picks.reshape(1, entries).minimum(e - 1) if {"experts.gate_up_bias", "experts.down_bias"} & set(p) else None  # the picks as a row
   bias = lambda name: p[name].gather(row).reshape(entries, 1, p[name].cols)  # each entry's expert's bias (none's: the last's, weighted 0)
@@ -726,14 +726,14 @@ def main():
     if on_host: top1, top5_share, _ = accuracy(None, arrays(weights, c.precision), c, first, after, top5, steps)
     else:
       chip = Chip(pci.open_device())
-      rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+      rt = Runtime(chip)
       t = upload(rt, weights, c.precision)
       print(f"weights on the chip in {time.time() - start:.0f}s, {mode}")
       top1, top5_share, _ = accuracy(rt, t, c, first, after, top5, steps)
     return print(f"token accuracy over {steps} steps after a {len(first)}-token prompt{' in numpy' if on_host else ''}: top-1 {100 * top1:.1f}%, top-5 {100 * top5_share:.1f}%"
                  f" ({time.time() - start:.0f}s)")
   enc, chip = Tokenizer(folder), Chip(pci.open_device())
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   start = time.time()
   ids, agree = enc.encode(prompt), 0
   size = -(-(len(ids) + steps) // 32) * 32  # a row for each place the generation reaches, in whole tiles

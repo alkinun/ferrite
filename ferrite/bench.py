@@ -15,7 +15,7 @@ def bench(chip, m, k, n, weights="bf16", repeat=3):
   """Seconds per (m x k) @ (k x n) with B in weights' dtype, the TFLOPS that is, the GB/s of reading each input once,
   and how many times over they were read from DRAM; inputs of 1.0, so the result is checkable. Reads are counted as
   responses, one a bf16 tile and two a block float's (its exponents, its values)."""
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   a, b = (Tensor.frombytes(rt, r, c, b"\x80\x3f" * (r * c)) for r, c in ((m, k), (k, n)))  # bf16 1.0
   b = b.cast(weights).realize()
   assert (a @ b).tolist()[0][0] == k  # compiled, and right

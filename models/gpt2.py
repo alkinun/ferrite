@@ -150,7 +150,7 @@ def main():
   path, prompt, steps = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "The meaning of life is", int(sys.argv[3]) if len(sys.argv) > 3 else 8
   dtype = sys.argv[4] if len(sys.argv) > 4 else "bf16"
   enc, chip = tiktoken.get_encoding("gpt2"), Chip(pci.open_device())
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   start = time.time()
   weights = load(path)
   t = upload(rt, weights, dtype)

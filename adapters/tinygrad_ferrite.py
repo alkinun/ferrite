@@ -34,7 +34,7 @@ def runtime():
   global RT
   if RT is None:
     chip = Chip(pci.open_device())
-    RT = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+    RT = Runtime(chip)
   return RT
 
 def fold(shape):  # any rank as ferrite's (batch, rows, columns): all but the last axis are rows, so no tile pads a short axis

@@ -98,7 +98,7 @@ def main():
   from ferrite.chip import Chip
   from ferrite.runtime import Runtime
   chip = Chip(pci.open_device())
-  losses = train(Runtime(chip, chip.tensix[0], chip.tensix[-1]), int(sys.argv[1]) if len(sys.argv) > 1 else 300, log=print)
+  losses = train(Runtime(chip), int(sys.argv[1]) if len(sys.argv) > 1 else 300, log=print)
   mean = lambda i, part: sum(step[i] for step in part) / len(part)
   print(f"every step: loss within {max(abs(f - p) for f, p, _, _ in losses):.0e} of PyTorch's on the same weights, gradients within "
         f"{max(g for _, _, g, _ in losses):.0e}")

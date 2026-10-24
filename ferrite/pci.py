@@ -1,12 +1,12 @@
-# The device interface at the PCIe level: config space, BAR0, and host memory the device can DMA to.
-# Two backends with the same methods: Sim (ttsim's libttsim.so) and Card (a real card through sysfs).
+# The device interface at the PCIe level: config space, BAR0, and host memory the device can DMA to. Two backends with
+# the same methods: Sim (ttsim's libttsim.so) and Card (a real card through sysfs); and a whole-chip reset for a card.
 import array, ctypes, gc, mmap, os, time
 from ferrite import bh
 
 class Sim:
   """libttsim.so: a virtual Blackhole driven by forwarding config and BAR0 accesses, at PCI address bdf (a multi-chip
   build has several). The library is one per process: every Sim shares it, its clock and the host memory it reaches.
-  counts: whether it models NIU_MST_RD_DATA_WORD_RECEIVED, the bytes a core's reads bring in (ttsim-chaos does; ttsim
+  counts: whether it models NIU_MST_RD_DATA_WORD_RECEIVED, the 64-byte flits a core's reads bring in (ttsim-chaos does; ttsim
   as released stops on it), which Runtime.profile reports."""
   lib, dma, clocks, counts = None, [], 0, False  # the library; (bus address, size, host address, buffer); chip cycles run so far
   def __init__(self, path, bdf=0):
@@ -64,7 +64,7 @@ class Sim:
 class Card:
   """A real card from userspace: config space and BAR0 through sysfs, DMA memory from locked hugepages.
   Needs root, the kernel driver unbound, and the IOMMU off or in passthrough (bus address == physical address)."""
-  counts = True  # its NIUs count the bytes their reads bring in (Sim's)
+  counts = True  # its NIUs count what their reads bring in (see Sim)
   def __init__(self, bdf):
     if os.geteuid() != 0: raise PermissionError("a card wants root: its config space, its BARs, and physical addresses for DMA")
     self.sys = f"/sys/bus/pci/devices/{bdf}"
@@ -157,11 +157,11 @@ def reset(bdf, timeout=10.0):
     try:
       with open(f"{path}/config", "rb") as f: f.seek(0x04); return gone or not int.from_bytes(f.read(2), "little") & bh.RESET_MARKER
     except OSError: return False  # its config space does not answer yet
-  while not back():
-    if time.monotonic() > deadline: raise TimeoutError(f"{bdf} did not come back from its reset within {timeout}s")
-    time.sleep(0.1)
+  def until(cond, what):
+    while not cond():
+      if time.monotonic() > deadline: raise TimeoutError(f"{bdf} did not come back from {what} within {timeout}s")
+      time.sleep(0.1)
+  until(back, "its reset")
   _write(f"{path}/remove", "1")
   _write("/sys/bus/pci/rescan", "1")
-  while not os.path.exists(f"{path}/config"):
-    if time.monotonic() > deadline: raise TimeoutError(f"{bdf} did not come back from a rescan within {timeout}s")
-    time.sleep(0.1)
+  until(lambda: os.path.exists(f"{path}/config"), "a rescan")

@@ -27,6 +27,7 @@ DST_HALF = 64  # Dst rows of one result in fp32; Dst holds two, so math fills on
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2  # results in Dst to pack, outputs packed but not reported, and
                                                        # intermediates packed into L1 but not yet waited for
 SEM_UNPACKED = 1 << 5  # frames (and matmul steps) unpacked but not reported
+MAX_OPS = 15  # a fused kernel's ops at most: SEM_L1 counts their intermediates
 ACCS = ((256, 1 << 3), (320, 1 << 4))  # reductions accumulate here in Dst (scratch 128 rows on), each with a
                                        # semaphore that is 1 while it is free: taken by the first step, given back by the pack
 
@@ -591,15 +592,13 @@ static void unflag(unsigned a, unsigned b) {{
   for (unsigned k = 0; k < b; k++) FLAGS[{FLAGS_B} + k] = 0;
   l1_settle({FLAGS:#x});
 }}
-// n bytes of this L1 to the same place in the `tiles` other tiles of rect (end | start << 12), until all have them. A
-// multicast leaves the outstanding count wrong (up once, down once a tile), so nothing else may be in flight: cleared after
+// n bytes of this L1 to the same place in the `tiles` other tiles of rect (end | start << 12), until all have them
 static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles) {{
   noc_wait();
   unsigned acks = NIU(WR_ACKS) + (n + MAX_PACKET - 1) / MAX_PACKET * tiles;
   l1_settle(l1);
   for (unsigned k; n; l1 += k, n -= k) noc_issue(l1, noc_me(), l1, rect, MCAST, k = n < MAX_PACKET ? n : MAX_PACKET);
-  while (NIU(WR_ACKS) != acks) {{}}
-  NIU(CLEAR_OUTSTANDING) = 0xFFFF;
+  mcast_done(acks);
 }}
 // This worker's part of what a row or column of the grid shares, n bytes at l1 (read in already): to the same place in
 // the `tiles` other tiles of rect, then flag, set to v, the same way. Alone, it waits for the reads
@@ -634,9 +633,7 @@ static unsigned landed(void) {{  // until the next matmul step's tiles are in: B
 }}
 {KMAIN}
   {" ".join(f"CFG[{i}] = {v:#x};" for i, v in cfg.items())}
-  asm volatile("fence" ::: "memory");  // the config writes are out; a read from the same block is processed after them
-  (void)CFG[{next(iter(cfg))}];
-  asm volatile("fence" ::: "memory");  // and has answered, so no instruction pushed below can see them stale
+  l1_settle((unsigned)&CFG[{next(iter(cfg))}]);  // the config writes are in, so no instruction pushed below sees them stale
   {tt(thread() + SETUP_UNPACK)}
   tensix_idle();  // the semaphores are set before the other threads can touch them
   SYNC[READY] = 1;
@@ -767,7 +764,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   L = n[axis]  # the sweep's length
   assert all(ext(size(r), axis) in (1, L) for op in ops for r in operands(op)), "a kernel sweeps its lines at one length"
   swept = lambda r: r != "zero" and ext(size(r), axis) == L and not reduced(r)  # varies along the sweep; otherwise one tile a line
-  assert len(ops) <= 15, "SEM_L1 counts at most 15 intermediates"
+  assert len(ops) <= MAX_OPS, f"SEM_L1 counts at most {MAX_OPS} intermediates"
   # passes: a swept op runs in the pass after every reduction it depends on has finished; a narrow one is ready then
   ready, sweep = {}, {}  # ready: first pass a value can be read in; sweep: pass a reduction sweeps its operand in
   for j, op in enumerate(ops):
@@ -1171,7 +1168,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   ob = f"e * {parts} + part" if parts > 1 else "e"  # the result's batch entry
   # BRISC: a tile of ones, once; then for each unit its places, from them its tiles of keys (k0 to k1) and the whole
   # ones (f0 to f1, not included), told to the TRISCs as a frame fetched
-  start = (f"unsigned lo = ~0u, hi = 0; " +
+  start = ("unsigned lo = ~0u, hi = 0; " +
            each(f"noc_get(BANK({tile(18, 'e', 'i0 + r', 0)}), AT(a[18], {tile(18, 'e', 'i0 + r', 0)}, 4096), {places:#x} + r * 4096, 4096);") +
            " noc_wait(); " +
            each(f"volatile unsigned *t = (volatile unsigned *)({places:#x} + r * 4096); "
@@ -1210,11 +1207,11 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   largest = f"{m_slot} + r"
   take = f"for (; drained < upto; drained++) {{ {tt(TAKE_L1)} }}"  # (the last tile's largests, packed)
   unpacker = units(f"fetched(); {read} {tt(REPORT)}",
-                   f"fetched(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k}") + f" {tt(REPORT)}" if held else
-                   f"fetched(); unsigned upto = posted; " +
+                   "fetched(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k}") + f" {tt(REPORT)}" if held else
+                   "fetched(); unsigned upto = posted; " +
                    each(f"if (kt > k0) {{ {take} {tt(unpack(largest, ZERO_SLOT))} }} {tt(unpack(the_mask, ZERO_SLOT))} {walk_k} posted++;") + f" {tt(REPORT)}",
-                   "posted += nr;" if held else f"drain(); " + each(f"{tt(unpack(largest, ZERO_SLOT))} posted++;"),  # (each row's largest, across its tile)
-                   f"fetched(); drain(); " + each(f"{tt(unpack(the_mask, largest))} {walk_k} posted++;") + " drain(); "  # each row's p, packed
+                   "posted += nr;" if held else "drain(); " + each(f"{tt(unpack(largest, ZERO_SLOT))} posted++;"),  # (each row's largest, across its tile)
+                   "fetched(); drain(); " + each(f"{tt(unpack(the_mask, largest))} {walk_k} posted++;") + " drain(); "  # each row's p, packed
                    f"{on_v} " + each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(unpack(val('j'), f'{p_slot} + r'))} }}") + f" {off_v} " +
                    each(tt(unpack(ones, f"{p_slot} + r"))) + f" {tt(REPORT)}", "")  # (the sums' products after, the ones bf16)
   told = "fetched(); " + read + " needed += 2 * (k1 - k0 + 1);"  # (the unit's frames, which the math and pack threads need not wait for)
@@ -1751,7 +1748,7 @@ void kmain(volatile unsigned *a) {{
     for (unsigned q = 0; q < {kt}; q++) {{  // the unit's row of each result tile: its k picks there, 0 past them
       for (unsigned c = 0; c < 32; c++) {{
         unsigned j = q * 32 + c, v = 0, id = 0;
-        if (s < n && j < {k}) v = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], id = {f"((volatile unsigned *)(LABELS + j * 64))[at(s, col[j] % 32) % 16]" if labels else f"p * {cols} + col[j]"};
+        if (s < n && j < {k}) v = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], id = {"((volatile unsigned *)(LABELS + j * 64))[at(s, col[j] % 32) % 16]" if labels else f"p * {cols} + col[j]"};
         if (s < n && {k} * {parts} == 1) v = x[col[0] / 32 * 1024 + at(s, col[0] % 32)], id = {"((volatile unsigned *)LABELS)[at(s, col[0] % 32) % 16]" if labels else "col[0]"};  // (copies across)
         values[at(r, c)] = v, ids[at(r, c)] = id;
       }}
@@ -1882,6 +1879,7 @@ void kmain(volatile unsigned *a) {{
 }}""")
 
 LINK_L1, LINK_TILES = 0x20000, 4  # where a copy across an Ethernet link keeps its two slots in each end's tile, of so many tiles
+def link_flags(dtype): return LINK_L1 + 2 * LINK_TILES * tile_bytes(dtype), 48  # its two flags and credit: zeroed before a copy
 
 def link_kernel(send, dtype):
   """One end of a copy across an Ethernet link (Tensor.to), args [first unit, units, the tensor's address, its tiles, this

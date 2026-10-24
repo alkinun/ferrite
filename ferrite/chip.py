@@ -1,5 +1,5 @@
 # A Blackhole over its PCIe device interface: NoC reads and writes through a shared 2 MiB TLB window (or a TLB of its
-# own: map), waits with a timeout, ARC messages and telemetry, and core reset.
+# own: map), waits with a timeout, ARC messages and telemetry, core reset, and its Ethernet links (links, send).
 import struct, time
 from ferrite import bh
 
@@ -14,7 +14,7 @@ def tlb_config(**fields):
 class Chip:
   def __init__(self, pci, boot=2.0):  # boot: seconds to wait for ARC's firmware (minutes after a reset: umd allows 300)
     assert (ids := pci.cfg_read(0)) == bh.VENDOR | bh.DEVICE << 16, f"not a Blackhole: {ids:#x}"
-    self.pci, self.tlb, self.target = pci, 0, None  # TLB 0 is the shared window; map hands out the rest
+    self.pci, self.target = pci, None  # TLB 0 is the shared window; map hands out the rest
     self.free_tlbs, self.kept = iter(range(1, bh.TLB_COUNT)), {}
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
     assert int.from_bytes(pci.read(bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED, "the NoC is not translating coordinates, which bh's are"
@@ -32,7 +32,8 @@ class Chip:
     self.banks = [b for b in range(len(bh.DRAM)) if t[bh.TAG_GDDR_ENABLED] >> b & 1]  # the DRAM banks firmware enabled
     training = lambda: [self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 3 for b in self.banks]  # a bank's: 0 still training,
     self.wait(lambda: 0 not in training(), "finish GDDR training", 300)                         # 1 done, 2 or 3 failed
-    assert not (bad := [b for b, s in zip(self.banks, training()) if s != 1]), f"GDDR banks {bad} failed training (UMD retrains with ARC message 0xB6)"
+    bad = [b for b, s in zip(self.banks, training()) if s != 1]
+    assert not bad, f"GDDR banks {bad} failed training (UMD retrains with ARC message 0xB6)"
 
   def map(self, x, y, addr, start=None, tlb=None):
     """Point a TLB at the 2 MiB block holding NoC address (x, y, addr), or for writes at that block in every Tensix of
@@ -50,11 +51,11 @@ class Chip:
     for i in range(3): self.pci.write(bh.TLB_CONFIG + 12 * tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
     return tlb * bh.TLB_WINDOW + addr - base
 
-  def window(self, x, y, addr, start=None):  # the shared TLB, moved only when an access needs another block
+  def window(self, x, y, addr, start=None):  # the shared TLB, 0, moved only when an access needs another block
     base = addr & ~(bh.TLB_WINDOW - 1)
-    if self.target != (x, y, base, start): self.map(x, y, base, start, self.tlb)
+    if self.target != (x, y, base, start): self.map(x, y, base, start, 0)
     self.target = (x, y, base, start)
-    return self.tlb * bh.TLB_WINDOW + addr - base
+    return addr - base
 
   def chunks(self, x, y, addr, n, start=None):  # (BAR0 offset, size) pieces of [addr, addr+n), split where the window moves
     while n:
@@ -132,15 +133,17 @@ class Chip:
     self.wait(free, f"free Ethernet channel {ch}'s TX queue", timeout)
     for name, v in (("START", src), ("SIZE", n), ("DEST", dst), ("CMD", bh.ETH_TT_L1_WRITE)): self.write32(x, y, reg(name), v)
 
-if __name__ == "__main__":  # what a card says about itself: the first thing to run on one (or on ttsim, with TTSIM set);
-  import os, sys            # with `reset`, after resetting it (pci.reset), for a card whose NoC or firmware hangs
+# What a card says about itself: the first thing to run on one (or on ttsim, with TTSIM set); with `reset`, after
+# resetting it (pci.reset), for a card whose NoC or firmware hangs
+if __name__ == "__main__":
+  import os, sys
   from ferrite import pci
-  if sys.argv[1:] == ["reset"]:
+  if reset := sys.argv[1:] == ["reset"]:
     assert "TTSIM" not in os.environ, "ttsim has no reset: a new process starts it afresh"
     pci.reset(bdf := pci.find_cards()[0])
     dev = pci.Card(bdf)
   else: dev = pci.open_device()
-  chip = Chip(dev, 300 if sys.argv[1:] == ["reset"] else 2)
+  chip = Chip(dev, 300 if reset else 2)
   t = chip.telemetry()
   fw = ".".join(str(t.get(bh.TAG_FIRMWARE, 0) >> s & 255) for s in (24, 16, 8))
   print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware {fw} up, Tensix powered; AI clock {t.get(bh.TAG_AICLK, 0)} MHz; "

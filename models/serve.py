@@ -706,7 +706,7 @@ def main():
   folder, args = fetch(sys.argv[1]), sys.argv[2:] + [None] * 5
   port, slots, places, mode, kv = int(args[0] or 8000), int(args[1] or 4), int(args[2] or 512), args[3] or "bf16", args[4]
   chip = Chip(pci.open_device())
-  rt, start = Runtime(chip, chip.tensix[0], chip.tensix[-1]), time.time()
+  rt, start = Runtime(chip), time.time()
   c, weights = llama.load(folder, places)
   c.precision = llama.precision(c, mode, kv)
   chunk = 2048 if c.experts else 256  # a mixture of experts' chunk reads nearly all of every block's experts (cost.prompt)

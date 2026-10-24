@@ -113,7 +113,7 @@ def test_hello(chip):
 
 def test_every_core(chip):
   # every core but the dispatcher; each answers with its own coordinates, read from its NIU
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { a[0] = noc_me(); }"))
   rt.wait()
   assert len(rt.cores) == len(chip.tensix) - 1  # and one dispatcher
@@ -122,7 +122,7 @@ def test_every_core(chip):
 def test_relaunch_without_reset(chip):
   # different kernels at the same address, back to back (each loaded after the last is evicted): each must run, not a
   # stale copy of the one before
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[2])
+  rt = Runtime(chip, end=chip.tensix[2])
   cores = rt.cores
   for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 2):
     rt.evict()
@@ -140,7 +140,7 @@ def test_relaunch_without_reset(chip):
 def test_kernel_moves_data(chip):
   # each core pulls its own 40 KiB slice of DRAM into L1 (3 NoC packets), adds its index to every word, writes it
   # back elsewhere in DRAM, then sends its first 64 bytes to the next core's L1
-  rt, n = Runtime(chip, chip.tensix[0], chip.tensix[4]), 40 * 1024  # four workers in the first row
+  rt, n = Runtime(chip, end=chip.tensix[4]), 40 * 1024  # four workers in the first row
   cores, (bx, by), src, dst = rt.cores, bh.DRAM[3], 1 << 20, 2 << 20
   data = [random.randbytes(n) for _ in cores]
   for i, d in enumerate(data): chip.write(bx, by, src + i * n, d)
@@ -162,7 +162,7 @@ void kmain(volatile unsigned *a) {  // a: [index, 1, bank x, bank y, src, dst, n
 def test_queue(chip):
   # 100 launches queued back to back through a ring that holds 32 of them (64 bytes each): it fills, the host waits for
   # space, the dispatcher wraps around it three times. Each launch adds its index to a word in every worker's L1.
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[2], ring=2048)
+  rt = Runtime(chip, end=chip.tensix[2], ring=2048)
   for x, y in rt.cores: chip.write32(x, y, DATA, 0)
   add = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[2]; }")
   rt.load(add)  # once, before: then it stays
@@ -193,7 +193,7 @@ def test_profile(chip):
   # each launch's [go, last report] on the dispatcher's wall clock lands in host memory, and Runtime.profile adds them
   # up by name: three kernels, queued back to back four times, take about the time the host saw (the rest is between
   # launches)
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   x, y = (Tensor.of(rt, [[float((r + c * k) % 7) for c in range(256)] for r in range(256)]) for k in (1, 2))
   run = lambda: ((x + y).realize(), (x @ y).realize(), x.softmax().realize())
   run(), rt.wait()  # compiled
@@ -209,7 +209,7 @@ def test_bytes(chip):
   # tiles each in two reads, exponents and values; a gather, for each result tile, its ids' tile, the zero tile (a copy
   # within L1) and each row's two runs in their 64-byte blocks
   if not chip.pci.counts: pytest.skip("ttsim as released does not count read data: TTSIM=path/to/ttsim-chaos's libttsim.so runs it")
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(0)
+  rt, rng = Runtime(chip), np.random.default_rng(0)
   x, y = (Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()) for _ in range(2))
   a, b = Tensor.of(rt, rng.normal(0, 1, (32, 128)).tolist()), Tensor.of(rt, rng.normal(0, 1, (128, 64)).tolist()).cast("bfp4").realize()
   table, ids = Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()), Tensor.of(rt, [[3, 40, 7]], "int32")
@@ -224,7 +224,7 @@ def test_jit(chip, monkeypatch):
   # tensor.jit records a function's second call and replays its launches after: each later call copies its inputs in
   # and sends the same launches, building nothing (one realize, the copy, a call), and gets what the function would.
   # A block of matmuls, a softmax and a layer norm, and its DRAM: what the recording took stays where the replays write
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   rng = np.random.default_rng(7)
   w, v = (Tensor.of(rt, bf16(rng.normal(0, 0.1, (96, 96))).tolist()) for _ in range(2))
   f = lambda x: ((x @ w).relu() @ v).softmax().layernorm() * 2.0
@@ -240,18 +240,18 @@ def test_jit(chip, monkeypatch):
 def test_hung_kernel_times_out(chip):
   # a launch that never finishes is named, with each stuck worker's report: which of its cores are still in it (here
   # BRISC, then TRISC1 and BRISC, which waits for it), its kernel's counters, and its NoC requests in flight
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  rt = Runtime(chip, end=chip.tensix[1])
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]\n  \(1, 2\): launch 1 not finished by "
                      r"BRISC\n    SYNC fetched 0, .*; FLAGS set: none\n    NoC requests in flight by id: none"): rt.wait(timeout=0.2)
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  rt = Runtime(chip, end=chip.tensix[1])
   rt.launch(compile_kernel(None, None, "void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"\(1, 2\): launch 1 not finished by BRISC, TRISC1\n"): rt.wait(timeout=0.2)
 
 def test_dram_is_freed(chip):
   # first fit, 64-byte aligned; a freed block merges with the holes on both sides; a tensor gives its DRAM back once
   # nothing refers to it, intermediates included, so a loop of launches leaves DRAM as it found it
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  rt = Runtime(chip, end=chip.tensix[1])
   a, b, c = (rt.dram_alloc(n) for n in (100, 4096, 1))
   assert (a, b, c) == (0, 128, 128 + 4096)
   rt.dram_free(b)
@@ -275,7 +275,7 @@ def test_dram_is_freed(chip):
 
 def test_tile_math(chip):
   # one tile of small integers through unpack -> FPU -> pack: add, sub and mul must be exact
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  rt = Runtime(chip, end=chip.tensix[1])
   a = [[float((r * 32 + c) % 17 - 8) for c in range(32)] for r in range(32)]
   b = [[float((r + 3 * c) % 11 - 5) for c in range(32)] for r in range(32)]
   ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
@@ -285,7 +285,7 @@ def test_tile_math(chip):
 def test_tensor_math(chip):
   # random bf16 over 8 tiles on 8 workers. mul runs all four fidelity phases into fp32 Dst, so it is the exact product
   # rounded once by the packer; add and sub align mantissas at 11 bits first, so allow one bf16 step of the larger input
-  rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 128
+  rt, rows, cols = Runtime(chip), 64, 128
   a, b = ([[bf(random.uniform(-4, 4)) for _ in range(cols)] for _ in range(rows)] for _ in range(2))
   ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
   assert (ta * tb).tolist() == [[packed(x * y) for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
@@ -298,7 +298,7 @@ def test_tensor_math(chip):
 def test_numbers_once(chip):
   # a number in an elementwise kernel is a tile, read once by each worker into a slot of its own, not once a tile:
   # x * 0.5 + 1.5 over 768 tiles reads x and two tiles a worker
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   a = bf16(np.random.default_rng(6).normal(0, 1, (1024, 768)))
   x = Tensor.of(rt, a.tolist())
@@ -309,7 +309,7 @@ def test_numbers_once(chip):
 
 def test_matmul_exact(chip):
   # small integers, K = 2 tiles so Dst accumulates across them; then A @ I == A bit for bit, which pins the tile layout
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   a = [[float((r * 7 + c * 3) % 3 - 1) for c in range(64)] for r in range(32)]
   b = [[float((r * 5 + c) % 3 - 1) for c in range(32)] for r in range(64)]
   assert (Tensor.of(rt, a) @ Tensor.of(rt, b)).tolist() == [[sum(a[i][k] * b[k][j] for k in range(64)) for j in range(32)] for i in range(32)]
@@ -325,7 +325,7 @@ def test_matmul_exact(chip):
 def test_matmul_random(chip):
   # 64x96 @ 96x128: 8 output tiles on 8 workers, 3 K tiles each. Four fidelity phases make every product exact, Dst sums
   # in fp32, the packer rounds once to bf16: the error stays under one bf16 step of sum |a*b|
-  rt, (m, k, n) = Runtime(chip, chip.tensix[0], chip.tensix[-1]), (64, 96, 128)
+  rt, (m, k, n) = Runtime(chip), (64, 96, 128)
   a = [[bf(random.uniform(-1, 1)) for _ in range(k)] for _ in range(m)]
   b = [[bf(random.uniform(-1, 1)) for _ in range(n)] for _ in range(k)]
   got = (Tensor.of(rt, a) @ Tensor.of(rt, b)).tolist()
@@ -342,7 +342,7 @@ def test_matmul_blocks(chip):
   a = [[float((r * 7 + c * 3) % 5 - 2) for c in range(96)] for r in range(160)]
   b = [[float((r + 2 * c) % 3 - 1) for c in range(192)] for r in range(96)]
   for workers in (chip.tensix[1], chip.tensix[-1]):
-    rt = Runtime(chip, chip.tensix[0], workers)
+    rt = Runtime(chip, end=workers)
     y = (Tensor.of(rt, a) @ Tensor.of(rt, b)).realize()  # queued
     canary = Tensor.of(rt, [[1.0] * 192] * 160)
     assert y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(96)) for j in range(192)] for i in range(160)]
@@ -357,7 +357,7 @@ def test_matmul_fidelity(chip):
   # fewer fidelity phases leave out just the bits compiler.matmul says: A's last significand bit below three phases, B's
   # last three below two. 1 + 2^-7 is 1 and bf16's last bit, so X @ I keeps it from three phases up, I @ X from two;
   # and on random values, three phases stay within the bf16 rounding of four, two within that and 2^-7
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   x, eye = Tensor.full(rt, 64, 64, 1 + 2**-7), Tensor.of(rt, np.eye(64).tolist())
   for phases in (4, 3, 2, 1):
     assert x.matmul(eye, fidelity=phases).tolist()[0][0] == (1 + 2**-7 if phases >= 3 else 1.0), phases
@@ -375,7 +375,7 @@ def test_bfp(chip, dtype):
   # by its values, whichever way B comes in: streamed beside A (K past 256 tiles), with A's row kept (and shared, a
   # token's), shared by multicast in three buffers, a block's column kept (a batch), and K split; and fused with what
   # follows it and with a bf16 matmul, unpacker 0 switched to the block float for its steps and back
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   rng = np.random.default_rng(5)
   a = bf16(rng.normal(0, 1, (64, 96)) * np.exp(rng.normal(0, 2, (64, 96))))
   assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast(dtype))[0], gpt2.bfp(a, dtype))
@@ -396,7 +396,7 @@ def test_matmul_multicast(chip):
   # whose K stays whole (split K's batch would read its own tiles); B read transposed (a tile a read: the unpacker
   # transposes each face, the math walks the faces transposed); and an epilogue fused after, bit for bit the same as
   # unfused
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   rng = np.random.default_rng(3)
   for m, k, n, bt in ((320, 96, 416, False), (288, 1920, 224, False), (64, 512, 256, False), (352, 64, 200, True),
@@ -417,7 +417,7 @@ def test_matmul_indexed(chip):
   # the chip, so a replay reads whatever experts its tokens chose. One token's 8 experts (a grid row each, A's row
   # shared), 4 tokens' 3 each (12 entries, more than the grid's rows) and 40 tokens' 2 (the indices two tiles), in bf16
   # and bfp4: each entry bit for bit the plain matmul by its expert, and one that picks none (16) zeros
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(29)
+  rt, rng = Runtime(chip), np.random.default_rng(29)
   experts = Tensor.of(rt, rng.normal(0, 0.1, (16, 96, 160)).tolist())
   for wt in ("bf16", "bfp4"):
     w = experts if wt == "bf16" else experts.cast(wt).realize()
@@ -432,7 +432,7 @@ def test_stream_on_one_worker(chip):
   # one worker gets every tile, so the pipeline really cycles: L1 slots and Dst halves alternate, the threads hand
   # tiles along by semaphore, and BRISC fetches and writes back around them. 32 elementwise tiles, then a 128x96 @ 96x128
   # matmul: 16 output tiles of 3 steps each
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  rt = Runtime(chip, end=chip.tensix[1])
   a, b = ([[bf(random.uniform(-2, 2)) for _ in range(128)] for _ in range(256)] for _ in range(2))
   assert (Tensor.of(rt, a) * Tensor.of(rt, b)).tolist() == [[packed(x * y) for x, y in zip(ra, rb)] for ra, rb in zip(a, b)]
   x = [[float((r + 2 * c) % 5 - 2) for c in range(96)] for r in range(128)]
@@ -454,7 +454,7 @@ def test_fusion(chip):
   # them (SEM_L1); and the second tree's math has three ops in a row that read only inputs, so the third waits for the
   # pack thread to drain a Dst half (SEM_DST)
   for workers in (chip.tensix[1], chip.tensix[-1]):  # one worker cycling through 12 tiles, then a tile per worker
-    rt = Runtime(chip, chip.tensix[0], workers)
+    rt = Runtime(chip, end=workers)
     a, b, c, d = (Tensor.of(rt, [[bf(random.uniform(-3, 3)) for _ in range(96)] for _ in range(128)]) for _ in range(4))
     for build in (lambda a, b, c, d: (a + b) * c - d * a, lambda a, b, c, d: (a + b) * ((c - d) + a * a)):
       fused, launches = build(a, b, c, d), rt.launches
@@ -466,7 +466,7 @@ def test_fusion(chip):
 def test_fused_cast(chip):
   # a cast at the root of a tree is in its kernel: the packer is switched to the result's format for the root's pack and
   # back. Bit for bit what casting the computed value gives (a bf16 kernel's result is rounded first, as its pack would)
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(16)
+  rt, rng = Runtime(chip), np.random.default_rng(16)
   x, y = (Tensor.of(rt, rng.normal(0, 2, (70, 100)).astype(np.float32).tolist(), "fp32") for _ in range(2))
   a, b, c = (Tensor.of(rt, rng.normal(0, 2, shape).tolist()) for shape in ((70, 100), (70, 100), (100, 40)))
   for build in (lambda: (x * 3 + y).bfloat16(), lambda: (x * 50 + y).cast("int32"), lambda: (x * y).sum(1).bfloat16(),
@@ -482,7 +482,7 @@ def test_assign(chip):
   # assign writes a tensor's new value in place, into its own DRAM, so views of it see the value and a recorded call
   # (jit) can update weights: tile by tile when what computes it reads the tensor elementwise, and through a copy of
   # its own when a matmul reads it, since a matmul reads whole rows and columns of what it may overwrite
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(17)
+  rt, rng = Runtime(chip), np.random.default_rng(17)
   w0, m = (bf16(rng.uniform(-1, 1, shape)) for shape in ((64, 96), (96, 96)))
   w, tm = Tensor.of(rt, w0.tolist()), Tensor.of(rt, m.tolist())
   addr, view = w.addr, w[:, 32:64]
@@ -500,7 +500,7 @@ def test_matmul_fusion(chip):
   # Bit for bit the same as one launch per op, since it is rounded to bf16 on its way to L1 as it would be to DRAM
   rnd = lambda r, c: [[bf(random.uniform(-1, 1)) for _ in range(c)] for _ in range(r)]
   for workers in (chip.tensix[1], chip.tensix[-1]):  # one worker cycling through 8 tiles, then a tile per worker
-    rt = Runtime(chip, chip.tensix[0], workers)
+    rt = Runtime(chip, end=workers)
     a, b, c, d, e, f = (Tensor.of(rt, rnd(*shape)) for shape in ((64, 96), (96, 128), (64, 128), (64, 128), (64, 64), (64, 128)))
     for build in (lambda: (a @ b) + c, lambda: (a @ b) * d - c, lambda: (a @ b) + (e @ f)):
       launches, got = rt.launches, build().tolist()
@@ -525,7 +525,7 @@ def test_sfpu(chip):
   # edges. The Tensix flushes denormals to zero on the way in and out, so the reference does too: 1/denormal is inf,
   # exp(-100) is 0. On an input (through x + 0), and in place after an add, where exp sees the add's fp32 result: no
   # bf16 rounding in between, so the reference is exp of the exact sum
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[2])
+  rt = Runtime(chip, end=chip.tensix[2])
   flush = lambda v: 0.0 if abs(v) < 2**-126 else v
   x = [[bf(random.uniform(-6, 6)) for _ in range(64)] for _ in range(64)]
   x[0][:10] = map(bf, [0.0, -0.0, 1.0, -1.0, -100.0, 3.0e-39, 1e30, -1e30, math.inf, -math.inf])
@@ -563,7 +563,7 @@ def test_elementwise(chip):
   # what is built from them, against numpy: to a bf16 step where they compute, exactly where they compare or pick. The
   # edges too: 0, -0, a denormal (the Tensix flushes it to 0), inf, -inf, and negatives where only positives make sense
   # (NaN, which the packer turns into inf)
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(8)
+  rt, rng = Runtime(chip), np.random.default_rng(8)
   edges = [0.0, -0.0, 1.0, -1.0, 3e-39, np.inf, -np.inf, 0.5, 2.0, 100.0, -100.0]
   def make(lo, hi, extra=()):
     a = bf16(np.concatenate([edges, extra, rng.uniform(lo, hi, 40 * 64 - len(edges) - len(extra))]).reshape(40, 64))
@@ -599,7 +599,7 @@ def test_elementwise(chip):
 def test_reductions(chip):
   # row max exactly, row sum to a bf16 step of the sum of magnitudes, each a column; then broadcast back:
   # x - max(x) along rows, and a column times a number, all against Python
-  rt, rows, cols = Runtime(chip, chip.tensix[0], chip.tensix[-1]), 64, 96
+  rt, rows, cols = Runtime(chip), 64, 96
   x = [[bf(random.uniform(-4, 4)) for _ in range(cols)] for _ in range(rows)]
   tx = Tensor.of(rt, x)
   assert tx.max(2).tolist() == [[max(row)] for row in x]
@@ -621,7 +621,7 @@ def test_softmax_and_layernorm(chip):
   # layernorm(x) = (x - mean) * rsqrt(var + eps) * gamma + beta, gamma and beta rows, repeated down.
   # On one worker (3 rows in a row, slots and accumulators reused) and on many
   for workers, rows, cols in ((chip.tensix[1], 96, 128), (chip.tensix[-1], 64, 160)):
-    rt = Runtime(chip, chip.tensix[0], workers)
+    rt = Runtime(chip, end=workers)
     x = [[bf(random.gauss(0, 2)) for _ in range(cols)] for _ in range(rows)]
     tx = Tensor.of(rt, x)
     launches, got = rt.launches, tx.softmax().tolist()
@@ -649,7 +649,7 @@ def test_attend(chip):
   # Without parts, two launches, the attention and the division, and nothing read but what the places reach: rows
   # whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of keys and of values
   # once (the keys kept in L1 between the sweeps)
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(43)
+  rt, rng = Runtime(chip), np.random.default_rng(43)
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   for e, rows, hd, keys, rep, fmt, shared, window, lo, hi, parts in (
       (2, 40, 64, 64, 1, "bf16", False, 0, 0, 64, 1), (4, 8, 64, 96, 2, "bf16", False, 0, 0, 96, 1), (2, 33, 256, 128, 1, "bf16", True, 0, 0, 128, 1),
@@ -685,7 +685,7 @@ def test_reduce_axes(chip):
   # fused with what reads it. On one worker (a column of tiles cycling through the slots) and on many
   rng = np.random.default_rng(6)
   for workers in (chip.tensix[1], chip.tensix[-1]):
-    rt = Runtime(chip, chip.tensix[0], workers)
+    rt = Runtime(chip, end=workers)
     x = bf16(rng.uniform(-6, -1, (3, 45, 70)))
     tx = Tensor.of(rt, x.tolist())
     for axis in (0, 1, 2):
@@ -698,7 +698,7 @@ def test_reduce_axes(chip):
     assert abs(got.tolist()[0][0] - x.mean()) <= 2**-7 * abs(x.mean()) and kernels(rt, launches) == 3, "an axis a launch"
     launches = rt.launches
     close(tx.sum(0) * tx[1] - 1.0, x.sum(0) * x[1] - 1, 2**-6)  # the batch sum, a view and a number in one kernel
-    assert kernels(rt, launches) == 1, "fused" 
+    assert kernels(rt, launches) == 1, "fused"
     y = bf16(rng.uniform(-2, 2, (2, 45, 200)))  # reductions of another length than the result along the axis: first, alone
     ty = Tensor.of(rt, y.tolist())
     close(tx[0:1, :, :].max(1) * ty[:, :, :70] + 1.0, x[0:1].max(1, keepdims=True) * y[:, :, :70] + 1, 2**-6)
@@ -714,7 +714,7 @@ def test_any_shape(chip):
   # home with zero padding (a matmul of two results needs that, or the padding of K adds in), and row reductions mask
   # their last tile's padding (with every value negative, an unmasked 0 would be the max and add up in softmax). One
   # kernel serves every row count in the same tiles (a prompt's chunks of any length): its last tile's rows an argument
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(0)
+  rt, rng = Runtime(chip), np.random.default_rng(0)
   def make(rows, cols, lo=-2.0, hi=2.0):
     a = bf16(rng.uniform(lo, hi, (rows, cols)))
     return a, Tensor.of(rt, a.tolist())
@@ -745,7 +745,7 @@ def test_views_transpose_gelu(chip):
   # 64-column attention heads. Transpose is exact, of odd shapes and of views, and turns a filled row into a filled
   # column. A repeat of heads (grouped-query attention's) indexed, sliced and repeated again reads the right ones. gelu
   # against numpy, within the bf16 rounding of its steps
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(1)
+  rt, rng = Runtime(chip), np.random.default_rng(1)
   def make(rows, cols, lo=-2.0, hi=2.0):
     a = bf16(rng.uniform(lo, hi, (rows, cols)))
     return a, Tensor.of(rt, a.tolist())
@@ -768,7 +768,7 @@ def test_batch(chip):
   # a batch of matrices: elementwise ops broadcast over it (a batch of 1 repeats), row reductions and softmax per
   # matrix, matmul matrix by matrix (or by one matrix for all), views that split a matrix into a batch of heads and a
   # batch back into matrices, all against numpy. Shapes are cut short on purpose (40 rows)
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(4)
+  rt, rng = Runtime(chip), np.random.default_rng(4)
   def make(*shape):
     a = bf16(rng.uniform(-2, 2, shape))
     return a, Tensor.of(rt, a.tolist())
@@ -783,7 +783,7 @@ def test_batch(chip):
   close(ta @ tb, a @ b, 2**-6)
   close(ta @ tw + trow, a @ w + row, 2**-6)
   (qkv, tqkv), (kt, tkt) = make(40, 192), make(192, 40)  # 3 heads of 64: split columns, split rows
-  heads, keys = tqkv.split(3), tkt.split(3, axis=0)
+  heads, keys = tqkv.split(3), tkt.split(3, axis=1)
   assert heads.shape == (3, 40, 64) and np.array(heads.tolist()).tolist() == qkv.reshape(40, 3, 64).transpose(1, 0, 2).tolist()
   assert np.array(keys.tolist()).tolist() == kt.reshape(3, 64, 40).tolist()
   close(heads @ keys, qkv.reshape(40, 3, 64).transpose(1, 0, 2) @ kt.reshape(3, 64, 40), 2**-6)
@@ -795,7 +795,7 @@ def test_batch(chip):
   assert heads.merge().tolist() == qkv.tolist()  # side by side again: a copy, and a kernel's result written into its columns
   (m, tm) = make(64, 64)
   close((heads @ tm).merge(), (qkv.reshape(40, 3, 64) @ m).reshape(40, 192), 2**-6)
-  one, a = Runtime(chip, chip.tensix[0], chip.tensix[1]), a[:, :20]  # last: it takes two of rt's cores. One worker, and one
+  one, a = Runtime(chip, end=chip.tensix[1]), a[:, :20]  # last: it takes two of rt's cores. One worker, and one
   close(Tensor.of(one, a.tolist()) @ Tensor.of(one, b.tolist()), a @ b, 2**-6)  # tile row a matrix: A's row in L1 changes with the matrix
 
 def test_movement(chip):
@@ -804,7 +804,7 @@ def test_movement(chip):
   # with tidy padding, so a matmul and a reduction can read it. Then random chains of moves, on one worker, whose cache
   # of tiles cycles
   rng = np.random.default_rng(7)
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   x = bf16(rng.uniform(-2, 2, (3, 45, 70)))
   tx = Tensor.of(rt, x.tolist())
   cases = [(tx.reshape(5, 27, 70), x.reshape(5, 27, 70)), (tx.reshape(63, 150), x.reshape(63, 150)),
@@ -834,7 +834,7 @@ def test_movement(chip):
   w = bf16(rng.uniform(-1, 1, (50, 20)))
   close(tx[0][5:40, 10:60] @ Tensor.of(rt, w.tolist()), x[0, 5:40, 10:60] @ w, 2**-6)
   close(tx[:, 3:50, 5:69].sum(1) * (1 / 47), x[:, 3:50, 5:69].sum(1, keepdims=True) / 47, 2**-7)
-  one = Runtime(chip, chip.tensix[0], chip.tensix[1])
+  one = Runtime(chip, end=chip.tensix[1])
   def move(t, a):  # a random move of t and the same of numpy's a; batches stay small
     b, r, c = a.shape
     kind = rng.choice(["reshape", "permute", "slice", "pad", "expand" if 1 in a.shape else "slice"])
@@ -878,7 +878,7 @@ def test_fp32(chip):
   rng = np.random.default_rng(9)
   f32 = lambda *shape: rng.uniform(-2, 2, shape).astype(np.float32)
   for workers in (chip.tensix[1], chip.tensix[-1]):
-    rt = Runtime(chip, chip.tensix[0], workers)
+    rt = Runtime(chip, end=workers)
     x, y = f32(2, 45, 70), f32(2, 45, 70)
     tx, ty = Tensor.of(rt, x.tolist(), "fp32"), Tensor.of(rt, y.tolist(), "fp32")
     launches, got = rt.launches, value((tx + ty) * tx - ty * 1.5)
@@ -919,7 +919,7 @@ def test_int32(chip):
   rng = np.random.default_rng(10)
   wrap = lambda a: (a + 2**31) % 2**32 - 2**31
   for workers in (chip.tensix[1], chip.tensix[-1]):
-    rt = Runtime(chip, chip.tensix[0], workers)
+    rt = Runtime(chip, end=workers)
     x, y, s = rng.integers(-2**31 + 1, 2**31, (45, 70)), rng.integers(-2**31 + 1, 2**31, (45, 70)), rng.integers(-99, 100, (45, 70))
     x[0, :5], s[0, :3] = [0, -1, 1, 2**31 - 1, -2**31 + 1], [3, 0, -3]
     tx, ty, ts = (Tensor.of(rt, a.tolist(), "int32") for a in (x, y, s))
@@ -939,7 +939,7 @@ def test_autograd(chip):
   # and its gradient by central differences in float64. fp32 tensors, odd shapes, broadcasting; matmuls to the FPU's
   # 2^-11, the rest to fp32's rounding. Then a bf16 leaf (its gradient comes back through the cast), a tensor read twice
   # (gradients add), and .grad adding up over two backward passes
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(11)
+  rt, rng = Runtime(chip), np.random.default_rng(11)
   softmax = lambda a, ax: np.exp(a - a.max(ax, keepdims=True)) / np.exp(a - a.max(ax, keepdims=True)).sum(ax, keepdims=True)
   norm = lambda a: (a - a.mean(2, keepdims=True)) / np.sqrt(a.var(2, keepdims=True) + 1e-5)
   ew, row, col, pos = ((2, 20, 40), (-1, 1)), ((1, 1, 40), (-1, 1)), ((1, 20, 1), (-1, 1)), ((2, 20, 40), (0.5, 2))
@@ -1000,7 +1000,7 @@ def test_fuzz(chip, monkeypatch):
   # random expressions (elementwise ops with broadcasting, unary ops, reductions along any axis, matmuls; odd shapes,
   # batches), and every kernel they turn into checked against numpy on the same inputs, read back from the chip:
   # whatever bf16 rounding piles up through a tree, each kernel must be right about its own inputs
-  rt, checked = Runtime(chip, chip.tensix[0], chip.tensix[-1]), []
+  rt, checked = Runtime(chip), []
   def numpy(e, xs):
     if isinstance(e, int): return xs[e]
     v = [numpy(s, xs) for s in e[1:]]
@@ -1066,7 +1066,7 @@ def test_mnist_mlp(chip):
   # numpy in float64. Two launches: matmul + bias + relu, then matmul + bias. Random weights (no dataset here); the
   # logits must match closely and so must the predicted classes, wherever the top two are not a near tie. K = 784 is
   # 25 tiles, more than the result is wide (which once made the kernel sweep the wrong tiles)
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(2)
+  rt, rng = Runtime(chip), np.random.default_rng(2)
   x = bf16(rng.uniform(0, 1, (16, 784)))
   w1, b1 = bf16(rng.normal(0, 784**-0.5, (784, 128))), bf16(rng.normal(0, 0.1, (1, 128)))
   w2, b2 = bf16(rng.normal(0, 128**-0.5, (128, 10))), bf16(rng.normal(0, 0.1, (1, 10)))
@@ -1084,7 +1084,7 @@ def test_mnist_cnn(chip):
   # a small CNN: MNIST-shaped images through a 3x3 convolution (1 -> 8 channels, padded) and relu, a 2x2 max pool, a
   # 3x3 convolution (8 -> 16) and relu, a pool, and 784 -> 10, against numpy in float64; random weights, as above. Each
   # convolution is one matmul by the stacked patches, each of whose 9 taps is one move
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3)
+  rt, rng = Runtime(chip), np.random.default_rng(3)
   w1, b1 = bf16(rng.normal(0, 1 / 3, (8, 1, 9))), bf16(rng.normal(0, 0.1, (8, 1, 1)))
   w2, b2 = bf16(rng.normal(0, 72**-0.5, (16, 8, 9))), bf16(rng.normal(0, 0.1, (16, 1, 1)))
   w3, b3 = bf16(rng.normal(0, 784**-0.5, (784, 10))), bf16(rng.normal(0, 0.1, (1, 10)))
@@ -1107,7 +1107,7 @@ def test_train(chip):
   # of the largest: the matmul's 2^-11, compounded), the step recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1
   # together, so a replay sends them in parts); the loss falling; and the first step the same as PyTorch's own
   pytest.importorskip("torch")
-  losses = train.train(Runtime(chip, chip.tensix[0], chip.tensix[-1]), 5, data=" ".join(map(str, range(3000))))
+  losses = train.train(Runtime(chip), 5, data=" ".join(map(str, range(3000))))
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
@@ -1123,7 +1123,7 @@ def test_tinygrad(chip):
   from adapters import tinygrad_ferrite
   from tinygrad import Tensor, TinyJit, dtypes, function, nn
   from tinygrad.helpers import Context
-  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])  # FERRITE on this process's chip
+  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip)  # FERRITE on this process's chip
   rng = np.random.default_rng(14)
   a, b, w = (rng.standard_normal(shape).astype(np.float32) for shape in ((2, 3, 40), (2, 3, 40), (40, 5)))
   cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.max(-1), lambda x, y, w: x.exp().log(),
@@ -1198,9 +1198,9 @@ def test_torch_frontend(chip):
   torch = pytest.importorskip("torch")
   from adapters import tinygrad_ferrite
   from tinygrad.helpers import Context
-  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip)
   with Context(DEV="FERRITE"):  # tinygrad's device for the "tiny" one, read at each op
-    import extra.torch_backend.backend  # registers "tiny" with PyTorch (its C++ part built once, then cached)
+    import extra.torch_backend.backend  # noqa: F401 -- registers "tiny" with PyTorch (its C++ part built once, then cached)
     g = torch.Generator().manual_seed(0)
     a, b, w = torch.randn(4, 40, generator=g), torch.randn(4, 40, generator=g), torch.randn(40, 24, generator=g)
     image, kernel, norm = torch.randn(1, 2, 10, 10, generator=g), torch.randn(3, 2, 3, 3, generator=g), torch.nn.LayerNorm(40)
@@ -1239,7 +1239,7 @@ def test_tinygrad_llm(chip):
   from tinygrad import Tensor as TT, dtypes, nn
   from tinygrad.helpers import Context
   from tinygrad.llm.model import Transformer, TransformerConfig
-  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = tinygrad_ferrite.RT = tinygrad_ferrite.RT or Runtime(chip)
   c, w = smol(np.random.default_rng(37), 2)
   sd = {"token_embd.weight": w["embed"], "output.weight": w["embed"], "output_norm.weight": w["norm"][0]}
   for l in range(2):  # tinygrad's Linear has (out, in), as Hugging Face's; q, k and v, and gate and up, apart
@@ -1269,7 +1269,7 @@ def test_gpt2_layer(chip, n, dtype, size):
   # biases and norms about 0 and 1 but 0.1 wide, so that they count; the attention is causal and not uniform (scores of
   # a few units). Every intermediate is bf16 here, so the block's change to x (up to ~2) must match to within 3% of its
   # size
-  rt, rng, d = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3), 768
+  rt, rng, d = Runtime(chip), np.random.default_rng(3), 768
   shapes = {"ln_1.weight": (1, d, 1), "ln_1.bias": (1, d, 0), "attn.c_attn.weight": (d, 3 * d, 0), "attn.c_attn.bias": (1, 3 * d, 0),
             "attn.c_proj.weight": (d, d, 0), "attn.c_proj.bias": (1, d, 0), "ln_2.weight": (1, d, 1), "ln_2.bias": (1, d, 0),
             "mlp.c_fc.weight": (d, 4 * d, 0), "mlp.c_fc.bias": (1, 4 * d, 0), "mlp.c_proj.weight": (4 * d, d, 0), "mlp.c_proj.bias": (1, d, 0)}
@@ -1295,7 +1295,7 @@ def test_gpt2_model(chip):
   # numpy with the same bf16 weights (in fp32 it matches Hugging Face's to 1e-4), and a pick numpy rates as good: first
   # " not" (407) by numpy, and " to" just 0.36 behind, closer than bf16's rounding through 12 blocks can tell apart (the
   # residual reaches 3000, where bf16 steps by 16). About 90 s on ttsim; models/gpt2.py generates text
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   weights = gpt2.load(os.environ["GPT2"])
   t, w, ids = gpt2.upload(rt, weights), gpt2.arrays(weights), [464, 3616, 286, 1204, 318]  # (tiktoken's gpt2 encoding)
   kv = gpt2.kv_cache(12, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist()))
@@ -1426,7 +1426,7 @@ def test_llama_layer(chip, n):
   # sharing 3 key and value heads, MLP 1536) on n tokens, its keys and values put into a cache of n places, against the
   # same code (models/llama.py) in numpy, float64, with the same bf16 weights and rotary tables. Every intermediate is bf16
   # here, so the block's change to x must match to within 3% of its size
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(12)
+  rt, rng = Runtime(chip), np.random.default_rng(12)
   c, w = smol(rng, 1)
   p = {k.removeprefix("layers.0."): v for k, v in w.items() if k.startswith("layers.0.")}
   x, (cos, sin, turn) = bf16(rng.normal(0, 1, (n, 576))), llama.rotary(c, n)
@@ -1444,7 +1444,7 @@ def test_kv_cache(chip):
   # keys and values at its place (data, not a shape) and seeing those before, against numpy doing the same. Every step
   # launches the same kernels, so from the third it is a replay (tensor.jit); and numpy's cached logits equal its full
   # recompute
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(13)
+  rt, rng = Runtime(chip), np.random.default_rng(13)
   c, w = smol(rng, 2)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
   kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
@@ -1466,7 +1466,7 @@ def test_topk(chip):
   # in parts, each part's 64 or 32 best side by side, and those parts' best given their indices as labels; and of a
   # matmul's softmax not yet computed, which the kernels of its max and of its columns once rounded apart (an index of 8
   # in 8 columns, when topk was passes of max), and none of their DRAM kept after
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(37)
+  rt, rng = Runtime(chip), np.random.default_rng(37)
   for batch, rows, cols, k in ((1, 1, 128, 8), (1, 3, 16, 4), (1, 40, 40, 1), (2, 33, 256, 32)):
     x = rng.normal(0, 2, (batch, rows, cols))
     x[0, -1, :3], x[0, -1, 3:] = [-0.0, 0.0, -0.0], -np.abs(x[0, -1, 3:]) - 1  # -0 and 0, equal and the largest
@@ -1507,7 +1507,7 @@ def test_moe(chip):
   # for bit as op by op; and a two-block
   # model of them decodes from a replay as it does op by op, so a replayed step reads whatever experts its token chose,
   # and near numpy
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
+  rt, rng = Runtime(chip), np.random.default_rng(31)
   experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
   c, w = SimpleNamespace(dim=64, k=4), experts(64, 16, 64)
@@ -1566,7 +1566,7 @@ def test_qwen3_moe(chip, tmp_path):
   assert (c.k, llama.head(c)) == (2, 32) and {"router", "experts.gate_up", "experts.down", "qk_norm", "qk_on"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.1.")}
   rel = lambda got: max(np.abs(got[r] - want[r]).max() / np.abs(want[r]).max() for r in range(len(ids)))
   assert rel(llama.forward(ids, list(range(8)), llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros), every=True)) < 0.005
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   on = lambda row: Tensor.of(rt, [row], "int32")
   got = gpt2.values(llama.forward(on(ids), on(list(range(8))), llama.upload(rt, weights), c, llama.kv_cache(c, 32, llama.zeros(rt)), every=True))
   assert rel(got) < 0.02 and np.array_equal(got.argmax(-1), want.argmax(-1)), rel(got)
@@ -1609,7 +1609,7 @@ def test_hf_families(chip, tmp_path, family):
   rel = lambda got: max(np.abs(got[r] - want[r]).max() / np.abs(want[r]).max() for r in range(len(ids)))
   numpy = rel(llama.forward(ids, list(range(8)), llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros), every=True))
   assert numpy < 0.005, numpy
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   on = lambda row: Tensor.of(rt, [row], "int32")
   got = gpt2.values(llama.forward(on(ids), on(list(range(8))), llama.upload(rt, weights), c, llama.kv_cache(c, 32, llama.zeros(rt)), every=True))
   ties = [want[r].max() - want[r][got[r].argmax()] <= 0.001 * np.ptp(want[r]) for r in range(len(ids))]  # its best, or one bf16 cannot tell from it
@@ -1653,7 +1653,7 @@ def test_qwen3_5_moe(chip, tmp_path, monkeypatch):
   numpy = llama.forward(ids, list(range(100)), w, c, kv, every=True)
   numpy_steps = [llama.forward([s], [100 + i], w, c, kv)[0] for i, s in enumerate(steps)]
   assert rel(numpy, want) < 0.005 and rel(numpy_steps, want_steps) < 0.005, (rel(numpy, want), rel(numpy_steps, want_steps))
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   on = lambda row: Tensor.of(rt, [row], "int32")
   t, ckv = llama.upload(rt, weights), llama.kv_cache(c, 128, llama.zeros(rt))
   got = gpt2.values(llama.forward(on(ids), on(list(range(100))), t, c, ckv, every=True))
@@ -1679,7 +1679,7 @@ def test_qwen3_5_sequences(chip):
   together = llama.delta(h, p, c, many[0], lambda op: None, np.array([[1.0, 0.0, 1.0]]))
   for u in (0, 2): assert np.allclose(together[u], llama.delta(h[u:u + 1], p, c, alone[u][0], lambda op: None)[0], atol=1e-5)
   assert np.array_equal(many[0][1][4:8], alone[1][0][1]), "a free slot's state as it was"
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   t, kv, np_kv = llama.upload(rt, weights), llama.kv_cache(c, 3 * size, llama.zeros(rt), 3), {u: llama.kv_cache(c, size, np.zeros) for u in prompts}
   on, ids = lambda row, d="int32": Tensor.of(rt, [row], d), {u: list(s) for u, s in prompts.items()}
   rel = lambda got, want: np.abs(got - want).max() / np.abs(want).max()
@@ -1707,7 +1707,7 @@ def test_delta_step(chip):
   # of the small Qwen3.5's heads, three of 64 by 96 (a dead one's conv and states left as they were) and four of
   # Qwen3.6's 32 heads of 128 by 128; a verify step from the states after both of the last step's tokens or after its
   # first alone, as accept says
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(1)
+  rt, rng = Runtime(chip), np.random.default_rng(1)
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
   for m in (1, 2):
     for n, kh, vh, kd, vd in ((1, 2, 4, 32, 32), (3, 2, 4, 64, 96), (4, 16, 32, 128, 128)):
@@ -1744,7 +1744,7 @@ def test_delta_pieces(chip):
     piece, S, _ = llama.chunk(*(t[:, s0:s0 + 64, :] for t in (q, k, v, beta, g)), S)
     assert np.abs(piece - o[:, s0:s0 + 64, :]).max() < 1e-6
   assert np.abs(after - S).max() < 1e-6
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   t, on = llama.upload(rt, weights), lambda row: Tensor.of(rt, [row], "int32")
   ids = [int(i) for i in rng.integers(0, 256, 150)]
   want = llama.forward(ids, list(range(150)), w, c, llama.kv_cache(c, 256, np.zeros), every=True)
@@ -1762,7 +1762,7 @@ def test_speculative(chip):
   rng = np.random.default_rng(37)
   c, weights = qwen35(rng)
   w, size = llama.arrays(weights), 32
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   t, kv = llama.upload(rt, weights), llama.kv_cache(c, 3 * size, llama.zeros(rt), 3, speculative=True)
   on, rel = lambda row, d="int32": Tensor.of(rt, [row], d), lambda got, want: np.abs(got - want).max() / np.abs(want).max()
   ref = lambda s: llama.forward(s, list(range(len(s))), w, c, llama.kv_cache(c, size, np.zeros), every=True)  # numpy, from nothing
@@ -1828,7 +1828,7 @@ from ferrite.chip import Chip
 from ferrite.runtime import Runtime
 from ferrite.tensor import Tensor
 chips = [Chip(pci.open_device(n)) for n in range(2)]
-rts = [Runtime(chip, chip.tensix[0], chip.tensix[-1]) for chip in chips]
+rts = [Runtime(chip) for chip in chips]
 for n, rt in enumerate(rts): assert (Tensor.of(rt, [[1.0, 2.0]]) * (n + 2)).tolist() == [[n + 2.0, 2 * n + 4.0]], n
 (a, links_a), (b, links_b) = (chip.links() for chip in chips)
 assert a != b and len(links_a) == len(links_b) == 2, (a, links_a, b, links_b)
@@ -1896,7 +1896,7 @@ def test_llama_8b_shapes(chip):
   # scaling), random weights, at TT's performance precision: B2's matmuls, casts and attention at their real sizes (the
   # logits over a vocabulary of 2048), a 64-token prompt and two decode steps against numpy. On ttsim the upload's casts
   # take minutes (the MLP's 4096 x 28672 to bfp4 is 114,688 tiles), which llama.upload waits for
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(8)
+  rt, rng = Runtime(chip), np.random.default_rng(8)
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=1, eps=1e-5, theta=500000.0, rope=rope, vocab=2048, ffn=14336, places=96)
   bits = lambda shape, scale, mean=0.0: gpt2.bf16_bits(rng.normal(mean, scale, shape))
@@ -1929,7 +1929,7 @@ def test_benchmark_load(chip, tmp_path):
   # B4's load (benchmark.load) against serve.py's server for a small model: two agents at once over HTTP, two turns each,
   # streamed; every turn's tokens come, and the second turns' prompts, each its first prompt and answer and more, are
   # mostly the server's cached rows (its slot held them)
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(37)
+  rt, rng = Runtime(chip), np.random.default_rng(37)
   c, w = smol(rng, 2, places=128)
   engine = serve.Engine(rt, {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, c, bytes_tokenizer(tmp_path), slots=2, places=128, chunk=32)
   threading.Thread(target=engine.run, daemon=True).start()
@@ -1944,7 +1944,7 @@ def test_chunked_prefill(chip):
   # not the prompt squared): 70 tokens in chunks of 32, 32 and 6, each chunk's keys and values cached before the next
   # reads them. In numpy, the logits of the prompt at once; on the chip, numpy's, and then a token decoded from the
   # cache the chunks filled
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(29)
+  rt, rng = Runtime(chip), np.random.default_rng(29)
   c, w = smol(rng, 2, places=96)
   t, prompt, on = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, [int(i) for i in rng.integers(0, 256, 70)], lambda row: Tensor.of(rt, [row], "int32")
   kv, np_kv = llama.kv_cache(c, 96, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 96, np.zeros)
@@ -1972,7 +1972,7 @@ def test_llama_precision(chip):
   assert [experts[k] for k in keys] == [("bfp4", 1), ("bfp4", 1), ("bfp8", 2), ("bfp8", 2), ("bfp4", 1), ("bfp8", None)]
   assert llama.weight_format("layers.3.shared_expert.down_proj", experts) == llama.weight_format("layers.3.experts.down", experts) == "bfp4"
   assert llama.weight_format("embed.T draft", experts) == "bfp4" and ("draft head", None) not in llama.precision(big, "tt")
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(5)
+  rt, rng = Runtime(chip), np.random.default_rng(5)
   c, w = smol(rng, 2)
   c.precision = llama.precision(c, "tt")
   weights = {k: llama.Weight(lambda v=v: (np.float32(v).view(np.uint32) >> 16).astype(np.uint16)) for k, v in w.items()}
@@ -1996,7 +1996,7 @@ def test_token_accuracy(chip):
   # reference's token whatever the model picked. Against a reference made the same way from numpy (its five most likely
   # at each place) the chip's picks are numpy's top-1 throughout, and a reference that is wrong at one place costs top-1
   # exactly that step; in numpy (rt None, the weights as numpy arrays) the picks and scores are the same
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(6)
+  rt, rng = Runtime(chip), np.random.default_rng(6)
   c, w = smol(rng, 2)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
   tokens = [int(i) for i in rng.integers(0, 256, 44)]
@@ -2026,7 +2026,7 @@ def test_put(chip):
   # rows into a tensor at places read on the chip (gather's inverse), against numpy: 70 rows (three tiles of places) of a
   # batch of 3, into 200 places (seven tile rows), scattered and out of order, one place twice (the later row stays),
   # bf16 and fp32; and a prompt's rows into their places in order, as a KV cache takes them
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
+  rt, rng = Runtime(chip), np.random.default_rng(23)
   for dtype in ("bf16", "fp32"):
     cache, x = rng.normal(0, 1, (3, 200, 96)).astype(np.float32), rng.normal(0, 1, (3, 70, 96)).astype(np.float32)
     if dtype == "bf16": cache, x = bf16(cache), bf16(x)
@@ -2047,7 +2047,7 @@ def test_block_float_cache(chip):
   # floats) and its values as they are, each key and value head serving two query heads: the matmuls, and attention in
   # one kernel, bit for bit the bf16 ones by the same values. A view of it copied as it is (assign) into a tensor of its
   # own, and from there into another view of it
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(16)
+  rt, rng = Runtime(chip), np.random.default_rng(16)
   for fmt in ("bfp8", "bfp4"):
     cache = Tensor.of(rt, np.zeros((4, 96, 64)).tolist()).cast(fmt).realize()  # 2 key heads, then 2 value heads
     want = np.zeros((4, 96, 64))
@@ -2073,7 +2073,7 @@ def test_batched_decode(chip):
   # side in one (sequence u's places from row 32 u), each token reading only its own sequence's rows (forward's slots).
   # Each prompt is prefilled into its rows, then every step is one call for all four, replayed from the third
   # (tensor.jit), against each sequence decoded alone in numpy
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(19)
+  rt, rng = Runtime(chip), np.random.default_rng(19)
   c, w = smol(rng, 2)
   t, size, prompts = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, 32, [[7, 200, 31], [5, 64], [9, 9, 9, 9, 9], [100]]
   kv = llama.kv_cache(c, size * len(prompts), lambda shape: Tensor.of(rt, np.zeros(shape).tolist()))
@@ -2096,7 +2096,7 @@ def test_batched_decode(chip):
 def bytes_tokenizer(folder):  # a byte-level vocabulary of the 256 bytes, as tokenizer.json in folder
   bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
   chars = map(chr, bs + [256 + i for i in range(256 - len(bs))])
-  (folder / "tokenizer.json").write_text(json.dumps({"model": {"vocab": {ch: b for ch, b in zip(chars, bs + [b for b in range(256) if b not in bs])}}, "added_tokens": []}))
+  (folder / "tokenizer.json").write_text(json.dumps({"model": {"vocab": dict(zip(chars, bs + [b for b in range(256) if b not in bs]))}, "added_tokens": []}))
   return llama.Tokenizer(str(folder))
 
 def test_heads(chip):
@@ -2104,7 +2104,7 @@ def test_heads(chip):
   # has them (a tie the first column's), and the log of the sum of exp(x t) over the whole row at each row's t, within
   # fp32's rounding: for Qwen3.6's vocabulary (97 parts of 2,560, then their best) and a small one (a part); and each
   # row's best alone (a draft's)
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(3)
+  rt, rng = Runtime(chip), np.random.default_rng(3)
   for vocab in (512, 248320):
     x, ts = rng.normal(0, 3, (3, vocab)).astype(np.float32), [1.0, 1 / 0.7, 2.0]
     x[1, 5] = x[1, vocab - 7] = x[1].max() + 1
@@ -2200,7 +2200,7 @@ def test_serve(chip, tmp_path):
   # answer to a JSON schema (response_format) is one; and with both slots held by streams, a request gets a 429 at once
   # (OpenRouter's ask: it tries the next provider), and is served once they end
   import urllib.request
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(23)
+  rt, rng = Runtime(chip), np.random.default_rng(23)
   c, w = smol(rng, 2)
   w = {k: bf16(v * 10) if k.endswith("_proj") else v for k, v in w.items()}  # sharp attention, so every cached row counts
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
@@ -2328,7 +2328,7 @@ def test_serve_sessions(chip, tmp_path, kv):
   # kept on the host, read back and put back in bf16, which holds their values.
   # In bfp4, 3 bits a value, a key the chip rounds the other way than numpy moves by an eighth of its run's largest:
   # numpy's own logits move 2.9% for qkv weights off by bf16's rounding, against 1.0% in bfp8, so its bound is 6%
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
+  rt, rng = Runtime(chip), np.random.default_rng(31)
   c, weights = qwen35(rng)
   w, tok, c.precision = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.precision(c, "bf16", kv=kv)
   c.mtp = 0  # (decoding a token a step: test_serve_speculative drafts with it)
@@ -2354,7 +2354,7 @@ def test_serve_speculative(chip, tmp_path):
   # at random, nearly every one is turned down and the next step goes on from the states before it. Either way three
   # requests on two slots give tokens whose logits are numpy's (agrees), and an agent's next turn goes on from the
   # session saved when the first ended (its states those before a turned-down draft), its new tokens alone prefilled
-  rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(31)
+  rt, rng = Runtime(chip), np.random.default_rng(31)
   c, weights = qwen35(rng)
   w, tok, t = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.upload(rt, weights)
   class Oracle(serve.Engine):
@@ -2492,7 +2492,7 @@ def test_llama_model(chip):
   # a Llama-family model's real weights (SmolLM-135M: 30 blocks, grouped-query attention, tied embeddings): after "The
   # meaning of life is", the next token's 49152 logits against the same model in numpy (whose fp32 version matches Hugging
   # Face's to 2e-5), then a token decoded with the KV cache. About a minute on ttsim; models/llama.py generates text
-  rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])
+  rt = Runtime(chip)
   c, weights = llama.load(os.environ["LLAMA"])
   w, t = llama.arrays(weights), llama.upload(rt, weights)
   kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)

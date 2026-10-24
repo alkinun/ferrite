@@ -1,21 +1,22 @@
-# Lazy tensors: bf16, fp32 or int32 (and bfp8 or bfp4 for a matmul's B), of any shape, batched or not, in DRAM as tiles (tile i
+# Lazy tensors: bf16, fp32 or int32 (and bfp8 or bfp4: a matmul's B, a KV cache), of any shape, batched or not, in DRAM as tiles (tile i
 # in bank i % 8). Their ops build a tree that realizing turns into kernels (compiler.py): as much of it as one kernel
 # holds fused into one launch, and what one kernel cannot hold (a matmul's operands, a move, a cast below the root, a
 # reduction of another shape) realized first.
 import array, collections, functools, math
 from ferrite import bh
-from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, ext, tile_bytes, shared_k
-from ferrite.compiler import attention_kernel, attention_parts, attention_store, bfp4_kernel, copy_kernel, delta_kernel, fused_kernel, gather_kernel, group_kernel, move_kernel, put_kernel, readback_kernel, topk_kernel
-from ferrite.compiler import LINK_L1, LINK_TILES, group_slots, link_kernel, touched_kernel, transpose_kernel
+from ferrite.compiler import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, attention_parts, attention_store, ext, group_slots, link_flags
+from ferrite.compiler import shared_k, tile_bytes
+from ferrite.compiler import (attention_kernel, bfp4_kernel, copy_kernel, delta_kernel, fused_kernel, gather_kernel, group_kernel, link_kernel,
+                              move_kernel, put_kernel, readback_kernel, topk_kernel, touched_kernel, transpose_kernel)
 
 FIDELITY = 4  # fidelity phases a bf16 matmul takes unless told: 4 makes exact products (compiler.matmul says what fewer leave out)
 
 class Tensor:
   """batch x rows x cols of bf16, fp32, int32, bfp8 or bfp4 (dtype; batch 1 unless said): in DRAM as 32x32 tiles, matrix after
   matrix, each in row-major tile order, tile i in bank i % 8; or, until realized, an op on other tensors. Realizing
-  compiles the whole tree of unrealized ops under it into one kernel; a matmul's own operands are realized first, since
-  each of its output tiles needs a whole row and column of them (a transposed B is read transposed rather than
-  realized).
+  compiles the tree of unrealized ops under it into as few kernels as fit (_fit); a matmul's own operands are realized
+  first, since each of its output tiles needs a whole row and column of them (a transposed B is read transposed rather
+  than realized).
   Any shape: the last tile row and column are padded, with zeros, except that a dimension of 1 fills its tile with
   copies (a row vector's tile holds the row 32 times), so broadcasting reuses the tile as it is. Every kernel leaves
   its result that way too, so a matmul can sum over a padded K.
@@ -83,24 +84,24 @@ class Tensor:
     its values being one). Waits for the launches queued. The chip writes the tiles into host memory, as many at a time
     as fit (readback_kernel), and they are read there: read over the BARs, each load would wait on PCIe."""
     self.realize()
-    n, rows, cols, ct, tb = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32), tile_bytes(self.dtype)
+    n, rows, cols, tc, tb = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32), tile_bytes(self.dtype)
     v = 32 if self.dtype in BFP else min(rows, 32)  # the rows a tile sends (readback_kernel), their bytes, and where each face starts
     sent, faces = tb if v == 32 else 32 * v * n, [16 * n * f for f in (0, min(v, 16), 2 * min(v, 16), 2 * min(v, 16) + max(v - 16, 0))]
     per, tiles, kernel = len(self.rt.back) // sent, bytearray(), _cached(("readback", self.dtype), lambda: readback_kernel(self.dtype))
     for start in range(0, self.tiles, per):
       k = min(per, self.tiles - start)
-      self.rt.launch(kernel, (start, self.addr, self.bstride, self.stride, self.offset, ct, self.tiles // self.batch, self.rep,
+      self.rt.launch(kernel, (start, self.addr, self.bstride, self.stride, self.offset, tc, self.tiles // self.batch, self.rep,
                               self.rt.back_bus & 0xFFFFFFFF, self.rt.back_bus >> 32, v), units=k, name="readback")
       self.rt.wait()
       tiles += self.rt.back[:k * sent]
     if self.dtype in BFP: tiles, sent = b"".join(_bf16s(tiles[i * sent:(i + 1) * sent], self.dtype) for i in range(self.tiles)), 2048
-    words, sw, run, per = memoryview(tiles).cast("Q"), sent // 8, 2 * n, self.tiles // self.batch  # 8-byte words: a tile's, a run's
-    out, row = bytearray(n * self.batch * rows * cols), memoryview(bytearray(32 * n * ct)).cast("Q")  # (a row of a tile band)
+    words, sw, run, matrix = memoryview(tiles).cast("Q"), sent // 8, 2 * n, self.tiles // self.batch  # 8-byte words: a tile's, a run's
+    out, row = bytearray(n * self.batch * rows * cols), memoryview(bytearray(32 * n * tc)).cast("Q")  # (a row of a tile band)
     for b, r in ((b, r) for b in range(self.batch) for r in range(rows)):  # frombytes' copies the other way: a row at a time,
-      first = (b * per + r // 32 * ct) * sw + (r % 16 * 16 * n) // 8  # word q of its runs in the left or right faces of every
+      first = (b * matrix + r // 32 * tc) * sw + (r % 16 * 16 * n) // 8  # word q of its runs in the left or right faces of every
       for half, q in ((half, q) for half in (0, 1) for q in range(run)):  # tile of its band at once
         start = first + faces[r % 32 // 16 * 2 + half] // 8 + q
-        row[half * run + q::2 * run] = words[start:start + ct * sw:sw]
+        row[half * run + q::2 * run] = words[start:start + tc * sw:sw]
       at = n * (b * rows + r) * cols
       out[at:at + n * cols] = row.cast("B")[:n * cols]
     return bytes(out)
@@ -131,18 +132,18 @@ class Tensor:
     each of its runs of 16 rounded as cast rounds them."""
     assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "rows of x, by a row of int32 places"
     assert (x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype), \
-      f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"  # into a block float (a KV cache), bf16 rows rounded on the way
+      f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"
     assert self.rep == 1, "into a tensor of its own, not a repeat"
-    x, ids, ct, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
+    x, ids, tc, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
     assert 2 * x.rows + tr <= 2**17, "the places, and the rows of each tile row, in a worker's L1"
     return self.realize()._run(_cached(("put", self.dtype), lambda: put_kernel(self.dtype)), *self._where(), *x._where(), ids.addr,
-                               ids.offset, x.rows, ct, tr, units=self.batch * x.rows * ct, name="put")
+                               ids.offset, x.rows, tc, tr, units=self.batch * x.rows * tc, name="put")
 
-  def _view(self, rows, cols, batch, offset, bstride=0, stride=None):
+  def _view(self, rows, cols, batch, offset, bstride=0):
     assert self.rep == 1, "a view's offsets and strides are the stored tensor's, which a repeat's matrices are not"
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
     v.op, v.addr, v.owner = None, self.realize().addr, self.owner or self
-    v.offset, v.bstride, v.stride = self.offset + offset, bstride, self.stride if stride is None else stride
+    v.offset, v.bstride, v.stride = self.offset + offset, bstride, self.stride
     return v
 
   def __getitem__(self, key):
@@ -214,13 +215,16 @@ class Tensor:
     v.rep = n
     return v._track("repeat", (self,), n)
 
-  def split(self, n, axis=1):
-    """The matrix cut into n equal parts along axis (1: columns, 0: rows) as a batch of n, in place: attention's heads;
+  def split(self, n, axis=2):
+    """The matrix cut into n equal parts along axis (2: columns, 1: rows) as a batch of n, in place: attention's heads;
     by rows, each matrix of a batch too, its parts one after another (a KV cache's heads as each sequence's part of
     them). The parts are whole tiles. A sum not yet computed of computed tensors (a matmul's parts of K) splits term by
     term, and stays a sum."""
     if terms := _terms(self): return sum((t.split(n, axis) for t in terms[1:]), terms[0].split(n, axis))
-    if axis: assert self.batch == 1 and self.cols % (32 * n) == 0; return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
+    assert axis in (1, 2)
+    if axis == 2:
+      assert self.batch == 1 and self.cols % (32 * n) == 0, "whole tiles, of one matrix"
+      return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
     assert self.rows % (32 * n) == 0 and (self.batch == 1 or self.bstride == self.rows // 32 * self.stride), "whole tiles, matrices one after another"
     return self._view(self.rows // n, self.cols, self.batch * n, 0, self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
@@ -419,7 +423,8 @@ class Tensor:
     if x.owner is not None or x.rep > 1 or x.offset: x = (x + 0).realize()  # a view: a whole tensor of its own first
     out = Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype)
     x.rt.wait(), rt.wait()
-    for chip, end in ((x.rt.chip, ch), (rt.chip, back)): chip.write(*bh.ETH[end], LINK_L1 + 2 * LINK_TILES * tile_bytes(x.dtype), bytes(48))
+    flags, n = link_flags(x.dtype)
+    for chip, end in ((x.rt.chip, ch), (rt.chip, back)): chip.write(*bh.ETH[end], flags, bytes(n))
     out._run(_cached(("link", False, x.dtype), lambda: link_kernel(False, x.dtype)), out.addr, out.tiles, *bh.ETH[back], units=1, name="link in")
     x._run(_cached(("link", True, x.dtype), lambda: link_kernel(True, x.dtype)), x.addr, x.tiles, *bh.ETH[ch], units=1, name="link out")
     return out
@@ -461,14 +466,14 @@ class Tensor:
       return _bf16x3(a, b)._track("matmul", (self, x), a, b).cast(dtype)
     assert self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch)), f"{self.shape} @ {x.shape}"
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
-    k, rt = -(-self.cols // 32), -(-self.rows // 32)
-    s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and rt == 1 and self.cols % (32 * s) == 0 and k // s >= 4
+    k, tr = -(-self.cols // 32), -(-self.rows // 32)
+    s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and tr == 1 and self.cols % (32 * s) == 0 and k // s >= 4
              and s * -(-x.cols // 32) <= len(self.rt.cores)], default=1)
     if s > 1:  # one row of tiles, too few to keep the workers busy (a token's MLP): K cut in s, a batch, and the parts
-      parts = self.split(s).matmul(x.split(s, 0), dtype, fidelity)  # summed. Not more rows: a batch of those would read
+      parts = self.split(s).matmul(x.split(s, 1), dtype, fidelity)  # summed. Not more rows: a batch of those would read
       return sum((parts[i] for i in range(1, s)), parts[0])           # its own tiles, where one matrix's blocks share them
-    if self.batch == x.batch == 1 and rt > 1 and k > shared_k(rt, self.rt.grid):  # K too long for the workers to share the
-      most = shared_k(rt, self.rt.grid, 1)                                         # tiles: in parts that fit, each added onto
+    if self.batch == x.batch == 1 and tr > 1 and k > shared_k(tr, self.rt.grid):  # K too long for the workers to share the
+      most = shared_k(tr, self.rt.grid, 1)                                         # tiles: in parts that fit, each added onto
       per, out = 32 * -(-k // -(-k // most)), None                                 # the parts before as it is made
       for c in range(0, self.cols, per):
         part = self[:, c:c + per].matmul(x[c:c + per, :], dtype, fidelity)
@@ -492,7 +497,8 @@ class Tensor:
     ht, kt, rep, ra = -(-self.cols // 32), -(-k.rows // 32), k.rep, -(-self.rows // 32)
     assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
     assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows
-    assert places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32", f"{self.shape} by {k.shape}, {places.shape}"
+    assert places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32", \
+      f"{self.shape} by {k.shape}, {places.shape}"
     units, wt = self.batch * -(-ra // 8), k.dtype if k.dtype in BFP else None
     P = parts or attention_parts(ht, self.rows, wt, kt, units, len(self.rt.cores))
     q, places = (_plain(t.realize()) for t in (self, places))
@@ -526,7 +532,8 @@ class Tensor:
     kh = (width - vh * vd) // 2 // kd
     ins = (x, conv, taps, dt, decay, *((first, accept, conv2) if first is not None else ()))
     assert all(t.dtype == "fp32" for t in (self, *ins)) and m in (1, 2) and (first is not None) == (m == 2) and vh % kh == 0
-    assert x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width) and dt.shape == decay.shape == (1, 1, vh)
+    assert x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width)
+    assert dt.shape == decay.shape == (1, 1, vh)
     live = live if live is not None else self._number(1.0, "fp32").expand(1, 1, n).realize()
     o = Tensor.frombytes(self.rt, n * m, vd, bytes(4 * vh * n * m * vd), vh, "fp32")  # (its padding rows 0, as no unit writes them)
     key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m)
@@ -628,11 +635,11 @@ def _backward(t, g):
   if op == "expand": return (_unbroadcast(g, x.shape),)
   if op == "pad": return (g[tuple(slice(w[0], w[0] + n) for w, n in zip(args[0], x.shape))],)
   if op == "index": return (g.pad(((args[0], x.batch - args[0] - 1), (0, 0), (0, 0))),)
-  if op == "split": return (g.merge() if args[0] else g.reshape(*x.shape),)
+  if op == "split": return (g.merge() if args[0] == 2 else g.reshape(*x.shape),)
   if op == "repeat": return (g.reshape(x.batch, args[0], x.rows * x.cols).sum(1).reshape(*x.shape),)
   if op == "merge": return (g.split(x.batch),)
   if op == "slice":  # back into place, zeros around it; a reversed axis reversed again
-    assert all(abs(r.step) == 1 for r in args[0]), "a slice with a step has no backward yet"
+    assert all(abs(r.step) == 1 for r in args[0]), "a slice with a step has no backward"
     g = g[tuple(slice(None, None, r.step) for r in args[0])] if any(r.step < 0 for r in args[0]) else g
     lo = [min(r) for r in args[0]]
     return (g.pad([(a, n - a - len(r)) for a, n, r in zip(lo, x.shape, args[0])]),)
@@ -643,7 +650,7 @@ def _backward(t, g):
 def _fit(t):
   """Parts of t's tree computed first. A tree that reduces sweeps its rows in passes, each recomputing what it reads,
   so a long matmul goes first, and so does an elementwise value that a reduction and something else both read (once,
-  on as many workers as it has tiles). Then until the rest fits one kernel (SEM_L1 counts 15 ops): a value two of its
+  on as many workers as it has tiles). Then until the rest fits one kernel (MAX_OPS): a value two of its
   ops read goes first, the biggest that fits (the residual stream an RMSNorm reads twice), else down the heaviest
   branch the first part that fits, so what is on top (a layer norm, say) stays whole."""
   if any(u.op in COMBINE for u in _lazy(t, set())):
@@ -652,12 +659,12 @@ def _fit(t):
     reads = collections.Counter(id(s) for u in lazy for s in u.srcs)
     for x in [u.srcs[0] for u in lazy if u.op in COMBINE]:
       if reads[id(x)] > 1 and all(u.op not in COMBINE and u.op != "matmul" for u in _lazy(x, set())): x.realize()
-  while _ops(t, set()) > 15:
+  while _ops(t) > MAX_OPS:
     lazy = list(_lazy(t, set()))
-    readers = collections.Counter(id(s) for u in lazy for s in {id(s): s for s in u.srcs}.values())
-    shared = [u for u in lazy[1:] if readers[id(u)] > 1 and _ops(u, set()) <= 15]
-    u = max(shared, key=lambda s: _ops(s, set())) if shared else t
-    while _ops(u, set()) > 15: u = max((s for s in u.srcs if s.op), key=lambda s: _ops(s, set()))
+    readers = collections.Counter(i for u in lazy for i in {id(s) for s in u.srcs})
+    shared = [u for u in lazy[1:] if readers[id(u)] > 1 and _ops(u) <= MAX_OPS]
+    u = max(shared, key=_ops) if shared else t
+    while _ops(u) > MAX_OPS: u = max((s for s in u.srcs if s.op), key=_ops)
     u.realize()
 def _terms(t):  # t, a sum not yet computed of computed tensors its shape, as those tensors; else None
   if t.op != "add" or any(s.shape != t.shape or s.dtype != t.dtype for s in t.srcs): return None
@@ -669,10 +676,11 @@ def _parts(t):  # an fp32 matmul's operand as bf16 (hi, lo), no lo for a bf16 on
   return t.bfloat16(), (t - t._unary("ftob")).bfloat16()  # lo: t less itself rounded as the cast to bf16 rounds, in one kernel
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
 def _plain(t): return (t + 0).realize() if t.rep > 1 else t  # a repeat copied, for a kernel that reads tiles by their place
-def _rows_free(e):  # whether e's kernel needs no input's exact rows, but the result's last tile's, an argument (fused_kernel's):
-  if isinstance(e, int): return True  # not if it reduces along rows, or a matmul reads B transposed (its rows become columns)
-  if e[0] in FOLDS and FOLDS[e[0]] == 1 or e[0] == "T" or e[0] == "matmul" and isinstance(e[2], tuple) and (e[2][0].lstrip("I").startswith("T") or len(e[2]) > 2):
-    return False  # or picks B's matrices by an index (whose rows count)
+def _rows_free(e):
+  """Whether e's kernel needs no input's exact row count, only the result's last tile's (fused_kernel's argument): not if
+  it reduces along rows, or a matmul reads B transposed (its rows become columns) or picks B's matrices by an index."""
+  if isinstance(e, int): return True
+  if FOLDS.get(e[0]) == 1 or e[0] == "matmul" and isinstance(e[2], tuple) and e[2][0][0] in "TI": return False
   return all(_rows_free(x) for x in e[1:] if isinstance(x, tuple))
 def _bf16x3(a, b):  # hi@hi + (hi@lo + lo@hi) in fp32, from two operands' parts
   (ah, al), (bh, bl) = a, b
@@ -694,10 +702,7 @@ def _lazy(t, seen, root=True):  # the unrealized ops under t, t first
   yield t
   for s in _below(t, root): yield from _lazy(s, seen, False)
 
-def _ops(t, seen, root=True):  # how many ops a kernel for t would hold, at most (an SFPU op on another's result adds none)
-  if t.op is None or id(t) in seen: return 0
-  seen.add(id(t))
-  return 1 + sum(_ops(s, seen, False) for s in _below(t, root))
+def _ops(t): return sum(1 for _ in _lazy(t, set()))  # how many ops a kernel for t would hold, at most
 
 def _tree(t, inputs):
   """The expression a kernel for t computes (fused_kernel's), realized tensors as numbers into inputs, and the dtype it
@@ -708,7 +713,6 @@ def _tree(t, inputs):
   axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
   n = ext(t.shape, axis)  # the sweep is as long as t along the axis, unless t is one tile there: then its first reduction says
   return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
-
 
 def _bf16s(tile, dtype):  # a block-float tile's values as bf16 (the unpacker's way, ISA FormatConversion.md): normalized,
   out = array.array("H", bytes(2048))  # 7 bits a value (bfp4's 3 shifted up to bfp8's place)
@@ -804,9 +808,9 @@ def jit(f):
     return out
   return run
 
-# (expression, input shapes, dtype, result dtype, workers' grid, input repeats) -> (image, units, name); a move, gather,
-# put or readback's name and dtype (a transpose's: its shape; bfp4's: its name) -> image
+# (expression, input shapes, dtype, result dtype, workers' grid, input repeats) -> (image, units, name); any other kernel's
+# name and what it is compiled for -> image
 kernels = {}
-def _cached(key, compile):
-  if key not in kernels: kernels[key] = compile()
+def _cached(key, make):
+  if key not in kernels: kernels[key] = make()
   return kernels[key]
