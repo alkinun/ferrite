@@ -132,20 +132,23 @@ def repack(old, new):  # the packer's config from old to new (kernel_config's), 
   return ([ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_PACK)] + writes +
           [ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_CFG)])
 def haloize(on): return reconfigure(SEC0_Haloize_mode=on)  # unpacker 0 transposes each 16x16 face into SrcA (or stops)
-def bfp_b(wt, slots, region=0, base=None):  # unpacker 0 reads block floats wt from a region of `slots` slots at B8 (a
-  # matmul's B: every slot's exponents, then their values; or at base), each value into SrcA as the bf16 it is; with 0,
-  fmt, base = (FORMAT[wt], base or B8 + region * slots * tile_bytes(wt)) if slots else (bh.BF16, slot_base("bf16"))  # bf16 from
-  return reconfigure(SEC0_format=fmt, SEC0_out_format=fmt, SEC0_z_dim=max(slots, 1), SEC0_base=base // 16 - 1)       # the slots again
+# Unpacker 0 reading block floats wt from a region of `slots` slots at B8 (a matmul's B: every slot's exponents, then
+# their values; or at base), each value into SrcA as the bf16 it is; with 0 slots, bf16 from the slots again
+def bfp_b(wt, slots, region=0, base=None):
+  fmt, base = (FORMAT[wt], base or B8 + region * slots * tile_bytes(wt)) if slots else (bh.BF16, slot_base("bf16"))
+  return reconfigure(SEC0_format=fmt, SEC0_out_format=fmt, SEC0_z_dim=max(slots, 1), SEC0_base=base // 16 - 1)
 def step_unpack(s):  # a matmul step: B's tile from stream slot s into SrcA, and A's next tile in its row into SrcB
   return [setadc(bh.UNPACK0, s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
           ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
-WALK = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),  # a step along B's column and A's row, both
-        ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # kept in L1
+# A tile into SrcA and one into SrcB, each unpacker's Z then on by 1; WALK: a step along B's column and A's row, both kept in L1
+PAIR = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
+        ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)]
+WALK = PAIR + REPORT
 def aim(row): return field(ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=0), row)  # the FPU and SFPU at Dst row on
 # In the programs, C's h is the first Dst row of the half the next op gets, 0 or DST_HALF: h ^= DST_HALF moves on
+DST_FREE = ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)  # until a Dst half is free for a result
 def math_begin(zero):  # wait for a free Dst half, aim the FPU at it, and zero it if the math accumulates
-  return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2), aim("h")] +
-          [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero])  # 16-row blocks
+  return [DST_FREE, aim("h")] + [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero]  # 16-row blocks
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU), ins("SEMPOST", sem_sel=SEM_DST)]
 def pack(row, slot, *done):  # 64 Dst rows from row into an L1 slot, then free them and post done
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
@@ -155,7 +158,8 @@ def pack(row, slot, *done):  # 64 Dst rows from row into an L1 slot, then free t
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
           ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + \
          [ins("SEMPOST", sem_sel=d) for d in done]
-TAKE_L1 = [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_L1, wait_sem_cond=1), ins("SEMGET", sem_sel=SEM_L1)]
+def take(sem): return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem)]  # once it is above 0
+TAKE_L1 = take(SEM_L1)
 
 def matmul_phase(transposed=False):
   """One fidelity phase of Dst += A @ B on a pair of tiles, A in SrcB and B in SrcA: MVMUL does
@@ -182,7 +186,9 @@ def from_bf16(b): return struct.unpack("<f", struct.pack("<I", b << 16))[0]
 # SFPU programs: a setup, then a body run 32 times; each pass loads 32 datums of the Dst half (4 rows x 8 even or odd
 # columns) into LReg 0 and stores the result back, the store stepping Dst by 2 (address modes 2 and 3; fp32 Dst, mod0 3).
 def sfp_load(r=0, at=0): return ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=at)
-def sfp_store(r, mod0=3): return ins("SFPSTORE", vd=r, mod0=mod0, addr_mode=3)
+def sfp_store(r, at=0, step=True, mod0=3): return ins("SFPSTORE", vd=r, mod0=mod0, addr_mode=3 if step else 2, imm10=at)
+# An SFPU program's start: the SFPU waits for the FPU's writes, and Dst's counter goes back to the row aim set
+SFPU_START = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
 RAW = 4  # SFPSTORE's INT32 mode stores the bits as they are; its FP32 mode flushes denormals, the small positive integers
 def sfp_bits(r, bits): return [ins("SFPLOADI", vd=r, mod0=8, imm16=bits >> 16), ins("SFPLOADI", vd=r, mod0=10, imm16=bits & 0xFFFF)]
 def sfp_const(r, x): return sfp_bits(r, struct.unpack("<I", struct.pack("<f", x))[0])  # a full fp32 constant into LReg r
@@ -267,7 +273,7 @@ def sin(phase):
 
 SFPU = {
   # max(x, 0): SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc; a pick, stored raw for int32
-  "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, RAW)]),
+  "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, mod0=RAW)]),
   "exp": exp(False), "exp2": exp(True), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
   "fexp": exp(False, True), "fexp2": exp(True, True), "recip": recip(), "frecip": recip(True),
   # sqrt(x) = x / sqrt(x): 1/sqrt(x) by the bit trick (0x5F3759DF - bits / 2, within 3.5%) and three Newton steps
@@ -290,7 +296,8 @@ BINARY = {"max", "cmplt", "cmpne", "keep", "drop"}
 # through exp, the reciprocal and comparisons, which bf16's take no time for: a bf16 NaN is inf before the SFPU sees it
 FP32_OPS = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip", "cmplt": "fcmplt",
             "cmpne": "fcmpne"}
-INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne", "keep": "keep", "drop": "drop"}  # what int32 does itself
+INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne",  # what int32 does itself
+             "keep": "keep", "drop": "drop"}
 CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # SFPU programs of a cast
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
@@ -303,33 +310,33 @@ SFPU |= {
   "fcmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 3, 4, True), ins("SFPMOV", vd=2, vc=0),
                        ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPOR", vd=1, vc=3),
                        ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
+  "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
-                      ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
+                      ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   "fadd": ([], binary(mad(0, 0, ONE, 1), sfp_store(0))), "fsub": ([], binary(mad(0, 1, ONE, 0, neg=1), sfp_store(0))),
   "fmul": ([], binary(mul(0, 0, 1), sfp_store(0))),
   # int32, two's complement in L1, Dst and LRegs alike (they move it raw). Ordering goes through sign-magnitude
   # (SFPCAST 3, its own inverse), the order SFPGT and SFPSWAP use; a comparison is 1, not 1.0
-  "iadd": ([], binary(ins("SFPIADD", vd=0, vc=1, mod1=4), sfp_store(0, RAW))),
-  "isub": ([], binary(ins("SFPIADD", vd=1, vc=0, mod1=6), sfp_store(1, RAW))),
+  "iadd": ([], binary(ins("SFPIADD", vd=0, vc=1, mod1=4), sfp_store(0, mod0=RAW))),
+  "isub": ([], binary(ins("SFPIADD", vd=1, vc=0, mod1=6), sfp_store(1, mod0=RAW))),
   "imax": ([], binary(*[ins("SFPCAST", vd=r, vc=r, mod1=3) for r in (0, 1)], ins("SFPSWAP", vd=1, vc=0, mod1=1), ins("SFPCAST", vd=0, vc=0, mod1=3),
-                      sfp_store(0, RAW))),
+                      sfp_store(0, mod0=RAW))),
   "icmplt": ([], binary(*[ins("SFPCAST", vd=r, vc=r, mod1=3) for r in (0, 1)], ins("SFPGT", vd=1, vc=0, mod1=8),
-                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
+                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   "icmpne": ([], binary(ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2),
-                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, RAW))),
+                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   # casts: an integer to sign-magnitude, then to float (to nearest, exact below 2^24); a float to the integer toward 0,
   # by shifting its mantissa (hidden bit in) by its exponent - 23: 0 where the exponent is negative, negated if negative
   "itof": ([], [sfp_load(), ins("SFPCAST", vd=0, vc=0, mod1=3), ins("SFPCAST", vd=0, vc=0), sfp_store(0)]),
   "ftoi": ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0), ins("SFPEXMAN", vd=2, vc=0), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=-23 & 0xFFF),
                 ins("SFPSHFT", vd=2, vc=1), CC_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), CC_ALL, ins("SFPSETCC", vc=0),
-                ins("SFPIADD", vd=2, vc=ZERO, mod1=6), CC_OFF, sfp_store(2, RAW)]),
+                ins("SFPIADD", vd=2, vc=ZERO, mod1=6), CC_OFF, sfp_store(2, mod0=RAW)]),
   "one": ([], [sfp_store(ONE)]),  # 1.0 everywhere (a tile of ones)
   "none": (sfp_const(1, -1e9), [sfp_store(1)]),  # -1e9 everywhere (a mask that hides every key)
   "floor": (sfp_const(3, -1e4), [sfp_load(), ins("SFPMOV", vd=1, vc=3), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0)]),  # max(x, -1e4)
   # an fp32 value rounded to bf16 as the packer rounds it (half up: the bits plus 2^15, the low 16 cleared), still fp32
   "ftob": ([ins("SFPLOADI", vd=2, mod0=2, imm16=0x8000), *sfp_bits(3, 0xFFFF0000)],
-           [sfp_load(), ins("SFPIADD", vd=0, vc=2, mod1=4), ins("SFPAND", vd=0, vc=3), sfp_store(0, RAW)]),
+           [sfp_load(), ins("SFPIADD", vd=0, vc=2, mod1=4), ins("SFPAND", vd=0, vc=3), sfp_store(0, mod0=RAW)]),
 }
 # Reductions along an axis (0: the batch, to one matrix; 1: rows, to one row; 2: columns, to one column): each tile
 # along it is x + 0 into Dst (the first in the reduction's accumulator, the rest 128 rows past it, where the SFPU folds
@@ -345,31 +352,30 @@ def across_rows(kind):
   four loads leaves 8 lanes a row, and rotating the group by 1, 2 and 4 lanes and folding each time leaves the
   row's result in every lane, which goes back to all four places."""
   rot = lambda d, s: ins("SFPSHFT2", vd=d, vc=s, mod1=3)
-  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+  p = list(SFPU_START)
   for base in (0, 4, 8, 12, 32, 36, 40, 44):
     at = [base, base + 2, base + 16, base + 18]  # even and odd columns, left and right face
     p += [sfp_load(r, a) for r, a in enumerate(at)]
     p += [fold(kind, 0, 1), fold(kind, 2, 3), fold(kind, 0, 2)]
     p += [rot(1, 0), fold(kind, 0, 1), rot(1, 0), rot(1, 1), fold(kind, 0, 1), rot(1, 0), rot(1, 1), rot(1, 1), rot(1, 1), fold(kind, 0, 1)]
-    p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
+    p += [sfp_store(0, at=a, step=False) for a in at]
   return p
 def across_cols(kind):
   """Fold every tile column across its 32 rows. Column c of a tile is lane c % 16 // 2 of the loads at the even (c even)
   or odd addresses of its two faces (the left ones for c < 16), a row of it in each 8-lane group: the 8 loads fold into
   one register, three copies and SFPTRANSP put each of its lane groups across a register of its own, and folding those
   leaves the column's result in every lane, which goes back to all 8 places."""
-  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
+  p = list(SFPU_START)
   for half, odd in [(h, o) for h in (0, 16) for o in (0, 2)]:
     at = [half + odd + base for base in (0, 4, 8, 12, 32, 36, 40, 44)]  # top face rows 0-15, bottom face
     p += [sfp_load(0, at[0])]
     p += [w for a in at[1:] for w in (sfp_load(1, a), fold(kind, 0, 1))]
     p += [ins("SFPMOV", vd=r, vc=0) for r in (1, 2, 3)] + [ins("SFPTRANSP")] + [fold(kind, 0, r) for r in (1, 2, 3)]
-    p += [ins("SFPSTORE", vd=0, mod0=3, addr_mode=2, imm10=a) for a in at]
+    p += [sfp_store(0, at=a, step=False) for a in at]
   return p
 ACROSS = {0: lambda kind: [], 1: across_cols, 2: across_rows}
-def masking(kind):  # the SFPU after the FPU, and the reduction's identity in a register: 0 (LReg 9), or -inf in LReg 5 for max
-  p = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)]
-  return (p, ZERO) if kind[:3] == "sum" else (p + sfp_const(5, -math.inf), 5)
+def masking(kind):  # an SFPU start, and the reduction's identity in a register: 0 (LReg 9), or -inf in LReg 5 for max
+  return (list(SFPU_START), ZERO) if kind[:3] == "sum" else (SFPU_START + sfp_const(5, -math.inf), 5)
 def mask_columns(kind, n, d=0):
   """Columns n and on of the tile at Dst row d to the reduction's identity (0, or -inf for max), so the padding past a
   tensor's last column does not count. An SFPSTORE writes 4 rows of 8 even or odd columns, lane l at column 2 (l % 8)
@@ -379,8 +385,8 @@ def mask_columns(kind, n, d=0):
   p += sfp_bits(7, 14) + [ins("SFPAND", vd=7, vc=15)]
   for base, right, odd in [(b, r, o) for b in (0, 4, 8, 12, 32, 36, 40, 44) for r in (0, 1) for o in (0, 1)]:
     t = max(0, min(8, -(-(n - 16 * right - odd) // 2)))  # the first lane (of 8) at column n or more
-    if t < 8: p += [CC_ON, at_least(7, 2 * t, 6),  # lanes t+
-                    ins("SFPSTORE", vd=identity, mod0=3, addr_mode=2, imm10=d + base + 16 * right + 2 * odd)]  # right faces: 16 rows on
+    if t < 8:  # lanes t on, of the store at the face's rows (a right face's 16 rows on)
+      p += [CC_ON, at_least(7, 2 * t, 6), sfp_store(identity, at=d + base + 16 * right + 2 * odd, step=False)]
   return p + [CC_OFF]
 def mask_rows(kind, m, d=0):
   """Rows m and on of the tile at Dst row d to the identity, past a tensor's last row. A store covers 4 rows, lane l in
@@ -388,18 +394,18 @@ def mask_rows(kind, m, d=0):
   p, identity = masking(kind)
   for r in range(0, 32, 4):  # tile rows r..r+3: Dst rows (r // 16) * 32 + r % 16 on, left face, and 16 more, right face
     k = max(0, m - r)
-    if k < 4: p += [w for o in (0, 2, 16, 18) for w in (CC_ON, at_least(15, 16 * k, 6),
-                                                     ins("SFPSTORE", vd=identity, mod0=3, addr_mode=2, imm10=d + r // 16 * 32 + r % 16 + o))]
+    if k < 4:
+      p += [w for o in (0, 2, 16, 18) for w in (CC_ON, at_least(15, 16 * k, 6), sfp_store(identity, at=d + r // 16 * 32 + r % 16 + o, step=False))]
   return p + [CC_OFF]
-def mask_rows_at(m, d=0):
-  """mask_rows("sum", m, d) for a C expression m, the rows the last tile holds (1 to 31), known when the kernel runs:
-  each group of 4 rows' words pushed with the immediates its place gives them."""
+def mask_rows_at(m):
+  """mask_rows("sum", m) for a C expression m, the rows the last tile holds (1 to 31), known when the kernel runs: each
+  group of 4 rows' words pushed with the immediates its place gives them."""
   p, identity = masking("sum")
-  cut, store = at_least(15, 0, 6), ins("SFPSTORE", vd=identity, mod0=3, addr_mode=2, imm10=0)
+  cut, store = at_least(15, 0, 6), sfp_store(identity, step=False)
   imm12, imm10 = bh.TENSIX_OPS["SFPIADD"][1]["imm12"][0], bh.TENSIX_OPS["SFPSTORE"][1]["imm10"][0]
   return (f"{tt(p)} for (unsigned r = 0; r < 32; r += 4) if ({m} < r + 4) {{ unsigned k = {m} > r ? {m} - r : 0; "
           f"for (unsigned o = 0; o < 4; o++) {{ push_word({CC_ON:#x}); push_word({cut:#x} | (-16 * k & 0xFFF) << {imm12}); "
-          f"push_word({store:#x} | ({d} + r / 16 * 32 + r % 16 + o % 2 * 2 + o / 2 * 16) << {imm10}); }} }} {tt([CC_OFF])}")
+          f"push_word({store:#x} | (r / 16 * 32 + r % 16 + o % 2 * 2 + o / 2 * 16) << {imm10}); }} }} {tt([CC_OFF])}")
 MASK = {1: mask_rows, 2: mask_columns}  # the padding past the last tile along an axis
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
@@ -450,22 +456,35 @@ def reduce_step(kind, slots, acc, first, edge=0, src=None):
   row, sem = ACCS[acc]
   mask = lambda d: MASK[FOLDS[kind]](kind, edge, d) if edge else []
   put = lambda d: fill(src, row + d) + FILLED if src is not None else elementwise("add", slots, dst=d)
-  if first: return ([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem), aim(row)] +
-                    put(0) + mask(0))
-  return ([aim(row)] + put(128) + mask(128) +
-          [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] + runs(slots, kind, 32))
+  if first: return take(sem) + [aim(row)] + put(0) + mask(0)
+  return [aim(row)] + put(128) + mask(128) + SFPU_START + runs(slots, kind, 32)
 def reduce_finish(kind, slots, acc, posts):  # fold across the tile and run the SFPU ops on the result (then MATH_END)
-  wait = ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)
-  return [wait, aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, slots)
+  return [DST_FREE, aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, slots)
 
 def sfpu(posts, slots):  # the SFPU ops, in order, over the Dst half the FPU just wrote
-  return [w for u in posts for w in [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100)] +
-          SFPU[u][0] + runs(slots, u, 32)]
+  return [w for u in posts for w in SFPU_START + SFPU[u][0] + runs(slots, u, 32)]
 
 def _array(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
 BANKS = _array("bank", [bh.noc_xy(x, y) for x, y in bh.DRAM]) + f"""
 #define BANK(t) bank[(t) % {len(bh.DRAM)}] & 63, bank[(t) % {len(bh.DRAM)}] >> 6  // tile t's bank's x, y
-#define AT(base, t, size) ((base) + (t) / {len(bh.DRAM)} * (size))  // and its address there, of a tensor at base: tiles of size bytes"""
+#define AT(base, t, size) ((base) + (t) / {len(bh.DRAM)} * (size))  // and its address there, of a tensor at base: tiles of size bytes
+static inline unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile"""
+# C shared by the kernels of BRISC's alone: the banks, copies inside this L1, and a row filling its tile
+ROWS = BANKS + """
+static void copy(unsigned from, unsigned to, unsigned n) {  // (this tile's coordinates read once a launch: an NIU register read)
+  static unsigned me;
+  if (!me) me = noc_me();
+  noc_get(me & 63, me >> 6, from, to, n);
+}
+// a tile of item-byte values: row 0 of faces 0 and 1 down their 16 rows, then faces 0-1 onto 2-3
+static void row_down(unsigned tile, unsigned item) {
+  unsigned face = 256 * item;
+  l1_settle(tile);
+  for (unsigned n = 16 * item; n < face; n *= 2) { copy(tile, tile + n, n); copy(tile + face, tile + face + n, n); noc_wait(); }
+  copy(tile, tile + 2 * face, 2 * face);
+  noc_wait();
+}"""
+def tile_of(i, b, r, c, a="a"): return f"({b}) * {a}[{i} + 1] + ({r}) * {a}[{i} + 2] + ({c}) + {a}[{i} + 3]"  # tile (b, r, c) of the tensor at a[i]
 
 def tt(words):
   """C for a TRISC to push words to its thread as .ttinsn instructions: each word rotated left by 2 and written into
@@ -488,14 +507,17 @@ DEPTH = 4  # matmul steps whose reads may be in flight at once, each through a s
 ZERO_SLOT, FRAMES = 0, 1 + 2 * DEPTH  # slot 0 is a zero tile, then B's stream slots and A's, two frames, the narrow ops, and
                                       # what stays in L1: A's rows, B's column or buffers, kept inputs
 UNPACKABLE = bh.UNPACKABLE  # the slots an unpacker reads are below this
-B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")  # a matmul's block-float B, past the slots: regions (one, or mc's three
-# buffers), each the exponents of its slots, then their values (the unpacker's layout), at most B8_SLOTS slots: the
-# unpacker finds a slot's exponents by its first datum, which must stay below bh.BFP_FIRST_DATUM
+# A matmul's block-float B, past the slots: regions (one, or mc's three buffers), each the exponents of its slots, then
+# their values (the unpacker's layout), at most B8_SLOTS slots: the unpacker finds a slot's exponents by its first datum,
+# which must stay below bh.BFP_FIRST_DATUM
+B8 = slot_base("bf16") + UNPACKABLE * tile_bytes("bf16")
 B8_SLOTS = bh.BFP_FIRST_DATUM // 1024
 
-def shared_k(rt, grid, added=0):  # the longest K, in tiles, of a matmul of rt tile rows, with `added` inputs added to it,
-  inputs, ops = 2 + added, 1 + added  # whose tiles the grid's workers share by multicast (mc): A's rows and B's three
-  return (UNPACKABLE - FRAMES - 2 * (inputs + ops) - ops) // (-(-rt // min(len(grid[1]), rt)) + 3)  # buffers past the frames
+# The longest K, in tiles, of a matmul of rt tile rows, with `added` inputs added to it, whose tiles the grid's workers
+# share by multicast (mc): A's rows and B's three buffers past the frames
+def shared_k(rt, grid, added=0):
+  inputs, ops = 2 + added, 1 + added
+  return (UNPACKABLE - FRAMES - 2 * (inputs + ops) - ops) // (-(-rt // min(len(grid[1]), rt)) + 3)
 
 # SYNC (its counters zeroed by the firmware for each launch) holds what BRISC and the TRISCs tell each other, each word
 # written by one of them: FETCHED, how many frames BRISC has fetched into L1; ISSUED, how many matmul steps it has
@@ -554,17 +576,18 @@ static void getb(unsigned base, unsigned t, unsigned s) {{
   noc_get(BANK(t), at + 64, r + {64 * b8} + {BFP[wt]} * z, {BFP[wt]});
 }}
 // A matmul step: B's tile (for SrcA) into b_slot and A's into a_slot, each a stream slot or its place in the row or column
-// kept in L1, unless it is there already (KEPT). how: B as it is (0), transposed (1), a block float (2). Step k's reads carry
-// transaction id k % DEPTH + 1, its stream slots': BRISC counts the steps whose reads are out (ISSUED), and thread 0
-// waits for that id's reads to land itself, so up to DEPTH steps' reads are in flight. A frame's reads carry id 0
+// kept in L1, unless it is there already (KEPT). bfp: B is a block float (getb); else bf16, a transposed B's tile as it
+// lies. Step k's reads carry transaction id k % DEPTH + 1, its stream slots': BRISC counts the steps whose reads are out
+// (ISSUED), and thread 0 waits for that id's reads to land itself, so up to DEPTH steps' reads are in flight. A frame's
+// reads carry id 0
 #define KEPT 0xFFFFFFFF
 static unsigned read_id;  // the transaction id initiator 1 puts on reads
 static void tagged(unsigned id) {{ if (id != read_id) {{ while (NIU1(CMD) & 1) {{}} NIU1(PACKET_TAG) = (read_id = id) << 10; }} }}
-static void step(unsigned how, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
+static void step(unsigned bfp, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
   unsigned s = steps % {DEPTH};
   reached(stream_done[s]);  // the step that last used slot s has been unpacked
   tagged(s + 1);
-  if (b_slot != KEPT) {{ if (how == 2) getb(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}  // a transposed B as it lies
+  if (b_slot != KEPT) {{ if (bfp) getb(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}
   if (a_slot != KEPT) get(a, a_tile, a_slot);
   (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU has counted the reads before thread 0 hears of them
   stream_done[s] = ++events;
@@ -623,10 +646,11 @@ def _unpacker(body, cfg, decls=""):  # TRISC0: the backend config and semaphores
 static unsigned needed, relayed, stepped;
 static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // the unpack reports, for BRISC
 static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // until BRISC has fetched the next frame
-static unsigned landed(void) {{  // until the next matmul step's tiles are in: BRISC has issued its reads, and those (its
-  unsigned z = stepped++ % {DEPTH};  // transaction id's) have landed. Its stream slot
-  // and no more than the 15 reports SEM_UNPACKED holds are pushed but not relayed: a step kept in L1 waits for no
-  // fetch, so thread 0 could fall further behind, and a post onto a full semaphore breaks the contract
+// Until the next matmul step's tiles are in: BRISC has issued its reads, and those (its transaction id's) have landed, and
+// no more than the 15 reports SEM_UNPACKED holds are pushed but not relayed (a step kept in L1 waits for no fetch, so
+// thread 0 could fall further behind, and a post onto a full semaphore breaks the contract). Its stream slot
+static unsigned landed(void) {{
+  unsigned z = stepped++ % {DEPTH};
   do relay(); while (peek(ISSUED) < stepped || needed + stepped - relayed > 15);
   while (NIU(OUTSTANDING + 4 + 4 * z)) relay();
   return z;
@@ -675,20 +699,24 @@ static void output(unsigned s, unsigned slot, unsigned t) {{
 def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   """A kernel for an expression: nested tuples, (op, x, y) for add, sub, mul and the binary SFPU ops, (op, x) for the
   unary ones, the reductions (FOLDS: sum0, max2, ...) and cast, and ("matmul", a, b[, phases]) at `phases` fidelity
-  phases (4 unless said), where a is an input and b an input, ("T", input) for one read transposed, or ("bfp8", input)
-  or ("bfp4", input) for a block float (unpacker 0 makes it bf16 on its way into SrcA); an input is a number, its place
-  in shapes. shapes: each input's (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the
-  others (broadcasting). dtype: what the inputs are and the kernel computes in; out: what its root is written as (a
-  cast, or a matmul written as fp32: the packer is switched to it for the root's pack); grid: the workers as
-  Runtime.grid has them, for a matmul to share its tiles between them; reps: each input's repeat
-  (Tensor.repeat_interleave: its matrix b is the one stored at b // rep), 1 unless said.
+  phases (4 unless said); an input is a number, its place in shapes. A matmul's a is an input, and b an input or how
+  it is read and the input: ("T", x) x transposed; ("bfp8", x) or ("bfp4", x) a block float (unpacker 0 makes it bf16
+  on its way into SrcA); ("Tbfp8", x) or ("Tbfp4", x) a block float transposed (a key cache); or any of those with "I"
+  before it ("I" alone for x as it is) and an int32 input ids after it, ("Ibfp4", x, ids): for batch entry b, the
+  matrix of x that ids picks at (b // k, b % k), k its columns (an index past x's batch picks none: zeros).
+  shapes: each input's (batch, rows, columns), laid out as Tensor says; a dimension of 1 repeats across the others
+  (broadcasting). dtype: what the inputs are and the kernel computes in; out: what its root is written as (a cast, or
+  a matmul written as fp32: the packer is switched to it for the root's pack); grid: the workers as Runtime.grid has
+  them, for a matmul to share its tiles between them; reps: each input's repeat (Tensor.repeat_interleave: its matrix
+  b is the one stored at b // rep), 1 unless said.
   bf16 goes through SrcA and SrcB and the FPU. fp32 and int32 cannot (they hold 19 bits), so the math thread puts each
   operand straight into Dst (fill) and the SFPU does all the math, add and sub too; there is no matmul.
   args: [first unit, units, then the result's and each input's DRAM address, tile strides for batch and row, and tile
   offset (Tensor's), then the rows the result's last tile row holds (0: 32)]: rows past them are zeros whatever the
-  shapes say, so one kernel serves every row count in the same tiles. A unit is a tile of the result, or a block of them (one matmul and nothing that reduces: up to 4
-  x 4, or given a grid, a worker's block of it), or, if the expression reduces along an axis, a whole line of tiles
-  along it (a row, a column, or one tile position through the batch), so the reduction can stay on chip.
+  shapes say, so one kernel serves every row count in the same tiles. A unit is a tile of the result, or a block of
+  them (one matmul and nothing that reduces: up to 4 x 4, or given a grid, a worker's block of it), or, if the
+  expression reduces along an axis, a whole line of tiles along it (a row, a column, or one tile position through the
+  batch), so the reduction can stay on chip.
 
   Every op computes into Dst and is packed into an L1 slot: elementwise ops from their operands' slots, a matmul from
   its K pairs of tiles, B's streamed through DEPTH slots (up to DEPTH steps' reads in flight) and A's row kept in L1
@@ -717,26 +745,29 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
       count(c)
   count(expr)
   out, dst = out or dtype, dtype != "bf16"  # dst: the math thread fills Dst itself and the SFPU does the math
-  ops, refs = [], {}  # ops: dicts with kind, x, y, posts, shape (a matmul's also how, bt, wt, kt, phases); refs: expr -> input number or ("op", j)
+  # ops: dicts with kind, x, y, posts, shape (a matmul's also ids, bt, wt, kt, phases); refs: expr -> input number or ("op", j)
+  ops, refs = [], {}
   size = lambda r: shapes[r] if isinstance(r, int) else ops[r[1]]["shape"]  # (batch, rows, columns)
   def visit(e):
     if isinstance(e, int): return e
     if e in refs: return refs[e]
-    if e[0] == "matmul":  # B is an input, or (how, input): ("T", input) that input transposed, ("bfp8", input) a block float,
-      how, y, *ids = e[2] if isinstance(e[2], tuple) else ("", e[2])  # ("Tbfp8", input) a block float transposed (a bfp8 key
-      how, ids = how.removeprefix("I"), ids[0] if ids else None  # cache); ("I" + how, input, ids) for each batch entry b the matrix
-      a, bt, wt = shapes[e[1]], how.startswith("T"), how.removeprefix("T") or None  # of B the int32 input ids picks (b // k, b % k)
+    if e[0] == "matmul":  # b: an input, or (how, x[, ids])
+      how, y, *ids = e[2] if isinstance(e[2], tuple) else ("", e[2])
+      how, ids = how.removeprefix("I"), ids[0] if ids else None
+      a, bt, wt = shapes[e[1]], how.startswith("T"), how.removeprefix("T") or None
       batch = shapes[ids][1] * shapes[ids][2] if ids is not None else max(a[0], shapes[y][0])
-      op = dict(kind="matmul", x=e[1], y=y, ids=ids, how=2 if wt else int(bt), bt=bt, wt=wt, kt=ext(a, 2),  # how: B fetched as a bf16 tile (0, 1) or a block float's (2)
-                shape=(batch, a[1], shapes[y][1 if bt else 2]), phases=e[3] if len(e) > 3 else 4)
+      op = dict(kind="matmul", x=e[1], y=y, ids=ids, bt=bt, wt=wt, kt=ext(a, 2), shape=(batch, a[1], shapes[y][1 if bt else 2]),
+                phases=e[3] if len(e) > 3 else 4)
     elif e[0] in COMBINE:
       x = visit(e[1])
       op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
-    elif e[0] == "cast" or e[0] in SFPU and e[0] not in BINARY:  # a unary op, or the root's cast (packed as out, after an
-      x = visit(e[1])                                              # SFPU program between floats and ints, if need be)
-      posts = ([CASTS[dtype, out]] if (dtype, out) in CASTS else []) if e[0] == "cast" else [FP32_OPS.get(e[0], e[0]) if dtype == "fp32" else e[0]]
-      if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below (a bf16 cast rounds it
-        ops[x[1]]["posts"] += ["ftob"] * (e[0] == "cast" and dtype == "bf16") + posts  # first, as its own pack would)
+    elif e[0] == "cast" or e[0] in SFPU and e[0] not in BINARY:
+      # a unary op, or the root's cast (packed as out, after an SFPU program between floats and ints, if need be)
+      x = visit(e[1])
+      posts = (([CASTS[dtype, out]] if (dtype, out) in CASTS else []) if e[0] == "cast" else
+               [FP32_OPS.get(e[0], e[0]) if dtype == "fp32" else e[0]])
+      if isinstance(x, tuple) and uses[e[1]] == 1:  # in place, on the result of the op below; a bf16 cast rounds it first, as its own pack would
+        ops[x[1]]["posts"] += ["ftob"] * (e[0] == "cast" and dtype == "bf16") + posts
         refs[e] = x
         return x
       op = dict(kind="add", x=x, y="zero", shape=size(x), posts=posts)  # operand + 0 into Dst, then the SFPU
@@ -748,9 +779,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     return refs[e]
   root = visit(expr)[1]
   # a root packed as another dtype than the rest: the packer switched to it for the root's pack and back, unless it is alone
-  config = kernel_config(dtype, out if len(ops) == 1 else dtype)
-  root_config = kernel_config(dtype, out)
-  around = (tt(repack(config, root_config)), tt(repack(root_config, config))) if out != dtype and len(ops) > 1 else ("", "")
+  cfg, root_cfg = kernel_config(dtype, out if len(ops) == 1 else dtype), kernel_config(dtype, out)
+  around = (tt(repack(cfg, root_cfg)), tt(repack(root_cfg, cfg))) if out != dtype and len(ops) > 1 else ("", "")
+  repacked = lambda j, words: f"{around[0]} {tt(words)} {around[1]}" if j == root else tt(words)  # op j's pack, the root's in out
   operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")] if op["kind"] != "matmul" else []
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
   axes = {FOLDS[op["kind"]] for op in ops if op["kind"] in COMBINE}
@@ -798,7 +829,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     kt = ops[matmuls[0]]["kt"]
     bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
     n_grid = (-(-w // bq), -(-rt // bp))
-    room = kt <= B8_SLOTS if ops[matmuls[0]]["how"] == 2 else base + (bp + 3) * kt <= UNPACKABLE  # B's three buffers
+    room = kt <= B8_SLOTS if ops[matmuls[0]]["wt"] else base + (bp + 3) * kt <= UNPACKABLE  # B's three buffers
     if base + bp * kt <= UNPACKABLE and room and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B: mc = n_grid
   # With one row of tiles (a token's matmul), the grid's workers each take a block of the result's columns and the first
   # grid row reads A's tiles in shares and multicasts them to all (bcast), so each comes from DRAM once, not once a
@@ -819,14 +850,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
             and size(ops[matmuls[0]]["x"])[0] == 1 and nb * w >= len(grid[0]) * len(grid[1]))
   if not mc and not bcast:
     bp = min(4, rt) if len(matmuls) == 1 and not reducing else 1
-    while bp > 1 and (base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE or ops[matmuls[0]]["how"] == 2 and ops[matmuls[0]]["kt"] > B8_SLOTS):
+    while bp > 1 and (base + (bp + 1) * ops[matmuls[0]]["kt"] > UNPACKABLE or ops[matmuls[0]]["wt"] and ops[matmuls[0]]["kt"] > B8_SLOTS):
       bp -= 1
     bq = min(4, w) if bp > 1 else 1
   if bp > 1 or mc: rows_at = [base]  # A's bp rows, then B's column (or its three buffers)
   kept_b = rows_at[0] + bp * ops[matmuls[0]]["kt"] if bp > 1 or mc else None
   # a block-float B goes to slots of its own at B8 (a region for each of mc's three buffers, or one for a block's column,
   # or for DEPTH to stream through), unpacker 0 switched to them for its steps
-  b8 = (ops[matmuls[0]]["kt"] if kept_b is not None else DEPTH) if any(ops[j]["how"] == 2 for j in matmuls) else 0
+  b8 = (ops[matmuls[0]]["kt"] if kept_b is not None else DEPTH) if any(ops[j]["wt"] for j in matmuls) else 0
   wts = {ops[j]["wt"] for j in matmuls if ops[j]["wt"]}  # the block floats B comes in: one kind a kernel
   assert len(wts) <= 1, "one block float a kernel"
   wt = next(iter(wts), "bfp8")
@@ -860,15 +891,15 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
   line_b, computed = None, [None]
   for j in matmuls:
     mine = [p for p, pl in enumerate(plans) if j in pl[1]]
-    if (reducing and line_b is None and len(mine) > 1 and ops[j]["how"] != 2 and rows_at[matmuls.index(j)] is not None and
+    if (reducing and line_b is None and len(mine) > 1 and not ops[j]["wt"] and rows_at[matmuls.index(j)] is not None and
         top + L * ops[j]["kt"] <= UNPACKABLE): line_b, computed, lines_at, top = j, mine, top, top + L * ops[j]["kt"]
   if line_b is not None: decls += f"static unsigned line_done[{L}];\n"
   single = {}  # without passes, an input of one tile in all (a number) gets a slot of its own too, fetched once a worker
   if kept_b is not None: top = max(top, kept_b + (3 if mc else 1) * ops[matmuls[0]]["kt"])  # past A's rows and B's buffers
   for r in range(inputs) if not reducing else ():
     if all(ext(shapes[r], ax) == 1 for ax in range(3)) and top < UNPACKABLE: single[r], top = top, top + 1
-  def slot(r):  # an input or swept op lives in the tile's frame (C's fr: 0 or 1), unless kept; a narrow op in a slot of its
-    if r == "zero": return ZERO_SLOT  # own after both frames
+  def slot(r):  # an input or swept op lives in the tile's frame (C's fr: 0 or 1), unless kept; a narrow op in a slot of its own
+    if r == "zero": return ZERO_SLOT
     if r in single: return single[r]
     if isinstance(r, int) and r in kept: return kept[r] if narrow(r) else f"{kept[r]} + k"
     if isinstance(r, int) or swept(r): return f"{FRAMES + (r if isinstance(r, int) else inputs + r[1])} + fr * {frame}"
@@ -889,15 +920,17 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     if j != root: return tt(MATH_END)
     at_end = lambda ax: f"{('i_', 'j')[ax - 1]} == {ext(size(me), ax) - 1}"
     edge = [f"if ({at_end(2)}) {{ {tt(mask_columns('sum', cols % 32))} }}"] * (cols > 1 and cols % 32 > 0)
-    edge += [f"if ({at_end(1)} && a[{arg(len(shapes))}]) {{ {mask_rows_at(f'a[{arg(len(shapes))}]')} }}"] * (rows > 1)  # (an argument)
+    edge += [f"if ({at_end(1)} && a[{arg(inputs)}]) {{ {mask_rows_at(f'a[{arg(inputs)}]')} }}"] * (rows > 1)  # (an argument)
     return " ".join(edge + [tt(MATH_END)])
   def pslot(r):  # where the packer puts r: its slot, or for a result in another dtype, one at OUTS
     return ("fr" if swept(me) else 0) if out != dtype and r == me else slot(r)
   def output(j):  # for the pack thread: where op j's result goes, if it is the root
     return f"output({'fr' if swept(me) else 0}, {pslot(me)}, {where(me, 2)}); " if j == root else ""
-  def fetch(p, r):  # BRISC's fetch of input r in pass p: into the frame, or into its kept slot in the first pass reading it,
-    if r in single: return f"if (tiles == 1) get(a[{arg(r)}], {tile(r)}, {single[r]});"  # with the first tile (tiles counts it already)
-    if r not in kept: return f"get(a[{arg(r)}], {tile(r)}, {slot(r)});"  # once the line before has been read there
+  # BRISC's fetch of input r in pass p: into the frame, or into its kept slot in the first pass reading it, once the line
+  # before has been read there; a single one with the first tile (tiles counts it already)
+  def fetch(p, r):
+    if r in single: return f"if (tiles == 1) get(a[{arg(r)}], {tile(r)}, {single[r]});"
+    if r not in kept: return f"get(a[{arg(r)}], {tile(r)}, {slot(r)});"
     if p != passes_of(r)[0]: return ""
     return (f"if (k == 0) {{ reached(narrow_done); get(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
             f"reached(kept_done[k]); get(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
@@ -920,23 +953,22 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     for j in once + swept_ops:
       op, me_j = ops[j], ("op", j)
       cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
-      pk = tt(pack("h", pslot(me_j), SEM_PACKED if j == root else SEM_L1))
-      pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
+      pk = repacked(j, pack("h", pslot(me_j), SEM_PACKED if j == root else SEM_L1))
       c[P].append(f"{cond}{{ {output(j)}{pk} h ^= {DST_HALF}; }}")
       if op["kind"] == "matmul":
-        kt, bw, q, how = op["kt"], ext(op["shape"], 2), matmuls.index(j), op["how"]  # B's width in tiles; which matmul
-        bt, bs = op["bt"], 0 if how == 2 else 1  # B transposed; B's first stream slot (a block float's are at B8)
+        kt, bw, q, bfp = op["kt"], ext(op["shape"], 2), matmuls.index(j), 1 if op["wt"] else 0  # B's width in tiles; which matmul; B a block float
+        bt, bs = op["bt"], 0 if bfp else 1  # B transposed; B's first stream slot (a block float's are at B8)
         x, y = arg(op["x"]), arg(op["y"])
         bj = 'j' if bw > 1 else 0  # B's tile (m, j), or for B transposed the input's tile (j, m)
         in_batch = f"ids(b) * a[{y + 1}] + " if op["ids"] is not None else matrix(op["y"], y)  # B's matrix: picked, or the batch's
         b_which = "ids(b)" if op["ids"] is not None else which(op["y"])  # (and which: a row or column kept in L1 is tagged by its own)
         live = f"if (ids(b) < {shapes[op['y']][0]}) " if op["ids"] is not None else ""  # an entry picking no matrix: zeros, nothing read
         b_tile = f"{in_batch}{bj} * a[{y + 2}] + m + a[{y + 3}]" if bt else f"{in_batch}m * a[{y + 2}] + {bj} + a[{y + 3}]"
-        on = tt(haloize(1) * bt + (bfp_b(wt, b8) if how == 2 else []))  # unpacker 0 transposing faces, reading a block float
-        off = tt(haloize(0) * bt + (bfp_b(wt, 0) if how == 2 else []))
-        if mc and how == 2: on = tt(haloize(1) * bt) + " " + " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp_b(wt, b8, r))} }}" for r in range(3))
+        on = tt(haloize(1) * bt + (bfp_b(wt, b8) if bfp else []))  # unpacker 0 transposing faces, reading a block float
+        off = tt(haloize(0) * bt + (bfp_b(wt, 0) if bfp else []))
+        if mc and bfp: on = tt(haloize(1) * bt) + " " + " else ".join(f"if (jj % 3 == {r}) {{ {tt(bfp_b(wt, b8, r))} }}" for r in range(3))
         a_tile = f"{matrix(op['x'], x)}i_ * a[{x + 2}] + m + a[{x + 3}]"
-        buf = mc and f"{0 if how == 2 else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a block float's in B8)
+        buf = mc and f"{0 if bfp else kept_b} + jj % 3 * {kt}"  # with mc, B's buffer for column jj (a block float's in B8)
         if mc:  # A's rows and B's columns come by multicast (see mc), column jj into B's buffer jj % 3
           gx_n, gy_n = mc
           gx, gy, a_n = f"unit % {bc}", f"unit / {bc}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {kt}"
@@ -945,9 +977,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
           get_a = (f"for (unsigned e = {a0}; e < {a1}; e++) "
                    f"{{ unsigned i_ = i0 + e / {kt}, m = e % {kt}; get(a[{x}], {a_tile}, {rows_at[q]} + e); }} "
                    f"share(SLOT({rows_at[q]} + {a0}), ({a1} - {a0}) * {tile_bytes(dtype)}, row_rect[{gy}], {gx_n - 1}, {gx}, 1);")
-          get_b = f"for (unsigned m = {b0}; m < {b1}; m++) {('get', 'get', 'getb')[how]}(a[{y}], {b_tile}, {buf} + m); "
+          get_b = f"for (unsigned m = {b0}; m < {b1}; m++) {'getb' if bfp else 'get'}(a[{y}], {b_tile}, {buf} + m); "
           share_b = lambda l1, n: f"share({l1}, ({b1} - {b0}) * {n}, col_rect[{gx}], {gy_n - 1}, {FLAGS_B} + {gy}, jj + 1);"
-          if how == 2:  # in region jj % 3 of B8: the share's exponents, then its values
+          if bfp:  # in region jj % 3 of B8: the share's exponents, then its values
             region = f"{B8} + jj % 3 * {kt * tile_bytes(wt)}"
             get_b += (f"if ({gy_n - 1} && {b1} > {b0}) mcast({region} + 64 * ({b0}), ({b1} - {b0}) * 64, col_rect[{gx}], {gy_n - 1}); " +
                       share_b(f"{region} + {64 * kt} + {BFP[wt]} * ({b0})", BFP[wt]))
@@ -960,29 +992,29 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
                       f"for (unsigned m = 0; m < {kt}; m++) kept_step(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[jj % 3] = events; }}")
         elif kept_b is not None:  # A's bp rows and B's column in L1
           c[B].append(f"{cond}{live}{{ unsigned na = fresh(i_ % {bp}, {which(op['x'])} * {rt} + i_), nb = fresh(15, {b_which} * {w} + j); "
-                      f"for (unsigned m = 0; m < {kt}; m++) step({how}, a[{y}], {b_tile}, nb ? {0 if how == 2 else kept_b} + m : KEPT, "
+                      f"for (unsigned m = 0; m < {kt}; m++) step({bfp}, a[{y}], {b_tile}, nb ? {0 if bfp else kept_b} + m : KEPT, "
                       f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT); tagged(0); }}")
         if kept_b is not None:  # unpacker 0 walks B's column, 1 the row of A
-          column = 0 if how == 2 else buf if mc else kept_b  # a block-float B's from the start of its region
+          column = 0 if bfp else buf if mc else kept_b  # a block-float B's from the start of its region
           c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, f'{rows_at[q]} + i_ % {bp} * {kt}'), setadc(bh.UNPACK0, column)])} "
                       f"{on} {live}for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
         elif rows_at[q] is None:  # A's tile streams in beside B's, each step
           c[B].append(f"{cond}{{ {live}for (unsigned m = 0; m < {kt}; m++) "
-                      f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, {1 + DEPTH} + steps % {DEPTH}); tagged(0); }}")
+                      f"step({bfp}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, {1 + DEPTH} + steps % {DEPTH}); tagged(0); }}")
           c[U].append(f"{cond}{{ {on} {live}for (unsigned m = 0; m < {kt}; m++) {{ unsigned z = landed(); "
                       f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
-        elif j == line_b:  # B's line in L1 across passes: fetched in the first pass that computes it, once the line before
-          line = f"{lines_at} + k * {kt}"  # has been done with it; A's row kept as below
+        elif j == line_b:  # B's line in L1 across passes: fetched in the first pass computing it, once the line before is done with it
+          line = f"{lines_at} + k * {kt}"  # (A's row kept as below)
           if p == computed[0]:
             c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, {which(op['x'])} * {rt} + i_); for (unsigned m = 0; m < {kt}; m++) "
-                        f"step({how}, a[{y}], {b_tile}, {line} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
+                        f"step({bfp}, a[{y}], {b_tile}, {line} + m, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
           else: c[B].append(f"for (unsigned m = 0; m < {kt}; m++) kept_step();")
           c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, line)])} {on} "
                       f"for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
         else:
           new = "0" if bcast or shared else f"fresh({q}, {which(op['x'])} * {rt} + i_)"  # (bcast's, shared's: A's row is in already)
           c[B].append(f"{cond}{live}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
-                      f"step({how}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
+                      f"step({bfp}, a[{y}], {b_tile}, {bs} + steps % {DEPTH}, a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT); tagged(0); }}")
           c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} {live}for (unsigned m = 0; m < {kt}; m++) {{ "
                       f"unsigned z = landed(); {tt(step_unpack(f'{bs} + z'))} }} {off}{posted} }}")
         c[M].append(f"{cond}{{ {tt(math_begin(True) + walk(True) * bt)} "  # a transposed B's walk, then the modes back
@@ -1014,8 +1046,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
         plain, cut = tt(reduce_step(kind, slots, acc, first, 0, src)), tt(reduce_step(kind, slots, acc, first, edge, src))
         return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
       finish, posted = f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}', "" if j == root else " posted++;"
-      pk = tt(pack(ACCS[acc][0], pslot(me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
-      pk = f"{around[0]} {pk} {around[1]}" if j == root else pk
+      pk = repacked(j, pack(ACCS[acc][0], pslot(me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
       unpacks = "" if dst else tt(unpack(slot(x), ZERO_SLOT))  # an fp32 step fills Dst itself
       mine = M if dst else U  # who drains and counts
       if swept(x):  # swept along the line
@@ -1076,16 +1107,27 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None):
     first = (f"  for (unsigned i = 0; i < {it}; i++) {{ unsigned t = a[{arg(r) + 3}] + i * a[{arg(r) + 2}];  // the indices' tile row i\n"
              f"    noc_get(BANK(t), AT(a[{arg(r)}], t, {ib}), IDS + i * {ib}, {ib}); }}\n  noc_wait();\n" + first)
   brisc = _brisc(total, first + program(B), dtype, out, decls + indices, tail, b8, wt)
-  image = compile_kernel(brisc, _unpacker(program(U), config, indices), _math(slots, program(M), dst, indices), _packer(program(P)))
+  image = compile_kernel(brisc, _unpacker(program(U), cfg, indices), _math(slots, program(M), dst, indices), _packer(program(P)))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and how many units the result is
+
+def attention_l1(ht, rows, wt, parts):
+  """attention_kernel's L1 for a unit: its R tile rows of queries, fs slots a frame (the masks, then bf16 keys and
+  values) and T output tiles a row (p v, the sums, and with parts its largest scores); past a tile of ones (slot 1), one
+  of -1e9 (2) and the two frames, the slots of each row's p, its largest and its queries, then the first slot free; and
+  from L1's top down, the output's tiles (each row's p v's then its sums, in fp32), the unit's places, and its ranges:
+  (two units') key tiles, first, last, the full ones' first and end, and whether its part has none."""
+  R = min(8, -(-rows // 32))
+  fs, T = R + (0 if wt else 2 * ht), ht + 1 + (parts > 1)
+  p_slot = 3 + 2 * fs
+  oacc = bh.L1_SIZE - R * T * tile_bytes("fp32")
+  places = oacc - R * tile_bytes("int32")
+  return R, fs, T, (p_slot, p_slot + R, p_slot + 2 * R), oacc, places, p_slot + 2 * R + R * ht, places - 64
 
 def attention_store(ht, rows, wt, parts):
   """Where a unit's keys can stay in L1 between attention_kernel's two sweeps: for a block float, the bases of regions
   of whole key rows (at most 64 slots each, the unpacker's), below B8 past the slots in use and past the frames' regions;
   for bf16, the first free slot. And how many key rows fit."""
-  R = min(8, -(-rows // 32))
-  used = 3 + 2 * (R + (0 if wt else 2 * ht)) + 2 * R + R * ht  # (ones, none, the frames, p, the largest, the queries)
-  top = bh.L1_SIZE - R * (ht + 1 + (parts > 1)) * tile_bytes("fp32") - R * tile_bytes("int32") - 64  # (attention_kernel's ranges)
+  *_, used, top = attention_l1(ht, rows, wt, parts)
   if not wt: return used, (UNPACKABLE - used) // ht
   per = 64 // ht  # key rows a region
   size = per * ht * tile_bytes(wt)
@@ -1128,22 +1170,21 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   second, so each comes from DRAM once a unit."""
   assert ht >= 2, "a head of 64 columns at least"
   ra = -(-rows // 32)
-  R = min(8, ra)  # tile rows a unit
-  per, fs = -(-ra // R), R + (0 if wt else 2 * ht)  # units a head; slots a frame (the masks, then bf16 keys and values)
+  R, fs, T, (p_slot, m_slot, q_row), oacc, places, used, ranges = attention_l1(ht, rows, wt, parts)
+  per = -(-ra // R)  # units a head
   ones, none, fr0 = 1, 2, 3  # a tile of ones and one of -1e9 (the SFPU's, packed once a launch), then the frames
   assert parts == 1 or R <= 2, "parts of units of one or two tile rows (decode's)"
-  T = ht + 1 + (parts > 1)  # a row's output tiles: p v, the sums, and with parts its largest scores
-  mask = lambda r: f"{fr0} + fr * {fs} + {r}"  # frame fr's mask tile for row r, and where the unpackers find its key tile m
-  key = lambda m: f"{m}" if wt else f"{fr0} + fr * {fs} + {R} + {m}"  # and value tile j (a block float's: in the frame's
-  val = lambda j: f"{ht} + {j}" if wt else f"{fr0} + fr * {fs} + {R + ht} + {j}"  # region at B8)
-  into = lambda z: f"fr * {2 * ht} + {z}" if wt else z  # where BRISC puts one (getb's region and slot)
-  p_slot, m_slot, q_row = fr0 + 2 * fs, fr0 + 2 * fs + R, fr0 + 2 * fs + 2 * R  # each row's p, its largest, its queries
-  oacc = bh.L1_SIZE - R * T * tile_bytes("fp32")  # the output's tiles, each row's p v's then its sums, in fp32
-  places = oacc - R * tile_bytes("int32")  # the unit's places, and (two units') key tiles: first, last, the full ones'
-  ranges = places - 64                     # first and end, and whether its part has none
-  assert ranges >= B8 + 2 * 2 * ht * tile_bytes(wt or "bf16") and q_row + R * ht <= UNPACKABLE, "a unit's tiles in L1"
-  if keep:  # a unit's first key rows (n = kt - k0 below room): a block float's row n in region n / rows_a, slot n % rows_a * ht
-    store, room = attention_store(ht, rows, wt, parts)  # on; a bf16's at slot store + n * ht on
+  # frame fr's mask tile for row r, and where the unpackers find its key tile m and value tile j (a block float's: in the
+  # frame's region at B8), and where BRISC puts one (getb's region and slot)
+  mask = lambda r: f"{fr0} + fr * {fs} + {r}"
+  key = lambda m: f"{m}" if wt else f"{fr0} + fr * {fs} + {R} + {m}"
+  val = lambda j: f"{ht} + {j}" if wt else f"{fr0} + fr * {fs} + {R + ht} + {j}"
+  into = lambda z: f"fr * {2 * ht} + {z}" if wt else z
+  assert ranges >= B8 + 2 * 2 * ht * tile_bytes(wt or "bf16") and used <= UNPACKABLE, "a unit's tiles in L1"
+  # keep: a unit's first key rows in L1, n = kt - k0 below room: a block float's row n in region n / rows_a from slot
+  # n % rows_a * ht on, a bf16's from slot store + n * ht on
+  if keep:
+    store, room = attention_store(ht, rows, wt, parts)
     rows_a = 64 // ht
   kept = f"(kt - k0 < {room})" if keep else "0"  # (a key row in the store)
   cfg = kernel_config() | config(Pack_L1_Acc=0)
@@ -1151,8 +1192,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   onto = first | config(Pack_L1_Acc=1)  # and added onto
   slots = allocate({"mmT", "mm", "max2", "exp", "one"} | ({"none", "floor", "ftob"} if parts > 1 else set()))
   held = R <= 2  # each row's largest kept in Dst (ACCS's two accumulators), else in L1 between key tiles
-  acc, group = ACCS[0][0], ACCS[0][1]  # (row r's at acc + 64 r, a later tile's 128 rows on; taken for a sweep)
-  tile = lambda i, b, r, c: f"({b}) * a[{i + 1}] + ({r}) * a[{i + 2}] + {c} + a[{i + 3}]"  # tile (b, r, c) of the tensor at a[i]
+  acc, group = ACCS[0]  # (row r's at acc + 64 r, a later tile's 128 rows on; taken for a sweep)
   each = lambda body: f"for (unsigned r = 0; r < nr; r++) {{ {body} }}"
   rng = f"(volatile unsigned *){ranges:#x} + (u & 1) * 8"
   read = f"asm volatile(\"fence\" ::: \"memory\"); volatile unsigned *g = {rng}; unsigned k0 = g[0], k1 = g[1], f0 = g[2], f1 = g[3], empty = g[4];"
@@ -1164,32 +1204,37 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
     for (unsigned kt = k0; kt <= k1; kt++) {{ unsigned fr = tiles++ & 1; {pass1} }}
     {end}
   }}"""
-  part = "(!empty && (kt < f0 || kt >= f1))"  # a tile of keys some row sees only in part: its mask tiles are read
+  part = "(!empty && (kt < f0 || kt >= f1))"  # a tile of keys some row sees only in part: BRISC builds its mask tiles (masked)
   ob = f"e * {parts} + part" if parts > 1 else "e"  # the result's batch entry
-  # BRISC: a tile of ones, once; then for each unit its places, from them its tiles of keys (k0 to k1) and the whole
-  # ones (f0 to f1, not included), told to the TRISCs as a frame fetched
+  # BRISC: for each unit its places, from them its tiles of keys (k0 to k1) and the whole ones (f0 to f1, not included),
+  # with parts this part's share of them, told to the TRISCs as a frame fetched
   start = ("unsigned lo = ~0u, hi = 0; " +
-           each(f"noc_get(BANK({tile(18, 'e', 'i0 + r', 0)}), AT(a[18], {tile(18, 'e', 'i0 + r', 0)}, 4096), {places:#x} + r * 4096, 4096);") +
+           each(f"noc_get(BANK({tile_of(18, 'e', 'i0 + r', 0)}), AT(a[18], {tile_of(18, 'e', 'i0 + r', 0)}, 4096), {places:#x} + r * 4096, 4096);") +
            " noc_wait(); " +
            each(f"volatile unsigned *t = (volatile unsigned *)({places:#x} + r * 4096); "
-                f"for (unsigned q = 0; q < 32 && (i0 + r) * 32 + q < a[23]; q++) {{ unsigned p = t[q / 16 * 512 + q % 16 * 16]; lo = p < lo ? p : lo; hi = p > hi ? p : hi; }}") +
+                f"for (unsigned q = 0; q < 32 && (i0 + r) * 32 + q < a[23]; q++) "
+                f"{{ unsigned p = t[at(q, 0)]; lo = p < lo ? p : lo; hi = p > hi ? p : hi; }}") +
            f" volatile unsigned *g = {rng}; unsigned k0 = {f'lo + 1 > {window} ? (lo + 1 - {window}) / 32 : 0' if window else '0'}, "
-           f"k1 = hi / 32 < a[22] - 1 ? hi / 32 : a[22] - 1, f0 = {f'hi + 1 > {window} ? (hi + 1 - {window} + 31) / 32 : 0' if window else '0'}, f1 = (lo + 1) / 32; " +
-           (f"unsigned n_ = k1 - k0 + 1, a0 = k0 + n_ * part / {parts}, a1 = k0 + n_ * (part + 1) / {parts}, empty = a0 == a1; "  # this part's
-            "if (empty) k1 = k0; else k0 = a0, k1 = a1 - 1; " if parts > 1 else "unsigned empty = 0; ") +                   # share of them
+           f"k1 = hi / 32 < a[22] - 1 ? hi / 32 : a[22] - 1, "
+           f"f0 = {f'hi + 1 > {window} ? (hi + 1 - {window} + 31) / 32 : 0' if window else '0'}, f1 = (lo + 1) / 32; " +
+           (f"unsigned n_ = k1 - k0 + 1, a0 = k0 + n_ * part / {parts}, a1 = k0 + n_ * (part + 1) / {parts}, empty = a0 == a1; "
+            "if (empty) k1 = k0; else k0 = a0, k1 = a1 - 1; " if parts > 1 else "unsigned empty = 0; ") +
            "g[0] = k0, g[1] = k1, g[2] = f0, g[3] = f1, g[4] = empty; asm volatile(\"fence\" ::: \"memory\"); ready(); ++events;")
   getk = "getb" if wt else "get"
-  framed = f"for (unsigned m = 0; m < {ht}; m++) {getk}(a[10], {tile(10, f'e / {rep}', 'kt', 'm')}, {into(key('m'))});"  # (into the frame)
+  framed = f"for (unsigned m = 0; m < {ht}; m++) {getk}(a[10], {tile_of(10, f'e / {rep}', 'kt', 'm')}, {into(key('m'))});"  # (into the frame)
   if not keep: stored = ""
-  elif wt: stored = (f"for (unsigned m = 0, n = kt - k0, z = n % {rows_a} * {ht}; m < {ht}; m++, z++) {{ unsigned t = {tile(10, f'e / {rep}', 'kt', 'm')}, "
-                     f"at = AT(a[10], t, {tile_bytes(wt)}); noc_get(BANK(t), at, store[n / {rows_a}] + 64 * z, 64); "
+  elif wt: stored = (f"for (unsigned m = 0, n = kt - k0, z = n % {rows_a} * {ht}; m < {ht}; m++, z++) "
+                     f"{{ unsigned t = {tile_of(10, f'e / {rep}', 'kt', 'm')}, at = AT(a[10], t, {tile_bytes(wt)}); "
+                     f"noc_get(BANK(t), at, store[n / {rows_a}] + 64 * z, 64); "
                      f"noc_get(BANK(t), at + 64, store[n / {rows_a}] + {64 * rows_a * ht} + {BFP[wt]} * z, {BFP[wt]}); }}")
-  else: stored = f"for (unsigned m = 0; m < {ht}; m++) get(a[10], {tile(10, f'e / {rep}', 'kt', 'm')}, {store} + (kt - k0) * {ht} + m);"
+  else: stored = f"for (unsigned m = 0; m < {ht}; m++) get(a[10], {tile_of(10, f'e / {rep}', 'kt', 'm')}, {store} + (kt - k0) * {ht} + m);"
   keys = lambda values: f"if (!{kept}) {{ {framed} }}" + (f" else {{ {stored} }}" if not values else "")  # (a row in the store: the first sweep's)
   fetch = lambda values: (f"reached(frame_done[fr]); if {part} {{ " + each(f"masked({mask('r')}, r, kt);") + " } " + keys(values) +
-                          (f" for (unsigned j = 0; j < {ht}; j++) {getk}(a[14], {tile(14, f'e / {rep}', 'kt', 'j')}, {into(val('j'))});" if values else "") +
+                          (f" for (unsigned j = 0; j < {ht}; j++) "
+                           f"{getk}(a[14], {tile_of(14, f'e / {rep}', 'kt', 'j')}, {into(val('j'))});" if values else "") +
                           f" l1_settle(SLOT({mask(0)})); ready(); frame_done[fr] = ++events;")
-  queries = "if (kt == k0) { reached(events); " + each(f"for (unsigned m = 0; m < {ht}; m++) get(a[6], {tile(6, 'e', 'i0 + r', 'm')}, {q_row} + r * {ht} + m);") + " }"
+  queries = ("if (kt == k0) { reached(events); " +
+             each(f"for (unsigned m = 0; m < {ht}; m++) get(a[6], {tile_of(6, 'e', 'i0 + r', 'm')}, {q_row} + r * {ht} + m);") + " }")
   brisc = units(start, f"{queries} {fetch(False)}", "", fetch(True), f"expect += nr * {T};")
   region = lambda words: f"if (fr) {{ {tt(words(1))} }} else {{ {tt(words(0))} }}"  # unpacker 0 at frame fr's block floats
   on_k, off_k = region(lambda f: haloize(1) + (bfp_b(wt, 2 * ht, f) if wt else [])), tt(haloize(0) + (bfp_b(wt, 0) if wt else []))
@@ -1200,36 +1245,36 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
     first_key = f"{kept} ? (kt - k0) % {rows_a} * {ht} : {key(0)}"
   elif keep: first_key = f"{kept} ? {store} + (kt - k0) * {ht} : {key(0)}"
   on_v, off_v = (region(lambda f: bfp_b(wt, 2 * ht, f)), tt(bfp_b(wt, 0))) if wt else ("", "")
-  pair = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),  # a key tile into SrcA, a query tile into SrcB,
-          ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)]  # each Z then on by 1
-  walk_k = f"{on_k} {tt([setadc(bh.UNPACK1, f'{q_row} + r * {ht}'), setadc(bh.UNPACK0, first_key)])} {tt([Loop(ht, pair)])} {off_k}"
+  # row r's queries and a tile row of keys, in pairs: a key tile into SrcA, a query tile into SrcB
+  walk_k = f"{on_k} {tt([setadc(bh.UNPACK1, f'{q_row} + r * {ht}'), setadc(bh.UNPACK0, first_key)])} {tt([Loop(ht, PAIR)])} {off_k}"
   the_mask = f"empty ? {none} : {part} ? {mask('r')} : {ZERO_SLOT}"
   largest = f"{m_slot} + r"
-  take = f"for (; drained < upto; drained++) {{ {tt(TAKE_L1)} }}"  # (the last tile's largests, packed)
+  drain_upto = f"for (; drained < upto; drained++) {{ {tt(TAKE_L1)} }}"  # (the last tile's largests, packed)
   unpacker = units(f"fetched(); {read} {tt(REPORT)}",
                    "fetched(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k}") + f" {tt(REPORT)}" if held else
                    "fetched(); unsigned upto = posted; " +
-                   each(f"if (kt > k0) {{ {take} {tt(unpack(largest, ZERO_SLOT))} }} {tt(unpack(the_mask, ZERO_SLOT))} {walk_k} posted++;") + f" {tt(REPORT)}",
-                   "posted += nr;" if held else "drain(); " + each(f"{tt(unpack(largest, ZERO_SLOT))} posted++;"),  # (each row's largest, across its tile)
+                   each(f"if (kt > k0) {{ {drain_upto} {tt(unpack(largest, ZERO_SLOT))} }} "
+                        f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k} posted++;") + f" {tt(REPORT)}",
+                   # (each row's largest, across its tile)
+                   "posted += nr;" if held else "drain(); " + each(f"{tt(unpack(largest, ZERO_SLOT))} posted++;"),
                    "fetched(); drain(); " + each(f"{tt(unpack(the_mask, largest))} {walk_k} posted++;") + " drain(); "  # each row's p, packed
                    f"{on_v} " + each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(unpack(val('j'), f'{p_slot} + r'))} }}") + f" {off_v} " +
                    each(tt(unpack(ones, f"{p_slot} + r"))) + f" {tt(REPORT)}", "")  # (the sums' products after, the ones bf16)
   told = "fetched(); " + read + " needed += 2 * (k1 - k0 + 1);"  # (the unit's frames, which the math and pack threads need not wait for)
   scores = lambda op, row: (f"{tt([aim(row)] + elementwise(op, slots) + walk(True))} "
                             f"for (unsigned m = 0; m < {ht}; m++) {{ {tt(matmul(slots, phases, True))} }} {tt(walk(False))}")
-  fold = tt([ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100), aim("h")] + runs(slots, "max2", 32))
+  fold_h = tt(SFPU_START + [aim("h")] + runs(slots, "max2", 32))  # the tile 128 rows past h into it
   begin = tt(math_begin(False))
   product = f"{tt(math_begin(True))} {tt(matmul(slots, phases))} {tt(MATH_END)} h ^= {DST_HALF};"  # p by a value tile, or by the ones
-  room = tt([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)])  # a result's place to pack from
-  take_acc = tt([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=group, wait_sem_cond=1), ins("SEMGET", sem_sel=group)])
-  fold_acc = tt([ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100), aim(f"{acc} + 64 * r")] + runs(slots, "max2", 32))
+  free = tt([DST_FREE])  # a result's place to pack from
+  take_acc, fold_acc = tt(take(group)), tt(SFPU_START + [aim(f"{acc} + 64 * r")] + runs(slots, "max2", 32))
   math = units(told,
                f"if (kt == k0) {{ {take_acc} }} " + each(f"if (kt == k0) {{ {scores('add', f'{acc} + 64 * r')} }} "
                                                         f"else {{ {scores('add', f'{acc + 128} + 64 * r')} {fold_acc} }}") if held else
-               each(f"{begin} if (kt > k0) {{ {tt(elementwise('add', slots))} {scores('add', 'h + 128')} {fold} }} "
+               each(f"{begin} if (kt > k0) {{ {tt(elementwise('add', slots))} {scores('add', 'h + 128')} {fold_h} }} "
                     f"else {{ {scores('add', 'h')} }} {tt(MATH_END)} h ^= {DST_HALF};"),
-               each(f"{room} {tt([aim(f'{acc} + 64 * r')] + across_rows('max2') + (sfpu(['floor', 'ftob'], slots) if parts > 1 else []) + MATH_END)}" +
-                    (f" {room} {tt([ins('SEMPOST', sem_sel=SEM_DST)])}" if parts > 1 else "")) if held else  # (the largest packed twice)
+               each(f"{free} {tt([aim(f'{acc} + 64 * r')] + across_rows('max2') + sfpu(['floor', 'ftob'] * (parts > 1), slots) + MATH_END)}" +
+                    (f" {free} {tt([ins('SEMPOST', sem_sel=SEM_DST)])}" if parts > 1 else "")) if held else  # (the largest packed twice)
                each(f"{begin} {tt(elementwise('add', slots) + across_rows('max2') + MATH_END)} h ^= {DST_HALF};"),
                each(f"{begin} {scores('sub', 'h')} {tt(sfpu(['exp'], slots))} {tt(MATH_END)} h ^= {DST_HALF};") + " " +
                each(f"for (unsigned j = 0; j < {ht}; j++) {{ {product} }}") + " " + each(product),
@@ -1240,27 +1285,30 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   packed = lambda slot: tt(pack("h", slot, SEM_L1)) + f" h ^= {DST_HALF};"
   packer = units(f"needed++; while (peek(FETCHED) < needed) relay(); {read} needed += 2 * (k1 - k0 + 1);",
                  "" if held else each(packed(largest)),
-                 each(tt(pack(f"{acc} + 64 * r", largest, SEM_L1)) + largest_out) + f" {tt([ins('SEMPOST', sem_sel=group)])}" if held else each(packed(largest)),
+                 (each(tt(pack(f"{acc} + 64 * r", largest, SEM_L1)) + largest_out) + f" {tt([ins('SEMPOST', sem_sel=group)])}" if held else
+                  each(packed(largest))),
                  each(packed(f"{p_slot} + r")) +
                  f" if (kt == k0) {{ while (peek(SENT) < outputs) relay(); {tt(repack(cfg, first))} }} else {{ {tt(repack(cfg, onto))} }} " +
                  each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(pack('h', out('j')))} h ^= {DST_HALF}; }}") + " " +
                  each(f"{tt(pack('h', out(ht)))} h ^= {DST_HALF};") +
                  f" if (kt == k0) {{ {tt(repack(first, cfg))} }} else {{ {tt(repack(onto, cfg))} }}",
                  each(f"for (unsigned j = 0; j < {T}; j++) {{ while (peek(SENT) + 4 <= outputs) relay(); "  # all of it goes home
-                      f"SYNC[RING + outputs % 4 * 2] = {out('j')}; SYNC[RING + outputs % 4 * 2 + 1] = {tile(2, ob, 'i0 + r', 'j')}; outputs++; "
+                      f"SYNC[RING + outputs % 4 * 2] = {out('j')}; SYNC[RING + outputs % 4 * 2 + 1] = {tile_of(2, ob, 'i0 + r', 'j')}; outputs++; "
                       f"{tt([ins('SEMPOST', sem_sel=SEM_PACKED)])} }}"))
-  made = [("one", ones)] + [("none", none)] * (parts > 1)  # the tile of ones (for the sums) and of -1e9 (an empty part's mask),
-  math = "".join(f"{tt(math_begin(False) + sfpu([p], slots) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math  # once a launch:
-  packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer                     # made by the SFPU
-  hide = to_bf16(-1e9) * 0x10001  # (two of -1e9, bf16, a word)
+  # the tile of ones (for the sums) and of -1e9 (an empty part's mask), made by the SFPU once a launch
+  made = [("one", ones)] + [("none", none)] * (parts > 1)
+  math = "".join(f"{tt(math_begin(False) + sfpu([p], slots) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math
+  packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer
+  hide = to_bf16(-1e9)
   decls = "static unsigned expect;" + (_array("store", store) if keep and wt else "") + f"""
-static void masked(unsigned slot, unsigned r, unsigned kt) {{  // tile row r's mask for key tile kt from its places: -1e9 where
-  volatile unsigned *places = (volatile unsigned *)({places:#x} + r * 4096), *m = (volatile unsigned *)SLOT(slot);  // a row sees
-  for (unsigned q = 0; q < 32; q++) {{  // not, two keys a word                                                          // no key
-    int p = places[q / 16 * 512 + q % 16 * 16], first = {f"p - {window - 1}" if window else "0"};
+// Tile row r's mask for key tile kt, from its places: -1e9 where a row does not see the key, else 0, two keys a word
+static void masked(unsigned slot, unsigned r, unsigned kt) {{
+  volatile unsigned *places = (volatile unsigned *)({places:#x} + r * 4096), *m = (volatile unsigned *)SLOT(slot);
+  for (unsigned q = 0; q < 32; q++) {{
+    int p = places[at(q, 0)], first = {f"p - {window - 1}" if window else "0"};
     for (unsigned c = 0; c < 32; c += 2) {{
       int j = kt * 32 + c;
-      m[(q / 16 * 2 + c / 16) * 128 + q % 16 * 8 + c % 16 / 2] = (j > p || j < first ? {hide & 0xFFFF:#x} : 0) | (j + 1 > p || j + 1 < first ? {hide & 0xFFFF0000:#x}u : 0);
+      m[at(q, c) / 2] = (j > p || j < first ? {hide:#x} : 0) | (j + 1 > p || j + 1 < first ? {hide << 16:#x}u : 0);
     }}
   }}
 }}"""
@@ -1294,69 +1342,81 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   TQ, TK = (lambda i, o=o: f"(F0 + {T0 + o} + ({i}))" for o in (0, kt))
   TV = lambda e, j: f"(F0 + {T0 + 2 * kt} + ({e}) * {vt} + ({j}))"
   DT, DC = (lambda e, o=o: f"(F0 + {T0 + 2 * kt + rep * vt + o} + ({e}))" for o in (0, rep))
-  I0, per = T0 + 2 * kt + rep * vt + 2 * rep, 2 * kt + rep * vt + 2 * rep  # then each token's: its inputs (q's, k's, v's), b and a
+  per = 2 * kt + rep * vt + 2 * rep  # the taps, dt and decay; and as many of each token's: its inputs (q's, k's, v's), b and a
+  I0 = T0 + per  # then each token's
   IQ, IK = (lambda t, i, o=o: f"(F0 + {I0 + o} + ({t}) * {per} + ({i}))" for o in (0, kt))
   IV = lambda t, e, j: f"(F0 + {I0 + 2 * kt} + ({t}) * {per} + ({e}) * {vt} + ({j}))"
   BB, AA = (lambda t, e, o=o: f"(F0 + {I0 + 2 * kt + rep * vt + o} + ({t}) * {per} + ({e}))" for o in (0, rep))
   F = I0 + m * per  # a frame's slots
-  mine = 2 * kt + rep * vt + 2 * rep + 1  # a token's broadcast tiles, packed: keys', queries', values', then e^g, beta, k . q
-  KC, QC, VV, E, BT, KQ = (lambda t, o=o: 1 + 2 * F + t * mine + o for o in (0, kt, 2 * kt, 2 * kt + rep * vt, 2 * kt + rep * vt + rep, mine - 1))
+  mine = per + 1  # a token's broadcast tiles, packed: keys', queries', values', then e^g, beta, k . q
+  KC, QC, VV, E, BT, KQ = (lambda t, o=o: 1 + 2 * F + t * mine + o
+                           for o in (0, kt, 2 * kt, 2 * kt + rep * vt, 2 * kt + rep * vt + rep, mine - 1))
   COL = 1 + 2 * F + m * mine  # a first of two's new tiles of the column, the second's S
   OUT = COL + kt * (m - 1)  # an output slot for each Dst half
   sources = 7 + m  # rows a unit reads of the conv: the 3 last inputs, the tokens' own, the 4 taps
   STAGE = slot_base("fp32") + (OUT + 2) * 4096  # BRISC's: each source's runs of q's and k's channels, then the scalars' 64-byte blocks
   scalars = 2 + 2 * rep + 2 * m * rep  # (live, accept; dt and decay; each token's b and a)
   assert STAGE + sources * 256 * kt + 64 * scalars <= OUTS and OUT + 2 <= UNPACKABLE, "a unit's tiles in L1"
-  R2, R3, R4, R5, R6, R7 = 128, 192, 256, 320, 384, 448  # Dst rows (fp32: a tile's 64): fills, the two sums (or a norm, decay), e^g, d (or x aside)
-  load = lambda r, at: ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=at)
-  store = lambda r, at, last=True: ins("SFPSTORE", vd=r, mod0=3, addr_mode=3 if last else 2, imm10=at)
-  sfpu_body = lambda words: [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100), Loop(32, words)]
+  # Dst rows (fp32: a tile's 64): fills, the two sums (or a norm, decay), e^g, d (or x aside)
+  R2, R3, R4, R5, R6, R7 = 128, 192, 256, 320, 384, 448
   programs = {  # each at Dst row 0 (aim(0)), its result into row r
-    "kq first": lambda r: [load(0, R2), load(1, R3), mul(2, 0, 1), store(2, R4)],
-    "kq": lambda r: [load(0, R2), load(1, R3), load(2, R4), mad(2, 0, 1, 2), store(2, R4)],
-    "sums first": lambda r: [load(0, R2), load(1, R3), load(2, R6), mul(3, 1, 0), mul(4, 2, 0), store(3, R4, False), store(4, R5)],
-    "sums": lambda r: [load(0, R2), load(1, R3), load(2, R6), load(3, R4), load(4, R5), mad(3, 1, 0, 3), mad(4, 2, 0, 4), store(3, R4, False), store(4, R5)],
-    "d": lambda r: [load(0, R2), load(1, R3), load(2, R6), load(3, R4), mad(4, 2, 3, 1, neg=1), mul(5, 0, 4), store(5, R7)],  # beta (v - e u)
-    "out": lambda r: [load(0, R6), load(1, R5), load(2, R7), load(3, R2), mul(4, 0, 1), mad(5, 2, 3, 4), store(5, r)],  # e w + d (k . q)
-    "state": lambda r: [load(0, R2), load(1, R3), load(2, R6), load(3, R7), mul(4, 2, 0), mad(5, 1, 3, 4), store(5, r)],  # e S + k d
-    "copy": lambda r: [load(0, R4), store(0, r)],
-    "mul": lambda r: [load(0, R2), load(1, R3), mul(2, 0, 1), store(2, r)],  # inputs by their taps
-    "add": lambda r: [load(0, R2), load(1, R3), mad(2, 0, ONE, 1), store(2, r)],  # a + dt
-    "aside": lambda r: [load(0, r), store(0, R7)],  # x, kept for SiLU's x sigmoid(x) and softplus's max(x, 0)
-    "neg": lambda r: [load(0, r), mul(1, 0, MINUS_ONE), store(1, r)],
-    "-abs": lambda r: [load(0, r), ins("SFPABS", vd=1, vc=0, mod1=1), mul(2, 1, MINUS_ONE), store(2, r)],
-    "1+": lambda r: [load(0, r), mad(1, 0, ONE, ONE), store(1, r)],
-    "times x": lambda r: [load(0, r), load(1, R7), mul(2, 0, 1), store(2, r)],
-    "+ max(x, 0)": lambda r: [load(0, R7), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), load(2, r), mad(3, 2, ONE, 0), store(3, r)],
-    "times R4": lambda r: [load(0, r), load(1, R4), mul(2, 0, 1), store(2, r)],  # by decay, or a q's or k's tile by its scale
-    "squares first": lambda r: [load(0, R2), mul(1, 0, 0), store(1, R4)],
-    "squares": lambda r: [load(0, R2), load(1, R4), mad(1, 0, 0, 1), store(1, R4)],
-    "+ eps": lambda r: [load(0, R4), *sfp_const(5, 1e-6), mad(1, 0, ONE, 5), store(1, R4)],
-    "q's scale": lambda r: [load(0, R4), *sfp_const(5, kd ** -0.5), mul(1, 0, 5), store(1, R4)]}
-  name = lambda n: "p_" + "".join(ch if ch.isalnum() else "_" for ch in n)  # (each program a function: its words once in the program,
-  run = lambda n: f"{name(n)}(0);"                                             # and the loops that call them short)
-  to_h = lambda n: f"{name(n)}(h);"
+    "kq first": lambda r: [sfp_load(0, R2), sfp_load(1, R3), mul(2, 0, 1), sfp_store(2, R4)],
+    "kq": lambda r: [sfp_load(0, R2), sfp_load(1, R3), sfp_load(2, R4), mad(2, 0, 1, 2), sfp_store(2, R4)],
+    "sums first": lambda r: [sfp_load(0, R2), sfp_load(1, R3), sfp_load(2, R6), mul(3, 1, 0), mul(4, 2, 0), sfp_store(3, R4, False),
+                             sfp_store(4, R5)],
+    "sums": lambda r: [sfp_load(0, R2), sfp_load(1, R3), sfp_load(2, R6), sfp_load(3, R4), sfp_load(4, R5), mad(3, 1, 0, 3),
+                       mad(4, 2, 0, 4), sfp_store(3, R4, False), sfp_store(4, R5)],
+    "d": lambda r: [sfp_load(0, R2), sfp_load(1, R3), sfp_load(2, R6), sfp_load(3, R4), mad(4, 2, 3, 1, neg=1), mul(5, 0, 4),
+                    sfp_store(5, R7)],  # beta (v - e u)
+    "out": lambda r: [sfp_load(0, R6), sfp_load(1, R5), sfp_load(2, R7), sfp_load(3, R2), mul(4, 0, 1), mad(5, 2, 3, 4),
+                      sfp_store(5, r)],  # e w + d (k . q)
+    "state": lambda r: [sfp_load(0, R2), sfp_load(1, R3), sfp_load(2, R6), sfp_load(3, R7), mul(4, 2, 0), mad(5, 1, 3, 4),
+                        sfp_store(5, r)],  # e S + k d
+    "copy": lambda r: [sfp_load(0, R4), sfp_store(0, r)],
+    "mul": lambda r: [sfp_load(0, R2), sfp_load(1, R3), mul(2, 0, 1), sfp_store(2, r)],  # inputs by their taps
+    "add": lambda r: [sfp_load(0, R2), sfp_load(1, R3), mad(2, 0, ONE, 1), sfp_store(2, r)],  # a + dt
+    "aside": lambda r: [sfp_load(0, r), sfp_store(0, R7)],  # x, kept for SiLU's x sigmoid(x) and softplus's max(x, 0)
+    "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, r)],
+    "-abs": lambda r: [sfp_load(0, r), ins("SFPABS", vd=1, vc=0, mod1=1), mul(2, 1, MINUS_ONE), sfp_store(2, r)],
+    "1+": lambda r: [sfp_load(0, r), mad(1, 0, ONE, ONE), sfp_store(1, r)],
+    "times x": lambda r: [sfp_load(0, r), sfp_load(1, R7), mul(2, 0, 1), sfp_store(2, r)],
+    "+ max(x, 0)": lambda r: [sfp_load(0, R7), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_load(2, r),
+                              mad(3, 2, ONE, 0), sfp_store(3, r)],
+    "times R4": lambda r: [sfp_load(0, r), sfp_load(1, R4), mul(2, 0, 1), sfp_store(2, r)],  # by decay, or a q's or k's tile by its scale
+    "squares first": lambda r: [sfp_load(0, R2), mul(1, 0, 0), sfp_store(1, R4)],
+    "squares": lambda r: [sfp_load(0, R2), sfp_load(1, R4), mad(1, 0, 0, 1), sfp_store(1, R4)],
+    "+ eps": lambda r: [sfp_load(0, R4), *sfp_const(5, 1e-6), mad(1, 0, ONE, 5), sfp_store(1, R4)],
+    "q's scale": lambda r: [sfp_load(0, R4), *sfp_const(5, kd ** -0.5), mul(1, 0, 5), sfp_store(1, R4)]}
+  # Each program, fold, mask and SFPU program the math thread runs is a function (helpers, below): its words once in the
+  # program, and the loops that call it short. A program takes its result's row; the rest work where aim_at aimed
+  name = lambda n: "p_" + "".join(ch if ch.isalnum() else "_" for ch in n)
+  call = lambda *names: " ".join(f"{name(n)}();" for n in names)
+  apply = lambda n: f"{name(n)}(0);"  # a program that stores to rows of its own
+  to_h = lambda n: f"{name(n)}(h);"  # a program whose result goes to the Dst half h
+  aim_at = lambda row: tt([aim(row)])
   free = tt([ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)])  # fills wait for the SFPU to be done with their rows
   fills = lambda *pairs: free + " " + tt([w for slot, row in pairs for w in fill(slot, row)] + FILLED)
-  half = tt([ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)])  # a Dst half free for a result
+  half = tt([DST_FREE])  # a Dst half free for a result
   done = f"{tt(MATH_END)} h ^= {DST_HALF};"
-  at = lambda row: tt([aim(row)])
-  folds = lambda *kinds: " ".join(f"{k}();" for k in kinds)  # (each fold a function: its words once in the program)
-  lib = lambda *names: f"{at('h')} {' '.join(f'{name(n)}();' for n in names)} {at(0)}"  # the SFPU's own programs on the tile at h
+  lib = lambda *names: f"{aim_at('h')} {call(*names)} {aim_at(0)}"  # the SFPU's own programs on the tile at h
   silu = f"{to_h('aside')} {to_h('neg')} {lib('fexp')} {to_h('1+')} {lib('frecip')} {to_h('times x')}"
   masks = {"columns 4 on": mask_columns("sum", 4), "rows 4 on": mask_rows("sum", 4), "all but place 0": mask_rows("sum", 1) + mask_columns("sum", 1)}
-  only = lambda mask: f"{at('h')} {name(mask)}();"  # the tile at h but the places filled, 0
-  conv = lambda ins, taps, mask, kind: f"{at(0)} {fills((ins, R2), (taps, R3))} {to_h('mul')} {only(mask)} {folds(kind)} {at(0)} {silu}"
-  def result(words, slot=None, home=None, keep=None):  # (math's, pack's) words for a result in the Dst half h: packed into
-    math = f"{half} {words} {done}" + (" posted++;" if slot is not None else "")  # slot (an intermediate, its L1 kept until
-    if home is None: return math, f"{tt(pack('h', slot, SEM_L1))} h ^= {DST_HALF};"  # it has gone home, if it goes: keep,
-    to, keep = (slot, keep) if slot is not None else (f"{OUT} + h / {DST_HALF}", f"h / {DST_HALF}")  # its output slot's
+  only = lambda mask: f"{aim_at('h')} {call(mask)}"  # the tile at h but the places filled, 0
+  conv = lambda x, taps, mask, kind: f"{aim_at(0)} {fills((x, R2), (taps, R3))} {to_h('mul')} {only(mask)} {call(kind)} {aim_at(0)} {silu}"
+  # (math's, pack's) words for a result in the Dst half h: packed into slot, an intermediate, or going home as tile home
+  # into its half's output slot; one that does both stays in slot until it has gone home (keep: the output slot it counts as)
+  def result(words, slot=None, home=None, keep=None):
+    math = f"{half} {words} {done}" + (" posted++;" if slot is not None else "")
+    if home is None: return math, f"{tt(pack('h', slot, SEM_L1))} h ^= {DST_HALF};"
+    to, keep = (slot, keep) if slot is not None else (f"{OUT} + h / {DST_HALF}", f"h / {DST_HALF}")
     return math, f"output({keep}, {to}, {home}); {tt(pack('h', to, SEM_PACKED, *([SEM_L1] if slot is not None else [])))} h ^= {DST_HALF};"
   loop = lambda var, n, pair: tuple(f"for (unsigned {var} = 0; {var} < {n}; {var}++) {{ {w} }}" for w in pair)  # (math's, pack's), n times
-  def unit_length(c, scale):  # the kt tiles of q's or k's at slot c to length 1 (and scaled): the sum of their squares folded down,
-    return [(f"drain(); {at(0)} {fills((c, R2))} {run('squares first')} for (unsigned i = 1; i < {kt}; i++) {{ {fills((f'{c} + i', R2))} "
-             f"{run('squares')} }} {at(R4)} {folds('sum1')} {at(0)} {run('+ eps')} {at(R4)} {name('sqrt')}(); {name('frecip')}(); {at(0)}"
-             + (f" {run(scale)}" if scale else ""), ""),  # its 1 / sqrt in R4, then each tile by it
+  # the kt tiles of q's or k's at slot c to length 1 (and scaled): the sum of their squares folded down, its 1 / sqrt in R4,
+  # then each tile by it
+  def unit_length(c, scale):
+    return [(f"drain(); {aim_at(0)} {fills((c, R2))} {apply('squares first')} for (unsigned i = 1; i < {kt}; i++) {{ {fills((f'{c} + i', R2))} "
+             f"{apply('squares')} }} {aim_at(R4)} {call('sum1')} {aim_at(0)} {apply('+ eps')} {aim_at(R4)} {call('sqrt', 'frecip')} {aim_at(0)}"
+             + (f" {apply(scale)}" if scale else ""), ""),
             loop("i", kt, result(f"{fills((f'{c} + i', 'h'))} {to_h('times R4')}", f"{c} + i"))]
   steps = []
   for t in range(m):  # each token's broadcast tiles: the conv's, the gates', and its k . q
@@ -1364,23 +1424,23 @@ def delta_kernel(kt, vt, vh, rep, m=1):
               loop("i", kt, result(conv(IK(t, "i"), TK("i"), "columns 4 on", "sum2"), f"{KC(t)} + i")),
               *unit_length(QC(t), "q's scale"), *unit_length(KC(t), None),
               loop("e", rep, loop("j", vt, result(conv(IV(t, "e", "j"), TV("e", "j"), "rows 4 on", "sum1"), f"{VV(t)} + e * {vt} + j"))),
-              loop("e", rep, result(f"{at('h')} {fills((BB(t, 'e'), 'h'))} {only('all but place 0')} {folds('sum2', 'sum1')} {at(0)} "
+              loop("e", rep, result(f"{aim_at('h')} {fills((BB(t, 'e'), 'h'))} {only('all but place 0')} {call('sum2', 'sum1')} {aim_at(0)} "
                                     f"{to_h('neg')} {lib('fexp')} {to_h('1+')} {lib('frecip')}", f"{BT(t)} + e")),  # beta = sigmoid(b)
-              loop("e", rep, result(f"{at(0)} {fills((DC('e'), R4))} {at(R4)} {name('all but place 0')}(); {folds('sum2', 'sum1')} "
-                                    f"{at(0)} {fills((AA(t, 'e'), R2), (DT('e'), R3))} {to_h('add')} {only('all but place 0')} {folds('sum2', 'sum1')} "
-                                    f"{at(0)} {to_h('aside')} {to_h('-abs')} {lib('fexp')} {to_h('1+')} {lib('log')} {to_h('+ max(x, 0)')} "
+              loop("e", rep, result(f"{aim_at(0)} {fills((DC('e'), R4))} {aim_at(R4)} {call('all but place 0', 'sum2', 'sum1')} {aim_at(0)} "
+                                    f"{fills((AA(t, 'e'), R2), (DT('e'), R3))} {to_h('add')} {only('all but place 0')} {call('sum2', 'sum1')} "
+                                    f"{aim_at(0)} {to_h('aside')} {to_h('-abs')} {lib('fexp')} {to_h('1+')} {lib('log')} {to_h('+ max(x, 0)')} "
                                     f"{to_h('times R4')} {lib('fexp')}", f"{E(t)} + e")),  # e^g = exp(decay softplus(a + dt))
-              (f"drain(); {at(0)} {fills((KC(t), R2), (QC(t), R3))} {run('kq first')} for (unsigned i = 1; i < {kt}; i++) "
-               f"{{ {fills((f'{KC(t)} + i', R2), (f'{QC(t)} + i', R3))} {run('kq')} }} {at(R4)} {folds('sum1')} {at(0)}", ""),
+              (f"drain(); {aim_at(0)} {fills((KC(t), R2), (QC(t), R3))} {apply('kq first')} for (unsigned i = 1; i < {kt}; i++) "
+               f"{{ {fills((f'{KC(t)} + i', R2), (f'{QC(t)} + i', R3))} {apply('kq')} }} {aim_at(R4)} {call('sum1')} {aim_at(0)}", ""),
               result(f"{free} {to_h('copy')}", KQ(t)), ("drain();", "")]
   column = []  # each value head's column tile j of S, through each token in turn
   for t in range(m):
     col = (lambda i: S_("e", i, "j")) if t == 0 else (lambda i: f"{COL} + ({i})")
     column += [("drain();" if t else "", ""),
-               (f"{fills((col(0), R2), (KC(t), R3), (QC(t), R6))} {run('sums first')} "
-                f"for (unsigned i = 1; i < {kt}; i++) {{ {fills((col('i'), R2), (f'{KC(t)} + i', R3), (f'{QC(t)} + i', R6))} {run('sums')} }} "
-                f"{at(R4)} {folds('sum1')} {at(R5)} {folds('sum1')} {at(0)} "
-                f"{fills((f'{BT(t)} + e', R2), (f'{VV(t)} + e * {vt} + j', R3), (f'{E(t)} + e', R6))} {run('d')}", ""),
+               (f"{fills((col(0), R2), (KC(t), R3), (QC(t), R6))} {apply('sums first')} "
+                f"for (unsigned i = 1; i < {kt}; i++) {{ {fills((col('i'), R2), (f'{KC(t)} + i', R3), (f'{QC(t)} + i', R6))} {apply('sums')} }} "
+                f"{aim_at(R4)} {call('sum1')} {aim_at(R5)} {call('sum1')} {aim_at(0)} "
+                f"{fills((f'{BT(t)} + e', R2), (f'{VV(t)} + e * {vt} + j', R3), (f'{E(t)} + e', R6))} {apply('d')}", ""),
                result(f"{fills((KQ(t), R2))} {to_h('out')}", home=f"{1 << 30:#x} | (unit * {rep} + e) << 8 | {t} << 6 | j"),
                loop("i", kt, result(f"{fills((col('i'), R2), (f'{KC(t)} + i', R3))} {to_h('state')}", f"{COL} + i" if t < m - 1 else None,
                                     f"{(m - 1 - t) << 31:#x} | (unit * {rep} + e) << 8 | (i * {vt} + j)", "2 + i"))]
@@ -1391,19 +1451,18 @@ def delta_kernel(kt, vt, vh, rep, m=1):
     {body}
   }}"""
   # BRISC: for each unit, once its frame is free, its states, its channels' runs and its values, put in place; then the
-  # conv's inputs it leaves; meanwhile, results go home as they are packed
-  tile = lambda i, b, r, c: f"({b}) * A[({i}) + 1] + ({r}) * A[({i}) + 2] + ({c}) + A[({i}) + 3]"  # tile (b, r, c) of the tensor at A[i]
-  first = 14 if m > 1 else None  # (where in args: the states after a first token, then x, the conv's inputs, the taps, dt and decay)
-  X = 22 if m > 1 else 14
+  # conv's inputs it leaves; meanwhile, results go home as they are packed. Where in args: the states after a first token
+  # (with m of 1, the states themselves), then x, the conv's inputs, the taps, dt and decay
+  first, X = (14, 22) if m > 1 else (2, 14)
   C, C2, TAPS = X + 4, X + 8, X + 4 + 4 * m
   DTA, DCA = TAPS + 4, TAPS + 8
-  run_at = lambda r: f"((({r}) % 32) / 16 * 2 + f) * 1024 + (({r}) % 16) * 64"  # row r's run in face f of an fp32 tile, in bytes
   sc = lambda k: f"STAGE + {sources * 256 * kt} + 64 * ({k})"  # scalar k's 64-byte block
-  scalar = lambda i, row, col, k: (f"{{ unsigned t_ = {tile(i, 0, f'({row}) / 32', f'({col}) / 32')}, o_ = (({row}) % 32 / 16 * 2 + ({col}) % 32 / 16) * 1024 + "
-                                   f"(({row}) % 16 * 16 + ({col}) % 16) * 4; noc_get(BANK(t_), AT(A[{i}], t_, 4096) + o_ / 64 * 64, {sc(k)}, 64); word[{k}] = o_ % 64 / 4; }}")
+  scalar = lambda i, row, col, k: (f"{{ unsigned t_ = {tile_of(i, 0, f'({row}) / 32', f'({col}) / 32', 'A')}, "
+                                   f"o_ = at(({row}) % 32, ({col}) % 32) * 4; "
+                                   f"noc_get(BANK(t_), AT(A[{i}], t_, 4096) + o_ / 64 * 64, {sc(k)}, 64); word[{k}] = o_ % 64 / 4; }}")
   value = lambda k: f"((volatile unsigned *)({sc(k)}))[word[{k}]]"
   staged = lambda src, g: f"(STAGE + ({src}) * {256 * kt} + ({g}) * {128 * kt})"  # source src's runs of q's (g 0) or k's channels (1)
-  brisc = SYNC_WORDS + ROWS + f"""
+  brisc = SYNC_WORDS + BANKS + f"""
 #define SLOT(i) ({slot_base("fp32"):#x} + (i) * 4096)
 #define STAGE {STAGE:#x}
 static const unsigned *A;
@@ -1413,11 +1472,11 @@ static void send(void) {{  // the results packed so far go home: an output's row
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1), unit = t >> 8 & 0x3FFFFF, s = unit / {vh}, h = unit % {vh};
     if (t >> 30 & 1) for (unsigned f = 0; f < 2; f++) {{  // the output's tile of the head's token: its row's runs
-      unsigned r = s * {m} + (t >> 6 & 3), o = {tile(6, 'h', 'r / 32', 't & 63')}, off = {run_at('r')};
+      unsigned r = s * {m} + (t >> 6 & 3), o = {tile_of(6, 'h', 'r / 32', 't & 63', 'A')}, off = at(r % 32, 16 * f) * 4;
       noc_put(SLOT(slot) + off, BANK(o), AT(A[6], o, 4096) + off, 64);
     }} else if (alive[unit / {rep} % 4]) {{  // the states', or the first token's
-      unsigned at = t >> 31 ? {first or 2} : 2, o = unit * A[at + 1] + (t & 255) / {vt} * A[at + 2] + (t & 255) % {vt} + A[at + 3];
-      noc_put(SLOT(slot), BANK(o), AT(A[at], o, 4096), 4096);
+      unsigned i = t >> 31 ? {first} : 2, o = {tile_of('i', 'unit', f'(t & 255) / {vt}', f'(t & 255) % {vt}', 'A')};
+      noc_put(SLOT(slot), BANK(o), AT(A[i], o, 4096), 4096);
     }}
     noc_wait();
   }}
@@ -1426,18 +1485,20 @@ static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
 // source src's row (the conv's 3 last inputs, from the states at A[c]; the tokens' own rows of x; the 4 taps): its runs of
 // the channels in n tiles from col on, both faces of each, into L1 at to (a tile's step bytes on, a face's half on)
 static void get_runs(unsigned src, unsigned s, unsigned c, unsigned col, unsigned n, unsigned to, unsigned step, unsigned half) {{
-  unsigned i = src < 3 ? c : src < {3 + m} ? {X} : {TAPS}, b = src < 3 ? src : src < {3 + m} ? 0 : src - {3 + m}, f = 0;
-  unsigned row = src < 3 ? s : src < {3 + m} ? s * {m} + src - 3 : 0, t = {tile('i', 'b', 'row / 32', 'col / 32')}, off = {run_at('row')};
+  unsigned i = src < 3 ? c : src < {3 + m} ? {X} : {TAPS}, b = src < 3 ? src : src < {3 + m} ? 0 : src - {3 + m};
+  unsigned row = src < 3 ? s : src < {3 + m} ? s * {m} + src - 3 : 0, t = {tile_of('i', 'b', 'row / 32', 'col / 32', 'A')};
+  unsigned off = at(row % 32, 0) * 4;
   for (unsigned j = 0; j < n; j++, t++, to += step) {{
     noc_get(BANK(t), AT(A[i], t, 4096) + off, to, 64);
     noc_get(BANK(t), AT(A[i], t, 4096) + off + 1024, to + half, 64);
   }}
 }}
-static void put_runs(unsigned at, unsigned d, unsigned s, unsigned col, unsigned n, unsigned from, unsigned step, unsigned half) {{  // into
-  unsigned t = {tile('at', 'd', 's / 32', 'col / 32')}, f = 0, off = {run_at('s')};                                          // input d
-  for (unsigned j = 0; j < n; j++, t++, from += step) {{                                                                     // of the
-    noc_put(from, BANK(t), AT(A[at], t, 4096) + off, 64);                                                                    // states
-    noc_put(from + half, BANK(t), AT(A[at], t, 4096) + off + 1024, 64);                                                      // at A[at]
+// and back: row s's runs of those channels from L1 at from, laid out the same, into input d of the conv's at A[i]
+static void put_runs(unsigned i, unsigned d, unsigned s, unsigned col, unsigned n, unsigned from, unsigned step, unsigned half) {{
+  unsigned t = {tile_of('i', 'd', 's / 32', 'col / 32', 'A')}, off = at(s % 32, 0) * 4;
+  for (unsigned j = 0; j < n; j++, t++, from += step) {{
+    noc_put(from, BANK(t), AT(A[i], t, 4096) + off, 64);
+    noc_put(from + half, BANK(t), AT(A[i], t, 4096) + off + 1024, 64);
   }}
 }}
 void kmain(volatile unsigned *args) {{
@@ -1449,9 +1510,9 @@ void kmain(volatile unsigned *args) {{
     {scalar(10, 0, 's', 0)} {scalar(18, 0, 's', 1) if m > 1 else ""}
     noc_wait();
     alive[unit % 4] = {value(0)} != 0;
-    unsigned taken = {value(1) if m > 1 else 1}, from = taken ? 2 : {first or 2}, c = taken ? {C} : {C2};  // (the states the last step's draft says)
+    unsigned taken = {value(1) if m > 1 else 1}, from = taken ? 2 : {first}, c = taken ? {C} : {C2};  // (the states the last step's draft says)
     for (unsigned e = 0; e < {rep}; e++) for (unsigned i = 0; i < {kt}; i++) for (unsigned j = 0; j < {vt}; j++) {{
-      unsigned t = (s * {vh} + hk * {rep} + e) * A[from + 1] + i * A[from + 2] + j + A[from + 3];
+      unsigned t = {tile_of('from', f's * {vh} + hk * {rep} + e', 'i', 'j', 'A')};
       noc_get(BANK(t), AT(A[from], t, 4096), SLOT({S_('e', 'i', 'j')}), 4096);
     }}
     for (unsigned src = 0; src < {sources}; src++) for (unsigned g = 0; g < 2; g++)  // q's and k's, staged
@@ -1471,53 +1532,42 @@ void kmain(volatile unsigned *args) {{
     noc_wait();
     for (unsigned g = 0; g < 2; g++) for (unsigned i = 0; i < {kt}; i++) {{  // q's and k's, a channel a row: input or tap j in column j
       unsigned *taps = (unsigned *)SLOT(g ? {TK('i')} : {TQ('i')}), *ins[{m}];
-      const unsigned *from = (const unsigned *){staged(0, 'g')} + i * 32;  // (the runs of source 0, tile i; a source's {64 * kt} words on)
+      // (source 0's runs of tile i, channel r its word r; each source's {64 * kt} words past the one before)
+      const unsigned *from = (const unsigned *){staged(0, 'g')} + i * 32;
       for (unsigned t = 0; t < {m}; t++) ins[t] = (unsigned *)SLOT(g ? {IK('t', 'i')} : {IQ('t', 'i')});
-      for (unsigned r = 0; r < 32; r++) {{
-        unsigned at = (r / 16 * 2) * 256 + r % 16 * 16, o = r / 16 * 16 + r % 16;  // its place in the tile, and in tile i's runs
-        for (unsigned j = 0; j < 4; j++) {{
-          taps[at + j] = from[({3 + m} + j) * {64 * kt} + o];
-          for (unsigned t = 0; t < {m}; t++) ins[t][at + j] = from[(t + j) * {64 * kt} + o];
-        }}
+      for (unsigned r = 0; r < 32; r++) for (unsigned j = 0; j < 4; j++) {{
+        taps[at(r, j)] = from[({3 + m} + j) * {64 * kt} + r];
+        for (unsigned t = 0; t < {m}; t++) ins[t][at(r, j)] = from[(t + j) * {64 * kt} + r];
       }}
     }}
     for (unsigned e = 0; e < {rep}; e++) {{
       ((volatile unsigned *)SLOT({DT('e')}))[0] = {value('2 + e')}, ((volatile unsigned *)SLOT({DC('e')}))[0] = {value(f'{2 + rep} + e')};
-      for (unsigned t = 0; t < {m}; t++)
-        ((volatile unsigned *)SLOT({BB('t', 'e')}))[0] = {value(f'{2 + 2 * rep} + t * {2 * rep} + e')}, ((volatile unsigned *)SLOT({AA('t', 'e')}))[0] = {value(f'{2 + 3 * rep} + t * {2 * rep} + e')};
+      for (unsigned t = 0; t < {m}; t++) {{
+        ((volatile unsigned *)SLOT({BB('t', 'e')}))[0] = {value(f'{2 + 2 * rep} + t * {2 * rep} + e')};
+        ((volatile unsigned *)SLOT({AA('t', 'e')}))[0] = {value(f'{2 + 3 * rep} + t * {2 * rep} + e')};
+      }}
     }}
-    if (alive[unit % 4]) for (unsigned t = 0; t < {m}; t++) for (unsigned d = 0; d < 3; d++) {{  // the inputs token t leaves: sources
-      unsigned at = t == {m - 1} ? {C} : {C2}, src = t + 1 + d, tv = src > 3 ? src - 3 : 0;      // t + 1 to t + 3
-      for (unsigned g = 0; g < 2; g++) put_runs(at, d, s, g ? ck : cq, {kt}, {staged('src', 'g')}, 128, 64);
-      put_runs(at, d, s, cv, {rep * vt}, SLOT({IV('tv', 0, 0)}) + (src - tv) * 64, 4096, 1024);  // (from token tv's tiles)
+    // the inputs token t leaves (sources t + 1 to t + 3), once read, where the sequence is live
+    if (alive[unit % 4]) for (unsigned t = 0; t < {m}; t++) for (unsigned d = 0; d < 3; d++) {{
+      unsigned into = t == {m - 1} ? {C} : {C2}, src = t + 1 + d, tv = src > 3 ? src - 3 : 0;
+      for (unsigned g = 0; g < 2; g++) put_runs(into, d, s, g ? ck : cq, {kt}, {staged('src', 'g')}, 128, 64);
+      put_runs(into, d, s, cv, {rep * vt}, SLOT({IV('tv', 0, 0)}) + (src - tv) * 64, 4096, 1024);  // (from token tv's tiles)
     }}
     l1_settle(SLOT(F0));
     ready(); frame_done[u & 1] = ++events;
   }}
   while (sent < A[1] * {rep * vt * m * (kt + 1)}) send();
 }}"""
+  def body(p):  # a program's words, its result into row 0 or the other half's (once, where it stores to neither)
+    other, zero = (tt(SFPU_START + [Loop(32, p(r))]) for r in (DST_HALF, 0))
+    return zero if other == zero else f"if (h) {{ {other} }} else {{ {zero} }}"
+  helper = lambda n, words, arg="void": f"__attribute__((noinline)) static void {name(n)}({arg}) {{ {words} }}\n"
+  helpers = "".join([helper(k, tt(ACROSS[FOLDS[k]](k))) for k in ("sum1", "sum2")] +  # down a tile's columns, along its rows
+                    [helper(n, tt(sfpu([n], {}))) for n in ("fexp", "frecip", "log", "sqrt")] +
+                    [helper(n, tt(words)) for n, words in masks.items()] + [helper(n, body(p), "unsigned h") for n, p in programs.items()])
   cfg = kernel_config("fp32", "fp32")
-  fold = "".join(f"__attribute__((noinline)) static void {k}(void) {{ {tt(ACROSS[FOLDS[k]](k))} }}\n" for k in ("sum1", "sum2"))  # down a tile's columns, along its rows
-  fold += "".join(f"__attribute__((noinline)) static void {name(n)}(void) {{ {tt(sfpu([n], {}))} }}\n" for n in ("fexp", "frecip", "log", "sqrt"))
-  fold += "".join(f"__attribute__((noinline)) static void {name(n)}(void) {{ {tt(words)} }}\n" for n, words in masks.items())
-  fold += "".join(f"__attribute__((noinline)) static void {name(n)}(unsigned h) {{ if (h) {{ {tt(sfpu_body(p(DST_HALF)))} }} else {{ {tt(sfpu_body(p(0)))} }} }}\n"
-                  for n, p in programs.items())  # (into the result's row: 0, or the other half's)
-  return compile_kernel(brisc, _unpacker(units("fetched();"), cfg), _math({}, units("fetched(); " + " ".join(math) + " " + tt(REPORT)), True, fold),
-                        _packer(units(" ".join(packs)), 2 + kt))
-
-ROWS = BANKS + """
-static void copy(unsigned from, unsigned to, unsigned n) {  // (this tile's coordinates read once a launch: an NIU register read)
-  static unsigned me;
-  if (!me) me = noc_me();
-  noc_get(me & 63, me >> 6, from, to, n);
-}
-static void row_down(unsigned tile, unsigned item) {  // a tile of item-byte values: row 0 of faces 0 and 1 down their 16 rows,
-  unsigned face = 256 * item;                         // then faces 0-1 onto 2-3
-  l1_settle(tile);
-  for (unsigned n = 16 * item; n < face; n *= 2) { copy(tile, tile + n, n); copy(tile + face, tile + face + n, n); noc_wait(); }
-  copy(tile, tile + 2 * face, 2 * face);
-  noc_wait();
-}"""  # C shared by the kernels of BRISC's alone: the banks, copies inside this L1, and a row filling its tile
+  return compile_kernel(brisc, _unpacker(units("fetched();"), cfg),
+                        _math({}, units("fetched(); " + " ".join(math) + " " + tt(REPORT)), True, helpers), _packer(units(" ".join(packs)), 2 + kt))
 
 def gather_kernel(dtype):
   """Rows of a tensor into a new one, args [first unit, units, out, the tensor's address, tile stride, tile offset, the
@@ -1526,14 +1576,14 @@ def gather_kernel(dtype):
   the tensor's tiles. A NoC read from DRAM must keep its address's low 6 bits, so each run comes in as the 64-byte
   block holding it, all of a tile's in flight at once, and is copied into place from there. One row fills its tile: it
   comes in once and is doubled up inside L1 by NoC copies from the tile to itself."""
-  tb, fb, run = tile_bytes(dtype), tile_bytes(dtype) // 4, 16 * ITEMSIZE[dtype]  # bytes in a tile, a face, a face's row
+  tb, item = tile_bytes(dtype), ITEMSIZE[dtype]
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
 #define IDS {DATA + tb:#x}
 #define BLOCKS {DATA + tb + 4096:#x}
 {ROWS}
-static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // index r of this tile's 32, in row 0
-static unsigned place(unsigned n, unsigned f) {{ return (n % 32 / 16 * 2 + f) * {fb} + n % 16 * {run}; }}  // row n's run in face f, in its tile
+static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}  // index r of this tile's 32, in row 0
+static unsigned run_of(unsigned n, unsigned f) {{ return at(n % 32, 16 * f) * {item}; }}  // row n's run in face f, in its tile, in bytes
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] - i * 32 < 32 ? a[7] - i * 32 : 32, it = a[9] + i;  // it: the indices' tile
@@ -1542,12 +1592,13 @@ void kmain(volatile unsigned *a) {{
     noc_wait();
     for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{  // row r's run in face f: its block into BLOCKS's 2 r + f
       unsigned n = id(r), from = n / 32 * a[4] + j + a[5];
-      noc_get(BANK(from), AT(a[3], from, {tb}) + place(n, f) / 64 * 64, BLOCKS + (2 * r + f) * 64, 64);
+      noc_get(BANK(from), AT(a[3], from, {tb}) + run_of(n, f) / 64 * 64, BLOCKS + (2 * r + f) * 64, 64);
     }}
     noc_wait();
     for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{
-      volatile unsigned *to = (volatile unsigned *)(SLOT + (r / 16 * 2 + f) * {fb} + r % 16 * {run}), *by = (volatile unsigned *)(BLOCKS + (2 * r + f) * 64 + place(id(r), f) % 64);
-      for (unsigned k = 0; k < {run // 4}; k++) to[k] = by[k];
+      volatile unsigned *to = (volatile unsigned *)(SLOT + run_of(r, f));
+      volatile unsigned *by = (volatile unsigned *)(BLOCKS + (2 * r + f) * 64 + run_of(id(r), f) % 64);
+      for (unsigned k = 0; k < {4 * item}; k++) to[k] = by[k];  // (a run's 16 values, in words)
     }}
     if (a[7] == 1) row_down(SLOT, {ITEMSIZE[dtype]});
     noc_write(SLOT, BANK(t), AT(a[2], t, {tb}), {tb});
@@ -1574,6 +1625,14 @@ void kmain(volatile unsigned *a) {{
   noc_wait();
 }}""")
 
+# C shared by put_kernel and bfp4_kernel
+NIBBLE = """
+static unsigned nibble(unsigned b, unsigned top) {  // bf16 b's 3 bits under exponent top, rounded to the nearest, and its sign
+  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0), q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
+  if (q > 7) q = 7;
+  return q ? (b >> 15 & 1) << 3 | q : 0;  // no sign on a zero: the unpacker reads -0 as -inf
+}"""
+
 def put_kernel(dtype):
   """Rows of x into rows of a tensor, in place (gather's inverse), args [first unit, units, then the tensor's and x's
   address, tile strides for batch and row, and tile offset, the int32 row of the n rows' places' address and tile offset,
@@ -1588,36 +1647,37 @@ def put_kernel(dtype):
   largest exponent, bfp8's 7 bits of magnitude half up (as the packer does), bfp4's 3 to the nearest (as bfp4_kernel
   does), a 0 without its sign (which the unpacker would read as -inf)."""
   bfp = dtype in BFP
-  t, s, run = tile_bytes(dtype), tile_bytes("bf16" if bfp else dtype), 16 * ITEMSIZE["bf16" if bfp else dtype]  # bytes in a tile of the tensor, of x, in x's run
-  copy = ("for (unsigned f = 0; f < 2; f++) pack(FROM + at(i, f), TILE, r, f);" if bfp else
-          f"for (unsigned f = 0; f < 2; f++) for (unsigned k = 0; k < {run // 4}; k++) "
-          f"((volatile unsigned *)(TILE + at(r, f)))[k] = ((volatile unsigned *)(FROM + at(i, f)))[k];")
-  whole = (f"noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}); noc_wait(); "
-           f"for (unsigned r = 0; r < 32; r++) for (unsigned f = 0; f < 2; f++) pack(FROM + at(r, f), TILE, r, f);" if bfp else
-           f"noc_get(BANK(from), AT(a[6], from, {t}), TILE, {t}); noc_wait();")
+  xd = "bf16" if bfp else dtype  # x's dtype
+  tb, xb = tile_bytes(dtype), tile_bytes(xd)  # bytes in a tile of the tensor, of x
+  copy = ("for (unsigned f = 0; f < 2; f++) pack(FROM + run_of(i, f), TILE, r, f);" if bfp else
+          f"for (unsigned f = 0; f < 2; f++) for (unsigned k = 0; k < {4 * ITEMSIZE[xd]}; k++) "
+          f"((volatile unsigned *)(TILE + run_of(r, f)))[k] = ((volatile unsigned *)(FROM + run_of(i, f)))[k];")
+  # value k of the run into the block-float tile: bfp4's two to a byte, bfp8's 7 bits of magnitude half up
+  rounded = ("if (k % 2) continue; ((volatile unsigned char *)tile)[64 + n * 8 + k / 2] = nibble(v[k], top) | nibble(v[k + 1], top) << 4;"
+             if dtype == "bfp4" else
+             "unsigned b = v[k], e = b >> 7 & 255, m = (b & 127) | (e ? 128 : 0), shift = top - e < 8 ? top - e : 8, "
+             "q = (m + (1u << shift)) >> (shift + 1); if (q > 127) q = 127; "
+             "((volatile unsigned char *)tile)[64 + n * 16 + k] = q ? (b >> 15) << 7 | q : 0;")
+  as_is = (f"noc_get(BANK(from), AT(a[6], from, {xb}), FROM, {xb}); noc_wait(); "
+           f"for (unsigned r = 0; r < 32; r++) for (unsigned f = 0; f < 2; f++) pack(FROM + run_of(r, f), TILE, r, f);" if bfp else
+           f"noc_get(BANK(from), AT(a[6], from, {tb}), TILE, {tb}); noc_wait();")
   return compile_kernel(f"""
 #define TILE {DATA:#x}
 #define FROM {DATA + 4096:#x}
 #define IDS {DATA + 8192:#x}
 #define PLACES {DATA + 12288:#x}
 {BANKS}
-static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[r / 16 * 256 + r % 16]; }}  // place r of the 32, in row 0
-static unsigned at(unsigned r, unsigned f) {{ return (r % 32 / 16 * 2 + f) * {s // 4} + r % 16 * {run}; }}  // row r's run in face f, in x
-static unsigned nibble(unsigned b, unsigned top) {{  // bf16 b's 3 bits under exponent top, rounded to the nearest, and its sign
-  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0), q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
-  if (q > 7) q = 7;
-  return q ? (b >> 15 & 1) << 3 | q : 0;
-}}
+static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}  // place r of the 32, in row 0
+static unsigned run_of(unsigned r, unsigned f) {{ return at(r % 32, 16 * f) * {ITEMSIZE[xd]}; }}  // row r's run in face f, in x, in bytes
+{NIBBLE}
 // the run of 16 bf16 values at src as row r's run in face f of the block-float tile at tile: its exponent, then its values
 static void pack(unsigned src, unsigned tile, unsigned r, unsigned f) {{
   volatile unsigned short *v = (volatile unsigned short *)src;
-  unsigned top = 0, n = (r % 32 / 16 * 2 + f) * 16 + r % 16;
+  unsigned top = 0, n = at(r % 32, 16 * f) / 16;  // (which of the tile's 64 runs)
   for (unsigned k = 0; k < 16; k++) {{ unsigned e = v[k] >> 7 & 255; if (e > top) top = e; }}
   ((volatile unsigned char *)tile)[n] = top;
   for (unsigned k = 0; k < 16; k++) {{
-    {"if (k % 2) continue; ((volatile unsigned char *)tile)[64 + n * 8 + k / 2] = nibble(v[k], top) | nibble(v[k + 1], top) << 4;" if dtype == "bfp4" else
-     "unsigned b = v[k], e = b >> 7 & 255, m = (b & 127) | (e ? 128 : 0), shift = top - e < 8 ? top - e : 8, q = (m + (1u << shift)) >> (shift + 1); "
-     "if (q > 127) q = 127; ((volatile unsigned char *)tile)[64 + n * 16 + k] = q ? (b >> 15) << 7 | q : 0;"}
+    {rounded}
   }}
 }}
 void kmain(volatile unsigned *a) {{
@@ -1637,16 +1697,16 @@ void kmain(volatile unsigned *a) {{
     if (ti >= tr || first[ti] != i0) continue;  // the tile of an earlier row's unit, or none
     unsigned to = b * a[3] + ti * a[4] + j + a[5], held = ~0u, whole = i0 % 32 == 0 && i0 + 32 <= n;
     for (unsigned k = 0; whole && k < 32; k++) whole = place[i0 + k] == 32 * ti + k;
-    if (whole) {{ unsigned from = b * a[7] + i0 / 32 * a[8] + j + a[9]; {whole} }}
-    else noc_get(BANK(to), AT(a[2], to, {t}), TILE, {t});  // (in flight with the first row's tile of x)
+    if (whole) {{ unsigned from = b * a[7] + i0 / 32 * a[8] + j + a[9]; {as_is} }}
+    else noc_get(BANK(to), AT(a[2], to, {tb}), TILE, {tb});  // (in flight with the first row's tile of x)
     for (unsigned i = i0; i != ~0u; i = next[i]) {{
       if (whole && i < i0 + 32) continue;
       unsigned r = place[i], from = b * a[7] + i / 32 * a[8] + j + a[9];
-      if (from != held) noc_get(BANK(from), AT(a[6], from, {s}), FROM, {s}), held = from;
+      if (from != held) noc_get(BANK(from), AT(a[6], from, {xb}), FROM, {xb}), held = from;
       noc_wait();
       {copy}
     }}
-    noc_write(TILE, BANK(to), AT(a[2], to, {t}), {t});
+    noc_write(TILE, BANK(to), AT(a[2], to, {tb}), {tb});
     noc_wait();
   }}
 }}""")
@@ -1656,10 +1716,11 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows, then the
   labels' address, tile strides and offset]. BRISC alone, a unit one row of a tile row of a part of x, 32 to a tile
   row, so a decode step's few rows go to as many workers: the row's runs come in (for more than 8 rows, the part's tile
-  row, once for a worker's units of it), and the row is scanned once (one row of x: by the tile row's first unit, which writes the whole tiles), run by run,
-  its k best so far a heap with the worst at its root (of equal values, the later column), which a better value
-  replaces: once the worst is a float of no sign, a value is checked against it as a signed integer, else by its key
-  (bf16 or fp32 as an unsigned integer once its sign orders it, negatives flipped, -0 as 0); then sorted, best first. parts: each row cut into so many parts of cols columns, whole tiles, each part's k
+  row, once for a worker's units of it), and the row is scanned once (one row of x: by the tile row's first unit,
+  which writes the whole tiles), run by run, its k best so far a heap with the worst at its root (of equal values, the
+  later column), which a better value replaces: once the worst is a float of no sign, a value is checked against it as
+  a signed integer, else by its key (bf16 or fp32 as an unsigned integer once its sign orders it, negatives flipped, -0
+  as 0); then sorted, best first. parts: each row cut into so many parts of cols columns, whole tiles, each part's k
   best side by side in the results ((batch, rows, parts k)), each index its column in the whole row. labels: each index
   taken from an int32 tensor of x's shape at the column picked, read 64 bytes about it (a part's best indices, for a
   topk over the parts' best). Each unit writes its row of each of the results' tiles (bf16 or fp32, and int32), both
@@ -1667,7 +1728,9 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   write the same bytes; but a dimension of 1 fills its tile with copies, as every tensor's does (one k of 1 the row with
   its column, one row of x every row)."""
   ct, kt, item, bits = -(-cols // 32), -(-k // 32), ITEMSIZE[dtype], 8 * ITEMSIZE[dtype]  # x's tiles a part, the results' a part
-  tb = 1024 * item
+  tb = tile_bytes(dtype)
+  pick = "0" if k * parts == 1 else "j"  # the pick result column j holds (one k of 1 in one part: copies of it across)
+  label = f"((volatile unsigned *)(LABELS + {pick} * 64))[at(s, col[{pick}] % 32) % 16]" if labels else f"p * {cols} + col[{pick}]"
   assert parts == 1 or (k % 32 == 0 and cols % 32 == 0), "parts of whole tiles, side by side in whole tiles"
   assert DATA + ct * tb + tb + 4096 + 64 * k <= OUTS, "a part's tile row in L1"
   return compile_kernel(f"""
@@ -1678,11 +1741,12 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
 {ROWS}
 typedef {"unsigned short" if item == 2 else "unsigned"} datum;
 typedef {"short" if item == 2 else "int"} signed_datum;
-static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
 // The k best so far as a heap, the worst at the root (of equal keys, the later column), so a better value takes its place
 #define WORSE(a, ca, b, cb) ((a) < (b) || ((a) == (b) && (ca) > (cb)))
-static int worse(const unsigned *top, const unsigned *col, unsigned i, unsigned j) {{ return WORSE(top[i], col[i], top[j], col[j]); }}
-static void swap(unsigned *top, unsigned *col, unsigned i, unsigned j) {{ unsigned t = top[i], c = col[i]; top[i] = top[j], col[i] = col[j], top[j] = t, col[j] = c; }}
+static void swap(unsigned *top, unsigned *col, unsigned i, unsigned j) {{
+  unsigned t = top[i], c = col[i];
+  top[i] = top[j], col[i] = col[j], top[j] = t, col[j] = c;
+}}
 static void down(unsigned *top, unsigned *col, unsigned i, unsigned n) {{  // the one at i sifted down: worse children moved up into its place
   unsigned key = top[i], c = col[i];
   for (unsigned l; (l = 2 * i + 1) < n; ) {{
@@ -1700,28 +1764,31 @@ void kmain(volatile unsigned *a) {{
   datum *x = (datum *)X;
   volatile datum *values = (volatile datum *)VALUES;  // a result tile of each: this unit's row in it, at its place
   volatile unsigned *ids = (volatile unsigned *)IDS;
-  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, done = ~0u, top[{k}], col[{k}], kept = 0;  // done: the row whose k best
-  for (unsigned u = 0; u < a[1]; u++) {{                                                                // top and col hold (copies' too)
-    unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, i = t % tr, p = t / tr % {parts}, b = t / tr / {parts};  // row r of x's
-    unsigned first = b * a[5] + i * a[6] + p * {ct} + a[7];                                                    // tile row i, part p, matrix b
+  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, done = ~0u, top[{k}], col[{k}], kept = 0;  // (done: the row top and col hold)
+  for (unsigned u = 0; u < a[1]; u++) {{
+    // row r of x's tile row i, part p, matrix b, from its tile first on
+    unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, i = t % tr, p = t / tr % {parts}, b = t / tr / {parts};
+    unsigned first = b * a[5] + i * a[6] + p * {ct} + a[7];
     unsigned n = rows == 1 ? 1 : rows - i * 32 < 32 ? rows - i * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here; the row r holds
-    unsigned face = r / 16 * 512 + r % 16 * 16;  // the row's run in the left face, in datums
+    unsigned face = at(r, 0);  // the row's run in the left face
     if (rows == 1 && r) continue;  // (one row of x: the tile row's first unit writes all its copies)
     if (s < n && t * 32 + s != done) {{
       done = t * 32 + s, kept = 0;
-      if (t != held || rows <= 8) {{  // a few rows: each one's own runs, where they lie in its tiles; more: the tile row, once
-        for (unsigned j = 0; j < {ct}; j++)                                                                    // a worker
+      if (t != held || rows <= 8) {{  // a few rows: each one's own runs, where they lie in its tiles; more: the tile row, once a worker
+        for (unsigned j = 0; j < {ct}; j++)
           if (rows <= 8) for (unsigned f = 0; f < 2; f++) {{
-            unsigned o = (s / 16 * 2 + f) * {256 * item} + s % 16 * {16 * item};
+            unsigned o = at(s, 16 * f) * {item};
             noc_get(BANK(first + j), AT(a[4], first + j, {tb}) + o, X + j * {tb} + o, {16 * item});
           }}
           else noc_get(BANK(first + j), AT(a[4], first + j, {tb}), X + j * {tb}, {tb});
         noc_wait();
         held = t;
       }}
-      const signed_datum *row = (const signed_datum *)x + (s / 16 * 2) * 256 + s % 16 * 16;  // its run of 16 in face 0 of tile 0
-      unsigned last = 0;  // the worst kept's key, and while it is a float of no sign, its bits: a later value is no better
-      int raw = -1;       // than it unless above it as a signed integer, one compare where the key takes four
+      const signed_datum *row = (const signed_datum *)x + at(s, 0);  // its run of 16 in face 0 of tile 0
+      // last: the worst kept's key; raw, while it is a float of no sign, its bits: a later value is no better than it unless
+      // above it as a signed integer, one compare where the key takes four
+      unsigned last = 0;
+      int raw = -1;
       for (unsigned c0 = 0; c0 < {cols}; c0 += 16) {{  // the row's run of 16 in each face of each tile, in order
         const signed_datum *run = row + c0 / 32 * 1024 + c0 % 32 / 16 * 256;
         if (raw >= 0 && c0 + 16 <= {cols}) {{  // (a whole run no better than the worst kept: one branch for its 16)
@@ -1733,8 +1800,10 @@ void kmain(volatile unsigned *a) {{
           signed_datum d = run[c - c0];
           if (kept == {k} && (raw >= 0 ? d <= raw : key((datum)d) <= last)) continue;  // no better than the worst kept
           unsigned v = key((datum)d), i;
-          if (kept < {k}) for (top[i = kept++] = v, col[i] = c; i && worse(top, col, i, (i - 1) / 2); i = (i - 1) / 2) swap(top, col, i, (i - 1) / 2);
-          else top[0] = v, col[0] = c, down(top, col, 0, {k});  // (it takes the worst's place)
+          if (kept < {k}) {{  // (it goes up while worse than its parent)
+            for (top[i = kept++] = v, col[i] = c; i && WORSE(top[i], col[i], top[(i - 1) / 2], col[(i - 1) / 2]); i = (i - 1) / 2)
+              swap(top, col, i, (i - 1) / 2);
+          }} else top[0] = v, col[0] = c, down(top, col, 0, {k});  // (it takes the worst's place)
           if (kept == {k}) last = top[0], raw = last >= {1 << (bits - 1):#x}u ? (int)(last & {(1 << (bits - 1)) - 1:#x}) : -1;
         }}
       }}
@@ -1748,8 +1817,7 @@ void kmain(volatile unsigned *a) {{
     for (unsigned q = 0; q < {kt}; q++) {{  // the unit's row of each result tile: its k picks there, 0 past them
       for (unsigned c = 0; c < 32; c++) {{
         unsigned j = q * 32 + c, v = 0, id = 0;
-        if (s < n && j < {k}) v = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], id = {"((volatile unsigned *)(LABELS + j * 64))[at(s, col[j] % 32) % 16]" if labels else f"p * {cols} + col[j]"};
-        if (s < n && {k} * {parts} == 1) v = x[col[0] / 32 * 1024 + at(s, col[0] % 32)], id = {"((volatile unsigned *)LABELS)[at(s, col[0] % 32) % 16]" if labels else "col[0]"};  // (copies across)
+        if (s < n && {pick} < {k}) v = x[col[{pick}] / 32 * 1024 + at(s, col[{pick}] % 32)], id = {label};
         values[at(r, c)] = v, ids[at(r, c)] = id;
       }}
       unsigned o = (b * tr + i) * {parts * kt} + p * {kt} + q;  // the result tile
@@ -1767,8 +1835,9 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
-def group_slots(rows, k, n):  # Tensor.group's tiles of slots, enough for any choices (one for each 32, and one more for each
-  return -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32  # value that can come), and the length of a run of places
+# Tensor.group's tiles of slots, enough for any choices (one for each 32, and one more for each value that can come), and
+# the length of a run of places
+def group_slots(rows, k, n): return -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32
 
 def group_kernel(rows, k, n):
   """A mixture of experts' tokens grouped by expert (Tensor.group), args [first unit, units, the order's address, the
@@ -1779,18 +1848,17 @@ def group_kernel(rows, k, n):
   runs, each choice's slot) are built in L1 as plain arrays and sent a tile at a time, a row's tile holding the row
   32 times and a column's the column, as every tensor's does."""
   t, rp = group_slots(rows, k, n)
-  fill = DATA + -(-rows // 32) * 4096  # past the choices: each value's count, then its next slot
-  out = (fill + 4 * (n + 33 * t + k * rp) + 63) // 64 * 64
+  fills = DATA + -(-rows // 32) * 4096  # past the choices: each value's count, then its next slot
+  out = (fills + 4 * (n + 33 * t + k * rp) + 63) // 64 * 64
   assert out + 4096 <= OUTS, "the choices and their arrays in L1"
   return compile_kernel(f"""
 #define IDS {DATA:#x}
-#define FILL {fill:#x}
+#define FILL {fills:#x}
 #define ORDER (FILL + {4 * n})
 #define TILES (ORDER + {4 * 32 * t})
 #define PLACES (TILES + {4 * t})
 #define OUT {out:#x}
 {ROWS}
-static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
 static unsigned choice(unsigned r, unsigned j) {{ return ((volatile unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
 static void send(unsigned base, unsigned i) {{ noc_write(OUT, BANK(i), AT(base, i, 4096), 4096); noc_wait(); }}
 void kmain(volatile unsigned *a) {{
@@ -1840,9 +1908,9 @@ def touched_kernel(rows, k, n):
 #define LIST {DATA + tr * 6144:#x}
 #define OUT {(DATA + tr * 6144 + 4 * n + 4 * slots + 63) // 64 * 64:#x}
 {ROWS}
-static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
-static unsigned choice(unsigned r, unsigned j) {{ return ((const unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}  // (L1 the NoC wrote,
-static unsigned weight(unsigned r, unsigned j) {{ return ((const unsigned short *)WEIGHTS)[r / 32 * 1024 + at(r % 32, j)]; }}  // past noc_wait's fence)
+// (plain reads of L1 the NoC wrote, past noc_wait's fence)
+static unsigned choice(unsigned r, unsigned j) {{ return ((const unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
+static unsigned weight(unsigned r, unsigned j) {{ return ((const unsigned short *)WEIGHTS)[r / 32 * 1024 + at(r % 32, j)]; }}
 void kmain(volatile unsigned *a) {{
   unsigned *list = (unsigned *)LIST, *mark = list + {slots}, *out = (unsigned *)OUT;
   if (!a[1]) return;
@@ -1863,18 +1931,19 @@ void kmain(volatile unsigned *a) {{
       for (unsigned r = 0; r < 32 && i * 32 + r < {rows}; r++) {{
         unsigned w = 0;
         for (unsigned j = 0; j < {k}; j++) if (choice(i * 32 + r, j) == e) w = weight(i * 32 + r, j);
-        for (unsigned *row = out + (r / 16 * 2) * 128 + r % 16 * 8, c = 0; c < 8; c++) row[c] = row[128 + c] = w | w << 16;  // (its runs in both faces)
+        for (unsigned *row = out + at(r, 0) / 2, c = 0; c < 8; c++) row[c] = row[128 + c] = w | w << 16;  // (its runs in both faces)
       }}
       unsigned t = s * {tr} + i;
       l1_settle(OUT);
       noc_write(OUT, BANK(t), AT(a[3], t, 2048), 2048), noc_wait();
     }}
     if (s % 32) continue;
-    for (unsigned r = 0; r < 32; r++) for (unsigned *row = out + (r / 16 * 2) * 256 + r % 16 * 16, e = s + r < {slots} ? list[s + r] : {n}, c = 0; c < 16; c++)
-      row[c] = row[256 + c] = e;                                                                                           // the experts'
-    l1_settle(OUT);                                                                                                        // tile of entries
-    noc_write(OUT, BANK(s / 32), AT(a[2], s / 32, 4096), 4096), noc_wait();                                                // s to s + 31,
-    copy({ZEROS:#x}, OUT, 4096), noc_wait();                                                                              // each across its row
+    // the experts' tile of entries s to s + 31, each across its row
+    for (unsigned r = 0; r < 32; r++) for (unsigned *row = out + at(r, 0), e = s + r < {slots} ? list[s + r] : {n}, c = 0; c < 16; c++)
+      row[c] = row[256 + c] = e;
+    l1_settle(OUT);
+    noc_write(OUT, BANK(s / 32), AT(a[2], s / 32, 4096), 4096), noc_wait();
+    copy({ZEROS:#x}, OUT, 4096), noc_wait();
   }}
 }}""")
 
@@ -1904,7 +1973,8 @@ def link_kernel(send, dtype):
     for (unsigned i = 0; i < n; i++) noc_write(BUF + i * {tb}, BANK(t + i), AT(a[2], t + i, {tb}), {tb});
     noc_wait();
     poke(CREDIT, c + 1), link_write(CREDIT, 16);"""
-  end = f"\n  while (peek(CREDIT) < (a[3] + {LINK_TILES - 1}) / {LINK_TILES}) {{}}  // the last credit is back: nothing of this copy is left on the link" if send else ""
+  # the sender ends once the last credit is back: nothing of this copy is left on the link
+  end = f"\n  while (peek(CREDIT) < (a[3] + {LINK_TILES - 1}) / {LINK_TILES}) {{}}" if send else ""
   return compile_kernel(f"""
 #define BUF {DATA:#x}
 #define WORD {DATA + slot:#x}
@@ -1913,8 +1983,15 @@ def link_kernel(send, dtype):
 #define CREDIT {LINK_L1 + 2 * slot + 32:#x}
 {BANKS}
 static unsigned ex, ey;  // this end's Ethernet tile
-static unsigned peek(unsigned addr) {{ unsigned at = WORD + (addr & 15); noc_get(ex, ey, addr, at, 4); noc_wait(); return *(volatile unsigned *)at; }}
-static void poke(unsigned addr, unsigned v) {{ unsigned at = WORD + 16 + (addr & 15); *(volatile unsigned *)at = v; noc_write(at, ex, ey, addr, 4); noc_wait(); }}
+static unsigned peek(unsigned addr) {{
+  unsigned at = WORD + (addr & 15);
+  noc_get(ex, ey, addr, at, 4); noc_wait();
+  return *(volatile unsigned *)at;
+}}
+static void poke(unsigned addr, unsigned v) {{
+  unsigned at = WORD + 16 + (addr & 15);
+  *(volatile unsigned *)at = v; noc_write(at, ex, ey, addr, 4); noc_wait();
+}}
 static void link_write(unsigned at, unsigned n) {{  // n bytes of the tile's L1 at `at` into the peer's, by TX queue 0
   do peek({q("CMD")}); while (peek({q("STATUS")}) & {bh.ETH_BUSY:#x});  // busy read after another register (BH-55)
   poke({q("START")}, at), poke({q("SIZE")}, n), poke({q("DEST")}, at), poke({q("CMD")}, {bh.ETH_TT_L1_WRITE});
@@ -1960,17 +2037,12 @@ def bfp4_kernel():
   """bf16 tiles as bfp4, args [first unit, units, out, x's address, tile strides for batch and row, tile offset, x's
   tile columns, tiles a matrix]. BRISC alone, a tile a unit: each run of 16 values (a face's row) shares its largest
   exponent, and each value keeps the 3 bits under it, rounded to the nearest (ties up), as Tenstorrent's host conversion
-  rounds; the packer's own bfp4 is its bfp8 with the low 4 bits dropped, toward zero, which moved SmolLM2-360M's logits
-  three times as far. Whole words only, in and out."""
+  rounds, where the packer's own bfp4 is its bfp8 with the low 4 bits dropped, toward zero. Whole words only, in and out."""
   return compile_kernel(f"""
 #define IN {DATA:#x}
 #define OUT {DATA + 2048:#x}
 {BANKS}
-static unsigned nibble(unsigned b, unsigned top) {{  // bf16 b's 3 bits under exponent top, rounded, and its sign
-  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0), q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
-  if (q > 7) q = 7;
-  return q ? (b >> 15 & 1) << 3 | q : 0;  // no sign on a zero: the unpacker reads -0 as -inf
-}}
+{NIBBLE}
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b * a[4] + i * a[5] + j + a[6], tops = 0;
@@ -2050,7 +2122,6 @@ static volatile datum *fetch(unsigned base, unsigned t) {{  // x's tile t, in L1
   held[s] = t, came[s] = launch;
   return (volatile datum *)(CACHE + s * {tb});
 }}
-static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
 // n datums from s to d, steps dd and ss apart: four at a time along a line of both, and bf16's two to a word
 static void run(volatile datum *d, volatile datum *s, unsigned n, unsigned dd, unsigned ss) {{
   if (dd == 1 && ss == 1) {{
