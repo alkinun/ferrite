@@ -11,11 +11,11 @@ from ferrite.chip import Chip
 from ferrite.runtime import Runtime
 from ferrite.tensor import Tensor
 
-chip = Chip(pci.open_device())                       # the card, or the simulator when TTSIM is set
-rt = Runtime(chip, chip.tensix[0], chip.tensix[-1])  # firmware on every Tensix core, one of them dispatching
+chip = Chip(pci.open_device())              # the card, or the simulator when TTSIM is set
+rt = Runtime(chip)                          # firmware on every Tensix core, one of them dispatching
 x = Tensor.of(rt, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 w = Tensor.of(rt, [[0.5, -1.0], [2.0, 0.25], [-1.0, 1.0]])
-print((x @ w).relu().softmax(-1).tolist())           # lazy: one fused kernel, launched when the value is read
+print((x @ w).relu().softmax(-1).tolist())  # lazy: one fused kernel, launched when the value is read
 ```
 
 ## Running

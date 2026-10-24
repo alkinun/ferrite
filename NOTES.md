@@ -62,11 +62,11 @@ MiB a bank). GDDR must be trained before first use: telemetry tag 22 has 2 bits 
 The device reaches host memory by NoC requests to the PCIe tile (19, 24) (ISA `PCIExpressTile/README.md`): an address
 below 2^58 goes to the host as a bus address (bits 58/59: relaxed ordering, no-snoop); bit 60 goes through the outbound
 iATU; `0xF800_0000_0000_0000` is the DBI. So a host buffer at bus address B is NoC address (19, 24, B), with no iATU
-setup (kmd's DMA-mask comment says the same). kmd and umd route pinned memory through the bit-60 window instead, so the
-direct path rests on firmware having set window 0 up after each boot. If it fails on the card, the fallback is kmd's:
-outbound region r at BAR2 + `0x1000 + 0x200 r` (base +`0x08`/`0x0C`, limit +`0x10`/`0x20`, target +`0x14`/`0x18`,
-CTRL_1 = `1 << 13`, CTRL_2 = `1 << 31`; kmd `blackhole.c` 86-120, 878-911) and bit 60 on the bus address. ttsim models
-that path too (`translate_pci_dma_addr`).
+setup of ferrite's (kmd's DMA-mask comment says the same). kmd and umd route pinned memory through the bit-60 window
+instead, so the direct path rests on firmware having set window 0 up after each boot. If it fails on the card, the
+fallback is kmd's: outbound region r at BAR2 + `0x1000 + 0x200 r` (base +`0x08`/`0x0C`, limit +`0x10`/`0x20`, target
++`0x14`/`0x18`, CTRL_1 = `1 << 13`, CTRL_2 = `1 << 31`; kmd `blackhole.c` 86-120, 878-911) and bit 60 on the bus
+address. ttsim models that path too (`translate_pci_dma_addr`).
 
 ### TLB windows
 
@@ -141,9 +141,9 @@ process on an unknown code, and returns zeros (so `0x57`, harvesting, is unusabl
 
 `ferrite/runtime.py`.
 
-**Cores.** `Runtime(chip, start, end)` takes a rectangle of Tensix in translated coordinates. Its last core runs the
-**dispatcher**, the rest are **workers**, also a grid of whole NoC rows (`Runtime.grid`: 9 rows of 12) for kernels that
-multicast along rows and columns.
+**Cores.** `Runtime(chip)` takes every Tensix (or the rectangle from `start` to `end`, in translated coordinates). Its
+last core runs the **dispatcher**, the rest are **workers**, also a grid of whole NoC rows (`Runtime.grid`: on a p150's
+120, 9 rows of 12) for kernels that multicast along rows and columns.
 
 **A worker's L1:**
 
@@ -176,7 +176,7 @@ arguments, 64-byte aligned, in a ring in host memory; then the new write pointer
 access, for one launch or a recorded block of them (`Runtime.block`). Commands never straddle the ring's end (a length
 of 0 marks the tail unused); pointers are free-running byte counts.
 
-**The dispatcher** (BRISC firmware, about 1.2 KB), in a loop:
+**The dispatcher** (BRISC firmware, about 1.3 KB), in a loop:
 
 1. Poll the doorbell; once it has run every command it read, read all the host has written since (at most `STAGE`, 64
    KiB) in one NoC read from the PCIe tile, and run the commands from its L1.
@@ -194,14 +194,13 @@ acknowledges, which leaves `NIU_MST_REQS_OUTSTANDING_ID` wrong (up once, down on
 `NIU_MST_WR_ACK_RECEIVED` up to the recipients and then clears the outstanding counters (`0xFFFF` at `NIU + 0x60`),
 with nothing else in flight.
 
-**A worker** (firmware for all four cores, about 680 bytes). BRISC presets request initiators 1 and 2 at boot
-(`noc_setup`). Each launch it polls `go` with a `fence`, sits out if its index is past the launch's workers, takes its
-share of the units, zeroes `SYNC`'s counters, invalidates the instruction caches (Tensix config 185, bits 0-3, then
-`fence`, read back, `fence`), writes the TRISCs' go, runs its program, waits for its transfers and the TRISCs' done,
-marks the launch done in its mailbox, and adds 1 to the dispatcher's count by a NoC atomic increment (posted, on a static
-VC, as tt-metal's). A TRISC polls its
-go, runs its program, waits until its Tensix thread has run all it pushed (`tensix_idle`), and writes its done. A queued
-launch takes about 150 ttsim cycles.
+**A worker** (firmware for all four cores, about 700 bytes, 800 where the NIU counts read data). BRISC presets request
+initiators 1 and 2 at boot (`noc_setup`). Each launch it polls `go` with a `fence`, sits out if its index is past the
+launch's workers, takes its share of the units, zeroes `SYNC`'s counters, invalidates the instruction caches (Tensix
+config 185, bits 0-3, then `l1_settle`), writes the TRISCs' go, runs its program, waits for its transfers and the
+TRISCs' done, marks the launch done in its mailbox, and adds 1 to the dispatcher's count by a NoC atomic increment
+(posted, on a static VC, as tt-metal's). A TRISC polls its go, runs its program, waits until its Tensix thread has run
+all it pushed (`tensix_idle`), and writes its done.
 
 **Profiles** (`Runtime.profile`). The dispatcher reads its tile's wall clock (`RISCV_DEBUG_REG_WALL_CLOCK_L`, ISA
 `DebugTimestamper.md`) at a launch's go and at its last report, into a ring of 1024 entries in host memory, so every
@@ -216,8 +215,8 @@ its own. Launches are named by their ops; `profile(since)` sums them by name.
 takes stays taken, `Runtime.pinned`); each later call copies its inputs into the second's and sends the recorded
 launches as one block, one doorbell write, nothing built or compiled. It asks of the function fixed input shapes and
 dtypes, nothing else it reads changing, and no reading back; its result and everything it kept are the same tensors
-every call. A decode step replays this way (a token's place is data, not a shape): 0.1 ms of host a token, against 21
-ms built op by op.
+every call. A decode step replays this way (a token's place is data, not a shape), the host's part of it the inputs'
+copies and one write to the ring.
 
 **Waiting** (`Runtime.wait`) polls the status words in host memory, never the chip, with a timeout counted from the
 last launch that finished. Only reading back waits; a readback is itself a launch (`readback_kernel`) that copies tiles
@@ -230,7 +229,8 @@ first fit, 64-byte aligned. A `Tensor` frees its DRAM in `__del__`, which goes b
 the free is done.
 
 **Device API**, prepended to every program (`DEVICE`): `noc_me`, `noc_read`, `noc_write`, `noc_get`, `noc_put`,
-`noc_wait`, `l1_settle`. `noc_get` and `noc_put` use the preset initiators 1 and 2, writing only the four registers that
+`noc_wait`, `l1_settle`, `mcast_done` (a multicast's acknowledgements), `tensix_idle` (TRISC only) and `CLOCK` (the
+tile's wall clock). `noc_get` and `noc_put` use the preset initiators 1 and 2, writing only the four registers that
 change (17 instructions a read). Rules (ISA `NoC/MemoryMap.md`, `NoC/Counters.md`, enforced by ttsim):
 
 - At most 16 KiB a request; source and destination agree in their low 4 bits for L1, low 6 when DRAM is involved.
@@ -244,7 +244,10 @@ Not built: commands other than a launch, NCRISC (in reset), and a barrier betwee
 
 ## The compiler
 
-`ferrite/compiler.py` emits the kernels; `ferrite/tensor.py` builds the trees of ops they compute.
+`ferrite/compiler.py` emits the kernels; `ferrite/tensor.py` builds the trees of ops they compute. A kernel works
+through *units* (a result tile, a block of them, or a line of tiles along a reduced axis), each in *passes* over its
+tiles; for each tile a *frame* of L1 *slots* holds the inputs and one slot per op (its *intermediates*), two frames
+alternating.
 
 **Who drives the Tensix.** Three threads, each an in-order instruction FIFO; any thread can issue to any unit. TRISC t
 pushes to thread t; BRISC only moves data (a BRISC and a TRISC push in the same cycle drop the TRISC's). An instruction
@@ -333,7 +336,7 @@ wrap at 64. A result tile is K steps into one Dst half, which sums in fp32.
   1's `CMD` back and fences before bumping `ISSUED`). The depth is a guess for the card to tune.
 
 **Matmul precision.** The FPU adds each group of 8 products after aligning them at 12 bits (ttsim's `mvmul`), so a
-matmul is good to about 2^-12 of its larger terms. An fp32 matmul is bf16x3: each operand hi + lo in bf16 (lo the
+matmul is good to about 2^-11 of its larger terms. An fp32 matmul is bf16x3: each operand hi + lo in bf16 (lo the
 operand less itself rounded by `ftob`), hi@hi + hi@lo + lo@hi in fp32.
 
 **Fidelity phases** (`matmul(fidelity=)`, `tensor.FIDELITY`): phase 0 multiplies A's top 7 bits by B's top 5, 1 the same
@@ -410,41 +413,30 @@ must not look. The keys' length is an argument, so one kernel serves every lengt
 - One sweep (flash attention's) would need the output rescaled in L1 whenever a row's largest grows, which the packer
   cannot do, so the keys are swept twice and the values once. A unit's keys that fit L1 stay there from the first sweep
   for the second (`attention_store`: a bf16 cache's in free slots; a block float's in regions of whole key rows, at most
-  64 tiles each, below B8 past the slots in use and past the frames' regions, 104 rows of Qwen3.6's 256-wide heads in
-  bfp8), the unpacker switched to each row's region: each key is read once. Within 1% of numpy. A decode step's
-  attention at Qwen3.6's shapes reads 1.13 times the cache's keys and values at 8 slots of 2,048 places, and 1.04 at
-  32 of 1,024.
+  64 tiles each, below B8 past the slots in use and past the frames' regions, 104 key tile rows of Qwen3.6's 256-wide
+  heads in bfp8), the unpacker switched to each row's region: each key is read once. Within 1% of numpy.
 
-A decode step has few units (a key head's per slot), so when they are few each unit's keys are shared out among up to 8
-**parts** on workers of their own (flash decoding), or as many more as keep each part's keys in L1, each part's p v, sums and largest coming home for a few fused kernels
-to combine, each weighted by exp of its largest less the largest of all. A part with no keys takes one tile hidden by a
+A decode step has few units (a key head's per slot), so each unit's keys are shared out among up to 8 **parts** (flash
+decoding): as many as the workers allow with at least 8 key tiles each, or, where a part's keys would not fit L1, as
+many as make them fit. Each part's p v, sums and largest come home for a few fused kernels to combine, each weighted by
+exp of its largest less the largest of all. A part with no keys takes one tile hidden by a
 tile of -1e9; a row's largest is held at -1e4 at least, so a row that sees none of a part's keys gets weight 0; each
 part's largest is rounded to bf16 in Dst so its p and its weight agree. `llama.attention` uses it for heads of 64 and
 wider, but gpt-oss's (its sinks).
 
 ### Gated DeltaNet's step
 
-`Tensor.delta` (`compiler.delta_kernel`): a decode step's Gated DeltaNet from its token's projections to its outputs,
-or a verify step's token and its draft, in fp32 on the SFPU, each state read once and written once. A unit is a key
-head of a sequence and its value heads, so it alone reads and writes its channels of the conv's last inputs. BRISC
-reads its value heads' S (kt x vt tiles each) into a frame (two alternate between units), from the states after both
-of the last step's tokens or after its first alone as accept says, and the row runs of its channels from the conv's
-last 3 inputs, the tokens' own rows of the projections and the 4 taps: q's and k's go into columns 0-3 of a tile (a
-channel a row), v's land in rows 0-3 (a channel a column), b, a, dt and decay in place 0. Once it has read them it
-writes the inputs each token leaves (each one up a place, its own last; a verify step's first token's into those kept
-apart), where the sequence is live: no shift launches, and the inputs never cross DRAM in whole tiles. The math thread
-fills Dst from L1 itself, masks what lies outside the filled places to 0 there (so no tile is zeroed in L1), and folds
-(`across_rows`, `across_cols`) into broadcast tiles: each channel's 4 inputs by its 4 taps summed across the row (or
-down the column) through SiLU, q and k each to length 1 by the sum of their squares folded down (q times kd^-1/2),
-beta = sigmoid(b) and e^g = exp(decay softplus(a + dt)) everywhere, k . q. The recurrence is separable by column: for
-each value head and column tile j, one SFPU pass over its kt tiles sums u = S^T k and w = S^T q down the column (two
-Dst accumulators), d = beta (v - e^g u) stays in Dst, the output's tile is e^g w + d (k . q), and the column's new
-tiles e^g S + k d (a first of two tokens' packed into L1 too, the second's S). The SFPU programs are functions the
-loops call, so no loop's body is thousands of inline Tensix words long: one that was made ttsim decode an XMOV (why is
-not known). BRISC reads and writes a source's runs a tile range at a time, and sends the output's row runs into its
-tile and the new tiles over the old, but a dead sequence's. A decode step's Gated DeltaNet block is then the qkv
-matmul, this kernel, the output's norm and gate and the output matmul: at Qwen3.6's shapes 22 launches with its
-experts, reading 65 MB at one sequence and 174 at eight; the kernel itself takes 34K ttsim cycles at one sequence.
+`Tensor.delta` (`compiler.delta_kernel`): a decode step's Gated DeltaNet from its token's projections to its outputs
+(or a verify step's token and its draft, see Speculative decoding), in fp32 on the SFPU, each state read once and
+written once. A unit is a key head of a sequence and its value heads, so it alone reads and writes its channels of the
+conv's last inputs; once BRISC has read them it writes the inputs each token leaves in place (each one up a place, its
+own last), so there are no shift launches and the inputs never cross DRAM in whole tiles. The math thread fills Dst
+from L1 itself and folds the conv, SiLU, q's and k's lengths and the gates into broadcast tiles. The recurrence is
+separable by column: for each value head and column tile j, one SFPU pass over its key tiles sums u = S^T k and w =
+S^T q down the column, d = beta (v - e^g u) stays in Dst, the output's tile is e^g w + d (k . q), and the column's new
+tiles e^g S + k d. The SFPU programs are functions the loops call, so no loop's body is thousands of inline Tensix words
+long. A decode step's Gated DeltaNet block is then the qkv matmul, this kernel, the output's norm and gate and the output
+matmul.
 
 ### Shapes and movement
 
@@ -497,8 +489,11 @@ differences.
 `models/llama.py` is written once for ferrite Tensors and numpy, numpy the reference at every step. It reads Llama's,
 Mistral's, Qwen2's and Qwen3's checkpoints, and Mixtral's, Qwen2-MoE's, Qwen3-MoE's and gpt-oss's (experts unpacked from
 MXFP4), and Qwen3.5's and Qwen3.6's, each checked against transformers' own model (`test_hf_families`, `test_qwen3_moe`,
-`test_qwen3_5_moe`). Weights are read only when uploaded (`Weight`) and cast on the chip to their formats (`precision`:
-bf16, bfp8, bfp4, or `tt`, Tenstorrent's performance precision); `llama.arrays` gives numpy the same values. Each block's
+`test_qwen3_5_moe`). A config is `llama.config`'s from config.json, or `llama.model(...)`'s by hand: what it says, the
+rest a plain Llama's. Weights are read only when uploaded (`Weight`) and cast on the chip to their formats
+(`precision`: bf16, bfp8, bfp4; `tt`, Tenstorrent's performance precision; or `experts`, every MLP matrix in bfp4 at one
+phase and the rest in bfp8 at two, a bfp4 draft head and a bfp8 KV cache: Qwen3.6 on one card); `llama.arrays` gives
+numpy the same values. Each block's
 q, k and v are one matrix, gate and up another (`fuse`). RoPE is one kernel for q, k and v (`x cos + (x @ turn) sin`).
 The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and Hugging Face's tokens over the same file.
 
@@ -512,16 +507,16 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
   picked in order, then none, and each entry's weight from each token, 0 where it picked another), weighted before the
   down projection and the entries summed, so each touched expert's weights are read once and the tokens' row once. A
   prompt's tokens are grouped by expert (`Tensor.group`, a counting sort on BRISC) so each expert's weights are read
-  once for every 32 of its tokens, the tiles past those used picking none. Whichever makes fewer tile rows. Nothing
-  comes back to the host, so a decode step replays. A synthetic block of 32 experts (2048 wide, 8 picked, bfp4) at 8
-  tokens reads 67 MB where a batch entry for each token and choice read 162.
+  once for every 32 of its tokens, the tiles past those used picking none. Up to 128 tokens (a decode or verify step's)
+  the first, whose extra tile rows cost less than grouping's gathers of 64-byte runs; past that, whichever makes fewer
+  tile rows. Nothing comes back to the host, so a decode step replays.
 - **Gated DeltaNet** (`delta`, Qwen3.5 and 3.6): one matmul makes q, k, v, z, b and a; a causal conv of 4 taps (its last
   3 inputs kept) and SiLU; each value head keeps a 128 x 128 state, S = e^g S + beta k (v - e^g S^T k)^T, read by its
-  query, RMS-normed and gated by SiLU(z), in fp32. A decode step's token, or a verify step's token and its draft, goes
-  through the recurrent rule in one kernel of each head (`Tensor.delta`, `step` numpy's), q and k from the conv's row
-  as it lies; a prompt goes in pieces of 64 (`chunk`, the UT transform: (I + L)^-1 = (I + P)(I + P^2)(I + P^4)..., P =
-  -L, no loop over tokens), everything the state does not enter done for every piece at once, then the state through
-  the pieces in turn. The states are written back in place (`assign`), so a replay carries them.
+  query, RMS-normed and gated by SiLU(z), in fp32. A decode step goes through the recurrent rule in one kernel of each
+  key head (`Tensor.delta`, `step` numpy's); a prompt goes in pieces of 64 (`chunk`, the UT transform: (I + L)^-1 = (I +
+  P)(I + P^2)(I + P^4)..., P = -L, no loop over tokens), everything the state does not enter done for every piece at
+  once, then the state through the pieces in turn. The states are written back in place (`assign`), so a replay carries
+  them.
 - **Gated attention** (Qwen3.5 and 3.6): each head's output times sigmoid(gate), RoPE on a quarter of each head, q and k
   RMS-normed per head, RMSNorms by 1 + w.
 - **Speculative decoding** (`draft`, `forward`'s accept): the multi-token prediction layer is a block past the last;
@@ -536,15 +531,20 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
 
 **Qwen3.6-35B-A3B** (40 blocks 2048 wide, 30 Gated DeltaNet and 10 attention; 256 experts of 512, 8 chosen, and a
 shared one; a vocabulary of 248,320). Real blocks are within 0.22% of transformers in numpy and about 1% a block on
-ttsim. Token accuracy in numpy over the whole model: bf16 top-1 99.6%, top-5 100%; every expert matrix in bfp4, the rest
-and the KV cache in bfp8 (21.7 GB, one card) 92.0% and 94.2%; the experts' gate and up in bfp4 and the rest in bfp8
-(27.2 GB) 93.8% and 96.0%; the experts' gate and up in bfp4 and the rest in bf16 98.2% and 99.6%, so the experts' down
-projection in bfp4 costs most of it. Every matrix in bfp8 (two cards) and a bfp4 KV cache are not measured yet: their
-runs on this host came out NaN ("Still unknown"). Tenstorrent's performance mode runs Llama-3.1-8B at 90% top-1. The
-multi-token prediction layer's draft is taken, a pick sampled as the request samples, at these shares of the first
-1,024 tokens' places (numpy, bf16): A Tale of Two Cities 92.5% greedy and 91.5% at Qwen3.6's own sampling (temperature
-1, top_k 20, top_p 0.95), ferrite's compiler 71.0% and 54.4%, these notes 71.9% and 57.9%; in the one-card formats the
-tale's 89.6% and 88.4%, the compiler's 70.0% and 54.0%, and by the bfp4 draft head 89.4% and 88.3%, 68.8% and 53.4%.
+ttsim. Token accuracy in numpy over the whole model, and the multi-token prediction layer's drafts taken (a pick
+sampled as the request samples) over the first 1,024 tokens' places of A Tale of Two Cities and of ferrite's compiler,
+greedy and at Qwen3.6's own sampling (temperature 1, top_k 20, top_p 0.95). Tenstorrent's performance mode runs
+Llama-3.1-8B at 90% top-1.
+
+| formats | GB | top-1 | top-5 | drafts taken: the tale | the compiler |
+|---|---|---|---|---|---|
+| bf16 | 71.0 | 99.6% | 100% | 92.5%, 91.5% | 71.0%, 54.4% |
+| the experts' gate and up bfp4, the rest bf16 | | 98.2% | 99.6% | | |
+| the experts' gate and up bfp4, the rest bfp8 | 27.2 | 93.8% | 96.0% | | |
+| `experts`: every MLP matrix bfp4, the rest and the KV cache bfp8 (one card) | 21.9 | 92.0% | 94.2% | 89.6%, 88.4% | 70.0%, 54.0% |
+| the same, drafting by the bfp4 draft head | | | | 89.4%, 88.3% | 68.8%, 53.4% |
+
+The experts' down projection in bfp4 costs most of the one-card layout's accuracy.
 
 ## Serving
 
@@ -565,27 +565,24 @@ tale's 89.6% and 88.4%, the compiler's 70.0% and 54.0%, and by the bfp4 draft he
   caches leave (`park` bytes: by default all that is free when the engine starts but 2 GiB), so keeping one and taking
   it back are a few launches and no PCIe; past that the least recently used go to the host (`keep` bytes), read back
   and later written over the BARs, and past that they are gone.
-- **Speculative steps** for a model with a prediction layer: a call verifying every slot's token and draft, then one
-  drafting the next (each row's best token, on the chip); a pick is sampled as it would be without a draft, so the tokens
-  are the model's own.
+- **Speculative steps** for a model with a prediction layer (see Speculative decoding): a call verifying every slot's
+  token and draft, then one drafting the next (each row's best token, on the chip).
 - **Heads** (`heads`). The output layer writes its logits in fp32, and each call ends with each row's head on the chip:
   its 64 largest logits and their tokens, by `topk` on parts of the row a worker's L1 holds (Qwen3.6's 248,320 as 97 of
   2,560), each part's 64 side by side, then a `topk` of those given their tokens as labels; and the log of the sum of
   exp(x t) over the row at its request's t = 1/temperature, each part's by one fp32 kernel (one sweep, from the part's
   largest, the first of its 64) and theirs by another: the logits are read once whole, and topk reads up to 8 rows'
   own runs rather than their tiles (a single row's scanned by one unit of each tile row, which writes all 32 copies of
-  its result). The host reads back under 1 KB a row, not the row: greedy is its first token; top_k up
-  to 64, and top_p and min_p whose cut lies inside the head, are exact from it, the sum giving each token's share of the
-  whole row; a draw with none of them that lands past the head's mass reads the whole rows back and draws from the rest
-  of its row alone. Penalties, shapes and logprobs read the whole row. 8 slots' tokens at temperature 0.7 and top_p 0.95
-  take 0.08 ms of the host's a step.
+  its result). The host reads back under 1 KB a row, not the row: greedy is its first token; top_k up to 64, and top_p
+  and min_p whose cut lies inside the head, are exact from it, the sum giving each token's share of the whole row; a
+  draw with none of them that lands past the head's mass reads the whole rows back and draws from the rest of its row
+  alone. Penalties, shapes and logprobs read the whole row.
 - **Requests.** Penalties (presence, frequency, repetition, as vLLM applies them), temperature, top_k, top_p, min_p,
   seed, stop strings (searched for only where the newest token's text could complete one), logprobs; those a request
   leaves out are the model's own (its `generation_config.json`'s, as vLLM takes them: Qwen3.6's top_k 20, top_p 0.95),
-  else OpenAI's. Qwen3.5's and 3.6's
-  template written out, tool calls back as OpenAI's `tool_calls`; `tool_choice` and `response_format` (a JSON schema,
-  parsed as a prefix) are shapes: a drawn token is taken if the text can still fit, else drawn again without it.
-  Reasoning comes apart from the answer (`reasoning_content`).
+  else OpenAI's. Qwen3.5's and 3.6's template written out, tool calls back as OpenAI's `tool_calls`; `tool_choice` and
+  `response_format` (a JSON schema, parsed as a prefix) are shapes: a drawn token is taken if the text can still fit,
+  else drawn again without it. Reasoning comes apart from the answer (`reasoning_content`).
 - **HTTP**: `/v1/models`, `/v1/completions`, `/v1/chat/completions`, whole or streamed. A request holds a slot from its
   arrival to its end, and one that finds none free gets a 429 at once (OpenRouter tries the next provider, and does not
   count 429s against uptime). Usage counts the prompt's cached tokens, and ends a stream. A request with no text for 600
@@ -593,25 +590,25 @@ tale's 89.6% and 88.4%, the compiler's 70.0% and 54.0%, and by the bfp4 draft he
 
 ## The cost model
 
-`models/cost.py`: what a model costs to serve, from its config alone. A card holds the weights in a mode's formats, a
-GiB for kernels and activations, and sessions (KV cache rows, Gated DeltaNet states). A decode step for n users reads
+`models/cost.py`: what a model costs to serve, from its config alone. A card holds the weights in a mode's formats
+(`llama.precision`'s, the KV cache's too unless `kv=` says), a GiB for kernels and activations, and sessions (KV cache
+rows, Gated DeltaNet states). A decode step for n users reads
 every matrix but the experts and the embedding, the experts its tokens pick (E (1 - (1 - k/E)^tokens) a block), the
 states (read and written once; a verify step's one of two read, both written), the rows attention's kernel reaches
 (keys once where a part keeps them in L1, values once), and activations (`ACTIVATIONS`: 4 MB a block in 32-row tiles,
 each picked expert's outputs for its tokens' tile rows, 45 MB of logits a tile row of tokens). It waits on DRAM or the
 matmuls, whichever is longer, then on its launches (`LAUNCHES`), then on the RISC-V work its kernels do past their reads
-(`CONTROL`, by the step's tokens). Launches and that work are counted on ttsim at Qwen3.6's shapes
-(`cmp/qwen36/step.py`), where the model's reads come within 11% of the counter's at one, eight and 32 slots, plain and
-speculative (its experts picked uniformly, where the counted step's tokens pick as they do). A prompt's chunks read the
-experts their tokens pick and their attention's keys and values for every eight tile rows of each query head. The card
-is its specification (512 GB/s at a 0.7 reach, a guess; 664 TFLOPS at one fidelity phase; a microsecond a launch) until
-the probe measures it (`probe=probe.json`).
+(`CONTROL`, by the step's tokens). Launches and that work are counted on ttsim at Qwen3.6's shapes, the bytes by
+ttsim-chaos's read counter. A prompt's chunks read the experts their tokens pick and their attention's keys and values
+for every eight tile rows of each query head. The card is its specification (512 GB/s at a 0.7 reach, a guess; 664
+TFLOPS at one fidelity phase, its bfp8 matmuls taking two; a microsecond a launch) until the probe measures it
+(`probe=probe.json`).
 
-For Qwen3.6 on one card (every MLP matrix bfp4, the rest bfp8, a bfp4 draft head, the KV cache bfp8), sessions of 16K
-tokens: 43 on the card (34 speculating); 88 tokens/s for one user, 283 a card at eight users (35 each), 352 at sixteen
-(22 each); speculating with 55% of drafts taken (code, prose) 102 for one user and 374 at sixteen, with 88% (a novel)
-123 and 453. Sessions of 4K tokens: 98 on the card; 406 tokens/s at sixteen users (25 each), 520 at 32. A 16K-token
-prompt in 0.70 s.
+For Qwen3.6 on one card (`python3 models/cost.py path/to/Qwen3.6-35B-A3B experts context=16384 accept=0.55`: every MLP
+matrix bfp4, the rest bfp8, a bfp4 draft head, the KV cache bfp8), sessions of 16K tokens: 43 on the card (34
+speculating); 89 tokens/s for one user, 285 a card at eight users (36 each), 354 at sixteen (22 each); speculating with
+55% of drafts taken (code, prose) 103 for one user and 375 at sixteen, with 88% (a novel) 125 and 454. Sessions of 4K
+tokens: 98 on the card; 408 tokens/s at sixteen users (26 each), 521 at 32. A 16K-token prompt in 0.69 s.
 
 ## tinygrad on ferrite
 
@@ -620,8 +617,8 @@ prompt in 0.70 s.
 into ferrite's lazy tensors, giving tinygrad an empty schedule. Movement stays a view (a small ShapeTracker), folded
 into ferrite's three axes when an op needs the data; a broadcast multiply summed is a ferrite matmul; what ferrite lacks
 (64-bit integers, bit operations, tinygrad's random numbers) runs lazily on tinygrad's CPU device. `TinyJit` is ferrite's
-replay. PyTorch runs through tinygrad's own frontend (`extra/torch_backend`). Not on the chip yet: symbolic shapes,
-dtypes past float32, bfloat16, int32 and bool.
+replay. PyTorch runs through tinygrad's own frontend (`extra/torch_backend`). On tinygrad's CPU device: symbolic
+shapes, and dtypes past float32, bfloat16, int32 and bool.
 
 ## ttsim
 
@@ -640,8 +637,8 @@ silicon's to check.
 then; static-VC requests keep their order); `TTSIM_CHAOS_TENSIX=p` and `TTSIM_CHAOS_RISCV=p` make a pipe or a core wait
 a turn with probability p; `TTSIM_CHAOS_SEED=n`; `TTSIM_CHAOS_UNHARVESTED=1` runs a p150's 140 Tensix, as firmware
 before 19.5 does. It also models the NIU's read-data counter (counter 3, a flit for each 64 bytes a read brings in), and
-exports `libttsim_chaos`, by which `pci.Sim` knows it does (`counts`). The suite passes under each; it caught missing
-waits for a frame's reads and a matmul step's, and TRISC0 running 16 reports ahead.
+exports `libttsim_chaos`, by which `pci.Sim` knows it does (`counts`). The suite passes under each, which checks the
+waits for a frame's reads and a matmul step's, and that TRISC0 never pushes a 16th report before relaying one.
 
 ## Ethernet links
 
@@ -680,7 +677,7 @@ not set. In order, each step needing only the ones before it:
 | 7 | `-k "sfpu or reduc or softmax or any_shape or views or batch or movement"` | run-time slots, BRISC's 2-byte L1 accesses, SFPU encodings, lane flags, `SFPTRANSP`, `Haloize_mode` |
 | 8 | the whole suite, a few times | the waits ttsim never makes happen; a failure that comes and goes points here |
 | 9 | `GPT2=... python3 -m pytest test -k gpt2`, then `models/gpt2.py` | everything at once, and the first timings (`Runtime.profile`; all 0 means `bh.WALL_CLOCK`) |
-| 10 | `python3 -m ferrite.probe`, `python3 -m ferrite.bench` (and `1 768 3072`, `4 bfp8`) | launch cost, DRAM GB/s by request size and reads in flight (block-float tiles as the matmuls read them, a near and a far bank) and a read's latency, NoC latency, MVMUL, unpack, pack and SFPU rates, BRISC's topk and grouping, PCIe; a matmul's TFLOPS and decode's GB/s. `probe 8 probe.json` feeds the cost model (its bandwidth: the slower of bfp8's and bfp4's tiles as the matmuls read them) |
+| 10 | `python3 -m ferrite.probe`, `python3 -m ferrite.bench` (and `1 768 3072`, `1 768 3072 4 bfp8`) | launch cost, DRAM GB/s by request size and reads in flight (block-float tiles as the matmuls read them, a near and a far bank) and a read's latency, NoC latency, MVMUL, unpack, pack and SFPU rates, BRISC's topk and grouping, PCIe; a matmul's TFLOPS and decode's GB/s. `probe 8 probe.json` feeds the cost model (its bandwidth: the slower of bfp8's and bfp4's tiles as the matmuls read them) |
 | 11 | `python3 -m ferrite.probe 256`, and a model of a few GB | uploads; if far under a GB/s, map the windows write-combined (`resource0_wc`) |
 | 12 | `test/benchmark.py ttnn ...`, then `ferrite ...` | ferrite against TT-NN on the same card |
 
@@ -699,11 +696,8 @@ reset`, untested).
   and its instruction cache invalidation is a no-op.
 - The card's real rates: DRAM bandwidth a step reaches, launch cost, the RISC-V work's speed, one worker's read
   bandwidth, the best `DEPTH`. The cost model guesses all of them.
-- **This host's CPU (an i7-12700KF) is unstable under load**: plain Python segfaults about one run in five, on some
-  CPUs and not others (`journalctl -k` names the CPU). A run that dies or goes wrong under load may be the host: a
-  whole-suite run that died; Qwen3.6's accuracy runs that came out NaN under full load (`gpt2.bfp` overflowing on
-  weights that round cleanly on one core; one of three sound on a rerun, the bfp4 KV cache's not in three, one of them
-  on the cores the crashes never name: the memory, more likely than a core); gpt-oss-20b's two bf16 runs far from
-  numpy with heavy work beside them; one `test_train` readback under ttsim-chaos.
+- Qwen3.6's token accuracy with every matrix in bfp8 (two cards), and with a bfp4 KV cache.
+- Why ttsim decodes an `XMOV` in a TRISC loop thousands of inline Tensix words long (the delta kernel's SFPU programs
+  are called functions for it).
 </content>
 </invoke>
