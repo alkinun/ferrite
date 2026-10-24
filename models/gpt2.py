@@ -51,29 +51,30 @@ def fns(x):  # what numpy and ferrite spell differently
     split = lambda a, n: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2)
     softmax = lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True)
     layernorm = lambda a: (a - a.mean(-1, keepdims=True)) / np.sqrt(a.var(-1, keepdims=True) + 1e-5)
-    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], split=split, softmax=softmax, layernorm=layernorm,
+    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], split=split, softmax=softmax, layernorm=layernorm,
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))),
                            put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b))
   if type(x).__module__ == "torch":  # test/train.py's reference
     import torch
     F = torch.nn.functional
-    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], width=lambda a: a.shape[-1], softmax=lambda a: a.softmax(-1),
+    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], softmax=lambda a: a.softmax(-1),
                            split=lambda a, n: a.reshape(a.shape[0], n, -1).transpose(0, 1), merge=lambda a: a.transpose(0, 1).reshape(a.shape[1], -1),
                            layernorm=lambda a: F.layer_norm(a, a.shape[-1:]), t=lambda a: a.transpose(-1, -2),
                            gelu=lambda a: F.gelu(a, approximate="tanh"))
-  return SimpleNamespace(rows=Tensor.gather, width=lambda a: a.cols, split=Tensor.split, softmax=Tensor.softmax,
+  return SimpleNamespace(rows=Tensor.gather, split=Tensor.split, softmax=Tensor.softmax,
                          layernorm=Tensor.layernorm, merge=Tensor.merge, t=lambda a: a.T, gelu=Tensor.gelu, put=Tensor.put)
 
 def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
+
+def block(w, pre): return {k[len(pre):]: w[k] for k in w if k.startswith(pre)}  # the weights named pre..., by the rest of their names
 
 def layer(x, p, mask, heads=HEADS, cache=None, places=None):
   """One transformer block: attention then MLP, each after a layer norm and added back. p: the block's weights by their
   names in the file, less "h.<layer>."; mask: 0 where a token may look, -1e9 where it may not (see mask); cache: this
   block's keys and values (kv_cache: the keys' heads, then the values'), a row for every place: this call's are put at
   places, both in one put, and attention reads all of them."""
-  f = fns(x)
-  d = f.width(x)
+  f, d = fns(x), x.shape[-1]
   hd = d // heads
   qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
   q, k, v = (f.split(qkv[:, i * d:(i + 1) * d], heads) for i in range(3))  # the heads as a batch
@@ -94,7 +95,7 @@ def forward(ids, w, mask, places=None, caches=None):
   f, layers = fns(w["wte.weight"]), 1 + max(int(k.split(".")[1]) for k in w if k.startswith("h."))
   x = f.rows(w["wte.weight"], ids) + f.rows(w["wpe.weight"], range(len(ids)) if places is None else places)
   for l in range(layers):
-    x = layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask, HEADS, caches and caches[l], places)
+    x = layer(x, block(w, f"h.{l}."), mask, HEADS, caches and caches[l], places)
   return f.rows(layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), [x.shape[-2] - 1]) @ w["wte.T"]
 
 def mask(places, size, window=None):
@@ -113,7 +114,7 @@ def masked(column, size, window=None):  # mask's, from a column of places: a bat
   return (out * -1e9).cast("bf16")
 
 @functools.cache
-def columns(rt, size): return Tensor.frombytes(rt, 1, size, np.arange(size, dtype=np.int32).tobytes(), 1, "int32")  # a mask's keys, 0 to size - 1: made once
+def columns(rt, size): return Tensor.frombytes(rt, 1, size, np.arange(size, dtype=np.int32).tobytes(), 1, "int32")  # a mask's keys, 0 on: once
 
 def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # each block's, by zeros(shape)
 
@@ -135,9 +136,9 @@ def arrays(weights, t=None):  # the same as numpy arrays; given them on the chip
   w = {name: values for name, (_, values) in weights.items()} | {"wte.T": weights["wte.weight"][1].T}
   return w | {k: values(x) for k, x in (t or {}).items() if x.dtype != "bf16"}
 
-def values(x):  # a ferrite matrix as numpy float32: fp32 as it is, bf16's bits, a block float's as bf16
-  raw = x.tobytes()
-  return (np.frombuffer(raw, np.float32) if x.dtype == "fp32" else bf16_floats(np.frombuffer(raw, np.uint16))).reshape(x.rows, x.cols)
+def values(x):  # a ferrite matrix as numpy: fp32 and int32 as they are, bf16 (and a block float, as bf16) as float32
+  raw, kind = x.tobytes(), {"fp32": np.float32, "int32": np.int32}.get(x.dtype)
+  return (np.frombuffer(raw, kind) if kind else bf16_floats(np.frombuffer(raw, np.uint16))).reshape(x.rows, x.cols)
 
 def logits(ids, w):  # the logits for the token after ids, in numpy, as a vector
   return forward(ids, w, mask(range(len(ids)), len(ids)))[0]

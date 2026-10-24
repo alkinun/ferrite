@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import numpy as np
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.join(os.path.dirname(__file__), "..", "models")]
 from ferrite import bh, pci
-import gpt2, llama
+import cost, gpt2, llama
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 SIZES = {False: SimpleNamespace(n=4096, runs=(3, 5, 20), steps=200, accuracy=500, users=32, lengths=(4096, 32768), blocks=None,
@@ -111,26 +111,28 @@ def load(url, agents, turns, text):
   for t in threads: t.join()
   assert not failed, failed
   first = sorted(stamps[0] - start for start, stamps, _ in done)
-  return {"agents": agents, "turns": len(done), "tokens/s a user": statistics.median((u["completion_tokens"] - 1) / (s[-1] - s[0]) for _, s, u in done if s[-1] > s[0]),
-          "tokens/s": sum(u["completion_tokens"] for *_, u in done) / (max(s[-1] for _, s, _ in done) - min(start for start, *_ in done)),
-          "seconds to first token": statistics.median(first), "seconds to first token, 90th percentile": first[int(0.9 * (len(first) - 1))],
-          "prompt tokens cached": sum(u["prompt_tokens_details"]["cached_tokens"] for *_, u in done) / sum(u["prompt_tokens"] for *_, u in done)}
+  each = statistics.median((u["completion_tokens"] - 1) / (s[-1] - s[0]) for _, s, u in done if s[-1] > s[0])
+  made, span = sum(u["completion_tokens"] for *_, u in done), max(s[-1] for _, s, _ in done) - min(start for start, *_ in done)
+  cached = sum(u["prompt_tokens_details"]["cached_tokens"] for *_, u in done) / sum(u["prompt_tokens"] for *_, u in done)
+  return {"agents": agents, "turns": len(done), "tokens/s a user": each, "tokens/s": made / span, "seconds to first token": statistics.median(first),
+          "seconds to first token, 90th percentile": first[int(0.9 * (len(first) - 1))], "prompt tokens cached": cached}
 
 def weights(c):  # each weight as llama.upload makes it, its rows, columns and format, from the model's sizes alone
   hd = llama.head(c)
   qkv = (c.heads + 2 * c.kv) * hd
-  shapes = {"embed": (c.vocab, c.dim), "embed.T": (c.dim, c.vocab), "norm": (1, c.dim), "cos": (c.places, qkv), "sin": (c.places, qkv), "turn": (hd, hd)}
-  for l in range(c.layers):
-    shapes |= {f"layers.{l}.{k}": s for k, s in (("input_layernorm", (1, c.dim)), ("post_attention_layernorm", (1, c.dim)), ("qkv_proj", (c.dim, qkv)),
-                                                 ("o_proj", (c.heads * hd, c.dim)), ("gate_up_proj", (c.dim, 2 * c.ffn)), ("down_proj", (c.ffn, c.dim)))}
-  return {k: SimpleNamespace(rows=r, cols=n, dtype=llama.weight_format(k, getattr(c, "precision", None))) for k, (r, n) in shapes.items()}
+  shapes = {"embed": (c.vocab, c.dim), "embed.T": (c.dim, c.vocab), "norm": (1, c.dim), "cos": (c.places, qkv), "sin": (c.places, qkv),
+            "turn": (hd, hd)}
+  block = {"input_layernorm": (1, c.dim), "post_attention_layernorm": (1, c.dim), "qkv_proj": (c.dim, qkv), "o_proj": (c.heads * hd, c.dim),
+           "gate_up_proj": (c.dim, 2 * c.ffn), "down_proj": (c.ffn, c.dim)}
+  for l in range(c.layers): shapes |= {f"layers.{l}.{k}": s for k, s in block.items()}
+  return {k: SimpleNamespace(rows=r, cols=n, dtype=llama.weight_format(k, c.precision)) for k, (r, n) in shapes.items()}
 
-def bytes_per_token(t, c, context):  # what a decode token reads (B2): every weight at its stored size
-  # but the embedding's and RoPE's tables, a row of each, and the KV cache at the decode's mean context
-  size = {"bf16": 2, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}
+def bytes_per_token(t, c, context):
+  """What a decode token reads (B2): every weight at its stored size but the embedding's and RoPE's tables, a row of
+  each, and the KV cache at the decode's mean context."""
   rows = {"embed": c.dim, "cos": t["cos"].cols, "sin": t["sin"].cols}
-  return (sum(size[x.dtype] * rows.get(k, x.rows * x.cols) for k, x in t.items())
-          + context * c.layers * 2 * c.kv * llama.head(c) * size[llama.cache_format(c)])
+  return (sum(cost.BYTES[x.dtype] * rows.get(k, x.rows * x.cols) for k, x in t.items())
+          + context * c.layers * 2 * c.kv * llama.head(c) * cost.BYTES[llama.cache_format(c)])
 
 def model(folder, s, places):  # the model's config at TT's performance precision, and its weights, read when wanted
   c, w = llama.load(folder, places)
@@ -143,11 +145,13 @@ def ferrite(folder, prompt, after, top5, book, s):
   from ferrite.runtime import Runtime
   from ferrite.tensor import Tensor, jit
   chip = Chip(pci.open_device())
-  rt, clock, on = Runtime(chip), chip.pci.now, lambda row: Tensor.of(rt, [row], "int32")
+  rt, clock, on, sim = Runtime(chip), chip.pci.now, lambda row: Tensor.of(rt, [row], "int32"), isinstance(chip.pci, pci.Sim)
+  tables = lambda n: llama.upload(rt, {k: w for k, w in llama.load(folder, n)[1].items() if k in ("cos", "sin")})  # RoPE's, for n places
   firmware = chip.telemetry().get(bh.TAG_FIRMWARE, 0)
-  out = {"versions": {"ferrite": git(ROOT), "firmware": ".".join(str(firmware >> b & 255) for b in (24, 16, 8)), "card": card(isinstance(chip.pci, pci.Sim)), "AI clock MHz": chip.aiclk,
-                      "host": host(), "lines of code": {d: lines(ROOT, lambda p: p.startswith(d + "/")) for d in ("ferrite", "adapters")}},
-         "clock": "ttsim's, not silicon's: a check of the script" if isinstance(chip.pci, pci.Sim) else "the host's"}
+  code = {d: lines(ROOT, lambda p: p.startswith(d + "/")) for d in ("ferrite", "adapters")}
+  versions = {"ferrite": git(ROOT), "firmware": ".".join(str(firmware >> b & 255) for b in (24, 16, 8)), "card": card(sim),
+              "AI clock MHz": chip.aiclk, "host": host(), "lines of code": code}
+  out = {"versions": versions, "clock": "ttsim's, not silicon's: a check of the script" if sim else "the host's"}
 
   def decode(t, c, users):
     """A user's tokens/s, `users` decoding together greedily (end-of-sequence ignored) after the same prompt, prefilled
@@ -169,20 +173,20 @@ def ferrite(folder, prompt, after, top5, book, s):
     """Seconds to the first token after ids, from them on the host, after a warm-up prefill of them (RoPE's tables
     uploaded for their places, the cache just big enough), and the chunk the prompt went in (llama.prefill): as many
     tokens as keep attention's scores within 2 GiB, all of them if they fit."""
-    t = t | llama.upload(rt, {k: w for k, w in llama.load(folder, len(ids))[1].items() if k in ("cos", "sin")})
-    size = -(-len(ids) // 32) * 32
+    t, size = t | tables(len(ids)), -(-len(ids) // 32) * 32
     kv, chunk = llama.kv_cache(c, size, llama.zeros(rt, llama.cache_format(c))), min(len(ids), max(32, (1 << 31) // (2 * c.heads * size) // 32 * 32))
     for _ in range(2):
       start = clock()
       int(llama.logits(llama.prefill(ids, t, c, kv, chunk, on)).argmax())
     return clock() - start, chunk
 
-  rng = np.random.default_rng(0)
-  a, b = (Tensor.frombytes(rt, s.n, s.n, (rng.standard_normal((s.n, s.n), np.float32).view(np.uint32) >> 16).astype(np.uint16).tobytes()) for _ in range(2))
-  for phases in (2, 4):
+  def matmul(phases):  # B1 (its tensors' DRAM back before the model's)
+    rng = np.random.default_rng(0)
+    a, b = (Tensor.frombytes(rt, s.n, s.n, (rng.standard_normal((s.n, s.n), np.float32).view(np.uint32) >> 16).astype(np.uint16).tobytes())
+            for _ in range(2))
     seconds = timed(lambda: a.matmul(b, fidelity=phases).realize(), rt.wait, clock, s.runs)
-    out[f"B1 matmul {s.n}^3 bf16, {phases} phases"] = {"ms": seconds * 1e3, "TFLOPS": 2 * s.n**3 / seconds / 1e12}
-  del a, b  # their DRAM back before the model's
+    return {"ms": seconds * 1e3, "TFLOPS": 2 * s.n**3 / seconds / 1e12}
+  for phases in (2, 4): out[f"B1 matmul {s.n}^3 bf16, {phases} phases"] = matmul(phases)
   c, w = model(folder, s, len(prompt) + max(s.steps, s.accuracy))
   t = llama.upload(rt, w, c.precision)
   tps = decode(t, c, 1)
@@ -193,13 +197,12 @@ def ferrite(folder, prompt, after, top5, book, s):
   top1, five, _ = llama.accuracy(rt, t, c, prompt, after, top5, s.accuracy)
   out["B2 token accuracy"] = {"top-1": top1, "top-5": five, "steps": s.accuracy}
   ids = llama.Tokenizer(folder).encode(book)
-  for n in s.lengths:  # a prompt ferrite cannot run yet is published as such
+  for n in s.lengths:  # a prompt ferrite cannot run is published as such
     try: out[f"B3 prefill, {n} tokens"] = dict(zip(("seconds to first token", "chunk"), prefill(t, c, ids[:n])))
-    except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run yet": f"{type(e).__name__}: {e}"}
+    except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run": f"{type(e).__name__}: {e}"}
   import serve  # B4: a slot for each agent, as many places as two tokens a word and every answer take
   places = -(-(2 * (s.turns.system + s.turns.task + s.turns.n * s.turns.tool) + s.turns.n * s.turns.out) // 32) * 32
-  engine = serve.Engine(rt, t | llama.upload(rt, {k: w for k, w in llama.load(folder, places)[1].items() if k in ("cos", "sin")}), c,
-                        llama.Tokenizer(folder), s.users, places, 256)
+  engine = serve.Engine(rt, t | tables(places), c, llama.Tokenizer(folder), s.users, places)
   threading.Thread(target=engine.run, daemon=True).start()
   httpd = serve.server(engine, os.path.basename(folder.rstrip("/")), port=0)
   threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -220,7 +223,8 @@ def ttnn(folder, prompt, after, top5, book, s):
   out = {"versions": {"tt-metal": git(tt), "umd": git(f"{tt}/tt_metal/third_party/umd"), "tt-kmd": read("/sys/module/tenstorrent/version"),
                       "firmware": next(map(read, glob.glob("/sys/class/tenstorrent/*/tt_fw_bundle_ver")), None), "card": card(sim),
                       "torch": torch.__version__, "host": host(),
-                      "lines of code": {"tt-metal": lines(tt, tenstorrent), "tt-kmd": lines(kmd, tenstorrent) if kmd else "not counted: TT_KMD not set"}},
+                      "lines of code": {"tt-metal": lines(tt, tenstorrent),
+                                        "tt-kmd": lines(kmd, tenstorrent) if kmd else "not counted: TT_KMD not set"}},
          "clock": "ttsim's, not silicon's: a check of the script" if sim else "the host's"}
 
   def matmul(n, phases):
@@ -230,7 +234,8 @@ def ttnn(folder, prompt, after, top5, book, s):
     device = ttnn.open_device(device_id=0)
     try:
       torch.manual_seed(0)
-      a, b = (ttnn.from_torch(torch.randn((n, n), dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device) for _ in range(2))
+      upload = lambda x: ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+      a, b = (upload(torch.randn((n, n), dtype=torch.bfloat16)) for _ in range(2))
       config = ttnn.WormholeComputeKernelConfig(math_fidelity=getattr(ttnn.MathFidelity, f"HiFi{phases}"), math_approx_mode=False,
                                                 fp32_dest_acc_en=True, packer_l1_acc=True)
       return timed(lambda: ttnn.matmul(a, b, compute_kernel_config=config), lambda: ttnn.synchronize_device(device), time.monotonic, s.runs)
@@ -261,7 +266,8 @@ def ttnn(folder, prompt, after, top5, book, s):
   c, _ = model(folder, s, 1)
   if "tokens/s" in out["B2 decode, batch 1"]:
     read = bytes_per_token(weights(c), c, len(prompt) + (s.steps + 1) / 2)
-    out["B2 decode, batch 1"] |= {"GB a token": read / 1e9, "effective DRAM bandwidth": out["B2 decode, batch 1"]["tokens/s"] * read / (bh.DRAM_GBPS * 1e9)}
+    b2 = out["B2 decode, batch 1"]
+    b2 |= {"GB a token": read / 1e9, "effective DRAM bandwidth": b2["tokens/s"] * read / (bh.DRAM_GBPS * 1e9)}
   out[f"B2 decode, batch {s.users}"] = demo(f"b2-batch-{s.users}", "batch-32 and not log-probs", ("tokens/s a user", "tokens/s"), *decoding,
                                             *(("--batch_size", str(s.users)) if s.users != 32 else ()), text=text)
   out["B2 token accuracy"] = demo("b2-accuracy", "ci-token-matching", ("top-1", "top-5"), "--max_generated_tokens", str(s.accuracy))
@@ -290,7 +296,8 @@ def main():
   if sys.argv[1] == "table": return print(table(*(json.load(open(p)) for p in sys.argv[2:4])))
   if sys.argv[1] == "load":
     path = os.environ.get("BOOK") or "tale-of-two-cities.txt.bz2"
-    return print(load(sys.argv[2].rstrip("/"), int(sys.argv[3]) if len(sys.argv) > 3 else 32, SIZES[False].turns, bz2.open(path, "rt", encoding="utf-8").read()))
+    book = bz2.open(path, "rt", encoding="utf-8").read()
+    return print(load(sys.argv[2].rstrip("/"), int(sys.argv[3]) if len(sys.argv) > 3 else 32, SIZES[False].turns, book))
   stack, folder, refpt, s = sys.argv[1], sys.argv[2], sys.argv[3], SIZES["--quick" in sys.argv]
   assert stack in ("ferrite", "ttnn"), "the stack to measure: ferrite or ttnn"
   prompt, after, top5 = llama.reference(refpt)

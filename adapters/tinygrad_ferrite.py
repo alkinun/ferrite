@@ -83,7 +83,8 @@ class Value:
   @property
   def shape(self): return self.view.shape
   def whole(self): return self.view.contiguous() and math.prod(self.shape) == math.prod(self.t.shape)  # its tensor, all of it, as it lies
-  def covers(self): return not self.view.mask and math.prod(n for n, s in zip(self.shape, self.view.strides) if s) == math.prod(self.t.shape)  # all of it, in any order
+  def covers(self):  # all of it, in any order
+    return not self.view.mask and math.prod(n for n, s in zip(self.shape, self.view.strides) if s) == math.prod(self.t.shape)
 
 def uncast(v):  # a bf16 tensor cast to fp32 for a matmul, as the bf16: ferrite multiplies fp32 by bf16 exactly (no lo part
   if isinstance(v, Value) and v.t.op == "cast" and v.t.dtype == "fp32" and v.t.srcs[0].dtype == "bf16":  # for it), and reads its
@@ -225,9 +226,10 @@ def flat(a, n, npd):  # a host value as n values' bytes
   a = np.asarray(a)
   return np.ascontiguousarray(np.broadcast_to(a, (n,)) if a.ndim == 0 else a.reshape(-1), npd).tobytes()
 
-recording, hosted = None, [0]  # while TinyJit records a call: each buffer it changes, [holder, before, stored into], and
+recording, hosted = None, 0  # while TinyJit records a call: each buffer it changes, [holder, before, stored into], and
 def note_host_work():  # its work on the host, with what it found there, which a replay would not do again
-  if recording is not None: hosted[0] += 1
+  global hosted
+  if recording is not None: hosted += 1
 
 def to_chip(v, dtype):  # a host value (a tinygrad CPU tensor) as a chip value, in its own shape
   return Value(upload(array(v), DTYPES[dtype]), View(v.shape), dtype)
@@ -249,11 +251,11 @@ def on_ferrite(u): return isinstance(u.device, str) and u.device.startswith("FER
 # Elementwise ops: tinygrad's on ferrite's (ferrite's comparisons give 1 or 0 in their operands' dtype, which is how a bool lives here)
 UNARY = {Ops.EXP2: tensor.Tensor.exp2, Ops.LOG2: tensor.Tensor.log2, Ops.SIN: tensor.Tensor.sin, Ops.SQRT: tensor.Tensor.sqrt,
          Ops.RECIPROCAL: tensor.Tensor.reciprocal, Ops.NEG: lambda x: -x}
-def chip(x): return isinstance(x, tensor.Tensor)  # else a number
+def is_tensor(x): return isinstance(x, tensor.Tensor)  # a ferrite tensor, else a number
 BINARY = {Ops.ADD: lambda a, b: a + b, Ops.SUB: lambda a, b: a - b, Ops.MUL: lambda a, b: a * b, Ops.CMPLT: lambda a, b: a < b,
-          Ops.MAX: lambda a, b: a.maximum(b) if chip(a) else b.maximum(a), Ops.CMPNE: lambda a, b: a.ne(b) if chip(a) else b.ne(a),
-          Ops.CMPEQ: lambda a, b: a.eq(b) if chip(a) else b.eq(a), Ops.FDIV: lambda a, b: a * b.reciprocal() if chip(b) else a / b,
-          Ops.AND: lambda a, b: a * b, Ops.OR: lambda a, b: a.maximum(b) if chip(a) else b.maximum(a)}  # AND and OR of bools only
+          Ops.MAX: lambda a, b: a.maximum(b) if is_tensor(a) else b.maximum(a), Ops.CMPNE: lambda a, b: a.ne(b) if is_tensor(a) else b.ne(a),
+          Ops.CMPEQ: lambda a, b: a.eq(b) if is_tensor(a) else b.eq(a), Ops.FDIV: lambda a, b: a * b.reciprocal() if is_tensor(b) else a / b,
+          Ops.AND: lambda a, b: a * b, Ops.OR: lambda a, b: a.maximum(b) if is_tensor(a) else b.maximum(a)}  # AND and OR of bools only
 ELEMENTWISE = {*UNARY, *BINARY, Ops.WHERE, Ops.CAST}
 EMPTIABLE = GroupOp.Elementwise | GroupOp.Movement | {Ops.REDUCE, Ops.COPY}  # ops whose value can have nothing in it
 
@@ -294,13 +296,13 @@ class Evaluator:
     if u.op in BINARY: return whole(BINARY[u.op](*(self.operand(s, shape, groups) for s in srcs)))
     if u.op is Ops.WHERE:
       c, x, y = (self.operand(s, shape, groups) for s in srcs)
-      if not chip(c): return None
+      if not is_tensor(c): return None
       return whole(c.where(x, y))
     if u.op is Ops.CAST:  # of a view of all of a tensor (a weight transposed): the tensor cast, the view kept, so a matmul
       if isinstance(v := srcs[0], Value) and v.covers() and DTYPES.get(u.dtype):  # can read the cast's source in place
         return Value(v.t.cast(DTYPES[u.dtype]), v.view, u.dtype)
       x = self.operand(srcs[0], shape, groups)
-      if not chip(x): return None
+      if not is_tensor(x): return None
       return whole(x.ne(0) if u.dtype is dtypes.bool else x.cast(DTYPES[u.dtype]))
     return None
 
@@ -427,7 +429,8 @@ class Evaluator:
     worked on on the host, those of the part replaced, so a value read from it before keeps what it had)."""
     chain = []
     while target.op not in (Ops.BUFFER, Ops.ALLOC):
-      assert target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE) or target.op is Ops.STAGE and target.arg is None, f"a store into {target.op}"
+      ok = target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE) or target.op is Ops.STAGE and target.arg is None
+      assert ok, f"a store into {target.op}"
       chain, target = chain + [target], target.src[0]
     if target.buffer.nbytes == 0: return None
     buf = target.buffer.ensure_allocated()
@@ -532,7 +535,7 @@ def tinyjit(self, *args, **kwargs):
   or binds a symbolic variable (a place in a sequence: the recording has its shapes for one value); the DRAM a recording
   that cannot be replayed took stays taken. tinygrad's checks of the inputs and the result are its own
   (_prepare_jit_inputs)."""
-  global recording
+  global recording, hosted
   given = [*args, *(v for _, v in sorted(kwargs.items()))]  # the inputs as tinygrad finds them: tensors, and those in a container
   ins = [t for t in given if t.__class__ is Tensor]
   ins += [t for x in given if isinstance(x, (tuple, list, dict)) for t in (x.values() if isinstance(x, dict) else x)
@@ -546,7 +549,7 @@ def tinyjit(self, *args, **kwargs):
     if params := get_parameters(ret): Tensor.realize(*params)
     return ret
   if self.cnt == 2:
-    values, recording, hosted[0], self.inputs = [h.value for h in holders], {}, 0, (names, info)
+    values, recording, hosted, self.inputs = [h.value for h in holders], {}, 0, (names, info)
     try:
       with tensor.Recording(runtime()) as rec:
         ret = self.fxn(*args, **kwargs)
@@ -556,7 +559,7 @@ def tinyjit(self, *args, **kwargs):
         # anew is laid out anew each replay, from its copy)
         same = lambda h, old: isinstance(h.value, Value) and (h.value.t.shape, h.value.t.dtype) == (old.t.shape, old.t.dtype)
         into_input = any(stored and h in holders for h, _, stored in recording.values())  # a replay would lose that store
-        self.replay = hosted[0] == 0 and not into_input and all(same(h, old) for h, old in back) and (rec, values, ret)
+        self.replay = hosted == 0 and not into_input and all(same(h, old) for h, old in back) and (rec, values, ret)
         for h, old in back if self.replay else ():
           if h.value.t is not old.t: old.t.assign(h.value.t)
           h.value = Value(old.t, h.value.view, h.value.dtype)

@@ -302,12 +302,12 @@ void loop(void) {{
 """
 
 class Runtime:
-  """A rectangle of Tensix from start to end (the chip's first and last unless said): its last tile dispatches, the rest are workers running kernels from
-  compile_kernel. A kernel is loaded into every worker once and stays (load), until the room for kernels is full and
-  they all go (evict). Launches go into a ring in host memory that the dispatcher reads by itself, so a launch costs the
-  host one PCIe write, the doorbell. The dispatcher runs one launch at a time and writes [ring read pointer, launches
-  done] back into host memory, where wait() and the ring's flow control look. A new Runtime takes over its rectangle's
-  cores: one that overlaps it stops working."""
+  """A rectangle of Tensix from start to end (the chip's first and last unless said): its last tile dispatches, the rest
+  are workers running kernels from compile_kernel. A kernel is loaded into every worker once and stays (load), until
+  the room for kernels is full and they all go (evict). Launches go into a ring in host memory that the dispatcher
+  reads by itself, so a launch costs the host one PCIe write, the doorbell. The dispatcher runs one launch at a time
+  and writes [ring read pointer, launches done] back into host memory, where wait() and the ring's flow control look.
+  A new Runtime takes over its rectangle's cores: one that overlaps it stops working."""
   def __init__(self, chip, start=None, end=None, ring=1 << 20):
     start, end = start or chip.tensix[0], end or chip.tensix[-1]
     assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"

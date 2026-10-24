@@ -30,7 +30,7 @@ def init(c, seed=0):
 def forward(ids, w, mask, c):  # the logits at every position of c.ctx: gpt2.forward's, the output layer tied to wte
   f = gpt2.fns(w["wte.weight"])
   x = f.rows(w["wte.weight"], ids) + w["wpe.weight"]  # a position embedding for each of the c.ctx
-  for l in range(c.layers): x = gpt2.layer(x, {k[len(f"h.{l}."):]: v for k, v in w.items() if k.startswith(f"h.{l}.")}, mask, c.heads)
+  for l in range(c.layers): x = gpt2.layer(x, gpt2.block(w, f"h.{l}."), mask, c.heads)
   return gpt2.layernorm(x, w["ln_f.weight"], w["ln_f.bias"]) @ f.t(w["wte.weight"])
 
 def cross_entropy(logits, onehot):  # the mean over positions of -log p(target), the targets picked out by a one-hot mask

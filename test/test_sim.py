@@ -82,7 +82,7 @@ def test_dram(chip):
 
 def test_cache_prune(tmp_path, monkeypatch):
   # compiled images unused for a week go, once a process, before its first compile; a used one is touched, so it stays,
-  # and a folder (an older checkout's tests built one here) is not an image
+  # and a folder (an older checkout's tests may build one here) is not an image
   import ferrite.runtime as runtime
   monkeypatch.setattr(runtime, "CACHE", tmp_path)
   old, new, folder = tmp_path / "old", tmp_path / "new", tmp_path / "folder"
@@ -514,8 +514,8 @@ def test_replay_keeps_pushes_small():
   # of its one REPLAY word
   c, slots = compiler, compiler.allocate({"mm", "mul"})
   tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
-  assert tile("add") <= 26 and tile("mul") <= 27, "was 48 and 80 before replay"
-  assert len(c.step_unpack(0) + c.matmul(slots)) <= 12, "a matmul step was 71"
+  assert tile("add") <= 26 and tile("mul") <= 27, "a tile's repeating runs replayed, a word each"
+  assert len(c.step_unpack(0) + c.matmul(slots)) <= 12, "a matmul step's phases replayed"
   assert len(c.sfpu(["recip"], c.allocate({"recip"}))) <= 3, "32 passes of 12 words: one REPLAY word, in a loop"
   for names in ({"mm", "mul"}, {"exp", "recip", "relu", "mm", "mul"}):  # what is recorded fits the 32-entry buffer
     assert sum(len(c.MATH_RUNS[n]) for n in c.allocate(names)) <= 32
@@ -609,7 +609,7 @@ def test_reductions(chip):
     assert all(abs(g - (v - max(row))) <= 2**-7 * max(abs(v), abs(max(row))) for g, v in zip(got, row))
   assert (tx.max(2) * 0.5).tolist() == [[max(row) / 2] for row in x]
   # a kernel sweeps its rows at one width and has two accumulators: reductions of a wider tensor, and a third, run first
-  # on their own (found by test_fuzz's longer runs)
+  # on their own
   y = [[bf(random.uniform(-4, 4)) for _ in range(200)] for _ in range(rows)]
   ty = Tensor.of(rt, y)
   for (got,), a, b in zip((tx.max(2) + ty.max(2)).tolist(), x, y): assert abs(got - (max(a) + max(b))) <= 2**-6 * 8, (got, a, b)
@@ -644,18 +644,19 @@ def test_attend(chip):
   # of queries, a key and value head serving two query heads (a repeat, read in place), 256-wide heads with one row of
   # places for all, a KV cache in bfp8, keys that end partway through a tile, three tile rows of queries, a sliding
   # window, ten tile rows (units of eight and of two). And with each unit's keys shared out among parts (a decode step's:
-  # rows of one place, a 1,024-key cache in bfp8 in the four parts the workers allow), rows that see none of some part's
-  # keys, parts with no keys at all (places below 32). One kernel serves other lengths and row counts in the same tiles.
-  # Without parts, two launches, the attention and the division, and nothing read but what the places reach: rows
-  # whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of keys and of values
-  # once (the keys kept in L1 between the sweeps)
+  # rows of one place, a 1,024-key cache in bfp8 in four parts (8 key tiles each, attention_parts' least)), rows that
+  # see none of some part's keys, parts with no keys at all (places below 32). One kernel serves other lengths and row
+  # counts in the same tiles. Without parts, two launches, the attention and the division, and nothing read but what the
+  # places reach: rows whose places are 200 to 255 of 256 read each unit's places' tile, its query tiles, its 8 tiles of
+  # keys and of values once (the keys kept in L1 between the sweeps)
   rt, rng = Runtime(chip), np.random.default_rng(43)
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
   for e, rows, hd, keys, rep, fmt, shared, window, lo, hi, parts in (
       (2, 40, 64, 64, 1, "bf16", False, 0, 0, 64, 1), (4, 8, 64, 96, 2, "bf16", False, 0, 0, 96, 1), (2, 33, 256, 128, 1, "bf16", True, 0, 0, 128, 1),
-      (4, 8, 64, 64, 2, "bfp8", False, 0, 0, 64, 1), (3, 70, 64, 40, 1, "bf16", True, 0, 0, 40, 1), (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 1),
-      (2, 8, 64, 256, 1, "bf16", False, 0, 200, 256, 1), (2, 300, 64, 320, 2, "bf16", True, 0, 0, 320, 1),
-      (4, 8, 64, 1024, 2, "bfp8", False, 0, 0, 1024, None), (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 3), (4, 8, 64, 256, 1, "bf16", False, 0, 0, 30, 8),
+      (4, 8, 64, 64, 2, "bfp8", False, 0, 0, 64, 1), (3, 70, 64, 40, 1, "bf16", True, 0, 0, 40, 1),
+      (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 1), (2, 8, 64, 256, 1, "bf16", False, 0, 200, 256, 1),
+      (2, 300, 64, 320, 2, "bf16", True, 0, 0, 320, 1), (4, 8, 64, 1024, 2, "bfp8", False, 0, 0, 1024, None),
+      (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 3), (4, 8, 64, 256, 1, "bf16", False, 0, 0, 30, 8),
       (2, 40, 64, 160, 1, "bf16", False, 0, 100, 160, 1), (2, 50, 64, 72, 1, "bf16", False, 0, 30, 72, 1)):
     q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
     places = rng.integers(lo, hi, (1 if shared else e, rows, 1))
@@ -800,9 +801,9 @@ def test_batch(chip):
 
 def test_movement(chip):
   # reshape, permute, expand, pad and slices at any offset and step, against numpy bit for bit (a move only copies).
-  # Slices of whole tiles stay views, and so do a batch's at any step; the rest is one launch each, and so is a chain of them. A moved tensor goes home
-  # with tidy padding, so a matmul and a reduction can read it. Then random chains of moves, on one worker, whose cache
-  # of tiles cycles
+  # Slices of whole tiles stay views, and so do a batch's at any step; the rest is one launch each, and so is a chain of
+  # them. A moved tensor goes home with tidy padding, so a matmul and a reduction can read it. Then random chains of
+  # moves, on one worker, whose cache of tiles cycles
   rng = np.random.default_rng(7)
   rt = Runtime(chip)
   x = bf16(rng.uniform(-2, 2, (3, 45, 70)))
@@ -1062,10 +1063,10 @@ def test_fuzz(chip, monkeypatch):
   assert len(checked) >= 20 and any(e[0] == "matmul" or "sum" in str(e) for e in checked)
 
 def test_mnist_mlp(chip):
-  # an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against
-  # numpy in float64. Two launches: matmul + bias + relu, then matmul + bias. Random weights (no dataset here); the
-  # logits must match closely and so must the predicted classes, wherever the top two are not a near tie. K = 784 is
-  # 25 tiles, more than the result is wide (which once made the kernel sweep the wrong tiles)
+  # an MNIST-shaped network, 784 -> 128 -> 10 with relu and biases, on a batch of 16, against numpy in float64. Two
+  # launches: matmul + bias + relu, then matmul + bias. Random weights (no dataset here); the logits must match closely
+  # and so must the predicted classes, wherever the top two are not a near tie. K = 784 is 25 tiles, more than the
+  # result is wide
   rt, rng = Runtime(chip), np.random.default_rng(2)
   x = bf16(rng.uniform(0, 1, (16, 784)))
   w1, b1 = bf16(rng.normal(0, 784**-0.5, (784, 128))), bf16(rng.normal(0, 0.1, (1, 128)))
@@ -1101,23 +1102,23 @@ def test_mnist_cnn(chip):
     assert np.allclose(logits, want, rtol=0.02, atol=0.02), np.abs(logits - want).max()
 
 def test_train(chip):
-  # training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning to count
-  # in fp32 with Adam (test/train.py learns README and NOTES, which change with every edit: once, a new text put one
-  # gradient past the bound). Every step's loss and gradients against PyTorch's on the same weights (to 1e-3, and 2e-3
-  # of the largest: the matmul's 2^-11, compounded), the step recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1
-  # together, so a replay sends them in parts); the loss falling; and the first step the same as PyTorch's own
+  # training: a small GPT (GPT-2's blocks, 2 of them, 64 wide, 64 characters of context) learning to count in fp32 with
+  # Adam (not README and NOTES, as test/train.py learns: they change with every edit). Every step's loss and gradients
+  # against PyTorch's on the same weights (to 1e-3, and 2e-3 of the largest: the matmul's 2^-11, compounded), the step
+  # recorded on its second call and replayed from the third (tensor.jit; its kernels do not fit in L1 together, so a
+  # replay sends them in parts); the loss falling; and the first step the same as PyTorch's own
   pytest.importorskip("torch")
   losses = train.train(Runtime(chip), 5, data=" ".join(map(str, range(3000))))
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
 def test_tinygrad(chip):
-  # tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and
-  # ferrite runs it: elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad
-  # writes one (a broadcast multiply, summed), softmax, a tinygrad function (inlined); integers and bools, a view of part
-  # of a buffer, stores into parts of one, and tensors with nothing in them; then an MLP trained with Adam for three
-  # steps, and a layer for five under TinyJit, replayed. All against tinygrad on its own CPU device, and on the chip
-  # (launches), not the host
+  # tinygrad's frontend on ferrite. tinygrad builds the graph (its Tensor, nn, autograd, Adam) and ferrite runs it:
+  # elementwise ops, reductions along any axis, movement of 3-D views, a matmul written as tinygrad writes one (a
+  # broadcast multiply, summed), softmax, a tinygrad function (inlined); integers and bools, a view of part of a buffer,
+  # stores into parts of one, and tensors with nothing in them; then an MLP trained with Adam for three steps, and a
+  # layer for five under TinyJit, replayed. All against tinygrad on its own CPU device, and on the chip (launches), not
+  # the host
   if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])  # (TINYGRAD=/path/to/tinygrad, or installed)
   pytest.importorskip("tinygrad")
   from adapters import tinygrad_ferrite
@@ -1246,7 +1247,8 @@ def test_tinygrad_llm(chip):
     qkv, gate_up, p = w[f"layers.{l}.qkv_proj"].T, w[f"layers.{l}.gate_up_proj"].T, f"layers.{l}."
     sd |= {f"blk.{l}.{k}": v for k, v in (("attn_q.weight", qkv[:576]), ("attn_k.weight", qkv[576:768]), ("attn_v.weight", qkv[768:]),
            ("attn_output.weight", w[p + "o_proj"].T), ("ffn_gate.weight", gate_up[:1536]), ("ffn_up.weight", gate_up[1536:]),
-           ("ffn_down.weight", w[p + "down_proj"].T), ("attn_norm.weight", w[p + "input_layernorm"][0]), ("ffn_norm.weight", w[p + "post_attention_layernorm"][0]))}
+           ("ffn_down.weight", w[p + "down_proj"].T), ("attn_norm.weight", w[p + "input_layernorm"][0]),
+           ("ffn_norm.weight", w[p + "post_attention_layernorm"][0]))}
   with Context(DEV="FERRITE"):
     model = Transformer(TransformerConfig(num_blocks=2, dim=576, hidden_dim=1536, n_heads=9, n_kv_heads=3, norm_eps=c.eps, vocab_size=256,
                                           head_dim=64, rope_theta=c.theta, rope_dim=64, v_head_dim=64, max_context=64))
@@ -1310,7 +1312,7 @@ def test_gpt2_model(chip):
     ids.append(int(want.argmax()))
 
 def smol(rng, layers, vocab=256, places=64):  # random weights in SmolLM-135M's shapes (as models/llama.py names them), its config
-  c = SimpleNamespace(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)
+  c = llama.model(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)
   shapes = {"input_layernorm": (1, 576, 1), "post_attention_layernorm": (1, 576, 1), "q_proj": (576, 576, 0), "k_proj": (576, 192, 0),
             "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
   w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
@@ -1327,19 +1329,20 @@ def qwen35(rng, vocab=256, places=64):
   64 and a shared one: every token takes all 8, weighted by the router, so that no near tie of experts decides a test;
   and a multi-token prediction layer (block 4, as load puts it).
   Its embedding is small next to what the blocks add (losing the Gated DeltaNet states moves its logits 100%)."""
-  c = SimpleNamespace(dim=128, heads=4, kv=2, head_dim=64, layers=4, eps=1e-6, theta=1e7, partial=0.25, gated=True, centered=True, conv=4,
-                      kh=2, vh=4, kd=32, vd=32, k=8, norm_topk=True, layer_types=["linear_attention"] * 3 + ["full_attention"], mtp=1)
+  c = llama.model(dim=128, heads=4, kv=2, head_dim=64, layers=4, eps=1e-6, theta=1e7, partial=0.25, gated=True, centered=True, conv=4,
+                  kh=2, vh=4, kd=32, vd=32, k=8, norm_topk=True, layer_types=["linear_attention"] * 3 + ["full_attention"], mtp=1)
   bits = lambda *shape, mean=0.0, sd=0.05: llama.Weight(lambda a=gpt2.bf16_bits(rng.normal(mean, sd, shape)): a)
   w = {"embed": bits(vocab, 128, sd=0.3), "embed.T": bits(128, vocab), "norm": bits(1, 128, sd=0.3), "mtp.fc": bits(256, 128),  # its own output layer
        "mtp.pre_fc_norm_embedding": bits(1, 128, sd=0.3), "mtp.pre_fc_norm_hidden": bits(1, 128, sd=0.3), "mtp.norm": bits(1, 128, sd=0.3)}
   for l in range(c.layers + c.mtp):  # (the multi-token prediction layer last: block 4, an attention block)
     pre = f"layers.{l}."
     w |= {pre + "input_layernorm": bits(1, 128, sd=0.3), pre + "post_attention_layernorm": bits(1, 128, sd=0.3), pre + "gate": bits(8, 128),
-          pre + "experts.gate_up_proj": bits(8, 128, 128), pre + "experts.down_proj": bits(8, 128, 64), pre + "shared_expert.gate_proj": bits(128, 64),
-          pre + "shared_expert.up_proj": bits(128, 64), pre + "shared_expert.down_proj": bits(64, 128), pre + "shared_expert_gate": bits(1, 128)}
-    if l < 3: w |= {pre + "in_proj_qkv": bits(128, 256), pre + "in_proj_z": bits(128, 128), pre + "in_proj_b": bits(128, 4), pre + "in_proj_a": bits(128, 4),
-                    pre + "conv1d": bits(256, 1, 4, sd=0.3), pre + "A_log": bits(1, 4, sd=0.5), pre + "dt_bias": bits(1, 4, mean=1.0, sd=0.2),
-                    pre + "norm": bits(1, 32, mean=1.0, sd=0.2), pre + "out_proj": bits(128, 128)}
+          pre + "experts.gate_up_proj": bits(8, 128, 128), pre + "experts.down_proj": bits(8, 128, 64),
+          pre + "shared_expert.gate_proj": bits(128, 64), pre + "shared_expert.up_proj": bits(128, 64),
+          pre + "shared_expert.down_proj": bits(64, 128), pre + "shared_expert_gate": bits(1, 128)}
+    if l < 3: w |= {pre + "in_proj_qkv": bits(128, 256), pre + "in_proj_z": bits(128, 128), pre + "in_proj_b": bits(128, 4),
+                    pre + "in_proj_a": bits(128, 4), pre + "conv1d": bits(256, 1, 4, sd=0.3), pre + "A_log": bits(1, 4, sd=0.5),
+                    pre + "dt_bias": bits(1, 4, mean=1.0, sd=0.2), pre + "norm": bits(1, 32, mean=1.0, sd=0.2), pre + "out_proj": bits(128, 128)}
     else: w |= {pre + "q_proj": bits(128, 512), pre + "k_proj": bits(128, 128), pre + "v_proj": bits(128, 128), pre + "o_proj": bits(256, 128),
                 pre + "q_norm": bits(1, 64, sd=0.3), pre + "k_norm": bits(1, 64, sd=0.3)}
   w |= {k: llama.Weight(lambda a=a: gpt2.bf16_bits(a)) for k, a in zip(("cos", "sin", "turn"), llama.rotary(c, places))}
@@ -1352,9 +1355,9 @@ def test_llama_frequencies():
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   hf = transformers.LlamaConfig(hidden_size=4096, num_attention_heads=32, rope_theta=500000.0, rope_scaling=rope, max_position_embeddings=131072)
   want = m.ROPE_INIT_FUNCTIONS["llama3"](hf, "cpu")[0].numpy()
-  got = llama.frequencies(SimpleNamespace(dim=4096, heads=32, theta=500000.0, rope=rope))
+  got = llama.frequencies(llama.model(dim=4096, heads=32, theta=500000.0, rope=rope))
   assert got.dtype == np.float32 and np.array_equal(got, want), np.abs(got - want).max()
-  plain = llama.frequencies(SimpleNamespace(dim=4096, heads=32, theta=500000.0))
+  plain = llama.frequencies(llama.model(dim=4096, heads=32, theta=500000.0))
   assert plain[0] == got[0] and plain[-1] == 8 * got[-1], "short wavelengths kept, long ones slowed by the factor"
 
 def safetensors(path, tensors):  # {name: (dtype "BF16" or "F32", array of its bits or values)} as a safetensors file
@@ -1376,9 +1379,11 @@ def test_llama_load(tmp_path):
            **{f"model.layers.0.self_attn.{n}_proj.weight": w(r, dim) for n, r in (("q", dim), ("k", 32), ("v", 32), ("o", dim))},
            **{f"model.layers.0.mlp.{n}_proj.weight": w(r, cl) for n, r, cl in (("gate", ffn, dim), ("up", ffn, dim), ("down", dim, ffn))}}
   norms = {f"model.layers.0.{n}.weight": rng.standard_normal(dim).astype(np.float32) for n in ("input_layernorm", "post_attention_layernorm")}
-  files = [{k: ("BF16", v) for k, v in list(parts.items())[:5]} | {k: ("F32", v) for k, v in norms.items()}, {k: ("BF16", v) for k, v in list(parts.items())[5:]}]
+  files = [{k: ("BF16", v) for k, v in list(parts.items())[:5]} | {k: ("F32", v) for k, v in norms.items()},
+           {k: ("BF16", v) for k, v in list(parts.items())[5:]}]
   for i, file in enumerate(files): safetensors(tmp_path / f"model-0000{i + 1}-of-00002.safetensors", file)
-  (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: f"model-0000{i + 1}-of-00002.safetensors" for i, file in enumerate(files) for k in file}}))
+  weight_map = {k: f"model-0000{i + 1}-of-00002.safetensors" for i, file in enumerate(files) for k in file}
+  (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   (tmp_path / "config.json").write_text(json.dumps({"hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1, "num_hidden_layers": 1,
                                                     "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "max_position_embeddings": 131072,
@@ -1404,18 +1409,22 @@ def test_tokenizer(tmp_path):
   tiktoken = pytest.importorskip("tiktoken")
   bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
   char = dict(zip(bs + [b for b in range(256) if b not in bs], map(chr, bs + [256 + i for i in range(256 - len(bs))])))
-  tokens = [bytes([b]) for b in range(256)] + [b"th", b"he", b"the", b" the", b"in", b"ing", b"12", b"123", b"\r\n", b"\x1cthe", "é".encode(), "😀".encode()]
+  tokens = [bytes([b]) for b in range(256)] + [b"th", b"he", b"the", b" the", b"in", b"ing", b"12", b"123", b"\r\n", b"\x1cthe",
+                                               "é".encode(), "😀".encode()]
   vocab = {"".join(char[b] for b in t): i for i, t in enumerate(tokens)}  # ids in merge order
-  text = "The thing's THE THING'LL 1234567 x²³ ½ ٣٤٥ in\u00a0the\u2003end \t\tthing\r\n\r\nthe \x1c\x1dctrl \x1cthe café 😀😀 x😀y e\u0301 McDonald's ǅungla ʰa/\n"
+  text = ("The thing's THE THING'LL 1234567 x²³ ½ ٣٤٥ in\u00a0the\u2003end \t\tthing\r\n\r\nthe \x1c\x1dctrl \x1cthe café "
+          "😀😀 x😀y e\u0301 McDonald's ǅungla ʰa/\n")
   llama3 = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
   o200k = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?"
-           r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+           r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+           r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
   for split, nfc in ((llama3, False), (None, False), (llama3, True), (o200k, False)):
     pre = {"type": "Split", "pattern": {"Regex": split}} if split else {"type": "ByteLevel"}
-    (tmp_path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": vocab}, "added_tokens": [{"content": "<|end|>", "id": len(vocab)}], "pre_tokenizer": pre,
-                                                         "normalizer": {"type": "NFC"} if nfc else None}))
+    (tmp_path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": vocab}, "added_tokens": [{"content": "<|end|>", "id": len(vocab)}],
+                                                         "pre_tokenizer": pre, "normalizer": {"type": "NFC"} if nfc else None}))
     ours = llama.Tokenizer(str(tmp_path))
-    theirs = tiktoken.Encoding("t", pat_str=split or llama.SPLIT, mergeable_ranks=dict(zip(tokens, range(len(tokens)))), special_tokens={"<|end|>": len(vocab)})
+    theirs = tiktoken.Encoding("t", pat_str=split or llama.SPLIT, mergeable_ranks=dict(zip(tokens, range(len(tokens)))),
+                               special_tokens={"<|end|>": len(vocab)})
     plain = unicodedata.normalize("NFC", text) if nfc else text
     assert ours.encode(text) == theirs.encode(plain), (split, nfc)
     assert ours.decode(ours.encode(text) + [len(vocab)]) == plain + "<|end|>"
@@ -1464,8 +1473,8 @@ def test_topk(chip):
   # first of equals first, -0 equal to 0), for one row (its results' tiles full of copies of it, as a broadcast reads
   # them), a k of 1 (copies across), rows past one tile, a batch, columns not a multiple of 32 and 256 of them; fp32 rows
   # in parts, each part's 64 or 32 best side by side, and those parts' best given their indices as labels; and of a
-  # matmul's softmax not yet computed, which the kernels of its max and of its columns once rounded apart (an index of 8
-  # in 8 columns, when topk was passes of max), and none of their DRAM kept after
+  # matmul's softmax not yet computed, the picks and their values those of the softmax as stored, and none of their DRAM
+  # kept after
   rt, rng = Runtime(chip), np.random.default_rng(37)
   for batch, rows, cols, k in ((1, 1, 128, 8), (1, 3, 16, 4), (1, 40, 40, 1), (2, 33, 256, 32)):
     x = rng.normal(0, 2, (batch, rows, cols))
@@ -1504,13 +1513,12 @@ def test_moe(chip):
   # (topk), matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen
   # logits and summed, as numpy does for one token, three, eight and 40 (each expert some token picked an entry of every
   # token, Tensor.touched) and for 160 (each expert's tokens grouped into tiles, Tensor.group), replayed (tensor.jit) bit
-  # for bit as op by op; and a two-block
-  # model of them decodes from a replay as it does op by op, so a replayed step reads whatever experts its token chose,
-  # and near numpy
+  # for bit as op by op; and a two-block model of them decodes from a replay as it does op by op, so a replayed step
+  # reads whatever experts its token chose, and near numpy
   rt, rng = Runtime(chip), np.random.default_rng(31)
   experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
-  c, w = SimpleNamespace(dim=64, k=4), experts(64, 16, 64)
+  c, w = llama.model(dim=64, k=4), experts(64, 16, 64)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
   for n in (1, 3, 8, 40, 160):
     h = bf16(rng.normal(0, 1, (n, 64)))
@@ -1522,7 +1530,9 @@ def test_moe(chip):
     assert np.array_equal(value(grouped(h)), value(llama.moe(h, t, c))), "a replayed grouping is the grouping"
   c, w = smol(rng, 2)
   c.k = 2
-  for l in range(2): del w[f"layers.{l}.gate_up_proj"], w[f"layers.{l}.down_proj"]; w |= {f"layers.{l}.{k}": v for k, v in experts(576, 8, 64).items()}
+  for l in range(2):
+    del w[f"layers.{l}.gate_up_proj"], w[f"layers.{l}.down_proj"]
+    w |= {f"layers.{l}.{k}": v for k, v in experts(576, 8, 64).items()}
   t, on = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, lambda row: Tensor.of(rt, [row], "int32")
   def decode(replay):  # each step's logits, for a prompt and four tokens after it (numpy's picks), and numpy's
     kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
@@ -1543,18 +1553,18 @@ def test_moe(chip):
 
 def test_qwen3_moe(chip, tmp_path):
   # Qwen3's mixture of experts as models/llama.py reads Hugging Face's files for it (transformers 5's config, RoPE's
-  # parameters in one place; a config cut to its first blocks reads only them): a dense block, then one with a router and experts (a tensor each, stacked into one batch
-  # by fuse) weighted by their probabilities among all (norm_topk_prob off, transformers' default), RMSNorms on each
-  # head of q and k, heads whose width the config gives (4 of 32 in a model 64 wide), and an output layer of its own.
-  # Hugging Face's own model (transformers, float32, random bf16 weights) is the reference: numpy's logits within 0.5%
-  # of its at every place (0.12%), the chip's within 2% (1%) and picking the same tokens. In TT's performance precision
-  # the experts take their block's MLP formats and phases, and the chip is within 1% of the span of numpy's given the
-  # same block floats (0.8%)
+  # parameters in one place; a config cut to its first blocks reads only them): a dense block, then one with a router
+  # and experts (a tensor each, stacked into one batch by fuse) weighted by their probabilities among all
+  # (norm_topk_prob off, transformers' default), RMSNorms on each head of q and k, heads whose width the config gives
+  # (4 of 32 in a model 64 wide), and an output layer of its own. Hugging Face's own model (transformers, float32,
+  # random bf16 weights) is the reference: numpy's logits within 0.5% of its at every place (0.12%), the chip's within
+  # 2% (1%) and picking the same tokens. In TT's performance precision the experts take their block's MLP formats and
+  # phases, and the chip is within 1% of the span of numpy's given the same block floats (0.8%)
   torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
   torch.manual_seed(0)
   config = transformers.Qwen3MoeConfig(hidden_size=64, intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=2, num_attention_heads=4,
-                                       num_key_value_heads=2, head_dim=32, num_experts=8, num_experts_per_tok=2, decoder_sparse_step=2, vocab_size=256,
-                                       max_position_embeddings=64, rope_theta=1e6, tie_word_embeddings=False)
+                                       num_key_value_heads=2, head_dim=32, num_experts=8, num_experts_per_tok=2, decoder_sparse_step=2,
+                                       vocab_size=256, max_position_embeddings=64, rope_theta=1e6, tie_word_embeddings=False)
   model = transformers.Qwen3MoeForCausalLM(config).to(torch.bfloat16).float()
   model.save_pretrained(tmp_path)
   ids = [3, 1, 4, 1, 5, 9, 2, 6]
@@ -1563,7 +1573,8 @@ def test_qwen3_moe(chip, tmp_path):
   assert not any(k.startswith("layers.1.") for k in llama.load(str(tmp_path), 32)[1]), "a config cut to its first block reads only it"
   (tmp_path / "config.json").write_text(json.dumps(json.loads((tmp_path / "config.json").read_text()) | {"num_hidden_layers": 2}))
   c, weights = llama.load(str(tmp_path), 32)
-  assert (c.k, llama.head(c)) == (2, 32) and {"router", "experts.gate_up", "experts.down", "qk_norm", "qk_on"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.1.")}
+  names = {k.split(".", 2)[2] for k in weights if k.startswith("layers.1.")}
+  assert (c.k, llama.head(c)) == (2, 32) and {"router", "experts.gate_up", "experts.down", "qk_norm", "qk_on"} <= names
   rel = lambda got: max(np.abs(got[r] - want[r]).max() / np.abs(want[r]).max() for r in range(len(ids)))
   assert rel(llama.forward(ids, list(range(8)), llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros), every=True)) < 0.005
   rt = Runtime(chip)
@@ -1580,7 +1591,8 @@ def test_qwen3_moe(chip, tmp_path):
 FAMILIES = {"qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mistral": ("Mistral", dict(sliding_window=None)),
             "qwen2_moe": ("Qwen2Moe", dict(moe_intermediate_size=64, shared_expert_intermediate_size=96, num_experts=8, num_experts_per_tok=2)),
             "mixtral": ("Mixtral", dict(num_local_experts=8, num_experts_per_tok=2)),
-            "gpt_oss": ("GptOss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=4, layer_types=["sliding_attention", "full_attention"],
+            "gpt_oss": ("GptOss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=4,
+                                       layer_types=["sliding_attention", "full_attention"],
                                        rope_parameters={"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False,
                                                         "original_max_position_embeddings": 8, "rope_theta": 1e4}))}
 
@@ -1590,14 +1602,15 @@ def test_hf_families(chip, tmp_path, family):
   # head), Qwen2's (biases on q, k and v), Mistral's, Qwen2-MoE's (a shared expert, gated by a sigmoid, beside the
   # chosen ones), Mixtral's (its experts' w1, w3 and w2 its gate, up and down) and gpt-oss's (attention sinks, a sliding
   # window every other block, YaRN, biases on the router and the experts, a clamped GLU; each of them alone off takes
-  # numpy past 0.5%). transformers' own model (float32,
-  # random bf16 weights, the biases and norms made to count) is the reference: numpy within 0.5% of its logits at every
-  # place, the chip within 2% and picking the same tokens, or one within 0.1% of the span of it (Qwen2-MoE's has such a tie)
+  # numpy past 0.5%). transformers' own model (float32, random bf16 weights, the biases and norms made to count) is the
+  # reference: numpy within 0.5% of its logits at every place, the chip within 2% and picking the same tokens, or one
+  # within 0.1% of the span of it (Qwen2-MoE's has such a tie)
   torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
   name, extra = FAMILIES[family]
   torch.manual_seed(0)
-  config = getattr(transformers, name + "Config")(hidden_size=128, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
-                                                  vocab_size=256, max_position_embeddings=64, rope_theta=1e4, tie_word_embeddings=False, **extra)
+  config = getattr(transformers, name + "Config")(hidden_size=128, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
+                                                  num_key_value_heads=2, vocab_size=256, max_position_embeddings=64, rope_theta=1e4,
+                                                  tie_word_embeddings=False, **extra)
   model = getattr(transformers, name + "ForCausalLM")(config)
   for name, p in model.named_parameters():  # biases start at 0 and norms at 1: make them count
     if p.ndim == 1 or "bias" in name: p.data.normal_(1, 0.2) if torch.all(p == 1) else p.data.normal_(0, 0.5)
@@ -1621,8 +1634,9 @@ def test_qwen3_5_moe(chip, tmp_path, monkeypatch):
   # fourth block attention gated by a sigmoid of its own and turning a quarter of each head, RMSNorms that scale by 1 + w,
   # and experts with a shared one. transformers' own model (float32, random bf16 weights; norms and the decay made to
   # count) is the reference: a 100-token prompt (two chunks), then decode steps from the caches and states, numpy within
-  # 0.5% of its logits at every place and step (0.13%, 0.06%), and the chip within 3% of numpy's (1.2%, 0.8%), picking the same tokens
-  # (or, 2 places of 100, one its bf16 logits cannot tell from numpy's: 0.3% of the span apart), its decode steps replayed. Each token takes all 8 experts, weighted by the router: of 400 choices of 2, some are near
+  # 0.5% of its logits at every place and step (0.13%, 0.06%), and the chip within 3% of numpy's (1.2%, 0.8%), picking
+  # the same tokens (or, 2 places of 100, one its bf16 logits cannot tell from numpy's: 0.3% of the span apart), its
+  # decode steps replayed. Each token takes all 8 experts, weighted by the router: of 400 choices of 2, some are near
   # ties (the 2nd and 3rd 1e-5 to 1e-3 apart, whatever the seed) that bf16 logits break either way
   torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
   if not hasattr(transformers, "Qwen3_5MoeTextConfig"): pytest.skip("a transformers with Qwen3.5-MoE")
@@ -1647,7 +1661,8 @@ def test_qwen3_5_moe(chip, tmp_path, monkeypatch):
       want_steps.append(out.logits[0, -1].numpy())
       cache = out.past_key_values
   c, weights = llama.load(str(tmp_path), 128)
-  assert c.gated and c.centered and c.partial == 0.25 and {"conv", "decay", "dt_bias"} <= {k.split(".", 2)[2] for k in weights if k.startswith("layers.0.")}
+  names = {k.split(".", 2)[2] for k in weights if k.startswith("layers.0.")}
+  assert c.gated and c.centered and c.partial == 0.25 and {"conv", "decay", "dt_bias"} <= names
   rel = lambda got, want: max(np.abs(g - w).max() / np.abs(w).max() for g, w in zip(got, want))
   w, kv = llama.arrays(weights), llama.kv_cache(c, 128, np.zeros)
   numpy = llama.forward(ids, list(range(100)), w, c, kv, every=True)
@@ -1666,8 +1681,8 @@ def test_qwen3_5_sequences(chip):
   # Qwen3.5's blocks for several sequences at once (qwen35), as a server's slots: each prompt prefilled into its own
   # (its KV rows from row 32 u, its Gated DeltaNet states batch entry u, in place: llama.states), then decode steps of a
   # token of each, one call for all, replayed, a free slot among them on its last row whose states stay as they were
-  # (live 0). Against each sequence alone in numpy, within 3% (0.8%) and picking its tokens (near); and llama.delta in numpy for a
-  # token of each of three sequences at once is each alone's
+  # (live 0). Against each sequence alone in numpy, within 3% (0.8%) and picking its tokens (near); and llama.delta in
+  # numpy for a token of each of three sequences at once is each alone's
   rng = np.random.default_rng(29)
   c, weights = qwen35(rng)
   w, size, prompts = llama.arrays(weights), 32, {0: [7, 200, 31], 2: [5, 64, 9, 9, 9]}
@@ -1714,19 +1729,22 @@ def test_delta_step(chip):
       width = 2 * kh * kd + vh * vd
       x = np.float32(rng.normal(0, 1, (1, n * m, width + vh * vd + 2 * vh)))
       conv, conv2 = (np.float32(rng.normal(0, 1, (3, n, width))) for _ in range(2))
-      taps, dt, decay = np.float32(rng.normal(0, 0.5, (4, 1, width))), np.float32(rng.normal(0, 1, (1, 1, vh))), np.float32(-rng.uniform(0.5, 2, (1, 1, vh)))
+      taps, dt = np.float32(rng.normal(0, 0.5, (4, 1, width))), np.float32(rng.normal(0, 1, (1, 1, vh)))
+      decay = np.float32(-rng.uniform(0.5, 2, (1, 1, vh)))
       S, first = (np.float32(rng.normal(0, 0.1, (n * vh, kd, vd))) for _ in range(2))
       live, accept = np.ones((1, 1, n), np.float32), np.float32(np.arange(n) % 2).reshape(1, 1, n)
       live[0, 0, 1:2] = 0  # (the second sequence: dead)
       ts = {k: up(a) for k, a in dict(S=S, x=x, conv=conv, taps=taps, dt=dt, decay=decay, live=live, first=first, accept=accept, conv2=conv2).items()}
-      got = value(ts["S"].delta(*(ts[k] for k in ("x", "conv", "taps", "dt", "decay", "live")), *((ts["first"], ts["accept"], ts["conv2"]) if m > 1 else ())))
+      got = value(ts["S"].delta(*(ts[k] for k in ("x", "conv", "taps", "dt", "decay", "live")),
+                                *((ts["first"], ts["accept"], ts["conv2"]) if m > 1 else ())))
       want_S, want_first, want_conv, want_conv2 = np.float64(S), np.float64(first), np.float64(conv), np.float64(conv2)
       want = llama.numpy_delta(want_S, x, want_conv, taps, dt, decay, live, *((want_first, accept, want_conv2) if m > 1 else ()))
       for a, b in ((got, want), (value(ts["S"]), want_S)) + (((value(ts["first"]), want_first),) if m > 1 else ()):
         assert np.abs(a - b).max() < 1e-5 * np.abs(b).max(), (m, n, kd, vd, np.abs(a - b).max() / np.abs(b).max())
       for a, b in ((value(ts["conv"]), want_conv),) + (((value(ts["conv2"]), want_conv2),) if m > 1 else ()):
         assert np.array_equal(a, np.float32(b)), (m, n, "the conv's inputs")
-      assert n < 3 or np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and np.array_equal(value(ts["conv"])[:, 1], conv[:, 1]), "a dead sequence's"
+      assert n < 3 or (np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and
+                       np.array_equal(value(ts["conv"])[:, 1], conv[:, 1])), "a dead sequence's"
 
 def test_delta_pieces(chip):
   # Gated DeltaNet's prompt in pieces of 64 at once (llama.chunk: all that the state does not enter for every piece, then
@@ -1739,9 +1757,9 @@ def test_delta_pieces(chip):
   q, k = rng.normal(0, 0.3, (4, 150, 32)), rng.normal(0, 0.3, (4, 150, 32))
   k /= np.linalg.norm(k, axis=-1, keepdims=True)
   v, beta, g, S = rng.normal(0, 1, (4, 150, 48)), rng.uniform(0, 1, (4, 150, 1)), -rng.uniform(0, 0.2, (4, 150, 1)), rng.normal(0, 0.1, (4, 32, 48))
-  o, after, _ = llama.chunk(q, k, v, beta, g, S)
+  o, after = llama.chunk(q, k, v, beta, g, S)
   for s0 in range(0, 150, 64):  # (a piece at a time: chunk's own pieces, one call each)
-    piece, S, _ = llama.chunk(*(t[:, s0:s0 + 64, :] for t in (q, k, v, beta, g)), S)
+    piece, S = llama.chunk(*(t[:, s0:s0 + 64, :] for t in (q, k, v, beta, g)), S)
     assert np.abs(piece - o[:, s0:s0 + 64, :]).max() < 1e-6
   assert np.abs(after - S).max() < 1e-6
   rt = Runtime(chip)
@@ -1808,15 +1826,18 @@ def test_mxfp4(tmp_path):
   blocks, scales = rng.integers(0, 256, (2, 64, 3, 16), dtype=np.uint8), rng.integers(118, 136, (2, 64, 3), dtype=np.uint8)
   want = packed.convert_moe_packed_tensors(torch.from_numpy(blocks), torch.from_numpy(scales)).view(torch.int16).numpy().view(np.uint16)
   assert np.array_equal(llama.mxfp4(blocks, scales), want)
-  config = {"hidden_size": 96, "num_attention_heads": 3, "num_key_value_heads": 1, "num_hidden_layers": 1, "rms_norm_eps": 1e-5, "rope_theta": 1e4,
-            "max_position_embeddings": 32, "vocab_size": 32, "intermediate_size": 32, "head_dim": 32, "num_experts_per_tok": 1, "model_type": "gpt_oss"}
+  config = {"hidden_size": 96, "num_attention_heads": 3, "num_key_value_heads": 1, "num_hidden_layers": 1, "rms_norm_eps": 1e-5,
+            "rope_theta": 1e4, "max_position_embeddings": 32, "vocab_size": 32, "intermediate_size": 32, "head_dim": 32,
+            "num_experts_per_tok": 1, "model_type": "gpt_oss"}
   (tmp_path / "config.json").write_text(json.dumps(config))
   f32 = lambda *shape: rng.normal(0, 1, shape).astype(np.float32)
-  attention = {f"model.layers.0.self_attn.{n}_proj.weight": f32(*shape) for n, shape in (("q", (96, 96)), ("k", (32, 96)), ("v", (32, 96)), ("o", (96, 96)))}
+  shapes = (("q", (96, 96)), ("k", (32, 96)), ("v", (32, 96)), ("o", (96, 96)))
+  attention = {f"model.layers.0.self_attn.{n}_proj.weight": f32(*shape) for n, shape in shapes}
   st.save_file(attention | {"model.embed_tokens.weight": f32(32, 96), "model.norm.weight": f32(96), "lm_head.weight": f32(32, 96),
                 "model.layers.0.mlp.experts.gate_up_proj_blocks": blocks, "model.layers.0.mlp.experts.gate_up_proj_scales": scales,
                 "model.layers.0.mlp.experts.gate_up_proj_bias": f32(2, 64), "model.layers.0.mlp.experts.down_proj": f32(2, 32, 96),
-                "model.layers.0.mlp.experts.down_proj_bias": f32(2, 96), "model.layers.0.mlp.router.weight": f32(2, 96), "model.layers.0.mlp.router.bias": f32(2)},
+                "model.layers.0.mlp.experts.down_proj_bias": f32(2, 96), "model.layers.0.mlp.router.weight": f32(2, 96),
+                "model.layers.0.mlp.router.bias": f32(2)},
                str(tmp_path / "model.safetensors"))
   c, weights = llama.load(str(tmp_path), 32)
   assert np.array_equal(weights["layers.0.experts.gate_up"].bits(), np.concatenate([want[..., ::2], want[..., 1::2]], -1)) and c.limit == 7.0
@@ -1852,10 +1873,11 @@ import sys, numpy as np  # a model split across the two chips: its first block o
 from types import SimpleNamespace
 sys.path.insert(0, "models")
 import gpt2, llama
-c, rng = SimpleNamespace(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
+c, rng = llama.model(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
 draw = lambda mean, std, shape: gpt2.bf16_floats(gpt2.bf16_bits(rng.normal(mean, std, shape)))
 w = {f"layers.{l}.{k}": draw(*how) for l in range(2) for k, how in (("input_layernorm", (1, 0.1, (1, 128))), ("qkv_proj", (0, 0.05, (128, 256))),
-     ("o_proj", (0, 0.05, (128, 128))), ("post_attention_layernorm", (1, 0.1, (1, 128))), ("gate_up_proj", (0, 0.05, (128, 512))), ("down_proj", (0, 0.05, (256, 128))))}
+     ("o_proj", (0, 0.05, (128, 128))), ("post_attention_layernorm", (1, 0.1, (1, 128))), ("gate_up_proj", (0, 0.05, (128, 512))),
+     ("down_proj", (0, 0.05, (256, 128))))}
 w |= {"norm": draw(1, 0.1, (1, 128)), "embed": draw(0, 1, (256, 128))}
 w |= {"embed.T": w["embed"].T.copy()} | dict(zip(("cos", "sin", "turn"), llama.rotary(c, 32)))
 ids = [5, 17, 3, 200, 9]
@@ -1869,7 +1891,7 @@ ch, (_, back) = next(iter(links_a.items()))
 for l, n in ((0, 0), (1, 1)):
   if x.rt is not rts[n]: x = x.to(rts[n], ch, back)  # the hidden state crosses the link
   rotary = (f.rows(up[n]["cos"], places[n]), f.rows(up[n]["sin"], places[n]), up[n]["turn"])
-  p = {k[len(f"layers.{l}."):]: v for k, v in up[n].items() if k.startswith(f"layers.{l}.")}
+  p = gpt2.block(up[n], f"layers.{l}.")
   x = llama.layer(x, p, c, rotary, gpt2.mask(places[n], 32), caches[n][l], places[n], l, True)
 got = llama.logits(f.mm(f.rows(llama.rms(x, up[1]["norm"], c), [4]), up[1]["embed.T"], None))
 assert np.abs(got - want).max() < 0.02 * np.ptp(want) and got.argmax() == want.argmax(), (np.abs(got - want).max(), np.ptp(want))
@@ -1898,7 +1920,7 @@ def test_llama_8b_shapes(chip):
   # take minutes (the MLP's 4096 x 28672 to bfp4 is 114,688 tiles), which llama.upload waits for
   rt, rng = Runtime(chip), np.random.default_rng(8)
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
-  c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=1, eps=1e-5, theta=500000.0, rope=rope, vocab=2048, ffn=14336, places=96)
+  c = llama.model(dim=4096, heads=32, kv=8, layers=1, eps=1e-5, theta=500000.0, rope=rope, vocab=2048, ffn=14336, places=96)
   bits = lambda shape, scale, mean=0.0: gpt2.bf16_bits(rng.normal(mean, scale, shape))
   w = {"layers.0.input_layernorm": bits((1, 4096), 0.1, 1), "layers.0.post_attention_layernorm": bits((1, 4096), 0.1, 1),
        "layers.0.qkv_proj": bits((4096, 6144), 0.02), "layers.0.o_proj": bits((4096, 4096), 0.02), "layers.0.gate_up_proj": bits((4096, 28672), 0.02),
@@ -1918,7 +1940,7 @@ def test_llama_8b_shapes(chip):
 def test_benchmark_table():
   # the two stacks' results side by side (benchmark.table), with B1's and B2's gate: TT-NN's speed over ferrite's, at most 1.5
   ours = {"versions": {"lines of code": {"ferrite": 1}}, "clock": "the host's", "B1 matmul 4096^3 bf16, 2 phases": {"ms": 3.0},
-          "B2 decode, batch 1": {"tokens/s": 40.0}, "B3 prefill, 32768 tokens": {"does not run yet": "MemoryError"}}
+          "B2 decode, batch 1": {"tokens/s": 40.0}, "B3 prefill, 32768 tokens": {"does not run": "MemoryError"}}
   theirs = {"versions": {"lines of code": {"tt-metal": 2}}, "clock": "the host's", "B1 matmul 4096^3 bf16, 2 phases": {"ms": 1.5},
             "B2 decode, batch 1": {"tokens/s": 50.0}, "B3 prefill, 32768 tokens": {"seconds to first token": 9.0}}
   rows = benchmark.table(ours, theirs).splitlines()
@@ -1935,7 +1957,8 @@ def test_benchmark_load(chip, tmp_path):
   threading.Thread(target=engine.run, daemon=True).start()
   httpd = serve.server(engine, "smol", port=0)
   threading.Thread(target=httpd.serve_forever, daemon=True).start()
-  got = benchmark.load(f"http://localhost:{httpd.server_address[1]}", 2, SimpleNamespace(system=6, task=2, tool=2, out=4, n=2), " ".join(f"w{i}" for i in range(40)))
+  got = benchmark.load(f"http://localhost:{httpd.server_address[1]}", 2, SimpleNamespace(system=6, task=2, tool=2, out=4, n=2),
+                       " ".join(f"w{i}" for i in range(40)))
   httpd.shutdown()
   assert got["turns"] == 4 and got["tokens/s"] > 0 and got["seconds to first token"] > 0 and got["prompt tokens cached"] > 0.3, got
 
@@ -1946,7 +1969,8 @@ def test_chunked_prefill(chip):
   # cache the chunks filled
   rt, rng = Runtime(chip), np.random.default_rng(29)
   c, w = smol(rng, 2, places=96)
-  t, prompt, on = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, [int(i) for i in rng.integers(0, 256, 70)], lambda row: Tensor.of(rt, [row], "int32")
+  t, prompt = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, [int(i) for i in rng.integers(0, 256, 70)]
+  on = lambda row: Tensor.of(rt, [row], "int32")
   kv, np_kv = llama.kv_cache(c, 96, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 96, np.zeros)
   want = llama.prefill(prompt, w, c, np_kv, 32)[0]
   assert np.allclose(want, llama.forward(prompt, range(70), w, c, llama.kv_cache(c, 96, np.zeros))[0], atol=1e-3)
@@ -1963,10 +1987,11 @@ def test_llama_precision(chip):
   # numpy, given the same block-float values (llama.arrays rounds the weights, and layer the cache, as the chip does:
   # gpt2.bfp) but exact products, picks the same tokens, its logits within 1% of their span. upload leaves no more DRAM
   # behind than one bf16 matrix: each cast is waited for, so the next weight's bf16 copy goes where this one's was
-  big = SimpleNamespace(layers=32, dim=4096)
+  big = llama.model(layers=32, dim=4096)
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
-  assert [llama.precision(big, "tt")[k] for k in (("attention", "decode"), ("attention", "prefill"), ("kv", None))] == [(None, 2), (None, 4), ("bfp8", None)]
+  tt = llama.precision(big, "tt")
+  assert [tt[k] for k in (("attention", "decode"), ("attention", "prefill"), ("kv", None))] == [(None, 2), (None, 4), ("bfp8", None)]
   experts = llama.precision(big, "experts")  # (Qwen3.6 on one card: every MLP matrix in bfp4 at one phase, the rest bfp8 at two,
   keys = (("gate_up", 31), ("down", 0), ("qkv", 5), ("head", None), ("draft head", None), ("kv", None))  # a draft's output layer bfp4)
   assert [experts[k] for k in keys] == [("bfp4", 1), ("bfp4", 1), ("bfp8", 2), ("bfp8", 2), ("bfp4", 1), ("bfp8", None)]
@@ -1980,7 +2005,8 @@ def test_llama_precision(chip):
   rt.wait()  # what upload freed goes back
   reached, held = max(a + n for a, n in rt.used.items()), sum(rt.used.values())  # DRAM a bank
   assert reached - held <= -(-max(x.tiles for x in t.values()) // 8) * 2048, "a cast weight's bf16 DRAM is used again"
-  assert {k: x.dtype for k, x in t.items() if "proj" in k or k == "embed.T"} == {k: "bfp4" if "gate_up" in k else "bfp8" for k in t if "proj" in k or k == "embed.T"}
+  formats = {k: x.dtype for k, x in t.items() if "proj" in k or k == "embed.T"}
+  assert formats == {k: "bfp4" if "gate_up" in k else "bfp8" for k in t if "proj" in k or k == "embed.T"}
   sizes = SimpleNamespace(**vars(c), vocab=256, places=64, ffn=1536)  # benchmark.weights, from the sizes alone, has them as upload makes them
   assert {k: (x.rows, x.cols, x.dtype) for k, x in t.items()} == {k: (x.rows, x.cols, x.dtype) for k, x in benchmark.weights(sizes).items()}
   arrays = llama.arrays(weights, c.precision)  # numpy's rounding to the formats, which is the chip's casts' (test_bfp)
@@ -2011,14 +2037,15 @@ def test_token_accuracy(chip):
   assert llama.accuracy(None, w, c, prompt, after, top5, 8) == (top1, five, picks), "in numpy (rt None), the same"
 
 def test_benchmark_bytes():
-  # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token): the bytes a
-  # decode token reads, each weight in the format TT's performance precision gives it (llama.weight_format, as upload
-  # casts it; benchmark.weights has them from the model's sizes, as test_llama_precision checks). Llama-3.1-8B's sizes
-  # give 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
-  c = SimpleNamespace(dim=4096, heads=32, kv=8, layers=32, vocab=128256, ffn=14336, places=736)
+  # what B2's effective DRAM bandwidth is computed from (benchmark.bytes_per_token): the bytes a decode token reads,
+  # each weight in the format TT's performance precision gives it (llama.weight_format, as upload casts it;
+  # benchmark.weights has them from the model's sizes, as test_llama_precision checks). Llama-3.1-8B's sizes give
+  # 6.20 GB a token, so 41.3 tokens/s is half the card's 512 GB/s
+  c = llama.model(dim=4096, heads=32, kv=8, layers=32, vocab=128256, ffn=14336, places=736)
   c.precision = llama.precision(c, "tt")
   t = benchmark.weights(c)
-  assert [t[k].dtype for k in ("layers.0.gate_up_proj", "layers.31.gate_up_proj", "layers.0.down_proj", "embed.T", "embed")] == ["bfp4", "bfp8", "bfp8", "bfp8", "bf16"]
+  names = ("layers.0.gate_up_proj", "layers.31.gate_up_proj", "layers.0.down_proj", "embed.T", "embed")
+  assert [t[k].dtype for k in names] == ["bfp4", "bfp8", "bfp8", "bfp8", "bf16"]
   read = benchmark.bytes_per_token(t, c, 612.5)
   assert round(read / 1e9, 2) == 6.20 and round(41.3 * read / 512e9, 3) == 0.5, read
 
@@ -2096,7 +2123,8 @@ def test_batched_decode(chip):
 def bytes_tokenizer(folder):  # a byte-level vocabulary of the 256 bytes, as tokenizer.json in folder
   bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
   chars = map(chr, bs + [256 + i for i in range(256 - len(bs))])
-  (folder / "tokenizer.json").write_text(json.dumps({"model": {"vocab": dict(zip(chars, bs + [b for b in range(256) if b not in bs]))}, "added_tokens": []}))
+  vocab = dict(zip(chars, bs + [b for b in range(256) if b not in bs]))
+  (folder / "tokenizer.json").write_text(json.dumps({"model": {"vocab": vocab}, "added_tokens": []}))
   return llama.Tokenizer(str(folder))
 
 def test_heads(chip):
@@ -2111,10 +2139,10 @@ def test_heads(chip):
     logits = Tensor.frombytes(rt, 3, vocab, x.tobytes(), dtype="fp32")
     values, ids, lse = serve.heads(logits, Tensor.of(rt, [[t] for t in ts], "fp32"))
     want, scaled = np.argsort(-x, -1, kind="stable")[:, :64], np.float64(x) * np.array(ts)[:, None]
-    assert np.array_equal(serve.read(ids), want) and np.array_equal(serve.read(values), np.take_along_axis(x, want, -1)), vocab
+    assert np.array_equal(gpt2.values(ids), want) and np.array_equal(gpt2.values(values), np.take_along_axis(x, want, -1)), vocab
     exact = scaled.max(1) + np.log(np.exp(scaled - scaled.max(1, keepdims=True)).sum(1))
-    assert np.allclose(serve.read(lse)[:, 0], exact, rtol=1e-6, atol=0), (serve.read(lse)[:, 0], exact)
-    assert np.array_equal(serve.read(serve.heads(logits, k=1)[1])[:, 0], want[:, 0])
+    assert np.allclose(gpt2.values(lse)[:, 0], exact, rtol=1e-6, atol=0), (gpt2.values(lse)[:, 0], exact)
+    assert np.array_equal(gpt2.values(serve.heads(logits, k=1)[1])[:, 0], want[:, 0])
 
 def test_sampling():
   # serve.Request.pick from a row's head (serve.Head: its 64 most likely and the log of the whole row's sum of exp, as
@@ -2169,12 +2197,14 @@ def test_shapes(tmp_path):
   assert "<tool_call>" not in said and said.startswith("<tool_callH") and finish == "stop", said
   with pytest.raises(ValueError): serve.chosen({"type": "function", "function": {"name": "write"}}, tools)
   schema = {"type": "object", "properties": {"ok": {"type": "boolean"}, "unit": {"enum": ["C", "F"]}, "n": {"type": "integer"},
-                                             "tags": {"type": "array", "items": {"$ref": "#/$defs/tag"}, "maxItems": 2}, "note": {"anyOf": [{"const": "hi"}, {"type": "null"}]}},
+                                             "tags": {"type": "array", "items": {"$ref": "#/$defs/tag"}, "maxItems": 2},
+                                             "note": {"anyOf": [{"const": "hi"}, {"type": "null"}]}},
             "required": ["ok", "unit", "n", "tags", "note"], "additionalProperties": False, "$defs": {"tag": {"enum": ["a", "b"]}}}
   fits = serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
   whole = '{"ok": true, "unit": "C", "n": -12, "tags": ["a"], "note": null}'
   assert [fits(whole[:k]) for k in (0, 1, 9, 20, 32, len(whole) - 1, len(whole))] == [1, 1, 1, 1, 1, 1, 2] and fits(whole + "\n") == 2
-  for text in ('{"ok": 1', '{"unit": "K"', '{"n": 1.5', '{"n": 1.', '{"n": -e', '{"x"', '{"tags": ["a", "b", "a"]', '{"note": "ho"', whole + "x", "```json", "{\n  "):
+  for text in ('{"ok": 1', '{"unit": "K"', '{"n": 1.5', '{"n": 1.', '{"n": -e', '{"x"', '{"tags": ["a", "b", "a"]', '{"note": "ho"', whole + "x",
+               "```json", "{\n  "):
     assert fits(text) == 0, text
   assert serve.formatted({"type": "json_object"})('{"a": [1, {"b": "c\\n"}]}') == 2 and serve.formatted({"type": "json_object"})("[1]") == 0
   for seed in range(3):  # (random logits: most bytes would not do, so most tokens are drawn again)
@@ -2187,18 +2217,18 @@ def test_shapes(tmp_path):
 def test_serve(chip, tmp_path):
   # models/serve.py's engine: three greedy requests on two slots (the third waits for one, then takes the slot used
   # longest ago) decode together, numpy's greedy tokens for each (every call reading 32 rows of each 64-row slot: the
-  # power of 2 that holds the longest sequence's), then the last two again alone, the last first (the slot used longer ago holds the
-  # other), each in the slot that holds it already, so a token of each is prefilled and the rest come from the cache:
-  # the same tokens as together, every step one replayed call for both slots, a free one idling on a row no sequence
-  # reaches (on any other it would spoil what its slot holds); a long prompt is prefilled a chunk between steps, so
-  # the others' tokens keep coming. A request ends at a stop string (without its text), at an end-of-sequence token,
-  # or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP, /v1/completions
-  # whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's or Llama 3's
-  # template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and streamed, or not
-  # at all when it is told not to think; a sampling parameter left out is the model's own (its generation_config's, here
-  # temperature 0); usage counts the prompt's tokens its slot held (cached), and ends a stream; an
-  # answer to a JSON schema (response_format) is one; and with both slots held by streams, a request gets a 429 at once
-  # (OpenRouter's ask: it tries the next provider), and is served once they end
+  # power of 2 that holds the longest sequence's), then the last two again alone, the last first (the slot used longer
+  # ago holds the other), each in the slot that holds it already, so a token of each is prefilled and the rest come from
+  # the cache: the same tokens as together, every step one replayed call for both slots, a free one idling on a row no
+  # sequence reaches (on any other it would spoil what its slot holds); a long prompt is prefilled a chunk between
+  # steps, so the others' tokens keep coming. A request ends at a stop string (without its text), at an end-of-sequence
+  # token, or when its client has gone, and says no text in which a stop string might yet begin. Over HTTP,
+  # /v1/completions whole and streamed give the engine's text, and /v1/models the model; chat messages go into ChatML's
+  # or Llama 3's template, or gpt-oss's harmony; a thinking model's reasoning comes apart from its answer, whole and
+  # streamed, or not at all when it is told not to think; a sampling parameter left out is the model's own (its
+  # generation_config's, here temperature 0); usage counts the prompt's tokens its slot held (cached), and ends a
+  # stream; an answer to a JSON schema (response_format) is one; and with both slots held by streams, a request gets a
+  # 429 at once (OpenRouter's ask: it tries the next provider), and is served once they end
   import urllib.request
   rt, rng = Runtime(chip), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -2245,7 +2275,8 @@ def test_serve(chip, tmp_path):
   http = serve.server(engine, "smol", port=0, defaults={"temperature": 0})
   threading.Thread(target=http.serve_forever, daemon=True).start()
   url = f"http://127.0.0.1:{http.server_address[1]}/v1"
-  post = lambda body: urllib.request.urlopen(urllib.request.Request(url + "/completions", json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=600)
+  post = lambda body: urllib.request.urlopen(urllib.request.Request(url + "/completions", json.dumps(body).encode(),
+                                                                    {"Content-Type": "application/json"}), timeout=600)
   r = serve.Request(tok, tok.encode("Hi there"), 6, 0)
   engine.waiting.put(r)
   text = tok.decode(done(r))
@@ -2254,11 +2285,13 @@ def test_serve(chip, tmp_path):
   assert reply["usage"]["prompt_tokens_details"]["cached_tokens"] == held, "all but the prompt's last token, which runs again"
   events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}))
   assert "".join(e["text"] for e in events) == text and events[-1]["finish_reason"] == "length" and usage["completion_tokens"] == 6
-  shaped = json.load(post({"prompt": "Hi there", "max_tokens": 80, "temperature": 0, "response_format": {"type": "json_schema", "json_schema": {"schema": {
-    "type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"], "additionalProperties": False}}}}))["choices"][0]
+  schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"], "additionalProperties": False}
+  shaped = json.load(post({"prompt": "Hi there", "max_tokens": 80, "temperature": 0,
+                           "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}}))["choices"][0]
   assert json.loads(shaped["text"])["answer"] in ("yes", "no") and shaped["finish_reason"] == "stop", shaped  # (ended once nothing else fits)
-  chances = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "logprobs": 2}))["choices"][0]["logprobs"]  # greedy: each
-  assert len(chances["tokens"]) == 6 and all(p == max(top.values()) <= 0 for p, top in zip(chances["token_logprobs"], chances["top_logprobs"]))  # the most likely
+  # greedy: each token the most likely
+  chances = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "logprobs": 2}))["choices"][0]["logprobs"]
+  assert len(chances["tokens"]) == 6 and all(p == max(top.values()) <= 0 for p, top in zip(chances["token_logprobs"], chances["top_logprobs"]))
   assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
   holding = [post({"prompt": "Hi there", "max_tokens": 20, "temperature": 0, "stream": True}) for _ in range(2)]  # both slots, held from the
   with pytest.raises(urllib.error.HTTPError) as e: post({"prompt": "Hi", "max_tokens": 2})                    # headers on
@@ -2272,16 +2305,18 @@ def test_serve(chip, tmp_path):
                                                                "<|start_header_id|>assistant<|end_header_id|>\n\n")
   think = serve.server(engine, "smol", "<|im_start|> <think>", port=0)  # a thinking model's template (Qwen3's)
   threading.Thread(target=think.serve_forever, daemon=True).start()
-  ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{think.server_address[1]}/v1/chat/completions", json.dumps(body).encode(),
-                                                                   {"Content-Type": "application/json"}), timeout=600)
+  ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{think.server_address[1]}/v1/chat/completions",
+                                                                   json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=600)
   r = serve.Request(tok, tok.encode(serve.chat("<|im_start|> <think>", hi[1:]), special=True), 6, 0)
   engine.waiting.put(r)
   text, body = tok.decode(done(r)), {"messages": hi[1:], "max_tokens": 6, "temperature": 0}
-  assert json.load(ask(body))["choices"][0]["message"] == {"role": "assistant", "reasoning_content": text.strip(), "content": ""}  # no </think> came
+  message = json.load(ask(body))["choices"][0]["message"]
+  assert message == {"role": "assistant", "reasoning_content": text.strip(), "content": ""}  # no </think> came
   events = streamed(ask(body | {"stream": True, "logprobs": True, "top_logprobs": 1}))[0]
   assert "".join(e["delta"].get("reasoning_content", "") for e in events) == text.strip() and not any("content" in e["delta"] for e in events)
   made = [c for e in events if e.get("logprobs") for c in e["logprobs"]["content"]]  # each piece's tokens, with their log probabilities
-  assert b"".join(bytes(c["bytes"]) for c in made).decode("utf-8", "replace") == text and all(c["top_logprobs"][0]["logprob"] == c["logprob"] for c in made)
+  joined = b"".join(bytes(c["bytes"]) for c in made).decode("utf-8", "replace")
+  assert joined == text and all(c["top_logprobs"][0]["logprob"] == c["logprob"] for c in made)
   off = len(tok.encode(serve.chat("<|im_start|> <think>", hi[1:], False), special=True))  # not thinking: the prompt's reasoning given, empty,
   with pytest.raises(urllib.error.HTTPError) as e: ask(body | {"chat_template_kwargs": {"enable_thinking": False}})  # too long for these slots
   assert json.load(e.value)["error"]["message"].startswith(f"{off} tokens")
@@ -2296,7 +2331,9 @@ def test_serve(chip, tmp_path):
   assert serve.answer("<|channel|>") == serve.answer("<|channel|>analysis") == ("", ""), "a channel's name, a token at a time, is neither"
 
 class Kept(serve.Request):  # a request that keeps the logits each of its tokens came from (its head's whole row)
-  def take(self, head, room): self.logits = getattr(self, "logits", []) + [head.row() if isinstance(head, serve.Head) else head]; return super().take(head, room)
+  def take(self, head, room):
+    self.logits = getattr(self, "logits", []) + [head.row() if isinstance(head, serve.Head) else head]
+    return super().take(head, room)
 
 def agrees(r, w, c, tol=0.03):  # a finished request: each token's logits within 3% of numpy's (from nothing, over its prompt
   ids = r.ids + r.made  # and the tokens it took before), each picked as numpy would (near)
@@ -2332,8 +2369,8 @@ def test_serve_sessions(chip, tmp_path, kv):
   c, weights = qwen35(rng)
   w, tok, c.precision = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.precision(c, "bf16", kv=kv)
   c.mtp = 0  # (decoding a token a step: test_serve_speculative drafts with it)
-  engine = serve.Engine(rt, llama.upload(rt, {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.4."))}), c, tok, slots=2, places=64, chunk=16,
-                        park=0 if kv == "bfp4" else None)
+  engine = serve.Engine(rt, llama.upload(rt, {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.4."))}), c, tok,
+                        slots=2, places=64, chunk=16, park=0 if kv == "bfp4" else None)
   threading.Thread(target=engine.run, daemon=True).start()
   together = [Kept(tok, p, 6, 0) for p in ([7, 200, 31, 64, 5], [5, 64], list(range(40, 60)))]  # the last longer than a chunk
   served(engine, together)
@@ -2345,7 +2382,7 @@ def test_serve_sessions(chip, tmp_path, kv):
     served(engine, r)
     agrees(r, w, c, tol)
     assert engine.prefilled - before == len(turn) - len(saved) == len(turn) - r.cached, (engine.prefilled - before, r.cached)
-  assert {type(v[-1]) for v in engine.saved.values()} == {bytes if kv == "bfp4" else Tensor}, "kept on the host, or on the chip"
+  assert {type(v[-1]) for v in engine.sessions.values()} == {bytes if kv == "bfp4" else Tensor}, "kept on the host, or on the chip"
 
 def test_serve_speculative(chip, tmp_path):
   # models/serve.py's engine drafting with Qwen3.5's multi-token prediction layer (qwen35's, at random): each step
@@ -2368,7 +2405,8 @@ def test_serve_speculative(chip, tmp_path):
     together = [Kept(tok, p, 8, 0) for p in prompts]
     served(engine, together)
     for r in together: agrees(r, w, c)
-    assert engine.spec and (engine.agreed >= 0.8 * engine.drafted if kind is Oracle else engine.agreed <= 0.2 * engine.drafted), (engine.agreed, engine.drafted)
+    assert engine.spec and (engine.agreed >= 0.8 * engine.drafted if kind is Oracle
+                            else engine.agreed <= 0.2 * engine.drafted), (engine.agreed, engine.drafted)
   first = together[0]
   before, r = engine.prefilled, Kept(tok, first.ids + first.made + [9, 8], 4, 0)
   served(engine, r)
@@ -2389,19 +2427,24 @@ def test_chat_tools(tmp_path):
             "properties": {"path": {"type": "string"}, "lines": {"type": "integer"}}, "required": ["path"]}}}]
   call = {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": {"path": "a.txt", "lines": 2}}}
   messages = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "What is in a.txt?"},
-              {"role": "assistant", "content": "", "reasoning_content": "I should read it.", "tool_calls": [call]}, {"role": "tool", "tool_call_id": "call_1", "content": "hello"}]
-  want = ("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n" + json.dumps(tools[0]) + "\n</tools>" + serve.CALLING +
-          "\n\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is in a.txt?<|im_end|>\n<|im_start|>assistant\n<think>\nI should read it.\n</think>\n\n<tool_call>\n"
-          "<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n"
-          "<tool_response>\nhello\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n")
+              {"role": "assistant", "content": "", "reasoning_content": "I should read it.", "tool_calls": [call]},
+              {"role": "tool", "tool_call_id": "call_1", "content": "hello"}]
+  want = ("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n" + json.dumps(tools[0]) + "\n</tools>" +
+          serve.CALLING + "\n\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is in a.txt?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+          "I should read it.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>\n"
+          "</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nhello\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n")
   assert serve.chat(qwen, messages, tools=tools) == want
-  assert serve.chat(qwen, messages[:2]) == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is in a.txt?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  assert serve.chat(qwen, messages[:2]) == ("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is in a.txt?<|im_end|>\n"
+                                            "<|im_start|>assistant\n<think>\n")
   assert serve.chat(qwen, messages[:2], False).endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "not thinking: its reasoning given, empty"
-  said = "I should read it.\n</think>\n\nLet me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>\n</function>\n</tool_call>"
+  said = ("I should read it.\n</think>\n\nLet me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n"
+          "<parameter=lines>\n2\n</parameter>\n</function>\n</tool_call>")
   text, made = serve.calls(serve.answer(said)[1], tools)
-  assert text == "Let me look." and [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in made] == [("read", {"path": "a.txt", "lines": 2})]
+  calls = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in made]
+  assert text == "Let me look." and calls == [("read", {"path": "a.txt", "lines": 2})]
   again = messages[:2] + [{"role": "assistant", "content": text, "reasoning_content": "I should read it.", "tool_calls": made}]
-  assert "Let me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>" in serve.chat(qwen, again + messages[3:], tools=tools)
+  prompt = serve.chat(qwen, again + messages[3:], tools=tools)
+  assert "Let me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>" in prompt
   class Stand:  # an engine that answers every request with `said`, a few characters at a time
     tok, places, waiting = bytes_tokenizer(tmp_path), 4096, queue.Queue()
     def offer(self, r): self.waiting.put(r); return True  # (room for every request)
@@ -2414,15 +2457,17 @@ def test_chat_tools(tmp_path):
   threading.Thread(target=stand.run, daemon=True).start()
   http = serve.server(stand, "qwen", qwen, port=0)
   threading.Thread(target=http.serve_forever, daemon=True).start()
-  ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/chat/completions", json.dumps(body).encode(),
-                                                                   {"Content-Type": "application/json"}), timeout=60)
+  ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/chat/completions",
+                                                                   json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=60)
   reply = json.load(ask({"messages": messages[:2], "tools": tools}))["choices"][0]
-  assert reply["finish_reason"] == "tool_calls" and reply["message"]["content"] == "Let me look." and reply["message"]["reasoning_content"] == "I should read it."
+  message = reply["message"]
+  assert reply["finish_reason"] == "tool_calls" and message["content"] == "Let me look." and message["reasoning_content"] == "I should read it."
   assert json.loads(reply["message"]["tool_calls"][0]["function"]["arguments"]) == {"path": "a.txt", "lines": 2}
   events = streamed(ask({"messages": messages[:2], "tools": tools, "stream": True}))[0]
   assert "".join(e["delta"].get("content", "") for e in events).strip() == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
   assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
-  with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": messages[:2], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "write"}}})
+  with pytest.raises(urllib.error.HTTPError) as e:
+    ask({"messages": messages[:2], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "write"}}})
   assert e.value.code == 400 and "no such tool" in json.load(e.value)["error"]["message"]
   with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": messages[:2], "response_format": {"type": "xml"}})
   assert e.value.code == 400
@@ -2430,14 +2475,15 @@ def test_chat_tools(tmp_path):
 
 def test_cost(tmp_path):
   # models/cost.py from a config alone: Qwen3.6-35B-A3B's 35.5B parameters (its multi-token prediction layer's 0.9B
-  # among them) and 2.95B a token, about 21.7 GB with its experts in bfp4, its KV cache rows 20 KB a token (10 attention
-  # blocks of 2 key and value heads of 256) and Gated DeltaNet states 66 MB a session (30 blocks of 32 heads' 128 x 128
-  # in fp32 and the conv's last 3 inputs), each to the byte; Llama-3.1-8B in Tenstorrent's performance precision reads
-  # benchmark.py's 6.20 GB a token (its weights, and its bfp8 KV cache at the decode's mean context, 612.5 places) within 2%.
-  # A decode step's dollars a million tokens are the card's dollars an hour over its tokens an hour; the probe's numbers,
-  # read from its file, give the rates. A prompt's chunk reads the experts its tokens pick, nearly all of every block's
-  # at 256 tokens, so Qwen3.6's 4K-token prompt takes over six times as long in chunks of 256 as of 2,048; at 32K places
-  # its attention's reads (a key head's rows for every eight tile rows of 32 queries of each query head) make it slower
+  # among them) and 2.95B a token, about 21.9 GB in the one-card formats (experts, its bfp4 draft head included), its KV
+  # cache rows 20 KB a token (10 attention blocks of 2 key and value heads of 256) and Gated DeltaNet states 66 MB a
+  # session (30 blocks of 32 heads' 128 x 128 in fp32 and the conv's last 3 inputs), each to the byte; Llama-3.1-8B in
+  # Tenstorrent's performance precision reads benchmark.py's 6.20 GB a token (its weights, and its bfp8 KV cache at the
+  # decode's mean context, 612.5 places) within 2%. A decode step's dollars a million tokens are the card's dollars an
+  # hour over its tokens an hour; the probe's numbers, read from its file, give the rates. A prompt's chunk reads the
+  # experts its tokens pick, nearly all of every block's at 256 tokens, so Qwen3.6's 4K-token prompt takes over six
+  # times as long in chunks of 256 as of 2,048; at 32K places its attention's reads (a key head's rows for every eight
+  # tile rows of 32 queries of each query head) make it slower
   qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
           "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
           "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
@@ -2475,8 +2521,9 @@ def test_fetch(tmp_path, monkeypatch):
   import functools, http.server, threading
   hub = tmp_path / "hub" / "org" / "model" / "resolve" / "main"
   hub.mkdir(parents=True)
-  files = {"config.json": "{}", "tokenizer.json": "{}", "generation_config.json": "{}", "chat_template.jinja": "<|im_start|>", "model-1.safetensors": "1", "model-2.safetensors": "2",
-           "model.safetensors.index.json": json.dumps({"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors", "c": "model-1.safetensors"}})}
+  weight_map = {"a": "model-1.safetensors", "b": "model-2.safetensors", "c": "model-1.safetensors"}
+  files = {"config.json": "{}", "tokenizer.json": "{}", "generation_config.json": "{}", "chat_template.jinja": "<|im_start|>",
+           "model-1.safetensors": "1", "model-2.safetensors": "2", "model.safetensors.index.json": json.dumps({"weight_map": weight_map})}
   for name, text in files.items(): (hub / name).write_text(text)
   quiet = type("Quiet", (http.server.SimpleHTTPRequestHandler,), {"log_message": lambda *a: None})
   hf = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(quiet, directory=str(tmp_path / "hub")))

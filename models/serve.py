@@ -1,10 +1,10 @@
-# An OpenAI-compatible server for a Llama-family model on ferrite. Requests join and leave a batch
-# that decodes together: each sequence has a slot of one KV cache (and of Gated DeltaNet's states), and every step is
-# one replayed call for all the slots. A prompt goes to the free slot whose last sequence began the same way, or takes
-# a session saved on the host that did, so what they share (a system prompt, an agent's conversation so far) is not
-# prefilled again.
-#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]   # a folder or a
-#   model id; the weights' formats (llama.precision), then the KV cache's
+# An OpenAI-compatible server for a Llama-family model on ferrite. Requests join and leave a batch that decodes
+# together: each sequence has a slot of one KV cache (and of Gated DeltaNet's states), and every step is one replayed
+# call for all the slots (two when speculating). A prompt goes to the free slot whose last sequence began the same way,
+# or takes a session kept on the chip (or, past its room, on the host) that did, so what they share (a system prompt,
+# an agent's conversation so far) is not prefilled again.
+#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]
+# model: a folder or a Hugging Face model id; then the weights' formats (llama.precision), and the KV cache's
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
 import codecs, collections, functools, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,8 +32,9 @@ def heads(logits, t=None, k=64):
   """Each row's head of a batch of logits (fp32, one matrix of rows by the vocabulary), on the chip: its k largest and
   their tokens, by topk on parts of the row that fit a worker's L1 and then on the parts' best (by their labels); and
   given t (a column of each row's 1/temperature), the log of the sum of exp(x t) over the row, in fp32, each part's in
-  one kernel and theirs together in another: (values, ids[, lse]), realized, what Head holds. None for a vocabulary that
-  cuts into no such parts (the host then reads whole rows)."""
+  one kernel and theirs together in another: (values, ids[, lse]), realized, what Head holds. A part is at most 96
+  tiles, and there are at most 125 (the second topk's row, 64 of each part's best, in a worker's L1). None for a
+  vocabulary that cuts into no such parts (the host then reads whole rows)."""
   tiles = logits.cols // 32
   parts = next((p for p in range(1, 126) if tiles % p == 0 and tiles // p <= 96), None) if logits.cols % 32 == 0 else None
   if parts is None: return None
@@ -45,13 +46,11 @@ def heads(logits, t=None, k=64):
   if parts > 1: top = lse.max(0); lse = (lse - top).exp().sum(0).log() + top
   return values.realize(), ids.realize(), lse.realize()
 
-def read(x): return np.frombuffer(x.tobytes(), {"fp32": np.float32, "int32": np.int32}[x.dtype]).reshape(x.rows, x.cols)  # (numpy's, its dtype)
-
 class Request:
   """A prompt's tokens and how to go on from them (pick), until a token in eos, a stop string or max_tokens. Each piece
   of new text goes into out as soon as no stop string could still begin in it, then None once the engine is done with
   it (end); finish says why. One whose client has gone (gone) ends at its next token, or takes no slot. cached: its
-  prompt's tokens that its slot, or a session saved on the host, held already, which were not prefilled. logprobs: for
+  prompt's tokens that its slot, or a session kept, held already, which were not prefilled. logprobs: for
   each token made, its log probability and those of the logprobs most likely (probs), from the model's logits as they
   are; marks: how many it had at each piece of text. shape: what its text must keep to (pick), or None. room: the slot it
   holds from its offer to its end (Engine.offer), if it was offered."""
@@ -65,8 +64,10 @@ class Request:
     self.text, self.utf8 = "", codecs.getincrementaldecoder("utf-8")("replace")  # the text made so far, but a character still coming
     self.room = None
 
-  def whole(self): return bool(self.presence or self.frequency or self.repetition != 1 or self.shape or self.logprobs is not None)  # wants
-  # whole rows: penalties move tokens past the head into it, a shape may turn down every one of it, log probabilities are at temperature 1
+  def whole(self):
+    """Whether it wants whole rows: penalties move tokens past the head into it, a shape may turn down all of it, and
+    log probabilities are at temperature 1."""
+    return bool(self.presence or self.frequency or self.repetition != 1 or self.shape or self.logprobs is not None)
 
   def pick(self, head):
     """The next token, from the head of its logits (Head) when it decides the draw (sample), else from the whole row:
@@ -87,8 +88,8 @@ class Request:
     for _ in range(32):
       if self.fits(token := self.draw(logits)): return token
       logits[token] = -np.inf
-    return next((int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t))), None)  # the likeliest that
-    # fits, else None: the end (a whole shape, for a model without an end of sequence; else a shape that leads nowhere)
+    # the likeliest that fits, else None: the end (a whole shape, for a model without an end of sequence; else a shape that leads nowhere)
+    return next((int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t))), None)
 
   def fits(self, token):  # whether the text with token keeps to the shape (or, token an end of sequence, the text is whole)
     return self.shape(self.tok.decode(self.made)) == 2 if token in self.eos else self.shape(self.tok.decode(self.made + [token])) > 0
@@ -135,8 +136,10 @@ class Request:
     i = min(int(np.searchsorted(np.cumsum(w), self.rng.random() * w.sum(), side="right")), len(w) - 1)
     return i if keep is None else int(keep[i])
 
-  def take(self, head, room):  # the next token from its logits' Head, or their whole row (numpy's); room: whether its slot
-    if self.gone: self.finish = "gone"; return True  # has a place for one more. Done?
+  def take(self, head, room):
+    """The next token from its logits' Head, or their whole row (numpy's); room: whether its slot has a place for one
+    more. Done?"""
+    if self.gone: self.finish = "gone"; return True
     head = head if isinstance(head, Head) else Head.of(head, scale(self))
     token = self.pick(head)
     end = token is None or token in self.eos
@@ -187,15 +190,16 @@ class Engine:
   token and a draft after it in one call (llama.forward's accept), takes the second token too where the model's pick
   for it is the draft (a pick sampled as it would be: the tokens are the model's own at any temperature), and drafts
   the next in another call (llama.draft); a turned-down draft's Gated DeltaNet states are put back by the next step."""
-  def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=256, keep=4 << 30, park=None):
+  def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=None, keep=4 << 30, park=None):
     assert places % 32 == 0, "slots of whole tiles"
-    self.rt, self.t, self.c, self.tok, self.places, self.chunk, self.keep = rt, t, c, tokenizer, places, chunk, keep
-    self.spec = getattr(c, "mtp", 0) > 0 and "mtp.fc" in t  # (drafts from the multi-token prediction layer)
+    self.rt, self.t, self.c, self.tok, self.places, self.keep = rt, t, c, tokenizer, places, keep
+    self.chunk = chunk or (2048 if c.experts else 256)  # a mixture of experts' chunk reads nearly all of every block's experts (cost.prompt)
+    self.spec = c.mtp > 0 and "mtp.fc" in t  # (drafts from the multi-token prediction layer)
     self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)), slots, self.spec)
     self.slot = [llama.slot(c, self.kv, u, slots) for u in range(slots)]  # the caches as slot u's alone
     self.park = max(0, sum(room for _, room in rt.holes) * len(bh.DRAM) - (2 << 30)) if park is None else park
     self.linear = any(llama.linear(c, l) for l in range(c.layers))  # (its states then say where a slot can go on from)
-    self.whole = llama.attends(c, t)  # (attention in one kernel reads only the rows its places reach: a replay for every length)
+    self.attends = llama.attends(c, t)  # (attention in one kernel reads only the rows its places reach: a replay for every length)
     self.held, self.busy = [[] for _ in range(slots)], [None] * slots
     self.used = [0] * slots  # when each slot last took a request: of those sharing as much, the one used longest ago goes
     self.replays, self.made, self.hidden = {}, {}, {}  # (a call's replay for each length it reads, what its last call made
@@ -204,7 +208,7 @@ class Engine:
     self.drafted = self.agreed = 0  # (drafts compared with the model's pick, and taken: what speculation saves shows here)
     self.waiting, self.prefilled = queue.Queue(), 0  # (tokens prefilled in all: what the prefix cache saves shows here)
     self.room = threading.BoundedSemaphore(slots)  # a slot for each offered request, from its offer to its end
-    self.saved = collections.OrderedDict()  # tokens -> (each block's bytes: a KV cache's rows, or Gated DeltaNet's states)
+    self.sessions = collections.OrderedDict()  # tokens -> each block's KV cache rows, or Gated DeltaNet states: tensors on the chip, or bytes
 
   def on(self, row, dtype="int32"): return Tensor.of(self.rt, [row], dtype)
 
@@ -215,7 +219,7 @@ class Engine:
     return True
 
   def length(self, last):  # the rows of each slot a call reads when its sequences' last place is last
-    return self.places if self.whole else min(self.places, 1 << max(5, last.bit_length()))
+    return self.places if self.attends else min(self.places, 1 << max(5, last.bit_length()))
 
   def replay(self, f, n):  # f's replay (jit) for calls reading n rows of each slot; what each call makes, kept (made)
     if (f, n) not in self.replays:
@@ -225,11 +229,13 @@ class Engine:
       self.replays[f, n] = jit(run)
     return self.replays[f, n]
 
-  def rows(self, f, n, ts):  # the rows of f's last call reading n rows, as Heads at each row's 1/temperature (ts): the chip's
-    logits, made = self.made[f, n]  # heads read back, and the whole rows once, if a draw wants them
+  def rows(self, f, n, ts):
+    """The rows of f's last call reading n rows, as Heads at each row's 1/temperature (ts): the chip's heads read back,
+    and the whole rows once, if a draw wants them."""
+    logits, made = self.made[f, n]
     whole = functools.cache(lambda: gpt2.values(logits))
     if made is None: return [Head.of(row, x) for row, x in zip(whole(), ts)]
-    values, ids, lse = (read(x) for x in made)
+    values, ids, lse = (gpt2.values(x) for x in made)
     return [Head(values[i], ids[i], lse[i, 0], lambda i=i: whole()[i]) for i in range(len(ts))]
 
   def column(self, ts): return Tensor.of(self.rt, [[x] for x in ts], "fp32")  # each row's 1/temperature, a column
@@ -238,11 +244,11 @@ class Engine:
     if self.linear: return len(held) if len(held) < len(ids) and list(ids[:len(held)]) == list(held) else 0
     return min(next((i for i, (a, b) in enumerate(zip(held, ids)) if a != b), min(len(held), len(ids))), len(ids) - 1)
 
-  def admit(self, r):  # into the free slot that holds the most of its prompt, or one that takes the saved session that does
+  def admit(self, r):  # into the free slot that holds the most of its prompt, or one that takes the kept session that does
     if r.gone: return r.end()
     free = [u for u, b in enumerate(self.busy) if b is None]
     u = max(free, key=lambda u: (self.reach(self.held[u], r.ids), -self.used[u]))
-    best = max(self.saved, key=lambda k: self.reach(k, r.ids), default=())
+    best = max(self.sessions, key=lambda k: self.reach(k, r.ids), default=())
     if self.reach(best, r.ids) > self.reach(self.held[u], r.ids): self.restore(u := min(free, key=lambda u: self.used[u]), best)
     self.used[u], self.busy[u] = max(self.used) + 1, r
     n = self.reach(self.held[u], r.ids)
@@ -253,28 +259,31 @@ class Engine:
       self.taken[u] = 1.0
     self.held[u], r.cached = r.ids[:n], n
 
-  def save(self, u):  # slot u's session kept, copied on the chip: its tokens, its rows of each KV cache (whole tiles) and its
-    key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32  # states (after a turned-down draft, those after the token before it)
-    if not key or key in self.saved or not self.park + self.keep: return
+  def save(self, u):
+    """Slot u's session kept, copied on the chip: its tokens, its rows of each KV cache (whole tiles) and its states
+    (after a turned-down draft, those after the token before it). Past park bytes on the chip, the least recently used
+    go to the host; past keep there, they are gone."""
+    key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32
+    if not key or key in self.sessions or not self.park + self.keep: return
     def copy(x):  # (a conv state's row by a move)
       x = x.get() if isinstance(x, llama.Row) else x
       return Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
-    self.saved[key] = [tuple(copy(x) for x in (s[:2] if self.taken[u] else s[2:])) if llama.linear(self.c, l) else copy(s[:, :rows, :])
-                       for l, s in enumerate(self.slot[u])]
+    self.sessions[key] = [tuple(copy(x) for x in (s[:2] if self.taken[u] else s[2:])) if llama.linear(self.c, l) else copy(s[:, :rows, :])
+                          for l, s in enumerate(self.slot[u])]
     each = lambda v: [x for part in v for x in (part if isinstance(part, tuple) else (part,))]  # (a session's tensors, or bytes)
     size = lambda v: sum(len(x) if isinstance(x, bytes) else x.batch * -(-x.rows // 32) * -(-x.cols // 32) * tile_bytes(x.dtype) for x in each(v))
-    for kind, room in ((Tensor, self.park), (bytes, self.keep)):  # past park bytes on the chip, the least recently used to the host;
-      held = [k for k, v in self.saved.items() if isinstance(each(v)[0], kind)]  # past keep there, gone
-      while sum(size(self.saved[k]) for k in held) > room:
+    for kind, room in ((Tensor, self.park), (bytes, self.keep)):
+      held = [k for k, v in self.sessions.items() if isinstance(each(v)[0], kind)]
+      while sum(size(self.sessions[k]) for k in held) > room:
         k = held.pop(0)
-        if kind is bytes or not self.keep: del self.saved[k]
-        else: self.saved[k] = [tuple(x.tobytes() for x in part) if isinstance(part, tuple) else part.tobytes() for part in self.saved[k]]
+        if kind is bytes or not self.keep: del self.sessions[k]
+        else: self.sessions[k] = [tuple(x.tobytes() for x in part) if isinstance(part, tuple) else part.tobytes() for part in self.sessions[k]]
 
-  def restore(self, u, key=()):  # a saved session into slot u, its tokens what the slot holds (none: its states all 0)
-    if key: self.saved.move_to_end(key)
+  def restore(self, u, key=()):  # a kept session into slot u, its tokens what the slot holds (none: its states all 0)
+    if key: self.sessions.move_to_end(key)
     rows = -(-len(key) // 32) * 32
     for l, s in enumerate(self.slot[u]):
-      data = self.saved[key][l] if key else None
+      data = self.sessions[key][l] if key else None
       if llama.linear(self.c, l):
         for i, x in enumerate(s[:2]):
           x.assign(data[i] if data and isinstance(data[i], Tensor) else
@@ -283,8 +292,10 @@ class Engine:
       elif data: s.put(self.on(list(range(rows))), Tensor.frombytes(self.rt, rows, s.cols, data, s.batch))
     self.held[u], self.taken[u] = list(key), 1.0
 
-  def fill(self, u):  # the next chunk of slot u's prompt; the last one's last logits give the first new token (and, speculating,
-    r, at = self.busy[u], len(self.held[u])  # the multi-token prediction layer over the chunk's places, the last its first draft)
+  def fill(self, u):
+    """The next chunk of slot u's prompt; the last one's last logits give the first new token (and, speculating, the
+    multi-token prediction layer over the chunk's places, the last its first draft)."""
+    r, at = self.busy[u], len(self.held[u])
     if r.gone: return self.take(u, None)
     ids = r.ids[at:at + self.chunk]
     places, n = self.on(list(range(at, at + len(ids)))), self.length(at + len(ids) - 1)
@@ -294,7 +305,8 @@ class Engine:
     self.prefilled += len(ids)
     if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, Head.of(gpt2.values(out)[0], scale(r)), 1 + self.spec)
     if self.spec and self.busy[u] is r:  # each place's next token: the prompt's, and past its end the one just taken
-      drafts = gpt2.values(llama.draft(self.on((r.ids + r.made)[at + 1:at + len(ids) + 1]), places, h, self.t, self.c, self.slot[u], length=n, every=False))
+      after = self.on((r.ids + r.made)[at + 1:at + len(ids) + 1])
+      drafts = gpt2.values(llama.draft(after, places, h, self.t, self.c, self.slot[u], length=n, every=False))
       if r.made: self.drafts[u], self.taken[u] = self.guess(u, int(drafts[-1].argmax())), 1.0
 
   def advance(self):  # one step for every slot: each decoding one's last token in, its next one out
@@ -308,7 +320,7 @@ class Engine:
     for u, (r, head) in enumerate(zip(live, self.rows(self.decode, n, ts))):
       if r: self.held[u].append(r.made[-1]); self.take(u, head)
 
-  def take(self, u, head, room=1):  # a slot's request takes its next token; a finished one leaves its slot, its session saved
+  def take(self, u, head, room=1):  # a slot's request takes its next token; a finished one leaves its slot, its session kept
     r = self.busy[u]                 # before it ends (so whoever waits on it finds the chip idle)
     if r.take(head, len(self.held[u]) + room < self.places): self.save(u); self.busy[u] = None; r.end()
     return self.busy[u] is None
@@ -317,26 +329,34 @@ class Engine:
     logits = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, length=length).realize()
     return logits, heads(logits, t)
 
-  def check(self, ids, places, live, accept, t, length):  # (speculating, replay's) each slot's token and draft taken in, after
-    logits, self.hidden[length] = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, accept=accept, hidden=True, length=length)
-    return logits.realize(), heads(logits, t)  # its last step's states (accept): their logits and heads, and their hidden states kept for guesses
+  def check(self, ids, places, live, accept, t, length):
+    """(Speculating, replay's) each slot's token and draft taken in, after its last step's states (accept): their logits
+    and heads, and their hidden states kept for guesses."""
+    logits, self.hidden[length] = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, accept=accept, hidden=True,
+                                                length=length)
+    return logits.realize(), heads(logits, t)
 
-  def guesses(self, ids, places, taken, length):  # (replay's) the multi-token prediction layer over each slot's two last places
-    n, d = len(self.busy), self.c.dim             # (the second the first again where its draft was turned down): its logits,
-    h = self.hidden[length].reshape(n, 2, d)      # and each row's best token
+  def guesses(self, ids, places, taken, length):
+    """(Replay's) the multi-token prediction layer over each slot's two last places (the second the first again where
+    its draft was turned down): its logits, and each row's best token."""
+    n, d = len(self.busy), self.c.dim
+    h = self.hidden[length].reshape(n, 2, d)
     first = h[:, 0:1, :]
     h = first.cat(first + taken.reshape(n, 1, 1) * (h[:, 1:2, :] - first), axis=1).reshape(2 * n, d).cast("bf16")  # (one or the other, exactly)
     logits = llama.draft(ids, places, h, self.t, self.c, self.kv, n, length).realize()
     return logits, heads(logits, k=1)
 
-  def guess(self, u, best): return best  # slot u's draft: the multi-token prediction layer's best token
+  def guess(self, u, best): return best  # slot u's draft: the multi-token prediction layer's best token (test_serve's oracle draws its own)
 
-  def speculate(self, live):  # one step for every slot: its token and its draft verified, the draft taken if the model's pick
-    n, at = len(live), [len(h) for h in self.held]  # agrees, then the next drafts
+  def speculate(self, live):
+    """One step for every slot: its token and its draft verified, the draft taken if the model's pick agrees, then the
+    next drafts."""
+    n, at = len(live), [len(h) for h in self.held]
     ids = [x for u, r in enumerate(live) for x in ([r.made[-1], self.drafts[u]] if r else [0, 0])]
     places = [p for u, r in enumerate(live) for p in ([at[u], at[u] + 1] if r else [self.places - 1] * 2)]
     m, ts = self.length(max(at[u] + 1 for u, r in enumerate(live) if r)), [x for r in live for x in (scale(r),) * 2]  # (the drafts' places too)
-    self.replay(self.check, m)(self.on(ids), self.on(places), self.on([float(bool(r)) for r in live], "fp32"), self.on(self.taken, "fp32"), self.column(ts))
+    alive = self.on([float(bool(r)) for r in live], "fp32")
+    self.replay(self.check, m)(self.on(ids), self.on(places), alive, self.on(self.taken, "fp32"), self.column(ts))
     rows = self.rows(self.check, m, ts)
     pairs = [[0, 0, self.places - 1, self.places - 1] for _ in range(n)]  # each slot's next tokens and their places, for the drafts
     for u, r in enumerate(live):
@@ -350,9 +370,10 @@ class Engine:
       self.taken[u], self.agreed = 1.0, self.agreed + 1
       if not self.take(u, rows[2 * u + 1], 2): pairs[u] = [self.drafts[u], r.made[-1], at[u], at[u] + 1]
     if not any(self.busy[u] is r for u, r in enumerate(live) if r): return
-    self.replay(self.guesses, m)(self.on([x for p in pairs for x in p[:2]]), self.on([q for p in pairs for q in p[2:]]), self.on(self.taken, "fp32"))
+    tokens, at = self.on([x for p in pairs for x in p[:2]]), self.on([q for p in pairs for q in p[2:]])
+    self.replay(self.guesses, m)(tokens, at, self.on(self.taken, "fp32"))
     logits, made = self.made[self.guesses, m]
-    best = read(made[1])[:, 0] if made else gpt2.values(logits).argmax(1)  # (each row's best token: its draft)
+    best = gpt2.values(made[1])[:, 0] if made else gpt2.values(logits).argmax(1)  # (each row's best token: its draft)
     for u, r in enumerate(live):
       if r and self.busy[u] is r: self.drafts[u] = self.guess(u, int(best[2 * u + 1]))
 
@@ -368,8 +389,10 @@ class Engine:
         if r: r.finish = "error"; r.end()
       raise
 
-def chat(template, messages, thinking=True, effort="medium", tools=None):  # messages as the prompt the model was trained on, for the kinds of
-  if "<tool_call>\n<function=" in template: return qwen(messages, thinking, tools)  # template it can be
+def chat(template, messages, thinking=True, effort="medium", tools=None):
+  """messages as the prompt the model was trained on, for the kinds of template it can be: Qwen3.5's (qwen), gpt-oss's,
+  Llama 3's, or ChatML."""
+  if "<tool_call>\n<function=" in template: return qwen(messages, thinking, tools)
   if tools: raise ValueError("tools, with a chat template other than Qwen3.5's")
   if "<|channel|>" in template:  # gpt-oss's (harmony): its own system message, a first system message as a developer's, the turns
     system = (f"You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: {time.strftime('%Y-%m-%d')}\n\n"
@@ -387,7 +410,8 @@ def chat(template, messages, thinking=True, effort="medium", tools=None):  # mes
     return prompt if thinking or "<think>" not in template else prompt + "<think>\n\n</think>\n\n"
   raise ValueError("a chat template other than gpt-oss's, Llama 3's or ChatML")
 
-CALLING = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
+CALLING = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
+           "<function=example_function_name>\n"
            "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
            "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the "
            "specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required "
@@ -400,7 +424,8 @@ def qwen(messages, thinking=True, tools=None):
   each assistant turn after the last question with its reasoning (an agent's tool calls since: the next prompt then
   goes on from the last one and its answer), tool calls as XML, tool results in a user turn of their own."""
   text = lambda m: (m.get("content") or "").strip()
-  question = [i for i, m in enumerate(messages) if m["role"] == "user" and not (text(m).startswith("<tool_response>") and text(m).endswith("</tool_response>"))]
+  answered = lambda m: text(m).startswith("<tool_response>") and text(m).endswith("</tool_response>")  # (a tool's result, as a user's turn)
+  question = [i for i, m in enumerate(messages) if m["role"] == "user" and not answered(m)]
   if not question: raise ValueError("no question among the messages")
   system = text(messages[0]) if messages[0]["role"] == "system" else None
   out = ""
@@ -419,8 +444,9 @@ def qwen(messages, thinking=True, tools=None):
         f = call.get("function", call)
         args = json.loads(f.get("arguments") or "{}") if isinstance(f.get("arguments"), str) else f.get("arguments") or {}
         out += ("\n\n" if content.strip() else "") if j == 0 else "\n"
-        out += f"<tool_call>\n<function={f['name']}>\n" + "".join(
-          f"<parameter={k}>\n{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}\n</parameter>\n" for k, v in args.items()) + "</function>\n</tool_call>"
+        given = lambda v: v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        out += f"<tool_call>\n<function={f['name']}>\n" + "".join(f"<parameter={k}>\n{given(v)}\n</parameter>\n" for k, v in args.items())
+        out += "</function>\n</tool_call>"
       out += "<|im_end|>\n"
     elif m["role"] == "tool":
       if i == 0 or messages[i - 1]["role"] != "tool": out += "<|im_start|>user"
@@ -440,8 +466,8 @@ def calls(text, tools=()):
     except ValueError: return v
   found = [(name, {k: value(name, k, v) for k, v in re.findall(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", body, re.S)})
            for name, body in re.findall(r"<function=([^>\n]+)>(.*?)</function>", mark + rest, re.S)]
-  return head.strip(), [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
-                        for name, args in found]
+  call = lambda name, args: {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}
+  return head.strip(), [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": call(name, args)} for name, args in found]
 
 def chosen(choice, tools):
   """The shape tool_choice gives an answer (Request's: a function of its text, 0 if it cannot begin one, 1 if it can,
@@ -455,7 +481,8 @@ def chosen(choice, tools):
   if not names: raise ValueError(f"tool_choice: no such tool among the tools: {choice}")
   can = lambda part, whole: whole.startswith(part) or part.startswith(whole)  # (part, as far as it has come, is or begins whole)
   def fits(text):  # (at once: whitespace first could go on for ever)
-    if not can(text, "<tool_call>\n<function=") or not all(any(can(part, n + ">") for n in names) for part in text.split("<function=")[1:]): return 0
+    if not can(text, "<tool_call>\n<function="): return 0
+    if not all(any(can(part, n + ">") for n in names) for part in text.split("<function=")[1:]): return 0
     return 2 if text.rstrip().endswith("</tool_call>") and calls(text, tools)[1] else 1
   return fits
 
@@ -568,8 +595,10 @@ def formatted(form):
     except Bad: return 0
   return fits
 
-def answer(text):  # a thinking model's text as its reasoning and its answer (none until it comes): Qwen3's around </think>,
-  if text.startswith("<|channel|>"):  # or gpt-oss's analysis channel, until its <|end|>, and its final one
+def answer(text):
+  """A thinking model's text as its reasoning and its answer (none until it comes): Qwen3's around </think>, or
+  gpt-oss's analysis channel, until its <|end|>, and its final one."""
+  if text.startswith("<|channel|>"):
     if "<|message|>" not in text: return "", ""  # (the channel's name still coming)
     head, _, content = text.partition("<|channel|>final<|message|>")
     return head.removeprefix("<|channel|>analysis<|message|>").partition("<|end|>")[0].strip(), content
@@ -590,7 +619,9 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   class Handler(BaseHTTPRequestHandler):
     def reply(self, code, body):
       data = json.dumps(body).encode()
-      self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers()
+      self.send_response(code)
+      self.send_header("Content-Type", "application/json"), self.send_header("Content-Length", str(len(data)))
+      self.end_headers()
       self.wfile.write(data)
     def do_GET(self):
       if self.path != "/v1/models": return self.reply(404, {"error": {"message": f"no {self.path}"}})
@@ -613,16 +644,18 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
           fits = form if call is None else (lambda text: max(form(text), call(text)))
         shape = fits and apart and (lambda text: fits(answer(text)[1])) or fits  # (a thinking model's on its answer alone)
         given = lambda k, default: q[k] if q.get(k) is not None else defaults.get(k, default)
-        r = Request(engine.tok, ids, q.get("max_tokens") or (engine.places if is_chat else 16), given("temperature", 1.0), given("top_p", 1.0),
-                    q.get("stop"), eos, q.get("seed"), max(given("top_k", 0), 0), given("min_p", 0.0), q.get("presence_penalty") or 0.0,
-                    q.get("frequency_penalty") or 0.0, given("repetition_penalty", 1.0), top, shape)
+        r = Request(engine.tok, ids, max_tokens=q.get("max_tokens") or (engine.places if is_chat else 16), temperature=given("temperature", 1.0),
+                    top_p=given("top_p", 1.0), stop=q.get("stop"), eos=eos, seed=q.get("seed"), top_k=max(given("top_k", 0), 0),
+                    min_p=given("min_p", 0.0), presence=q.get("presence_penalty") or 0.0, frequency=q.get("frequency_penalty") or 0.0,
+                    repetition=given("repetition_penalty", 1.0), logprobs=top, shape=shape)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens: a slot holds {engine.places - 2}"}})
-      if not engine.offer(r): return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})  # (OpenRouter asks for one at
-      # once under load, rather than a wait: it tries the request's next provider, and does not count it against uptime)
+      # OpenRouter asks for a 429 at once under load, rather than a wait: it tries the request's next provider, and does not
+      # count it against uptime
+      if not engine.offer(r): return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})
       head = {"id": f"ferrite-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       seen = {"text": "", "reasoning_content": "", "content": ""}
-      def parts(text):  # a chat's text as a thinking model's reasoning and answer, apart, and only the answer's text before its tool calls
+      def parts(text):  # a chat's text as a thinking model's reasoning and answer, apart, and the answer's before its tool calls
         out = dict(zip(("reasoning_content", "content"), answer(text))) if apart else {"content": text}
         if tools:  # (and before what may be the start of one)
           shown = out["content"].partition("<tool_call>")[0]
@@ -638,9 +671,10 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       piece = lambda text, done: ({"index": 0, "delta": delta(text)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
       word, raw = lambda t: engine.tok.decode([t]), lambda t: list(engine.tok.bytes[t])
       def chances(made):  # tokens' log probabilities as OpenAI gives them: a chat's for its content, a completion's as lists
-        if is_chat: return {"content": [{"token": word(t), "logprob": p, "bytes": raw(t), "top_logprobs": [{"token": word(a), "logprob": b, "bytes": raw(a)}
-                                                                                                              for a, b in top]} for t, p, top in made]}
-        return {"tokens": [word(t) for t, _, _ in made], "token_logprobs": [p for _, p, _ in made], "top_logprobs": [{word(a): b for a, b in top} for _, _, top in made]}
+        one = lambda t, p: {"token": word(t), "logprob": p, "bytes": raw(t)}
+        if is_chat: return {"content": [one(t, p) | {"top_logprobs": [one(a, b) for a, b in top]} for t, p, top in made]}
+        return {"tokens": [word(t) for t, _, _ in made], "token_logprobs": [p for _, p, _ in made],
+                "top_logprobs": [{word(a): b for a, b in top} for _, _, top in made]}
       def logprobs(k=None):  # its tokens' log probabilities, or those of its k-th piece's
         if r.logprobs is None: return {"logprobs": None}
         return {"logprobs": chances(r.probs if k is None else r.probs[r.marks[k - 1] if k else 0:r.marks[k]])}
@@ -655,7 +689,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
           for k, text in enumerate(iter(lambda: r.out.get(timeout=wait), None)):  # (each piece with its tokens' log probabilities)
             send(head | {"choices": [piece(text, None) | logprobs(k)]})
           if made := called(seen["text"])[1]:
-            send(head | {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}, "finish_reason": None}]})
+            calling = {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}
+            send(head | {"choices": [{"index": 0, "delta": calling, "finish_reason": None}]})
           send(head | {"choices": [piece("", "tool_calls" if made else r.finish)]})
           send(head | {"choices": [], "usage": usage()})
           return self.wfile.write(b"data: [DONE]\n\n")
@@ -685,7 +720,8 @@ def fetch(model, cache=os.path.expanduser("~/.cache/ferrite/hub")):
     token = {"Authorization": f"Bearer {os.environ['HF_TOKEN']}"} if "HF_TOKEN" in os.environ else {}
     url = f"{os.environ.get('HF_ENDPOINT', 'https://huggingface.co')}/{model}/resolve/main/{name}"
     try:
-      with urllib.request.urlopen(urllib.request.Request(url, headers=token), timeout=60) as r, open(path + ".part", "wb") as f: shutil.copyfileobj(r, f)
+      with urllib.request.urlopen(urllib.request.Request(url, headers=token), timeout=60) as r, open(path + ".part", "wb") as f:
+        shutil.copyfileobj(r, f)
     except urllib.error.HTTPError as e:
       if needed or e.code != 404: raise
       return None
@@ -709,17 +745,17 @@ def main():
   rt, start = Runtime(chip), time.time()
   c, weights = llama.load(folder, places)
   c.precision = llama.precision(c, mode, kv)
-  chunk = 2048 if c.experts else 256  # a mixture of experts' chunk reads nearly all of every block's experts (cost.prompt)
-  engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places, chunk)
+  engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places)
   config = lambda f: llama.read_json(os.path.join(folder, f)) if os.path.exists(os.path.join(folder, f)) else {}
-  eos = (config("generation_config.json") or config("config.json")).get("eos_token_id")
-  defaults = {k: v for k, v in config("generation_config.json").items() if k in ("temperature", "top_k", "top_p", "min_p", "repetition_penalty")}
+  generation, name = config("generation_config.json"), os.path.basename(folder.rstrip("/"))
+  eos = (generation or config("config.json")).get("eos_token_id")
+  eos = eos if isinstance(eos, list) else [] if eos is None else [eos]
+  defaults = {k: v for k, v in generation.items() if k in ("temperature", "top_k", "top_p", "min_p", "repetition_penalty")}
   threading.Thread(target=engine.run, daemon=True).start()
-  print(f"{os.path.basename(folder.rstrip('/'))} on the chip in {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} places, "
-        f"prompts {chunk} tokens at a time, port {port}", flush=True)
+  print(f"{name} on the chip in {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} places, "
+        f"prompts {engine.chunk} tokens at a time, port {port}", flush=True)
   jinja = os.path.join(folder, "chat_template.jinja")  # where transformers 5 keeps it
   template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
-  server(engine, os.path.basename(folder.rstrip("/")), template, eos if isinstance(eos, list) else [eos] if eos is not None else [], port,
-         defaults=defaults).serve_forever()
+  server(engine, name, template, eos, port, defaults=defaults).serve_forever()
 
 if __name__ == "__main__": main()
