@@ -1700,29 +1700,33 @@ def test_qwen3_5_sequences(chip):
   assert not any(np.any(np.frombuffer(s.tobytes(), np.float32)) for l in range(3) for s in free[l]), "the free slot's states stay 0"
 
 def test_delta_step(chip):
-  # Tensor.delta, Gated DeltaNet's recurrence for a decode step's token, or a verify step's token and its draft, in one
-  # kernel (each state read once): each value head's outputs and new states as numpy's step from the same q, k, v, beta
-  # and g, to fp32's rounding, its key head shared by vh / kh value heads, for one sequence of the small Qwen3.5's
-  # heads, three of 64 by 96 (a dead one's states left as they were) and four of Qwen3.6's 32 heads of 128 by 128; a
-  # verify step from the states after both of the last step's tokens or after its first alone, as accept says
+  # Tensor.delta, a Gated DeltaNet decode step's token, or a verify step's token and its draft, in one kernel of each key
+  # head (each state read once), from each token's projections: the conv over its last inputs and its own, SiLU, q and k
+  # to length 1, beta and g, and the recurrence; each value head's outputs and new states as numpy's (numpy_delta) within
+  # 1e-5 of their largest, the conv's inputs each token leaves exactly, a key head for vh / kh value heads: one sequence
+  # of the small Qwen3.5's heads, three of 64 by 96 (a dead one's conv and states left as they were) and four of
+  # Qwen3.6's 32 heads of 128 by 128; a verify step from the states after both of the last step's tokens or after its
+  # first alone, as accept says
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(1)
-  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0] if a.ndim == 3 else 1, "fp32")
+  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
   for m in (1, 2):
     for n, kh, vh, kd, vd in ((1, 2, 4, 32, 32), (3, 2, 4, 64, 96), (4, 16, 32, 128, 128)):
-      tokens = []
-      for _ in range(m):
-        q, k = rng.normal(0, 0.3, (kh, n, kd)), rng.normal(0, 0.3, (kh, n, kd))
-        tokens.append((q, k / np.linalg.norm(k, axis=-1, keepdims=True), rng.normal(0, 1, (vh, n, vd)), rng.uniform(0, 1, (n, vh)), -rng.uniform(0, 0.5, (n, vh))))
+      width = 2 * kh * kd + vh * vd
+      x = np.float32(rng.normal(0, 1, (1, n * m, width + vh * vd + 2 * vh)))
+      conv, conv2 = (np.float32(rng.normal(0, 1, (3, n, width))) for _ in range(2))
+      taps, dt, decay = np.float32(rng.normal(0, 0.5, (4, 1, width))), np.float32(rng.normal(0, 1, (1, 1, vh))), np.float32(-rng.uniform(0.5, 2, (1, 1, vh)))
       S, first = (np.float32(rng.normal(0, 0.1, (n * vh, kd, vd))) for _ in range(2))
-      live, accept = np.ones((1, n)), np.float32(np.arange(n) % 2).reshape(1, n)
-      live[0, 1:2] = 0  # (the second sequence: dead)
-      states, firsts = up(S), up(first)
-      got = value(states.delta([tuple(map(up, t)) for t in tokens], up(live), *((firsts, up(accept)) if m > 1 else ())))
-      want_S, want_first = np.float64(S), np.float64(first)
-      want = llama.numpy_delta(want_S, tokens, live, *((want_first, accept) if m > 1 else ()))
-      for a, b in ((got, want), (value(states), want_S)) + (((value(firsts), want_first),) if m > 1 else ()):
-        assert np.abs(a - b).max() < 1e-5 * np.abs(b).max(), (m, n, kd, vd, np.abs(a - b).max())
-      assert n < 3 or np.array_equal(value(states)[vh:2 * vh], S[vh:2 * vh]), "a dead sequence's states as they were"
+      live, accept = np.ones((1, 1, n), np.float32), np.float32(np.arange(n) % 2).reshape(1, 1, n)
+      live[0, 0, 1:2] = 0  # (the second sequence: dead)
+      ts = {k: up(a) for k, a in dict(S=S, x=x, conv=conv, taps=taps, dt=dt, decay=decay, live=live, first=first, accept=accept, conv2=conv2).items()}
+      got = value(ts["S"].delta(*(ts[k] for k in ("x", "conv", "taps", "dt", "decay", "live")), *((ts["first"], ts["accept"], ts["conv2"]) if m > 1 else ())))
+      want_S, want_first, want_conv, want_conv2 = np.float64(S), np.float64(first), np.float64(conv), np.float64(conv2)
+      want = llama.numpy_delta(want_S, x, want_conv, taps, dt, decay, live, *((want_first, accept, want_conv2) if m > 1 else ()))
+      for a, b in ((got, want), (value(ts["S"]), want_S)) + (((value(ts["first"]), want_first),) if m > 1 else ()):
+        assert np.abs(a - b).max() < 1e-5 * np.abs(b).max(), (m, n, kd, vd, np.abs(a - b).max() / np.abs(b).max())
+      for a, b in ((value(ts["conv"]), want_conv),) + (((value(ts["conv2"]), want_conv2),) if m > 1 else ()):
+        assert np.array_equal(a, np.float32(b)), (m, n, "the conv's inputs")
+      assert n < 3 or np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and np.array_equal(value(ts["conv"])[:, 1], conv[:, 1]), "a dead sequence's"
 
 def test_delta_pieces(chip):
   # Gated DeltaNet's prompt in pieces of 64 at once (llama.chunk: all that the state does not enter for every piece, then

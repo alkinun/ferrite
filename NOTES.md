@@ -424,23 +424,28 @@ wider, but gpt-oss's (its sinks).
 
 ### Gated DeltaNet's step
 
-`Tensor.delta` (`compiler.delta_kernel`): a decode step's recurrence, S = e^g S + beta k (v - e^g S^T k)^T and the output
-S^T q after it, for each value head of each sequence (a unit), in fp32 on the SFPU, each state read once and written
-once; or a verify step's token and its draft, from the states after both of the last step's tokens or after its first
-alone (BRISC reads the one its accept says), both tokens' new states written, one read and two writes where eleven
-passes were. BRISC reads the head's S (kt x vt tiles) into a frame (two alternate between units), each token's row
-runs of its key's and query's values and its value's, and its beta and g, and live: it stores each key and query
-value in column 0 of a zero tile's row, the value's runs land in row 0 of zero tiles, each scalar in place 0. The math thread fills Dst from L1
-itself (fp32) and folds those across their rows and columns (`across_rows`, `across_cols`) into broadcast tiles: a
-column tile of the key and of the query, a row tile of the value, e^g and beta everywhere, k . q from the column tiles'
-products folded down. The recurrence is separable by column: for each column tile j, one SFPU pass over its kt tiles
-sums u = S^T k and w = S^T q down the column (two Dst accumulators), d = beta (v - e^g u) stays in Dst, the output's
-tile is e^g w + d (k . q), and the column's new tiles e^g S + k d (a first of two tokens' packed into L1 too, the
-second's S); programs read up to five Dst places at once (fills at fixed rows, a result in a half by a variant for
-each). BRISC sends the output's row runs into its tile and the new
-tiles over the old, but a dead sequence's. A decode step's Gated DeltaNet block is then the qkv matmul, the conv,
-its inputs' shift, q's and k's norms, beta and g, this kernel, the output's norm and gate and the output matmul: no
-moves.
+`Tensor.delta` (`compiler.delta_kernel`): a decode step's Gated DeltaNet from its token's projections to its outputs,
+or a verify step's token and its draft, in fp32 on the SFPU, each state read once and written once. A unit is a key
+head of a sequence and its value heads, so it alone reads and writes its channels of the conv's last inputs. BRISC
+reads its value heads' S (kt x vt tiles each) into a frame (two alternate between units), from the states after both
+of the last step's tokens or after its first alone as accept says, and the row runs of its channels from the conv's
+last 3 inputs, the tokens' own rows of the projections and the 4 taps: q's and k's go into columns 0-3 of a tile (a
+channel a row), v's land in rows 0-3 (a channel a column), b, a, dt and decay in place 0. Once it has read them it
+writes the inputs each token leaves (each one up a place, its own last; a verify step's first token's into those kept
+apart), where the sequence is live: no shift launches, and the inputs never cross DRAM in whole tiles. The math thread
+fills Dst from L1 itself, masks what lies outside the filled places to 0 there (so no tile is zeroed in L1), and folds
+(`across_rows`, `across_cols`) into broadcast tiles: each channel's 4 inputs by its 4 taps summed across the row (or
+down the column) through SiLU, q and k each to length 1 by the sum of their squares folded down (q times kd^-1/2),
+beta = sigmoid(b) and e^g = exp(decay softplus(a + dt)) everywhere, k . q. The recurrence is separable by column: for
+each value head and column tile j, one SFPU pass over its kt tiles sums u = S^T k and w = S^T q down the column (two
+Dst accumulators), d = beta (v - e^g u) stays in Dst, the output's tile is e^g w + d (k . q), and the column's new
+tiles e^g S + k d (a first of two tokens' packed into L1 too, the second's S). The SFPU programs are functions the
+loops call, so no loop's body is thousands of inline Tensix words long: one that was made ttsim decode an XMOV (why is
+not known). BRISC sends the output's row runs into its tile and the new tiles over
+the old, but a dead sequence's. A decode step's Gated DeltaNet block is then the qkv matmul, this kernel, the output's
+norm and gate and the output matmul: at Qwen3.6's shapes 22 launches with its experts where it was 30, 65 MB read where
+it was 87 at one sequence and 174 where 204 at eight; the kernel's RISC-V work is 38K ttsim cycles at one sequence
+and 55K at eight, where the six kernels it replaces took 13K and 20K.
 
 ### Shapes and movement
 

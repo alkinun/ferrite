@@ -508,25 +508,30 @@ class Tensor:
     weighted = lambda at, cols: functools.reduce(Tensor.__add__, [(m - top).exp() * part(p, at, cols) for p, m in enumerate(largest)])
     return (weighted(0, self.cols) / weighted(ht, 1)).cast("bf16")
 
-  def delta(self, tokens, live=None, first=None, accept=None):
-    """Gated DeltaNet's recurrence for a token of each sequence, or a token and its draft (a verify step's), in place:
-    self the states (sequences times value heads, a key's width by a value's; fp32), each S = e^g S + beta k (v - e^g
-    S^T k)^T a token, and each head's output S^T q after it, by one kernel (delta_kernel) reading each state once.
-    tokens: each token's (q, k, v, beta, g): q and k (key heads, sequences, a key's width), v (value heads, sequences, a
-    value's width), a key head for every vh / kh value heads, beta and g (sequences, value heads); live (a row of
-    sequences, 0 for one whose states stay as they were; all live unless said); all fp32. A token and its draft: first,
-    the states after a first token alone, which accept (a row of sequences) says to go on from (0) or self (1), and which
-    take the states after this step's token; self after its draft. Returns the outputs, (value heads, a sequence's
-    tokens in turn, a value's width) in fp32; no gradient."""
-    m, (q, k, v, beta, g) = len(tokens), tokens[0]
-    vh, kh, n = beta.cols, q.batch, beta.rows
-    assert self.dtype == "fp32" and all(t.dtype == "fp32" for x in tokens for t in x) and vh % kh == 0 and self.batch == n * vh and (first is None) == (m == 1)
-    assert all(x[0].shape == x[1].shape == (kh, n, self.rows) and x[2].shape == (vh, n, self.cols) and x[3].shape == x[4].shape == (1, n, vh) for x in tokens)
+  def delta(self, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2=None):
+    """Gated DeltaNet's decode step for a token of each sequence, or a verify step's token and its draft, in place,
+    from the tokens' projections, by one kernel (delta_kernel) reading each state once: self the states (sequences
+    times value heads, a key's width by a value's), each S = e^g S + beta k (v - e^g S^T k)^T a token, and each head's
+    output S^T q after it. x: each token's projections, a row (q's, k's, v's, z's, b's and a's side by side; a
+    sequence's tokens in turn); conv: the conv's last 3 inputs (3 matrices, oldest first, a sequence a row), which each
+    token moves up a place, its own last; taps (4 matrices of a row); dt and decay (a row of value heads): each token's
+    q, k and v are the SiLU of its conv, q and k to length 1 (q times a key's width^-1/2), beta = sigmoid(b), g = decay
+    softplus(a + dt). live: a row of sequences, 0 for one whose conv and states stay as they were (all live unless
+    said); all fp32. A token and its draft: first and conv2, the states and the conv's inputs after a first token alone,
+    which accept (a row of sequences) says to go on from (0) or self and conv (1), and which take those after this
+    step's token; self and conv after its draft. Returns the outputs, (value heads, a sequence's tokens in turn, a
+    value's width) in fp32; no gradient."""
+    n, kd, vd, width = conv.rows, self.rows, self.cols, conv.cols
+    m, vh = x.rows // n, self.batch // n
+    kh = (width - vh * vd) // 2 // kd
+    ins = (x, conv, taps, dt, decay, *((first, accept, conv2) if first is not None else ()))
+    assert all(t.dtype == "fp32" for t in (self, *ins)) and m in (1, 2) and (first is not None) == (m == 2) and vh % kh == 0
+    assert x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width) and dt.shape == decay.shape == (1, 1, vh)
     live = live if live is not None else self._number(1.0, "fp32").expand(1, 1, n).realize()
-    o = Tensor.frombytes(self.rt, n * m, self.cols, bytes(4 * vh * n * m * self.cols), vh, "fp32")  # (its padding rows 0, as no unit writes them)
-    key = ("delta", -(-self.rows // 32), -(-self.cols // 32), vh, vh // kh, m)
-    ins = [self.realize(), o] + [_plain(t.realize()) for t in (live, *((first, accept) if m > 1 else ()), *(t for x in tokens for t in x))]
-    return o._run(_cached(key, lambda: delta_kernel(*key[1:])), *[x for t in ins for x in t._where()], units=n * vh, name="delta")
+    o = Tensor.frombytes(self.rt, n * m, vd, bytes(4 * vh * n * m * vd), vh, "fp32")  # (its padding rows 0, as no unit writes them)
+    key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m)
+    order = [self, o, live, *((first, accept) if m > 1 else ()), x, conv, *((conv2,) if m > 1 else ()), taps, dt, decay]
+    return o._run(_cached(key, lambda: delta_kernel(*key[1:])), *[v for t in order for v in _plain(t.realize())._where()], units=n * kh, name="delta")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above, so autograd has them too
   def conv2d(self, w, padding=0):
