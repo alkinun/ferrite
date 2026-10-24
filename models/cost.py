@@ -24,13 +24,14 @@ LAUNCHES = {"attention": 21, "experts": 17, "deltanet": 5, "rest": 10,  # a deco
 # projections, the delta kernel, its output's norm and gate), the rest (the embedding's gather, the places' columns, the
 # final norm, the output layer, sampling's heads), each a verify step's too, and the multi-token prediction layer's call.
 # Counted on ttsim at Qwen3.6's shapes, eight slots (cmp/qwen36/step.py).
-ACTIVATIONS = 12e6, 45e6  # bytes a decode step reads past its weights, experts, states and attention's rows: a block's
-# (activations in 32-row tiles, each expert's outputs) and the rest's (the logits sampling reads), at Qwen3.6's shapes
+ACTIVATIONS = 4e6, 45e6  # bytes a decode step reads past its weights, experts, states and attention's rows: a block's
+# activations in 32-row tiles and the rest's (the logits sampling reads, a tile row of tokens), at Qwen3.6's shapes; and
+# each picked expert's outputs (outputs below), its tokens' tile rows of its gate and up, their GLU and its down
 CONTROL = {  # ttsim cycles a block's launches (with its experts), and the rest's, take past their reads at 265 bytes a cycle
   "attention": ((1, 42000), (8, 21800), (32, 24000)), "deltanet": ((1, 38400), (8, 13500), (32, 17900)),  # (358 GB/s at
   "rest": ((1, 180000), (8, 837000), (32, 1918000)),                                                       # 1.35 GHz), by
-  "attention verify": ((2, 46900), (16, 29800)), "deltanet verify": ((2, 63600), (16, 28200)),            # the step's tokens:
-  "rest verify": ((2, 449000), (16, 1702000)), "draft": ((2, 50300), (16, 32800))}                         # the RISC-V work a
+  "attention verify": ((2, 46900), (16, 29800), (64, 49000)), "deltanet verify": ((2, 63600), (16, 28200), (64, 26800)),  # the
+  "rest verify": ((2, 449000), (16, 1702000), (64, 5104000)), "draft": ((2, 50300), (16, 32800), (64, 49300))}  # step's tokens: the RISC-V work a
 # card waits on beyond DRAM (cmp/qwen36/step.py's "past reads" at Qwen3.6's shapes; between counts, a straight line)
 WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 banks of 4 GiB, a GiB of it for kernels and activations
@@ -108,11 +109,12 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   reads += blocks * attention(c, c.kv * users, c.heads // c.kv * (1 + speculative), use["context"], use["kv"])  # verify's: one of two, both)
   flops = 2 * n * s.values + n * sum(4 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))
   linear, v = sum(llama.linear(c, l) for l in range(c.layers)), " verify" * speculative
-  reads += c.layers * ACTIVATIONS[0] + ACTIVATIONS[1]
+  outputs = lambda tokens: touched(c, tokens) * -(-tokens // 32) * 32 * (3 * (c.moe or 0) + d) * BYTES["bf16"]  # (a block's)
+  reads += c.layers * ACTIVATIONS[0] + s.moe * outputs(n) + ACTIVATIONS[1] * -(-n // 32)
   launches = blocks * LAUNCHES["attention" + v] + linear * LAUNCHES["deltanet" + v] + s.moe * LAUNCHES["experts"] + LAUNCHES["rest" + v]
   control = blocks * past("attention" + v, n) + linear * past("deltanet" + v, n) + past("rest" + v, n)
   if speculative:  # the drafting call: the layer over two places a user, and the output layer again
-    reads += s.draft + c.mtp * touched(c, 2 * users) * s.expert + s.head + c.mtp * ACTIVATIONS[0]
+    reads += s.draft + c.mtp * (touched(c, 2 * users) * s.expert + ACTIVATIONS[0] + outputs(2 * users)) + s.head
     reads += c.mtp * attention(c, c.kv * users, 2 * c.heads // c.kv, use["context"], use["kv"])
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)
     launches += LAUNCHES["draft"]

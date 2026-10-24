@@ -596,16 +596,22 @@ tale's 89.6% and 88.4%, the compiler's 70.0% and 54.0%, and by the bfp4 draft he
 `models/cost.py`: what a model costs to serve, from its config alone. A card holds the weights in a mode's formats, a
 GiB for kernels and activations, and sessions (KV cache rows, Gated DeltaNet states). A decode step for n users reads
 every matrix but the experts and the embedding, the experts its tokens pick (E (1 - (1 - k/E)^tokens) a block), the
-states, and what attention's kernel reads (keys twice, values once); it waits on DRAM or the
-matmuls, whichever is longer, then on its launches (`LAUNCHES`, counted on ttsim) or the RISC-V work ttsim counts
-(`CONTROL`), whichever is more. A prompt's chunks read the experts their tokens pick and their attention's keys and
-values for every eight tile rows of each query head. The card is its specification (512 GB/s at a 0.7 reach, a guess;
-664 TFLOPS at one fidelity phase; a microsecond a launch) until the probe measures it (`probe=probe.json`).
+states (read and written once; a verify step's one of two read, both written), the rows attention's kernel reaches
+(keys once where a part keeps them in L1, values once), and activations (`ACTIVATIONS`: 4 MB a block in 32-row tiles,
+each picked expert's outputs for its tokens' tile rows, 45 MB of logits a tile row of tokens). It waits on DRAM or the
+matmuls, whichever is longer, then on its launches (`LAUNCHES`), then on the RISC-V work its kernels do past their reads
+(`CONTROL`, by the step's tokens). Launches and that work are counted on ttsim at Qwen3.6's shapes
+(`cmp/qwen36/step.py`), where the model's reads come within 11% of the counter's at one, eight and 32 slots, plain and
+speculative (its experts picked uniformly, where the counted step's tokens pick as they do). A prompt's chunks read the
+experts their tokens pick and their attention's keys and values for every eight tile rows of each query head. The card
+is its specification (512 GB/s at a 0.7 reach, a guess; 664 TFLOPS at one fidelity phase; a microsecond a launch) until
+the probe measures it (`probe=probe.json`).
 
-For Qwen3.6 on one card (experts bfp4, KV cache bfp8, sessions of 32K tokens): 25 sessions; 93 tokens/s for one user,
-237 a card at eight users, 273 at sixteen; a 32K-token prompt in 2.1 s. Decoding speculatively with 94% of drafts taken
-(`accept=0.94`; it pays above 44% at one user and 55% at eight): 22 sessions, 125 tokens/s for one user, 61 each and 243
-a card at four, 295 a card at eight.
+For Qwen3.6 on one card (every MLP matrix bfp4, the rest bfp8, a bfp4 draft head, the KV cache bfp8), sessions of 16K
+tokens: 43 on the card (34 speculating); 88 tokens/s for one user, 283 a card at eight users (35 each), 352 at sixteen
+(22 each); speculating with 55% of drafts taken (code, prose) 102 for one user and 374 at sixteen, with 88% (a novel)
+123 and 453. Sessions of 4K tokens: 98 on the card; 406 tokens/s at sixteen users (25 each), 520 at 32. A 16K-token
+prompt in 0.70 s.
 
 ## tinygrad on ferrite
 
