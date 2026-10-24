@@ -1834,15 +1834,16 @@ def touched_kernel(rows, k, n):
 #define OUT {(DATA + tr * 6144 + 4 * n + 4 * slots + 63) // 64 * 64:#x}
 {ROWS}
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
-static unsigned choice(unsigned r, unsigned j) {{ return ((volatile unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
-static unsigned weight(unsigned r, unsigned j) {{ return ((volatile unsigned short *)WEIGHTS)[r / 32 * 1024 + at(r % 32, j)]; }}
+static unsigned choice(unsigned r, unsigned j) {{ return ((const unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}  // (L1 the NoC wrote,
+static unsigned weight(unsigned r, unsigned j) {{ return ((const unsigned short *)WEIGHTS)[r / 32 * 1024 + at(r % 32, j)]; }}  // past noc_wait's fence)
 void kmain(volatile unsigned *a) {{
-  volatile unsigned *list = (volatile unsigned *)LIST, *mark = list + {slots};
+  unsigned *list = (unsigned *)LIST, *mark = list + {slots}, *out = (unsigned *)OUT;
   if (!a[1]) return;
   for (unsigned i = 0; i < {tr}; i++) {{
     unsigned u = a[6] + i * a[5], v = a[9] + i * a[8];
     noc_get(BANK(u), AT(a[4], u, 4096), IDS + i * 4096, 4096), noc_get(BANK(v), AT(a[7], v, 2048), WEIGHTS + i * 2048, 2048);
   }}
+  copy({ZEROS:#x}, OUT, 4096);  // (a weights' tile's rows past the choices' stay 0)
   for (unsigned e = 0; e < {n}; e++) mark[e] = 0;
   noc_wait();
   for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) mark[choice(r, j)] = 1;
@@ -1852,19 +1853,21 @@ void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned s = a[0] + u, e = list[s];
     for (unsigned i = 0; i < {tr}; i++) {{  // its weights' tile row i: each row's weight for e, across the row
-      volatile unsigned *out = (volatile unsigned *)OUT;
-      for (unsigned r = 0; r < 32; r++) {{
+      for (unsigned r = 0; r < 32 && i * 32 + r < {rows}; r++) {{
         unsigned w = 0;
-        for (unsigned j = 0; j < {k} && i * 32 + r < {rows}; j++) if (choice(i * 32 + r, j) == e) w = weight(i * 32 + r, j);
-        for (unsigned c = 0; c < 32; c += 2) out[at(r, c) / 2] = w | w << 16;
+        for (unsigned j = 0; j < {k}; j++) if (choice(i * 32 + r, j) == e) w = weight(i * 32 + r, j);
+        for (unsigned *row = out + (r / 16 * 2) * 128 + r % 16 * 8, c = 0; c < 8; c++) row[c] = row[128 + c] = w | w << 16;  // (its runs in both faces)
       }}
       unsigned t = s * {tr} + i;
+      l1_settle(OUT);
       noc_write(OUT, BANK(t), AT(a[3], t, 2048), 2048), noc_wait();
     }}
     if (s % 32) continue;
-    volatile unsigned *out = (volatile unsigned *)OUT;  // the experts' tile of entries s to s + 31, each across its row
-    for (unsigned r = 0; r < 32; r++) for (unsigned c = 0; c < 32; c++) out[at(r, c)] = s + r < {slots} ? list[s + r] : {n};
-    noc_write(OUT, BANK(s / 32), AT(a[2], s / 32, 4096), 4096), noc_wait();
+    for (unsigned r = 0; r < 32; r++) for (unsigned *row = out + (r / 16 * 2) * 256 + r % 16 * 16, e = s + r < {slots} ? list[s + r] : {n}, c = 0; c < 16; c++)
+      row[c] = row[256 + c] = e;                                                                                           // the experts'
+    l1_settle(OUT);                                                                                                        // tile of entries
+    noc_write(OUT, BANK(s / 32), AT(a[2], s / 32, 4096), 4096), noc_wait();                                                // s to s + 31,
+    copy({ZEROS:#x}, OUT, 4096), noc_wait();                                                                              // each across its row
   }}
 }}""")
 
