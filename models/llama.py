@@ -100,12 +100,13 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, acc
   fidelity phases), rotary: (cos, sin, turn), the tables' rows for this call's places; cache: this block's keys' heads
   then its values', each with a row for every place, this call's written at its rows (or Gated DeltaNet's states);
   mask: -1e9 where a token must not look (gpt2.mask, or around's: on the chip with its places and window); prefill: a
-  prompt's tokens at once, not decode's; live, accept: delta's; slots: forward's."""
+  prompt's tokens at once, not decode's; live: around's, a free slot's token picking no expert (moe) and leaving its
+  Gated DeltaNet states as they were (delta); accept: delta's; slots: forward's."""
   phases = lambda op, block=l: precision_of(c, op, block)[1]  # None: FIDELITY
   h = rms(x, p["input_layernorm"], c)
   x = x + (delta(h, p, c, cache, phases, live, accept) if "conv" in p else attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots))
   h = rms(x, p["post_attention_layernorm"], c)
-  return x + (moe(h, p, c, phases) if "router" in p else mlp(h, p, phases))
+  return x + (moe(h, p, c, phases, live) if "router" in p else mlp(h, p, phases))
 
 def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   """A block's attention over its cache (layer). For several sequences (slots: as many tokens of each, in turn), each
@@ -146,11 +147,11 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
 
 def delta(h, p, c, state, phases, live=None, accept=None):
   """Gated DeltaNet (Qwen3.5's linear attention) over this call's tokens: one sequence's next ones, or as many of each
-  of several (a decode step of a batch, whose live row, 1 or 0 for each, says which are a sequence's: the others
-  leave their states as they were). state: [the conv's last c.conv - 1 inputs (each place's a matrix, its sequences'
-  rows), S (c.vh batch entries a sequence)], updated in place; S is each value head's memory (a key's width by a
-  value's), which a token decays by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g S^T
-  k)^T, and reads with its query. A speculative step's state also keeps both after its first token alone ([...,
+  of several (a decode step of a batch, whose live column, 1 or 0 for each token, says which are a sequence's: the
+  others leave their states as they were). state: [the conv's last c.conv - 1 inputs (each place's a matrix, its
+  sequences' rows), S (c.vh batch entries a sequence)], updated in place; S is each value head's memory (a key's width
+  by a value's), which a token decays by exp(g), then corrects toward its value by beta: S = e^g S + beta k (v - e^g
+  S^T k)^T, and reads with its query. A speculative step's state also keeps both after its first token alone ([...,
   conv's, S]), and its accept row (1 or 0 a sequence) says which the next step goes on from: after both tokens, or
   after the first when its second, a draft, was turned down. p: qkv_proj (q, k and v, then z, b and a, side by side),
   conv (its taps), decay (-exp(A_log)), dt_bias, norm and o_proj. In fp32 from the projections on (as transformers
@@ -161,8 +162,9 @@ def delta(h, p, c, state, phases, live=None, accept=None):
   n, seqs, qk, vw, r = h.shape[-2], past.shape[1], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
   m, width, taps = n // seqs, 2 * qk + vw, p["conv"]  # each sequence's tokens; the conv's channels, and its taps (a batch entry each)
   x = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32")
-  keep = lambda old, new: new if live is None else old + live.reshape(1, seqs, 1) * (new - old)  # (the sequences as rows)
-  big = lambda old, new: new if live is None else old + f.repeat(live.reshape(seqs, 1, 1), c.vh) * (new - old)
+  alive = lambda: live.reshape(1, seqs, m)[:, :, :1]  # (each sequence's first token's: the sequences as rows)
+  keep = lambda old, new: new if live is None else old + alive() * (new - old)
+  big = lambda old, new: new if live is None else old + f.repeat(alive().reshape(seqs, 1, 1), c.vh) * (new - old)
   if (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
     # A decode step's token, or a verify step's token and then its draft, in one kernel of each key head (f.delta): the
     # conv over each one's last inputs (a verify step's those after the last step's draft or its token alone, as accept
@@ -194,12 +196,13 @@ def numpy_delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None,
   tokens in turn): the conv over its last inputs (conv, oldest first; a verify step's conv2's, after the last step's
   token alone, where accept says 0) and its own, through SiLU; each key head's q and k to length 1 (q times a key's
   width^-1/2), each value head's beta (sigmoid of b) and g (decay times softplus of a + dt); then step from S (or
-  first, as accept says). Where live, the conv's inputs and the states are written in place: a first of two's into
-  conv2 and first, the last's into conv and S. The outputs, (value heads, a sequence's tokens in turn, a value's width)."""
+  first, as accept says). Where live (each token's 1 or 0, a sequence's first token's counting), the conv's inputs and
+  the states are written in place: a first of two's into conv2 and first, the last's into conv and S. The outputs,
+  (value heads, a sequence's tokens in turn, a value's width), 0 where not live."""
   n, width = conv.shape[1], conv.shape[-1]
   (vh, kd, vd), m = (S.shape[0] // n, *S.shape[1:]), x.shape[-2] // n
   qk, vw, x = (width - vh * vd) // 2, vh * vd, np.asarray(x).reshape(n, m, -1)
-  each = lambda a: np.ones(n, bool) if a is None else np.asarray(a).reshape(n) != 0
+  each = lambda a: np.ones(n, bool) if a is None else np.asarray(a).reshape(n, -1)[:, 0] != 0  # (a sequence's, or its first token's)
   alive, taken = each(live), each(accept) if m > 1 else np.ones(n, bool)
   chain = np.where(taken[None, :, None], conv, conv2) if m > 1 else conv  # (the last inputs, oldest first)
   state = np.where(np.repeat(taken, vh)[:, None, None], S, first) if m > 1 else S
@@ -217,7 +220,7 @@ def numpy_delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None,
     o, state = step(column(q), column(k), row(y[:, 2 * qk:]), row(beta), row(g), state)
     (into, states), heads = (conv2, first) if t < m - 1 else (conv, S), np.repeat(alive, vh)
     into[:, alive], states[heads] = chain[:, alive], state[heads]
-    out.append(o.reshape(n, vh, vd))
+    out.append(o.reshape(n, vh, vd) * alive[:, None, None])
   return np.stack(out, 2).transpose(1, 0, 2, 3).reshape(vh, n * m, vd)
 
 def step(q, k, v, beta, g, S):
@@ -271,18 +274,20 @@ def glu(gate, up, limit=None):  # SwiGLU's silu(gate) * up; with a limit, gpt-os
   gate = f.minimum(gate, limit)
   return gate * f.sigmoid(gate * 1.702) * (f.minimum(f.maximum(up, -limit), limit) + 1)
 
-def moe(h, p, c, phases=lambda op: None):
+def moe(h, p, c, phases=lambda op: None, live=None):
   """A mixture of experts in the MLP's place (Qwen3's, Mixtral's): each token's router logits, its c.k best experts
   (topk, on the chip), and their SwiGLUs weighted by the softmax of their logits (which Qwen3's top-k probabilities,
   renormalized, are too) and summed; and a shared expert's SwiGLU, if the block has one, gated by a sigmoid of its own.
   p: router (dim x experts), experts.gate_up and experts.down (a batch of the experts' matrices), and gpt-oss's biases
   (router.bias, experts.gate_up_bias and experts.down_bias, a row each expert); phases(op): the fidelity phases of the
-  experts' gate_up and down. c.limit: gpt-oss's GLU (glu)."""
+  experts' gate_up and down. c.limit: gpt-oss's GLU (glu). live: a column of each token's 1 or 0, a token of 0 weighting
+  its experts 0, so that a decode step reads none for it (Tensor.touched)."""
   f, norm = fns(h), c.norm_topk
   logits = f.mm(h, p["router"], None)
   logits = logits + p["router.bias"] if "router.bias" in p else logits  # (gpt-oss's bias)
   values, ids = f.topk(logits if norm else f.softmax(logits), c.k)  # (without norm_topk_prob, the chosen ones' probabilities among all)
-  y = f.experts(h, p, ids, f.softmax(values) if norm else values, (phases("gate_up"), phases("down")), c.limit)
+  w = f.softmax(values) if norm else values
+  y = f.experts(h, p, ids, w if live is None else w * live, (phases("gate_up"), phases("down")), c.limit)
   if "shared_expert_gate" not in p: return y
   return y + f.sigmoid(f.mm(h, p["shared_expert_gate"], None)) * mlp(h, p, phases, "shared_expert.")  # Qwen2-MoE's, every token's
 
@@ -296,14 +301,14 @@ def numpy_experts(h, p, ids, w, phases, limit=None):  # each token's chosen expe
 
 def chip_experts(h, p, ids, w, phases, limit=None):
   """numpy_experts on the chip, by matmuls that pick each expert's weights where they lie (index=). For a few tokens (a
-  decode step) each expert some token picked is one entry with every token its rows (Tensor.touched), its SwiGLU
-  weighted by each token's weight for that expert (0 where the token picked it not), and the entries summed: each such
-  expert's weights read once, and the tokens' rows once a worker. For more (a prompt), each expert's tokens grouped
-  into whole tiles (Tensor.group), a batch entry for each tile, so its weights are read once for every 32 of its tokens,
-  and each token's k outputs gathered back, weighted and summed. Up to 128 tokens (a decode step's) the first, whose
-  extra tile rows cost less than the second's gathers of 64-byte runs; past that whichever makes the fewer tile rows.
-  Either replays, an entry that picks no expert costing nothing but its zeros. An expert's biases are gathered by the
-  same picks."""
+  decode step) each expert some token picked by a weight not 0 is one entry with every token its rows
+  (Tensor.touched), its SwiGLU weighted by each token's weight for that expert (0 where the token picked it not), and
+  the entries summed: each such expert's weights read once, and the tokens' rows once a worker. For more (a prompt),
+  each expert's tokens grouped into whole tiles (Tensor.group), a batch entry for each tile, so its weights are read
+  once for every 32 of its tokens, and each token's k outputs gathered back, weighted and summed. Up to 128 tokens (a
+  decode step's) the first, whose extra tile rows cost less than the second's gathers of 64-byte runs; past that
+  whichever makes the fewer tile rows. Either replays, an entry that picks no expert costing nothing but its zeros. An
+  expert's biases are gathered by the same picks."""
   gate_up, down = p["experts.gate_up"], p["experts.down"]
   (n, k), m, e = ids.shape[1:], down.rows, gate_up.batch
   dense = n <= 128 or -(-n // 32) * min(n * k, e) <= -(-n * k // 32) + min(n * k, e)  # (each way's tile rows a matrix)
@@ -422,46 +427,50 @@ def fuse(w, c):
   return w
 
 def around(w, c, places, size, slots=None, length=None):
-  """For tokens at places: their caches' rows, the rotary tables' rows, and attention's masks over a cache of size rows,
-  a sliding window's too (or None). For several sequences (slots), the next tokens of each in turn: each one's rows
-  in its own part of the caches (size / slots rows), the masks laid out as attention lays out their scores, and a
-  token on its part's last row (a free slot's, which no sequence reaches) seeing only the part's first. length:
-  the masks over a sequence's first length rows alone, the most attention then reads of it. On the chip each mask goes
-  with its rows' places, a column, and its window, which attention in one kernel (Tensor.attend) takes in the mask's
-  place, reading only the rows they reach."""
+  """For tokens at places: their caches' rows, the rotary tables' rows, attention's masks over a cache of size rows, a
+  sliding window's too (or None), and which tokens are live (None: all). For several sequences (slots), the next
+  tokens of each in turn: each one's rows in its own part of the caches (size / slots rows), the masks laid out as
+  attention lays out their scores, and a column of each token's 1 for live, but 0 for a token on its part's last row (a
+  free slot's, which no sequence reaches), which sees only the part's first. length: the masks over a sequence's first
+  length rows alone, the most attention then reads of it. On the chip each mask goes with its rows' places, a column,
+  and its window, which attention in one kernel (Tensor.attend) takes in the mask's place, reading only the rows they
+  reach."""
   numpy = not isinstance(places, Tensor)
   f, places = fns(w["norm"]), np.asarray(places) if numpy else places
-  rotary, n = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), places.shape[-1]
-  if not slots: rows, width, column = places, length or size, places.reshape(-1, 1) if numpy else places.reshape(1, n, 1)
+  rotary, n, live = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), places.shape[-1], None
+  at = places.reshape(-1, 1) if numpy else places.reshape(1, n, 1)  # (each token's place, a column)
+  if not slots: rows, width, column = places, length or size, at
   else:
     part, rep = size // slots, c.heads // c.kv
     rows = places + firsts(None if numpy else places.rt, n, slots, part)
-    seen = f.where(places < part - 1, places, 0)  # (a free slot's token sees its first)
+    live = f.now(f.bf16(at < part - 1))  # (bf16, as the experts' weights it multiplies)
+    seen = f.where(at < part - 1, at, 0)  # (a free slot's token sees its first)
     column = f.expand(seen.reshape(1, n, 1), (1, n, rep)).reshape(1, n * rep, 1)
     column = f.expand(column, (c.kv, n * rep, 1)).reshape(c.kv * slots, n // slots * rep, 1)  # (a key head's and sequence's rows)
     width = length or part
   masks = lambda win: gpt2.masked(column, width, win) if numpy else (gpt2.masked(column, width, win), column, win or 0)
-  return rows, rotary, masks(None), c.sliding and masks(c.sliding)
+  return rows, rotary, masks(None), c.sliding and masks(c.sliding), live
 
 @functools.cache
 def firsts(rt, n, slots, part):  # n tokens' sequences' first rows, n / slots tokens each in turn: a row of int32 on the chip
   row = [i // (n // slots) * part for i in range(n)]
   return np.asarray(row) if rt is None else Tensor.of(rt, [row], "int32")
 
-def forward(ids, places, w, c, caches, slots=None, every=False, live=None, accept=None, hidden=False, length=None):
+def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hidden=False, length=None):
   """The logits for the token after ids, the tokens at places in the sequence: their keys and values go into caches (a
   block's keys' heads then its values', each with a row for every place), and each sees the places up to its own. ids
   and places are rows: lists for numpy, int32 tensors for ferrite. slots: several sequences decoding together (a
   batch of users), the next tokens of each in turn, as many each, their caches side by side (kv_cache's slots: each a
-  part of every block's), each token reading only its own sequence's; then the logits are every token's.
-  every: every token's logits (fp32), not only the last's. w is looked up a block at a time (arrays makes numpy's weights as
-  they are looked up). live, accept: with slots, for Gated DeltaNet's states (delta). hidden: (the logits, every
-  token's hidden state, normed: what the multi-token prediction layer takes, draft). length: attention reads only each
-  sequence's first length rows (a multiple of 32, past every place of this call's), so a call costs what its sequences
-  hold, not their caches' size (attention in one kernel reads only what they hold, whatever the length)."""
+  part of every block's), each token reading only its own sequence's (a free slot's on its part's last row: around);
+  then the logits are every token's. every: every token's logits (fp32), not only the last's. w is looked up a block
+  at a time (arrays makes numpy's weights as they are looked up). accept: with slots, for Gated DeltaNet's states
+  (delta). hidden: (the logits, every token's hidden state, normed: what the multi-token prediction layer takes,
+  draft). length: attention reads only each sequence's first length rows (a multiple of 32, past every place of this
+  call's), so a call costs what its sequences hold, not their caches' size (attention in one kernel reads only what
+  they hold, whatever the length)."""
   f = fns(w["norm"])
   x, size = f.rows(w["embed"], ids), next(k.shape[-2] for k in caches if not isinstance(k, list))  # an attention block's places
-  rows, rotary, mask, window = around(w, c, places, size, slots, length)
+  rows, rotary, mask, window, live = around(w, c, places, size, slots, length)
   prefill = slots is None and x.shape[-2] > 1
   for l in range(c.layers):
     seen = window if window is not None and windowed(c, l) else mask
@@ -480,8 +489,8 @@ def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
   e, h = rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), rms(h, w["mtp.pre_fc_norm_hidden"], c)
   fc = w["mtp.fc"]
   x = f.mm(e, fc[:d, :], None) + f.mm(h, fc[d:, :], None)
-  rows, rotary, mask, _ = around(w, c, places, caches[l].shape[-2], slots, length)
-  x = layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, slots=slots)
+  rows, rotary, mask, _, live = around(w, c, places, caches[l].shape[-2], slots, length)
+  x = layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, live, slots=slots)
   own = "embed.T draft" in w  # (an output layer of its own: the precision's draft head)
   last = x if every else f.rows(x, [x.shape[-2] - 1])
   return f.mm(rms(last, w["mtp.norm"], c), w["embed.T draft" if own else "embed.T"], precision_of(c, "draft head" if own else "head")[1], "fp32")

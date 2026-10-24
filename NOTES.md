@@ -435,8 +435,9 @@ from L1 itself and folds the conv, SiLU, q's and k's lengths and the gates into 
 separable by column: for each value head and column tile j, one SFPU pass over its key tiles sums u = S^T k and w =
 S^T q down the column, d = beta (v - e^g u) stays in Dst, the output's tile is e^g w + d (k . q), and the column's new
 tiles e^g S + k d. The SFPU programs are functions the loops call, so no loop's body is thousands of inline Tensix words
-long. A decode step's Gated DeltaNet block is then the qkv matmul, this kernel, the output's norm and gate and the output
-matmul.
+long. A dead sequence's units (a free slot's, live 0) read nothing but that flag: their math runs on whatever their
+frame holds, and BRISC sends 0 for their outputs and nothing for their states. A decode step's Gated DeltaNet block is
+then the qkv matmul, this kernel, the output's norm and gate and the output matmul.
 
 ### Shapes and movement
 
@@ -504,12 +505,12 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
 - **A mixture of experts** (`moe`): each token's k best experts by `topk` on the chip (a kernel of BRISC's, a row a
   worker), their SwiGLUs by matmuls that pick the experts' weights where they lie, weighted and summed. A decode step's
   tokens go through each expert some token picked once, every token an entry's rows (`Tensor.touched`: the experts
-  picked in order, then none, and each entry's weight from each token, 0 where it picked another), weighted before the
-  down projection and the entries summed, so each touched expert's weights are read once and the tokens' row once. A
-  prompt's tokens are grouped by expert (`Tensor.group`, a counting sort on BRISC) so each expert's weights are read
-  once for every 32 of its tokens, the tiles past those used picking none. Up to 128 tokens (a decode or verify step's)
-  the first, whose extra tile rows cost less than grouping's gathers of 64-byte runs; past that, whichever makes fewer
-  tile rows. Nothing comes back to the host, so a decode step replays.
+  picked by a weight not 0, in order, then none, and each entry's weight from each token, 0 where it picked another),
+  weighted before the down projection and the entries summed, so each touched expert's weights are read once and the
+  tokens' row once. A prompt's tokens are grouped by expert (`Tensor.group`, a counting sort on BRISC) so each
+  expert's weights are read once for every 32 of its tokens, the tiles past those used picking none. Up to 128 tokens
+  (a decode or verify step's) the first, whose extra tile rows cost less than grouping's gathers of 64-byte runs; past
+  that, whichever makes fewer tile rows. Nothing comes back to the host, so a decode step replays.
 - **Gated DeltaNet** (`delta`, Qwen3.5 and 3.6): one matmul makes q, k, v, z, b and a; a causal conv of 4 taps (its last
   3 inputs kept) and SiLU; each value head keeps a 128 x 128 state, S = e^g S + beta k (v - e^g S^T k)^T, read by its
   query, RMS-normed and gated by SiLU(z), in fp32. A decode step goes through the recurrent rule in one kernel of each
@@ -551,8 +552,9 @@ The experts' down projection in bfp4 costs most of the one-card layout's accurac
 `models/serve.py`, an OpenAI-compatible server.
 
 - **Slots.** The engine's KV cache has `slots` slots of `places` rows, and each step is one replayed call for every slot,
-  a free one running on its last row, which no sequence reaches, its attention seeing the slot's first row alone (one
-  tile read) and its Gated DeltaNet states left as they are. Attention in one kernel reads only the rows each
+  a free one running on its last row, which no sequence reaches (`llama.around`'s live): its attention sees the slot's
+  first row alone (one tile read), its token weights its experts 0 so `touched` lists none for it, and the delta
+  kernel neither reads nor writes its Gated DeltaNet states. Attention in one kernel reads only the rows each
   sequence's place reaches, so one replay serves every length; otherwise (gpt-oss's sinks, heads narrower than 64)
   attention reads each slot's rows up to the power of 2 (32 at least) that holds the longest sequence's, a replay
   recorded for each such length. A prompt is prefilled a chunk between steps (2,048 tokens for a mixture of experts,

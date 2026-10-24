@@ -401,11 +401,12 @@ class Tensor:
                units=1, name="group")
     return order, tiles, places
   def touched(self, n, weights):
-    """A mixture of experts' choices (int32, rows x k, values below n) as the experts some row picks, each once: experts,
-    a column of min(rows k, n), those picked in increasing order then n (none); and weights, (that many, rows, 1), each
-    entry's weight from each row (bf16, weights' at the choice, 0 for a row that did not pick it). A decode step's few
-    tokens then go through each picked expert once, every token an entry's rows (a matmul by index=experts, which skips
-    none), weighted and summed over the entries. By one kernel of BRISC's alone, an entry a unit (touched_kernel)."""
+    """A mixture of experts' choices (int32, rows x k, values below n) as the experts some row picks by a weight not 0,
+    each once: experts, a column of min(rows k, n), those picked in increasing order then n (none); and weights, (that
+    many, rows, 1), each entry's weight from each row (bf16, weights' at the choice, 0 for a row that did not pick it).
+    A decode step's few tokens then go through each picked expert once, every token an entry's rows (a matmul by
+    index=experts, which skips none), weighted and summed over the entries. By one kernel of BRISC's alone, an entry a
+    unit (touched_kernel)."""
     assert self.dtype == "int32" and weights.dtype == "bf16" and self.shape == weights.shape and self.batch == 1 and self.cols <= 32
     x, w, rows, k = _plain(self.realize()), _plain(weights.realize()), self.rows, self.cols
     slots = min(rows * k, n)
@@ -522,19 +523,19 @@ class Tensor:
     sequence's tokens in turn); conv: the conv's last 3 inputs (3 matrices, oldest first, a sequence a row), which each
     token moves up a place, its own last; taps (4 matrices of a row); dt and decay (a row of value heads): each token's
     q, k and v are the SiLU of its conv, q and k to length 1 (q times a key's width^-1/2), beta = sigmoid(b), g = decay
-    softplus(a + dt). live: a row of sequences, 0 for one whose conv and states stay as they were (all live unless
-    said); all fp32. A token and its draft: first and conv2, the states and the conv's inputs after a first token alone,
-    which accept (a row of sequences) says to go on from (0) or self and conv (1), and which take those after this
-    step's token; self and conv after its draft. Returns the outputs, (value heads, a sequence's tokens in turn, a
-    value's width) in fp32; no gradient."""
+    softplus(a + dt). All fp32 but live: a column of tokens in bf16, 0 for a sequence's (its first token's says) whose
+    conv and states stay as they were, unread, and whose outputs are 0 (all live unless said). A token and its draft:
+    first and conv2, the states and the conv's inputs after a first token alone, which accept (a row of sequences) says
+    to go on from (0) or self and conv (1), and which take those after this step's token; self and conv after its
+    draft. Returns the outputs, (value heads, a sequence's tokens in turn, a value's width) in fp32; no gradient."""
     n, kd, vd, width = conv.rows, self.rows, self.cols, conv.cols
     m, vh = x.rows // n, self.batch // n
     kh = (width - vh * vd) // 2 // kd
     ins = (x, conv, taps, dt, decay, *((first, accept, conv2) if first is not None else ()))
+    live = live if live is not None else self._number(1.0, "bf16").expand(1, n * m, 1).realize()
     assert all(t.dtype == "fp32" for t in (self, *ins)) and m in (1, 2) and (first is not None) == (m == 2) and vh % kh == 0
     assert x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width)
-    assert dt.shape == decay.shape == (1, 1, vh)
-    live = live if live is not None else self._number(1.0, "fp32").expand(1, 1, n).realize()
+    assert dt.shape == decay.shape == (1, 1, vh) and live.shape == (1, n * m, 1) and live.dtype == "bf16"
     o = Tensor.frombytes(self.rt, n * m, vd, bytes(4 * vh * n * m * vd), vh, "fp32")  # (its padding rows 0, as no unit writes them)
     key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m)
     order = [self, o, live, *((first, accept) if m > 1 else ()), x, conv, *((conv2,) if m > 1 else ()), taps, dt, decay]

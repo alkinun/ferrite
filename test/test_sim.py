@@ -1513,17 +1513,20 @@ def test_moe(chip):
   # (topk), matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen
   # logits and summed, as numpy does for one token, three, eight and 40 (each expert some token picked an entry of every
   # token, Tensor.touched) and for 160 (each expert's tokens grouped into tiles, Tensor.group), replayed (tensor.jit) bit
-  # for bit as op by op; and a two-block model of them decodes from a replay as it does op by op, so a replayed step
-  # reads whatever experts its token chose, and near numpy
+  # for bit as op by op; a free slot's token (live 0) weights its experts 0, its output 0, and touched lists only the
+  # experts others pick by a weight not 0; and a two-block model of them decodes from a replay as it does op by op, so a
+  # replayed step reads whatever experts its token chose, and near numpy
   rt, rng = Runtime(chip), np.random.default_rng(31)
   experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
   c, w = llama.model(dim=64, k=4), experts(64, 16, 64)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
-  for n in (1, 3, 8, 40, 160):
-    h = bf16(rng.normal(0, 1, (n, 64)))
-    got, want = value(llama.moe(Tensor.of(rt, h.tolist()), t, c))[0], llama.moe(h, w, c)
-    assert np.abs(got - want).max() < 0.02 * np.abs(want).max(), (n, np.abs(got - want).max())
+  for n in (1, 3, 8, 40, 160):  # (row 1, where there is one, a free slot's)
+    h, live = bf16(rng.normal(0, 1, (n, 64))), np.float32(np.arange(n) != 1).reshape(n, 1)
+    got, want = value(llama.moe(Tensor.of(rt, h.tolist()), t, c, live=Tensor.of(rt, live.tolist())))[0], llama.moe(h, w, c, live=live)
+    assert np.abs(got - want).max() < 0.02 * np.abs(want).max() and not got[1:2].any(), (n, np.abs(got - want).max())
+  ids, weights = Tensor.of(rt, [[0, 3], [5, 3], [7, 1]], "int32"), Tensor.of(rt, [[0.5, 0.5], [0, 0], [0.25, 0.75]])
+  assert value(ids.touched(8, weights)[0])[0, :, 0].tolist() == [0, 1, 3, 7, 8, 8], "expert 5, weighted 0, not listed"
   grouped, prompts = tensor.jit(lambda h: llama.moe(h, t, c)), np.random.default_rng(41)  # grouping replays: each call its own
   for _ in range(3):
     h = Tensor.of(rt, bf16(prompts.normal(0, 1, (160, 64))).tolist())
@@ -1681,8 +1684,8 @@ def test_qwen3_5_sequences(chip):
   # Qwen3.5's blocks for several sequences at once (qwen35), as a server's slots: each prompt prefilled into its own
   # (its KV rows from row 32 u, its Gated DeltaNet states batch entry u, in place: llama.states), then decode steps of a
   # token of each, one call for all, replayed, a free slot among them on its last row whose states stay as they were
-  # (live 0). Against each sequence alone in numpy, within 3% (0.8%) and picking its tokens (near); and llama.delta in
-  # numpy for a token of each of three sequences at once is each alone's
+  # (llama.around's live 0). Against each sequence alone in numpy, within 3% (0.8%) and picking its tokens (near); and
+  # llama.delta in numpy for a token of each of three sequences at once is each alone's
   rng = np.random.default_rng(29)
   c, weights = qwen35(rng)
   w, size, prompts = llama.arrays(weights), 32, {0: [7, 200, 31], 2: [5, 64, 9, 9, 9]}
@@ -1691,7 +1694,7 @@ def test_qwen3_5_sequences(chip):
   for s in alone: s[0][1][:] = rng.normal(0, 0.1, s[0][1].shape)  # each sequence some state of its own
   many = llama.kv_cache(c, 3 * size, np.zeros, 3)
   for u in range(3): many[0][1][4 * u:4 * u + 4] = alone[u][0][1]
-  together = llama.delta(h, p, c, many[0], lambda op: None, np.array([[1.0, 0.0, 1.0]]))
+  together = llama.delta(h, p, c, many[0], lambda op: None, np.array([[1.0], [0.0], [1.0]]))
   for u in (0, 2): assert np.allclose(together[u], llama.delta(h[u:u + 1], p, c, alone[u][0], lambda op: None)[0], atol=1e-5)
   assert np.array_equal(many[0][1][4:8], alone[1][0][1]), "a free slot's state as it was"
   rt = Runtime(chip)
@@ -1703,10 +1706,10 @@ def test_qwen3_5_sequences(chip):
     want = llama.forward(s, list(range(len(s))), w, c, np_kv[u])[0]
     assert rel(got, want) < 0.03 and near([got], [want]), (u, rel(got, want))
     ids[u].append(int(want.argmax()))
-  step = tensor.jit(lambda ids, places, live: llama.forward(ids, places, t, c, kv, 3, live=live))
+  step = tensor.jit(lambda ids, places: llama.forward(ids, places, t, c, kv, 3))
   for i in range(4):
     places = [len(ids[u]) - 1 if u in ids else size - 1 for u in range(3)]
-    got = gpt2.values(step(on([ids[u][-1] if u in ids else 0 for u in range(3)]), on(places), on([1.0, 0.0, 1.0], "fp32")))
+    got = gpt2.values(step(on([ids[u][-1] if u in ids else 0 for u in range(3)]), on(places)))
     for u in prompts:
       want = llama.forward(ids[u][-1:], [places[u]], w, c, np_kv[u])[0]
       assert rel(got[u], want) < 0.03 and near([got[u]], [want]), (i, u, rel(got[u], want))
@@ -1719,9 +1722,10 @@ def test_delta_step(chip):
   # head (each state read once), from each token's projections: the conv over its last inputs and its own, SiLU, q and k
   # to length 1, beta and g, and the recurrence; each value head's outputs and new states as numpy's (numpy_delta) within
   # 1e-5 of their largest, the conv's inputs each token leaves exactly, a key head for vh / kh value heads: one sequence
-  # of the small Qwen3.5's heads, three of 64 by 96 (a dead one's conv and states left as they were) and four of
-  # Qwen3.6's 32 heads of 128 by 128; a verify step from the states after both of the last step's tokens or after its
-  # first alone, as accept says
+  # of the small Qwen3.5's heads, three of 64 by 96 and four of Qwen3.6's 32 heads of 128 by 128, the second dead (live
+  # 0: its conv and states left as they were, its outputs 0, and where read data is counted, nothing read for it but its
+  # live and accept); a verify step from the states after both of the last step's tokens or after its first alone, as
+  # accept says
   rt, rng = Runtime(chip), np.random.default_rng(1)
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
   for m in (1, 2):
@@ -1732,19 +1736,26 @@ def test_delta_step(chip):
       taps, dt = np.float32(rng.normal(0, 0.5, (4, 1, width))), np.float32(rng.normal(0, 1, (1, 1, vh)))
       decay = np.float32(-rng.uniform(0.5, 2, (1, 1, vh)))
       S, first = (np.float32(rng.normal(0, 0.1, (n * vh, kd, vd))) for _ in range(2))
-      live, accept = np.ones((1, 1, n), np.float32), np.float32(np.arange(n) % 2).reshape(1, 1, n)
-      live[0, 0, 1:2] = 0  # (the second sequence: dead)
-      ts = {k: up(a) for k, a in dict(S=S, x=x, conv=conv, taps=taps, dt=dt, decay=decay, live=live, first=first, accept=accept, conv2=conv2).items()}
-      got = value(ts["S"].delta(*(ts[k] for k in ("x", "conv", "taps", "dt", "decay", "live")),
-                                *((ts["first"], ts["accept"], ts["conv2"]) if m > 1 else ())))
+      live, accept = np.float32(np.arange(n * m) // m != 1).reshape(1, n * m, 1), np.float32(np.arange(n) % 2).reshape(1, 1, n)
+      ts = {k: up(a) for k, a in dict(S=S, x=x, conv=conv, taps=taps, dt=dt, decay=decay, first=first, accept=accept, conv2=conv2).items()}
+      call = lambda live: ts["S"].delta(*(ts[k] for k in ("x", "conv", "taps", "dt", "decay")), Tensor.of(rt, live[0].tolist()),
+                                        *((ts["first"], ts["accept"], ts["conv2"]) if m > 1 else ()))
+      got = value(call(live))
       want_S, want_first, want_conv, want_conv2 = np.float64(S), np.float64(first), np.float64(conv), np.float64(conv2)
       want = llama.numpy_delta(want_S, x, want_conv, taps, dt, decay, live, *((want_first, accept, want_conv2) if m > 1 else ()))
       for a, b in ((got, want), (value(ts["S"]), want_S)) + (((value(ts["first"]), want_first),) if m > 1 else ()):
         assert np.abs(a - b).max() < 1e-5 * np.abs(b).max(), (m, n, kd, vd, np.abs(a - b).max() / np.abs(b).max())
       for a, b in ((value(ts["conv"]), want_conv),) + (((value(ts["conv2"]), want_conv2),) if m > 1 else ()):
         assert np.array_equal(a, np.float32(b)), (m, n, "the conv's inputs")
-      assert n < 3 or (np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and
-                       np.array_equal(value(ts["conv"])[:, 1], conv[:, 1])), "a dead sequence's"
+      if n == 1: continue
+      assert np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and np.array_equal(value(ts["conv"])[:, 1], conv[:, 1]), "a dead sequence's"
+      if chip.pci.counts:  # (the same call again, every sequence live, then the second dead)
+        reads = []
+        for alive in (np.ones_like(live), live):
+          since = rt.launches
+          call(alive)
+          reads += [r[3] for r in rt.profile(since) if r[0] == "delta"]
+        assert n * (reads[1] - kh * 64 * m) == (n - 1) * reads[0], (m, n, reads)
 
 def test_delta_pieces(chip):
   # Gated DeltaNet's prompt in pieces of 64 at once (llama.chunk: all that the state does not enter for every piece, then
@@ -1771,7 +1782,7 @@ def test_delta_pieces(chip):
 
 def test_speculative(chip):
   # A speculative decode step for Qwen3.5 (qwen35): for each of two slots, the token it knows and a draft after it,
-  # verified in one call, a third slot free (live 0). A draft that is the model's own next token is taken and the next
+  # verified in one call, a third slot free (on its last row). A draft that is the model's own next token is taken and the next
   # step goes on from after both tokens; one that is not is turned down and the next step goes on from the Gated
   # DeltaNet states after the first token alone (accept 0), as kept by the step. Drafts right and wrong in turn, every
   # step replayed, each slot's two logits within 3% of numpy's for its sequence from nothing. And the multi-token
@@ -1802,14 +1813,14 @@ def test_speculative(chip):
       theirs = llama.draft(s[1:], list(range(len(s) - 1)), nh, llama.arrays(weights, c.precision), c, llama.kv_cache(c, size, np.zeros))
       assert max(rel(mine[r], theirs[r]) for r in range(len(s) - 1)) < 0.03
       c.precision = None
-  step = tensor.jit(lambda ids, places, live, accept: llama.forward(ids, places, t, c, kv, 3, live=live, accept=accept))
+  step = tensor.jit(lambda ids, places, accept: llama.forward(ids, places, t, c, kv, 3, accept=accept))
   accept = [1.0, 1.0, 1.0]
   for i in range(6):
     right = {u: int(ref(s)[-1].argmax()) for u, s in seqs.items()}
     drafts = {u: right[u] if (i + u) % 2 == 0 else (right[u] + 1) % 256 for u in seqs}
     ids = [x for u in range(3) for x in ([seqs[u][-1], drafts[u]] if u in seqs else [0, 0])]
     places = [p for u in range(3) for p in ([len(seqs[u]) - 1, len(seqs[u])] if u in seqs else [size - 1, size - 1])]
-    got = gpt2.values(step(on(ids), on(places), on([1.0, 1.0, 0.0], "fp32"), on(accept, "fp32")))
+    got = gpt2.values(step(on(ids), on(places), on(accept, "fp32")))
     for u, s in seqs.items():
       want = ref(s + [drafts[u]])[-2:]
       assert rel(got[2 * u], want[0]) < 0.03 and rel(got[2 * u + 1], want[1]) < 0.03, (i, u, rel(got[2 * u], want[0]), rel(got[2 * u + 1], want[1]))

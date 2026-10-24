@@ -1318,7 +1318,7 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
 def delta_kernel(kt, vt, vh, rep, m=1):
   """Gated DeltaNet's decode step for each sequence (Tensor.delta), from its token's projections to its outputs, or a
   verify step's token and its draft, in fp32, each state read once: args [first unit, units, then the states', the
-  output's (a head a matrix, a sequence's m tokens rows in turn) and live's (a sequence a column) DRAM address, tile
+  output's (a head a matrix, a sequence's m tokens rows in turn) and live's (bf16, a token a row) DRAM address, tile
   strides for batch and row, and tile offset; with m of 2 then the states' after a first token and accept's (a sequence
   a column); then x's (a token a row: its q's, k's, v's, z's, b's and a's side by side, a sequence's m in turn), the
   conv's last inputs' (3 matrices, oldest first, a sequence a row; with m of 2 then those after a first token), the
@@ -1334,7 +1334,7 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   value head and column tile j of its S, and each token in turn, one SFPU pass sums u = S^T k and w = S^T q down the
   column's tiles, then d = beta (v - e^g u), the token's output e^g w + d (k . q), and the column's new tiles e^g S +
   k d, the next token's S. Each token's states go home (the last's to the states, a first of two's to the others), a
-  dead sequence's not."""
+  dead sequence's not: BRISC reads nothing of it but its live and accept, and sends 0 for its outputs."""
   kh, kd, vd = vh // rep, 32 * kt, 32 * vt
   qk, vw = kh * kd, vh * vd
   S_ = lambda e, i, j: f"(F0 + ({e}) * {kt * vt} + ({i}) * {vt} + ({j}))"  # value head e's S, tile (i, j)
@@ -1457,10 +1457,10 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   C, C2, TAPS = X + 4, X + 8, X + 4 + 4 * m
   DTA, DCA = TAPS + 4, TAPS + 8
   sc = lambda k: f"STAGE + {sources * 256 * kt} + 64 * ({k})"  # scalar k's 64-byte block
-  scalar = lambda i, row, col, k: (f"{{ unsigned t_ = {tile_of(i, 0, f'({row}) / 32', f'({col}) / 32', 'A')}, "
-                                   f"o_ = at(({row}) % 32, ({col}) % 32) * 4; "
-                                   f"noc_get(BANK(t_), AT(A[{i}], t_, 4096) + o_ / 64 * 64, {sc(k)}, 64); word[{k}] = o_ % 64 / 4; }}")
-  value = lambda k: f"((volatile unsigned *)({sc(k)}))[word[{k}]]"
+  scalar = lambda i, row, col, k, size=4: (f"{{ unsigned t_ = {tile_of(i, 0, f'({row}) / 32', f'({col}) / 32', 'A')}, "  # (a bf16's: size 2)
+                                           f"o_ = at(({row}) % 32, ({col}) % 32) * {size}; noc_get(BANK(t_), AT(A[{i}], t_, {1024 * size}) "
+                                           f"+ o_ / 64 * 64, {sc(k)}, 64); word[{k}] = o_ % 64 / {size}; }}")
+  value = lambda k, size=4: f"((volatile {'unsigned short' if size == 2 else 'unsigned'} *)({sc(k)}))[word[{k}]]"
   staged = lambda src, g: f"(STAGE + ({src}) * {256 * kt} + ({g}) * {128 * kt})"  # source src's runs of q's (g 0) or k's channels (1)
   brisc = SYNC_WORDS + BANKS + f"""
 #define SLOT(i) ({slot_base("fp32"):#x} + (i) * 4096)
@@ -1468,13 +1468,14 @@ def delta_kernel(kt, vt, vh, rep, m=1):
 static const unsigned *A;
 static unsigned fetched, events, frame_done[2], sent, alive[4], word[{scalars}];
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
-static void send(void) {{  // the results packed so far go home: an output's row runs, a live sequence's state's tiles
+static void send(void) {{  // the results packed so far go home: an output's row runs (a dead sequence's 0), a live one's state's tiles
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1), unit = t >> 8 & 0x3FFFFF, s = unit / {vh}, h = unit % {vh};
+    unsigned live = alive[unit / {rep} % 4];
     if (t >> 30 & 1) for (unsigned f = 0; f < 2; f++) {{  // the output's tile of the head's token: its row's runs
       unsigned r = s * {m} + (t >> 6 & 3), o = {tile_of(6, 'h', 'r / 32', 't & 63', 'A')}, off = at(r % 32, 16 * f) * 4;
-      noc_put(SLOT(slot) + off, BANK(o), AT(A[6], o, 4096) + off, 64);
-    }} else if (alive[unit / {rep} % 4]) {{  // the states', or the first token's
+      noc_put((live ? SLOT(slot) : {ZEROS:#x}) + off, BANK(o), AT(A[6], o, 4096) + off, 64);
+    }} else if (live) {{  // the states', or the first token's
       unsigned i = t >> 31 ? {first} : 2, o = {tile_of('i', 'unit', f'(t & 255) / {vt}', f'(t & 255) % {vt}', 'A')};
       noc_put(SLOT(slot), BANK(o), AT(A[i], o, 4096), 4096);
     }}
@@ -1507,9 +1508,10 @@ void kmain(volatile unsigned *args) {{
     unsigned unit = A[0] + u, F0 = 1 + (u & 1) * {F}, s = unit / {kh}, hk = unit % {kh};
     unsigned cq = hk * {kd}, ck = {qk} + hk * {kd}, cv = {2 * qk} + hk * {rep * vd};  // its channels: q's, k's, its value heads' v's
     reached(frame_done[u & 1]);
-    {scalar(10, 0, 's', 0)} {scalar(18, 0, 's', 1) if m > 1 else ""}
+    {scalar(10, f's * {m}', 0, 0, 2)} {scalar(18, 0, 's', 1) if m > 1 else ""}
     noc_wait();
-    alive[unit % 4] = {value(0)} != 0;
+    alive[unit % 4] = {value(0, 2)} != 0;
+    if (!alive[unit % 4]) {{ ready(); frame_done[u & 1] = ++events; continue; }}  // (a dead sequence's: nothing read)
     unsigned taken = {value(1) if m > 1 else 1}, from = taken ? 2 : {first}, c = taken ? {C} : {C2};  // (the states the last step's draft says)
     for (unsigned e = 0; e < {rep}; e++) for (unsigned i = 0; i < {kt}; i++) for (unsigned j = 0; j < {vt}; j++) {{
       unsigned t = {tile_of('from', f's * {vh} + hk * {rep} + e', 'i', 'j', 'A')};
@@ -1547,8 +1549,8 @@ void kmain(volatile unsigned *args) {{
         ((volatile unsigned *)SLOT({AA('t', 'e')}))[0] = {value(f'{2 + 3 * rep} + t * {2 * rep} + e')};
       }}
     }}
-    // the inputs token t leaves (sources t + 1 to t + 3), once read, where the sequence is live
-    if (alive[unit % 4]) for (unsigned t = 0; t < {m}; t++) for (unsigned d = 0; d < 3; d++) {{
+    // the inputs token t leaves (sources t + 1 to t + 3), once read
+    for (unsigned t = 0; t < {m}; t++) for (unsigned d = 0; d < 3; d++) {{
       unsigned into = t == {m - 1} ? {C} : {C2}, src = t + 1 + d, tv = src > 3 ? src - 3 : 0;
       for (unsigned g = 0; g < 2; g++) put_runs(into, d, s, g ? ck : cq, {kt}, {staged('src', 'g')}, 128, 64);
       put_runs(into, d, s, cv, {rep * vt}, SLOT({IV('tv', 0, 0)}) + (src - tv) * 64, 4096, 1024);  // (from token tv's tiles)
@@ -1897,10 +1899,10 @@ def touched_kernel(rows, k, n):
   """A mixture of experts' choices as the experts some row picks (Tensor.touched), args [first unit, units, the
   experts' address, the weights', then the choices' address, tile stride for rows and tile offset, then the choices'
   weights' (bf16) the same]. BRISC alone, a unit an entry: each worker reads the choices (rows x k, values below n) and
-  their weights once, marks the experts picked, and lists them in increasing order, then n (none) past them; entry s
-  writes its tile of each of its weights' tile rows, row r the weight row r gave expert s of the list (0 if it picked
-  it not), across the row, and the entries' first of each 32 their tile of the experts' column, each its expert across
-  its row, as a column's tile holds it."""
+  their weights once, marks the experts picked by a weight not 0, and lists them in increasing order, then n (none)
+  past them; entry s writes its tile of each of its weights' tile rows, row r the weight row r gave expert s of the
+  list (0 if it picked it not), across the row, and the entries' first of each 32 their tile of the experts' column,
+  each its expert across its row, as a column's tile holds it."""
   tr, slots = -(-rows // 32), min(rows * k, n)
   return compile_kernel(f"""
 #define IDS {DATA:#x}
@@ -1921,7 +1923,7 @@ void kmain(volatile unsigned *a) {{
   copy({ZEROS:#x}, OUT, 4096);  // (a weights' tile's rows past the choices' stay 0)
   for (unsigned e = 0; e < {n}; e++) mark[e] = 0;
   noc_wait();
-  for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) mark[choice(r, j)] = 1;
+  for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) if (weight(r, j)) mark[choice(r, j)] = 1;
   unsigned count = 0;
   for (unsigned e = 0; e < {n}; e++) if (mark[e]) list[count++] = e;
   for (; count < {slots}; count++) list[count] = {n};

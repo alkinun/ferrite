@@ -316,7 +316,7 @@ class Engine:
     ids = [r.made[-1] if r else 0 for r in live]
     places = [len(h) if r else self.places - 1 for h, r in zip(self.held, live)]
     n, ts = self.length(max(p for p, r in zip(places, live) if r)), [scale(r) for r in live]
-    self.replay(self.decode, n)(self.on(ids), self.on(places), self.on([float(bool(r)) for r in live], "fp32"), self.column(ts))
+    self.replay(self.decode, n)(self.on(ids), self.on(places), self.column(ts))
     for u, (r, head) in enumerate(zip(live, self.rows(self.decode, n, ts))):
       if r: self.held[u].append(r.made[-1]); self.take(u, head)
 
@@ -325,15 +325,14 @@ class Engine:
     if r.take(head, len(self.held[u]) + room < self.places): self.save(u); self.busy[u] = None; r.end()
     return self.busy[u] is None
 
-  def decode(self, ids, places, live, t, length):  # (replay's) a token of every slot: their logits, and their heads at t
-    logits = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, length=length).realize()
+  def decode(self, ids, places, t, length):  # (replay's) a token of every slot: their logits, and their heads at t
+    logits = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), length=length).realize()
     return logits, heads(logits, t)
 
-  def check(self, ids, places, live, accept, t, length):
+  def check(self, ids, places, accept, t, length):
     """(Speculating, replay's) each slot's token and draft taken in, after its last step's states (accept): their logits
     and heads, and their hidden states kept for guesses."""
-    logits, self.hidden[length] = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), live=live, accept=accept, hidden=True,
-                                                length=length)
+    logits, self.hidden[length] = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), accept=accept, hidden=True, length=length)
     return logits.realize(), heads(logits, t)
 
   def guesses(self, ids, places, taken, length):
@@ -355,8 +354,7 @@ class Engine:
     ids = [x for u, r in enumerate(live) for x in ([r.made[-1], self.drafts[u]] if r else [0, 0])]
     places = [p for u, r in enumerate(live) for p in ([at[u], at[u] + 1] if r else [self.places - 1] * 2)]
     m, ts = self.length(max(at[u] + 1 for u, r in enumerate(live) if r)), [x for r in live for x in (scale(r),) * 2]  # (the drafts' places too)
-    alive = self.on([float(bool(r)) for r in live], "fp32")
-    self.replay(self.check, m)(self.on(ids), self.on(places), alive, self.on(self.taken, "fp32"), self.column(ts))
+    self.replay(self.check, m)(self.on(ids), self.on(places), self.on(self.taken, "fp32"), self.column(ts))
     rows = self.rows(self.check, m, ts)
     pairs = [[0, 0, self.places - 1, self.places - 1] for _ in range(n)]  # each slot's next tokens and their places, for the drafts
     for u, r in enumerate(live):
