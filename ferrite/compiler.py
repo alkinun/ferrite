@@ -1293,8 +1293,8 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   kh, kd, vd = vh // rep, 32 * kt, 32 * vt
   qk, vw = kh * kd, vh * vd
   S_ = lambda e, i, j: f"(F0 + ({e}) * {kt * vt} + ({i}) * {vt} + ({j}))"  # value head e's S, tile (i, j)
-  T0 = rep * kt * vt  # then the taps of the key head's q's and k's channels (columns), of each value head's v's (rows),
-  TQ, TK = (lambda i, o=o: f"(F0 + {T0 + o} + ({i}))" for o in (0, kt))  # and each value head's dt and decay
+  T0 = rep * kt * vt  # then the taps: of the key head's q's and k's channels (columns), of its value heads' v's (rows); dt, decay
+  TQ, TK = (lambda i, o=o: f"(F0 + {T0 + o} + ({i}))" for o in (0, kt))
   TV = lambda e, j: f"(F0 + {T0 + 2 * kt} + ({e}) * {vt} + ({j}))"
   DT, DC = (lambda e, o=o: f"(F0 + {T0 + 2 * kt + rep * vt + o} + ({e}))" for o in (0, rep))
   I0, per = T0 + 2 * kt + rep * vt + 2 * rep, 2 * kt + rep * vt + 2 * rep  # then each token's: its inputs (q's, k's, v's), b and a
@@ -1310,7 +1310,7 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   STAGE = slot_base("fp32") + (OUT + 2) * 4096  # BRISC's: each source's runs of q's and k's channels, then the scalars' 64-byte blocks
   scalars = 2 + 2 * rep + 2 * m * rep  # (live, accept; dt and decay; each token's b and a)
   assert STAGE + sources * 256 * kt + 64 * scalars <= OUTS and OUT + 2 <= UNPACKABLE, "a unit's tiles in L1"
-  R2, R3, R4, R5, R6, R7 = 128, 192, 256, 320, 384, 448  # Dst rows (fp32: a tile's 64): fills, the two sums, e^g, d
+  R2, R3, R4, R5, R6, R7 = 128, 192, 256, 320, 384, 448  # Dst rows (fp32: a tile's 64): fills, the two sums (or a norm, decay), e^g, d (or x aside)
   load = lambda r, at: ins("SFPLOAD", vd=r, mod0=3, addr_mode=2, imm10=at)
   store = lambda r, at, last=True: ins("SFPSTORE", vd=r, mod0=3, addr_mode=3 if last else 2, imm10=at)
   sfpu_body = lambda words: [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), ins("SETRWC", bit_mask=0b0100), Loop(32, words)]
@@ -1683,16 +1683,17 @@ typedef {"unsigned short" if item == 2 else "unsigned"} datum;
 typedef {"short" if item == 2 else "int"} signed_datum;
 static unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile
 // The k best so far as a heap, the worst at the root (of equal keys, the later column), so a better value takes its place
-static int worse(const unsigned *top, const unsigned *col, unsigned i, unsigned j) {{ return top[i] < top[j] || (top[i] == top[j] && col[i] > col[j]); }}
+#define WORSE(a, ca, b, cb) ((a) < (b) || ((a) == (b) && (ca) > (cb)))
+static int worse(const unsigned *top, const unsigned *col, unsigned i, unsigned j) {{ return WORSE(top[i], col[i], top[j], col[j]); }}
 static void swap(unsigned *top, unsigned *col, unsigned i, unsigned j) {{ unsigned t = top[i], c = col[i]; top[i] = top[j], col[i] = col[j], top[j] = t, col[j] = c; }}
-static void down(unsigned *top, unsigned *col, unsigned i, unsigned n) {{
-  for (unsigned m = i;; i = m) {{
-    unsigned l = 2 * i + 1;
-    if (l < n && worse(top, col, l, m)) m = l;
-    if (l + 1 < n && worse(top, col, l + 1, m)) m = l + 1;
-    if (m == i) return;
-    swap(top, col, i, m);
+static void down(unsigned *top, unsigned *col, unsigned i, unsigned n) {{  // the one at i sifted down: worse children moved up into its place
+  unsigned key = top[i], c = col[i];
+  for (unsigned l; (l = 2 * i + 1) < n; ) {{
+    unsigned m = l + 1 < n && WORSE(top[l + 1], col[l + 1], top[l], col[l]) ? l + 1 : l;
+    if (!WORSE(top[m], col[m], key, c)) break;
+    top[i] = top[m], col[i] = col[m], i = m;
   }}
+  top[i] = key, col[i] = c;
 }}
 static unsigned key(unsigned v) {{  // the order of the floats, as unsigned integers
   const unsigned sign = 1u << {bits - 1}, all = {(1 << bits) - 1:#x};
