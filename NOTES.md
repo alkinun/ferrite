@@ -570,8 +570,9 @@ in bf16 over the same text.
   its 64 largest logits and their tokens, by `topk` on parts of the row a worker's L1 holds (Qwen3.6's 248,320 as 97 of
   2,560), each part's 64 side by side, then a `topk` of those given their tokens as labels; and the log of the sum of
   exp(x t) over the row at its request's t = 1/temperature, each part's by one fp32 kernel (one sweep, from the part's
-  largest, the first of its 64) and theirs by another: the logits' tile row is read twice, and a single row's is
-  scanned by one unit of each tile row, which writes all 32 copies of its result. The host reads back under 1 KB a row, not the row: greedy is its first token; top_k up
+  largest, the first of its 64) and theirs by another: the logits are read once whole, and topk reads up to 8 rows'
+  own runs rather than their tiles (a single row's scanned by one unit of each tile row, which writes all 32 copies of
+  its result). The host reads back under 1 KB a row, not the row: greedy is its first token; top_k up
   to 64, and top_p and min_p whose cut lies inside the head, are exact from it, the sum giving each token's share of the
   whole row; a draw with none of them that lands past the head's mass reads the whole rows back and draws from the rest
   of its row alone. Penalties, shapes and logprobs read the whole row. 8 slots' tokens at temperature 0.7 and top_p 0.95

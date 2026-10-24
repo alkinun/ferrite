@@ -1652,8 +1652,8 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   """Each row's k largest of its cols and their columns, the first of equals first, args [first unit, units, the
   values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows, then the
   labels' address, tile strides and offset]. BRISC alone, a unit one row of a tile row of a part of x, 32 to a tile
-  row, so a decode step's few rows go to as many workers: the part's tile row comes in (once for a worker's units of
-  it), and the row is scanned once (one row of x: by the tile row's first unit, which writes the whole tiles), run by run,
+  row, so a decode step's few rows go to as many workers: the row's runs come in (for more than 8 rows, the part's tile
+  row, once for a worker's units of it), and the row is scanned once (one row of x: by the tile row's first unit, which writes the whole tiles), run by run,
   its k best so far a heap with the worst at its root (of equal values, the later column), which a better value
   replaces: once the worst is a float of no sign, a value is checked against it as a signed integer, else by its key
   (bf16 or fp32 as an unsigned integer once its sign orders it, negatives flipped, -0 as 0); then sorted, best first. parts: each row cut into so many parts of cols columns, whole tiles, each part's k
@@ -1705,8 +1705,13 @@ void kmain(volatile unsigned *a) {{
     if (rows == 1 && r) continue;  // (one row of x: the tile row's first unit writes all its copies)
     if (s < n && t * 32 + s != done) {{
       done = t * 32 + s, kept = 0;
-      if (t != held) {{
-        for (unsigned j = 0; j < {ct}; j++) noc_get(BANK(first + j), AT(a[4], first + j, {tb}), X + j * {tb}, {tb});
+      if (t != held || rows <= 8) {{  // a few rows: each one's own runs, where they lie in its tiles; more: the tile row, once
+        for (unsigned j = 0; j < {ct}; j++)                                                                    // a worker
+          if (rows <= 8) for (unsigned f = 0; f < 2; f++) {{
+            unsigned o = (s / 16 * 2 + f) * {256 * item} + s % 16 * {16 * item};
+            noc_get(BANK(first + j), AT(a[4], first + j, {tb}) + o, X + j * {tb} + o, {16 * item});
+          }}
+          else noc_get(BANK(first + j), AT(a[4], first + j, {tb}), X + j * {tb}, {tb});
         noc_wait();
         held = t;
       }}
@@ -1715,6 +1720,11 @@ void kmain(volatile unsigned *a) {{
       int raw = -1;       // than it unless above it as a signed integer, one compare where the key takes four
       for (unsigned c0 = 0; c0 < {cols}; c0 += 16) {{  // the row's run of 16 in each face of each tile, in order
         const signed_datum *run = row + c0 / 32 * 1024 + c0 % 32 / 16 * 256;
+        if (raw >= 0 && c0 + 16 <= {cols}) {{  // (a whole run no better than the worst kept: one branch for its 16)
+          int better = 0;
+          for (unsigned c = 0; c < 16; c++) better |= run[c] > raw;
+          if (!better) continue;
+        }}
         for (unsigned c = c0, end = c0 + 16 < {cols} ? c0 + 16 : {cols}; c < end; c++) {{
           signed_datum d = run[c - c0];
           if (kept == {k} && (raw >= 0 ? d <= raw : key((datum)d) <= last)) continue;  // no better than the worst kept
