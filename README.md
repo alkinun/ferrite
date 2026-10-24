@@ -35,7 +35,7 @@ GPT-2 and the Llama family (Llama 3.1, Mistral, Qwen2 and Qwen3, the mixtures of
 Qwen3-MoE and gpt-oss, and Qwen3.5 and Qwen3.6 with their Gated DeltaNet blocks) with their real weights, each checked
 against the same model in numpy and against transformers. Weights in bf16, bfp8 or bfp4; a decode step replayed from a
 recording; mixtures of experts with their experts chosen on the chip. `models/serve.py` is an OpenAI-compatible server
-for them: requests decode together, sessions are kept on the host between an agent's turns, Qwen3.6 drafts with its
+for them: requests decode together, sessions are kept on the card between an agent's turns, Qwen3.6 drafts with its
 multi-token prediction layer, and tool calls, structured outputs and cached-token usage are OpenAI's and OpenRouter's.
 tinygrad runs on ferrite as a device (`adapters/`), and PyTorch through tinygrad's frontend.
 

@@ -412,8 +412,8 @@ must not look. The keys' length is an argument, so one kernel serves every lengt
   for the second (`attention_store`: a bf16 cache's in free slots; a block float's in regions of whole key rows, at most
   64 tiles each, below B8 past the slots in use and past the frames' regions, 104 rows of Qwen3.6's 256-wide heads in
   bfp8), the unpacker switched to each row's region: each key is read once. Within 1% of numpy. A decode step's
-  attention at Qwen3.6's shapes reads 1.13 times the cache's keys and values at 8 slots of 2,048 places where it read
-  1.65, and 1.04 at 32 of 1,024.
+  attention at Qwen3.6's shapes reads 1.13 times the cache's keys and values at 8 slots of 2,048 places, and 1.04 at
+  32 of 1,024.
 
 A decode step has few units (a key head's per slot), so when they are few each unit's keys are shared out among up to 8
 **parts** on workers of their own (flash decoding), or as many more as keep each part's keys in L1, each part's p v, sums and largest coming home for a few fused kernels
@@ -441,11 +441,10 @@ each value head and column tile j, one SFPU pass over its kt tiles sums u = S^T 
 Dst accumulators), d = beta (v - e^g u) stays in Dst, the output's tile is e^g w + d (k . q), and the column's new
 tiles e^g S + k d (a first of two tokens' packed into L1 too, the second's S). The SFPU programs are functions the
 loops call, so no loop's body is thousands of inline Tensix words long: one that was made ttsim decode an XMOV (why is
-not known). BRISC sends the output's row runs into its tile and the new tiles over
-the old, but a dead sequence's. A decode step's Gated DeltaNet block is then the qkv matmul, this kernel, the output's
-norm and gate and the output matmul: at Qwen3.6's shapes 22 launches with its experts where it was 30, 65 MB read where
-it was 87 at one sequence and 174 where 204 at eight; the kernel's RISC-V work is 38K ttsim cycles at one sequence
-and 55K at eight, where the six kernels it replaces took 13K and 20K.
+not known). BRISC reads and writes a source's runs a tile range at a time, and sends the output's row runs into its
+tile and the new tiles over the old, but a dead sequence's. A decode step's Gated DeltaNet block is then the qkv
+matmul, this kernel, the output's norm and gate and the output matmul: at Qwen3.6's shapes 22 launches with its
+experts, reading 65 MB at one sequence and 174 at eight; the kernel itself takes 34K ttsim cycles at one sequence.
 
 ### Shapes and movement
 
@@ -576,7 +575,7 @@ in bf16 over the same text.
   to 64, and top_p and min_p whose cut lies inside the head, are exact from it, the sum giving each token's share of the
   whole row; a draw with none of them that lands past the head's mass reads the whole rows back and draws from the rest
   of its row alone. Penalties, shapes and logprobs read the whole row. 8 slots' tokens at temperature 0.7 and top_p 0.95
-  take 0.08 ms of the host's a step, where drawing from whole rows took 4.3.
+  take 0.08 ms of the host's a step.
 - **Requests.** Penalties (presence, frequency, repetition, as vLLM applies them), temperature, top_k, top_p, min_p,
   seed, stop strings (searched for only where the newest token's text could complete one), logprobs; those a request
   leaves out are the model's own (its `generation_config.json`'s, as vLLM takes them: Qwen3.6's top_k 20, top_p 0.95),
