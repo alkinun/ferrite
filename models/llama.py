@@ -57,7 +57,8 @@ def precision(c, mode="bf16", kv=None):
   block's gate and up in bfp8 at two, as its model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json has
   them. experts: every MLP matrix (a mixture's experts' and shared expert's, gate, up and down) in bfp4 at one phase,
   which multiplies all of a bfp4 value's bits, the rest and the output layer in bfp8 at two: Qwen3.6-35B-A3B on one card
-  (21.7 GB). kv: the KV cache's format (None at block None), bf16 unless said (tt's and experts' bfp8)."""
+  (21.7 GB), its multi-token prediction layer drafting by a copy of the output layer in bfp4 at one ("draft head", 0.29
+  GB; its drafts taken 0.1 to 1.2 points less often than by the bfp8 one). kv: the KV cache's format (None at block None), bf16 unless said (tt's and experts' bfp8)."""
   four = {"bfp4": ("gate_up",), "tt": ("gate_up",), "experts": ("gate_up", "down")}.get(mode, ())  # the ops in bfp4
   fast = mode in ("tt", "experts")  # one phase for a bfp4 B and two for a bfp8 one, else four
   def entry(op):
@@ -67,6 +68,7 @@ def precision(c, mode="bf16", kv=None):
   p = {(op, l): entry(op) for l in range(c.layers + getattr(c, "mtp", 0)) for op in ("qkv", "o", "gate_up", "down")}
   if mode == "tt" and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
   p["head", None] = entry("head")
+  if mode == "experts": p["draft head", None] = ("bfp4", 1)
   return p | {("attention", "decode"): (None, 2 if mode == "tt" else 4), ("attention", "prefill"): (None, 4), ("kv", None): (kv or ("bfp8" if fast else "bf16"), None)}
 
 def rms(x, w, c):  # RMSNorm, scaled by w (Qwen3.5's by 1 + w: n w + n, exact where 1 + w would round in bf16)
@@ -293,11 +295,13 @@ def chip_experts(h, p, ids, w, phases, limit=None):
   weighted by each token's weight for that expert (0 where the token picked it not), and the entries summed: each such
   expert's weights read once, and the tokens' rows once a worker. For more (a prompt), each expert's tokens grouped
   into whole tiles (Tensor.group), a batch entry for each tile, so its weights are read once for every 32 of its tokens,
-  and each token's k outputs gathered back, weighted and summed. Whichever makes the fewer tile rows; either replays,
-  an entry that picks no expert costing nothing but its zeros. An expert's biases are gathered by the same picks."""
+  and each token's k outputs gathered back, weighted and summed. Up to 128 tokens (a decode step's) the first, whose
+  extra tile rows cost less than the second's gathers of 64-byte runs; past that whichever makes the fewer tile rows.
+  Either replays, an entry that picks no expert costing nothing but its zeros. An expert's biases are gathered by the
+  same picks."""
   gate_up, down = p["experts.gate_up"], p["experts.down"]
   (n, k), m, e = ids.shape[1:], down.rows, gate_up.batch
-  dense = -(-n // 32) * min(n * k, e) <= -(-n * k // 32) + min(n * k, e)  # (each way's tile rows a matrix)
+  dense = n <= 128 or -(-n // 32) * min(n * k, e) <= -(-n * k // 32) + min(n * k, e)  # (each way's tile rows a matrix)
   if dense: (picks, weights), x = ids.touched(e, w), h
   else:
     order, picks, places = ids.group(e)
@@ -470,7 +474,9 @@ def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
   rows, rotary, mask, _ = around(w, c, places, caches[l].shape[-2], slots, length)
   p = {k[len(f"layers.{l}."):]: w[k] for k in w if k.startswith(f"layers.{l}.")}
   x = layer(x, p, c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, slots=slots)
-  return f.mm(rms(x if every else f.rows(x, [x.shape[-2] - 1]), w["mtp.norm"], c), w["embed.T"], None, "fp32")
+  own = "embed.T draft" in w  # (an output layer of its own: the precision's draft head)
+  phases = (getattr(c, "precision", None) or {}).get(("draft head", None), (None, None))[1] if own else None
+  return f.mm(rms(x if every else f.rows(x, [x.shape[-2] - 1]), w["mtp.norm"], c), w["embed.T draft" if own else "embed.T"], phases, "fp32")
 
 def prefill(ids, w, c, caches, chunk, on=lambda row: row):
   """forward over a prompt from place 0, chunk tokens at a time, as Tenstorrent's prefill takes a long one: each chunk's
@@ -581,12 +587,15 @@ def weight_format(name, prec):  # a weight's format on the chip: the matrices a 
   op = name.split(".")[-1].removesuffix("_proj")
   if name.startswith("layers.") and op in ("conv", "decay", "dt_bias", "norm"): return "fp32"
   matrix = name.endswith(("_proj", "experts.gate_up", "experts.down"))
-  key = ("head", None) if name == "embed.T" else (op, int(name.split(".")[1])) if matrix else None
-  return prec[key][0] if prec and key else "bf16"
+  key = {"embed.T": ("head", None), "embed.T draft": ("draft head", None)}.get(name) or ((op, int(name.split(".")[1])) if matrix else None)
+  return prec[key][0] if prec and key in prec else "bf16"
+
+def drafting(weights, prec):  # the weights, and the output layer again as the draft's own where prec gives it one (draft head)
+  return weights | {"embed.T draft": weights["embed.T"]} if prec and ("draft head", None) in prec and "mtp.fc" in weights else weights
 
 def upload(rt, weights, prec=None):  # the weights as ferrite Tensors, one at a time, each cast on the chip to its format
   t = {}                                # and waited for, so the next weight's bf16 copy goes where this one's was: a model
-  for name, w in weights.items():       # takes the DRAM its formats need and one matrix more, not all its bf16 besides
+  for name, w in drafting(weights, prec).items():  # takes the DRAM its formats need and one matrix more, not all its bf16 besides
     bits = w.bits()
     x = t[name] = Tensor.frombytes(rt, *bits.shape[-2:], bits.tobytes(), bits.shape[0] if bits.ndim == 3 else 1)
     if (f := weight_format(name, prec)) != "bf16":
@@ -607,7 +616,7 @@ def arrays(weights, prec=None):
     if f in ("bf16", "fp32"): return v
     rows = v.reshape(-1, v.shape[-1])  # (a batch of experts' too)
     return np.concatenate([gpt2.bfp(rows[i:i + 1024], f).astype(np.float32) for i in range(0, len(rows), 1024)]).reshape(v.shape)
-  return Made({name: functools.partial(made, name, w) for name, w in weights.items()})
+  return Made({name: functools.partial(made, name, w) for name, w in drafting(weights, prec).items()})
 
 def logits(f_out): return gpt2.values(f_out)[0]  # a ferrite row of logits, as a numpy vector
 

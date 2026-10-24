@@ -1502,8 +1502,8 @@ def test_topk(chip):
 def test_moe(chip):
   # a mixture of experts in the MLP's place (llama.moe): a token's router logits choose its k experts on the chip
   # (topk), matmuls that pick each one's weights there (index=) run their SwiGLUs, weighted by the softmax of the chosen
-  # logits and summed, as numpy does for one token, three and eight (each expert some token picked an entry of every
-  # token, Tensor.touched) and for 40 (each expert's tokens grouped into tiles, Tensor.group), replayed (tensor.jit) bit
+  # logits and summed, as numpy does for one token, three, eight and 40 (each expert some token picked an entry of every
+  # token, Tensor.touched) and for 160 (each expert's tokens grouped into tiles, Tensor.group), replayed (tensor.jit) bit
   # for bit as op by op; and a two-block
   # model of them decodes from a replay as it does op by op, so a replayed step reads whatever experts its token chose,
   # and near numpy
@@ -1512,13 +1512,13 @@ def test_moe(chip):
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
   c, w = SimpleNamespace(dim=64, k=4), experts(64, 16, 64)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
-  for n in (1, 3, 8, 40):
+  for n in (1, 3, 8, 40, 160):
     h = bf16(rng.normal(0, 1, (n, 64)))
     got, want = value(llama.moe(Tensor.of(rt, h.tolist()), t, c))[0], llama.moe(h, w, c)
     assert np.abs(got - want).max() < 0.02 * np.abs(want).max(), (n, np.abs(got - want).max())
   grouped, prompts = tensor.jit(lambda h: llama.moe(h, t, c)), np.random.default_rng(41)  # grouping replays: each call its own
   for _ in range(3):
-    h = Tensor.of(rt, bf16(prompts.normal(0, 1, (40, 64))).tolist())
+    h = Tensor.of(rt, bf16(prompts.normal(0, 1, (160, 64))).tolist())
     assert np.array_equal(value(grouped(h)), value(llama.moe(h, t, c))), "a replayed grouping is the grouping"
   c, w = smol(rng, 2)
   c.k = 2
@@ -1757,7 +1757,8 @@ def test_speculative(chip):
   # step goes on from after both tokens; one that is not is turned down and the next step goes on from the Gated
   # DeltaNet states after the first token alone (accept 0), as kept by the step. Drafts right and wrong in turn, every
   # step replayed, each slot's two logits within 3% of numpy's for its sequence from nothing. And the multi-token
-  # prediction layer on the chip (llama.draft), over a prompt's hidden states and next tokens, within 3% of numpy's
+  # prediction layer on the chip (llama.draft), over a prompt's hidden states and next tokens, within 3% of numpy's, by
+  # the output layer, or by a copy of its own in bfp4 (a precision's draft head), numpy's rounded as the chip's
   rng = np.random.default_rng(37)
   c, weights = qwen35(rng)
   w, size = llama.arrays(weights), 32
@@ -1776,6 +1777,13 @@ def test_speculative(chip):
       mine = gpt2.values(llama.draft(on(s[1:]), on(list(range(len(s) - 1))), h, t, c, llama.slot(c, kv, u, 3)))
       theirs = llama.draft(s[1:], list(range(len(s) - 1)), nh, w, c, llama.kv_cache(c, size, np.zeros))
       assert max(rel(mine[r], theirs[r]) for r in range(len(s) - 1)) < 0.03
+      c.precision = {("draft head", None): ("bfp4", 1)}
+      head = llama.upload(rt, {k: weights[k] for k in ("embed.T", "mtp.fc")}, c.precision)["embed.T draft"]
+      assert head.dtype == "bfp4"
+      mine = gpt2.values(llama.draft(on(s[1:]), on(list(range(len(s) - 1))), h, t | {"embed.T draft": head}, c, llama.slot(c, kv, u, 3)))
+      theirs = llama.draft(s[1:], list(range(len(s) - 1)), nh, llama.arrays(weights, c.precision), c, llama.kv_cache(c, size, np.zeros))
+      assert max(rel(mine[r], theirs[r]) for r in range(len(s) - 1)) < 0.03
+      c.precision = None
   step = tensor.jit(lambda ids, places, live, accept: llama.forward(ids, places, t, c, kv, 3, live=live, accept=accept))
   accept = [1.0, 1.0, 1.0]
   for i in range(6):
@@ -1959,9 +1967,11 @@ def test_llama_precision(chip):
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
   assert [llama.precision(big, "tt")[k] for k in (("attention", "decode"), ("attention", "prefill"), ("kv", None))] == [(None, 2), (None, 4), ("bfp8", None)]
-  experts = llama.precision(big, "experts")  # (Qwen3.6 on one card: every MLP matrix in bfp4 at one phase, the rest bfp8 at two)
-  assert [experts[k] for k in (("gate_up", 31), ("down", 0), ("qkv", 5), ("head", None), ("kv", None))] == [("bfp4", 1), ("bfp4", 1), ("bfp8", 2), ("bfp8", 2), ("bfp8", None)]
+  experts = llama.precision(big, "experts")  # (Qwen3.6 on one card: every MLP matrix in bfp4 at one phase, the rest bfp8 at two,
+  keys = (("gate_up", 31), ("down", 0), ("qkv", 5), ("head", None), ("draft head", None), ("kv", None))  # a draft's output layer bfp4)
+  assert [experts[k] for k in keys] == [("bfp4", 1), ("bfp4", 1), ("bfp8", 2), ("bfp8", 2), ("bfp4", 1), ("bfp8", None)]
   assert llama.weight_format("layers.3.shared_expert.down_proj", experts) == llama.weight_format("layers.3.experts.down", experts) == "bfp4"
+  assert llama.weight_format("embed.T draft", experts) == "bfp4" and ("draft head", None) not in llama.precision(big, "tt")
   rt, rng = Runtime(chip, chip.tensix[0], chip.tensix[-1]), np.random.default_rng(5)
   c, w = smol(rng, 2)
   c.precision = llama.precision(c, "tt")
@@ -2439,7 +2449,7 @@ def test_cost(tmp_path):
   for name, j in (("qwen", qwen), ("llama", llama8b)): (tmp_path / name).mkdir(); (tmp_path / name / "config.json").write_text(json.dumps(j))
   c = llama.config(str(tmp_path / "qwen"))
   s, use = cost.shape(c, "experts"), dict(cost.USE)
-  assert 35.4e9 < s.held < 35.6e9 and 2.9e9 < s.values < 3.0e9 and 21.5e9 < s.bytes < 21.9e9, (s.held, s.values, s.bytes)
+  assert 35.4e9 < s.held < 35.6e9 and 2.9e9 < s.values < 3.0e9 and 21.8e9 < s.bytes < 22.2e9, (s.held, s.values, s.bytes)  # (its draft's head too)
   one = cost.session(c, use | {"context": 1})
   assert (one.kv, one.state) == (10 * 2 * 2 * 256 * 2, 30 * 4 * (32 * 128 * 128 + 3 * (2 * 16 * 128 + 32 * 128)))
   l8 = llama.config(str(tmp_path / "llama"))

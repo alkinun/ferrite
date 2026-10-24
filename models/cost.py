@@ -16,15 +16,22 @@ import llama
 BYTES = {"bf16": 2.0, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}  # a value's, with its share of its tile's exponents
 MODES = {"bf16": {}, "bfp8": {"*": "bfp8"},  # each kind of matrix's format, Tenstorrent's performance precision's, and with
          "bfp4": {"*": "bfp8", "gate_up": "bfp4"},  # every expert matrix in bfp4 (Qwen3.6 on a card). The embedding stays
-         "experts": {"*": "bfp8", "gate_up": "bfp4", "down": "bfp4"}}  # bf16 (a token's row is gathered), and so do the routers
-LAUNCHES = {"attention": 18, "experts": 18, "deltanet": 27, "deltanet verify": 57, "rest": 11, "draft": 46}  # a decode step's
-# for several slots: an attention block's (with its norms, and its attention in parts at a long cache), a mixture of experts' more, a Gated DeltaNet block's (and one
-# taking a token and a draft at once), the rest (the embedding's gather, the step's masks, the final norm and the output
-# layer), the multi-token prediction layer's call. Counted on ttsim at Qwen3.6's shapes, four slots (cmp/qwen36/launches.py).
-CONTROL = {"deltanet": (20600, 12400), "attention": (18400, 7600), "rest": (2900, 1200),  # a decode step's RISC-V work as
-           "deltanet verify": (44200, 13600), "attention verify": (30500, 6400), "rest verify": (6100, 800)}  # ttsim counts it,
-# and a verify step's: a Gated DeltaNet block's (with its experts), an attention block's (with its experts), the rest's, so
-# many cycles and so many more a token (cmp/qwen36/control.py at Qwen3.6's shapes, one slot and eight: moves, most of it)
+         "experts": {"*": "bfp8", "gate_up": "bfp4", "down": "bfp4", "draft head": "bfp4"}}  # bf16 (a token's row is gathered), and
+# so do the routers; with a draft head, the multi-token prediction layer drafts by a copy of the output layer in its format
+LAUNCHES = {"attention": 21, "experts": 17, "deltanet": 5, "rest": 10,  # a decode step's: an attention block's (its norms,
+            "attention verify": 21, "deltanet verify": 5, "rest verify": 17, "draft": 54}  # projections, RoPE, the cache's put,
+# attention in parts and their sum, its output and gate), a mixture of experts' more, a Gated DeltaNet block's (its
+# projections, the delta kernel, its output's norm and gate), the rest (the embedding's gather, the places' columns, the
+# final norm, the output layer, sampling's heads), each a verify step's too, and the multi-token prediction layer's call.
+# Counted on ttsim at Qwen3.6's shapes, eight slots (cmp/qwen36/step.py).
+ACTIVATIONS = 12e6, 45e6  # bytes a decode step reads past its weights, experts, states and attention's rows: a block's
+# (activations in 32-row tiles, each expert's outputs) and the rest's (the logits sampling reads), at Qwen3.6's shapes
+CONTROL = {  # ttsim cycles a block's launches (with its experts), and the rest's, take past their reads at 265 bytes a cycle
+  "attention": ((1, 42000), (8, 21800), (32, 24000)), "deltanet": ((1, 38400), (8, 13500), (32, 17900)),  # (358 GB/s at
+  "rest": ((1, 180000), (8, 837000), (32, 1918000)),                                                       # 1.35 GHz), by
+  "attention verify": ((2, 46900), (16, 29800)), "deltanet verify": ((2, 63600), (16, 28200)),            # the step's tokens:
+  "rest verify": ((2, 449000), (16, 1702000)), "draft": ((2, 50300), (16, 32800))}                         # the RISC-V work a
+# card waits on beyond DRAM (cmp/qwen36/step.py's "past reads" at Qwen3.6's shapes; between counts, a straight line)
 WORKERS = 119  # a p150's 120 Tensix tiles but the dispatcher
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # a p150: 8 GDDR6 banks of 4 GiB, a GiB of it for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # its 512 GB/s, and the share of it a decode step reaches (a guess)
@@ -55,10 +62,12 @@ def shape(c, mode="bf16"):
   every = (sum(delta if llama.linear(c, l) else attention for l in range(c.layers)) + len(moe) * mixture
            + (c.layers - len(moe)) * d * f * (2 * fmt("gate_up") + fmt("down")) + c.vocab * d * fmt("head"))
   draft = c.mtp * (attention + mixture + 2 * d * d * fmt("fc"))
+  copy = c.mtp * c.vocab * d * fmt("draft head") if "draft head" in MODES[mode] else 0  # (the draft's own output layer)
   values = (sum((d * (2 * c.kh * c.kd + 2 * c.vh * c.vd + 2 * c.vh) + c.vh * c.vd * d) if llama.linear(c, l) else attention / fmt("attention") for l in range(c.layers))
             + len(moe) * (3 * d * (sh + (c.k or 0) * m) + d * e) + (c.layers - len(moe)) * 3 * d * f + c.vocab * d)
   return SimpleNamespace(every=every, expert=d * m * (2 * fmt("gate_up") + fmt("down")), moe=len(moe), draft=draft, embed=c.vocab * d * BYTES["bf16"],
-                         bytes=every + (len(moe) + c.mtp) * e * d * m * (2 * fmt("gate_up") + fmt("down")) + draft + c.vocab * d * BYTES["bf16"],
+                         head=copy or c.vocab * d * fmt("head"),  # (the output layer a draft reads)
+                         bytes=every + (len(moe) + c.mtp) * e * d * m * (2 * fmt("gate_up") + fmt("down")) + draft + copy + c.vocab * d * BYTES["bf16"],
                          values=values, held=values + (len(moe) + c.mtp) * (e - (c.k or 0)) * 3 * d * m + c.mtp * (attention / fmt("attention") + 2 * d * d)
                          + c.vocab * d * (0 if c.tied else 1))
 
@@ -82,27 +91,34 @@ def attention(c, entries, queries, rows, kv):  # the bytes an attention block re
   parts = attention_parts(ht, queries, wt, kt, units, WORKERS)
   return units * (2 * kt + max(0, kt - parts * attention_store(ht, queries, wt, parts)[1])) * 32 * llama.head(c) * BYTES[kv]
 
+def past(kind, n):  # CONTROL's cycles for kind at n tokens: a straight line between its counts, flat past them
+  points = CONTROL[kind]
+  if n <= points[0][0] or n >= points[-1][0]: return points[0][1] if n <= points[0][0] else points[-1][1]
+  (a, x), (b, y) = next((p, q) for p, q in zip(points, points[1:]) if p[0] <= n <= q[0])
+  return x + (y - x) * (n - a) / (b - a)
+
 def step(c, s, use, card, users, speculative=False, cards=1):
   """A decode step for `users` sessions at once, a token each, or a token and a draft each then the next drafts (two
-  calls): the bytes it reads (and the states' it writes), its flops, launches, control and seconds (waiting on DRAM or
-  on the matmuls, whichever is longer, then on the launches or the kernels' own RISC-V work, if the card's counts as
-  ttsim's does, whichever is more: the small kernels that do it read little), and tokens/s a user."""
+  calls): the bytes it reads (and the states' it writes), its flops, launches, control and seconds: waiting on DRAM or
+  on the matmuls, whichever is longer, then on its launches, then on the RISC-V work its kernels do past their reads
+  (if the card's counts as ttsim's does), and tokens/s a user."""
   n, one, d = users * (1 + speculative), session(c, use, speculative), c.dim
   blocks = sum(not llama.linear(c, l) for l in range(c.layers))
   reads = s.every + s.moe * touched(c, n) * s.expert + users * one.state * (1.5 if speculative else 2)  # states read and written once (a
   reads += blocks * attention(c, c.kv * users, c.heads // c.kv * (1 + speculative), use["context"], use["kv"])  # verify's: one of two, both)
   flops = 2 * n * s.values + n * sum(4 * c.heads * llama.head(c) * use["context"] for l in range(c.layers) if not llama.linear(c, l))
-  linear = sum(llama.linear(c, l) for l in range(c.layers))
-  launches = (c.layers - linear) * LAUNCHES["attention"] + linear * LAUNCHES["deltanet verify" if speculative else "deltanet"]
-  launches += s.moe * LAUNCHES["experts"] + LAUNCHES["rest"]
-  cycles = lambda kind, blocks: blocks * (lambda a, b: a + b * n)(*CONTROL[kind + " verify" if speculative else kind])
-  control = (cycles("attention", c.layers - linear + c.mtp * speculative) + cycles("deltanet", linear) + cycles("rest", 1 + speculative)) / bh.AICLK
+  linear, v = sum(llama.linear(c, l) for l in range(c.layers)), " verify" * speculative
+  reads += c.layers * ACTIVATIONS[0] + ACTIVATIONS[1]
+  launches = blocks * LAUNCHES["attention" + v] + linear * LAUNCHES["deltanet" + v] + s.moe * LAUNCHES["experts"] + LAUNCHES["rest" + v]
+  control = blocks * past("attention" + v, n) + linear * past("deltanet" + v, n) + past("rest" + v, n)
   if speculative:  # the drafting call: the layer over two places a user, and the output layer again
-    reads += s.draft + c.mtp * touched(c, 2 * users) * s.expert + c.vocab * d * BYTES["bfp8"]
+    reads += s.draft + c.mtp * touched(c, 2 * users) * s.expert + s.head + c.mtp * ACTIVATIONS[0]
     reads += c.mtp * attention(c, c.kv * users, 2 * c.heads // c.kv, use["context"], use["kv"])
     flops += 2 * 2 * users * (s.draft / BYTES["bfp8"] + c.k * 3 * d * (c.moe or 0) + c.vocab * d)
     launches += LAUNCHES["draft"]
-  seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + max(launches * card["launch"], control)
+    control += c.mtp * past("draft", n)
+  control /= bh.AICLK
+  seconds = max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)) + launches * card["launch"] + control
   return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, control=control, flops=flops, rate=(1 + use["accept"] if speculative else 1) / seconds)
 
 def prompt(c, s, use, card, chunk, cards=1):
@@ -121,7 +137,7 @@ def prompt(c, s, use, card, chunk, cards=1):
     reads = s.every + s.moe * touched(c, m) * s.expert + blocks * attention(c, c.heads, m, rows, use["kv"])
     flops = 2 * m * (s.values - c.vocab * d) + 2 * c.vocab * d + blocks * 4 * m * c.heads * hd * rows
     if c.mtp:
-      reads += s.draft + c.mtp * touched(c, m) * s.expert + c.vocab * d * BYTES["bfp8"]
+      reads += s.draft + c.mtp * touched(c, m) * s.expert + s.head
       flops += 2 * m * (s.draft / BYTES["bfp8"] + c.k * 3 * d * c.moe + c.vocab * d)
     seconds += max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards))
   return SimpleNamespace(seconds=seconds, rate=n / seconds)

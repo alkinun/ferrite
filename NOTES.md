@@ -525,9 +525,10 @@ The tokenizer is tokenizer.json's byte-level BPE in plain Python, tiktoken's and
 - **Gated attention** (Qwen3.5 and 3.6): each head's output times sigmoid(gate), RoPE on a quarter of each head, q and k
   RMS-normed per head, RMSNorms by 1 + w.
 - **Speculative decoding** (`draft`, `forward`'s accept): the multi-token prediction layer is a block past the last;
-  from a place's hidden state and the next token it gives a draft. A verify step takes a token and its draft and keeps
-  the DeltaNet states twice, after both and after the first; the next step's accept row says which it goes on from,
-  the kernel reading that one alone and writing both.
+  from a place's hidden state and the next token it gives a draft, by the output layer, or in the one-card layout by a
+  copy of it in bfp4 (`precision`'s draft head, 0.29 GB), half the bytes for drafts nearly as often taken. A verify
+  step takes a token and its draft and keeps the DeltaNet states twice, after both and after the first; the next
+  step's accept row says which it goes on from, the kernel reading that one alone and writing both.
 - **Token accuracy** (`llama.accuracy`), Tenstorrent's way: the reference file's (tt_transformers'
   `tests/reference_outputs/<model>.refpt`) first 512 tokens as the prompt, then 500 steps fed the file's next token;
   top-1 where the pick is the reference model's best, top-5 where it is among its five. In numpy it runs as one prefill
@@ -539,9 +540,11 @@ ttsim. Token accuracy in numpy over the whole model: bf16 top-1 99.6%, top-5 100
 and the KV cache in bfp8 (21.7 GB, one card) 92.0% and 94.2%; the experts' gate and up in bfp4 and the rest in bfp8
 (27.2 GB) 93.8% and 96.0%; the experts' gate and up in bfp4 and the rest in bf16 98.2% and 99.6%, so the experts' down
 projection in bfp4 costs most of it. Every matrix in bfp8 (two cards) and a bfp4 KV cache are not measured yet: their
-runs on this host came out NaN ("Still unknown"). Tenstorrent's performance mode runs Llama-3.1-8B at 90% top-1. The multi-token prediction
-layer's draft is the model's own greedy pick at 94.3% of the places past the prompt (92.5% over all 1,022), in numpy
-in bf16 over the same text.
+runs on this host came out NaN ("Still unknown"). Tenstorrent's performance mode runs Llama-3.1-8B at 90% top-1. The
+multi-token prediction layer's draft is taken, a pick sampled as the request samples, at these shares of the first
+1,024 tokens' places (numpy, bf16): A Tale of Two Cities 92.5% greedy and 91.5% at Qwen3.6's own sampling (temperature
+1, top_k 20, top_p 0.95), ferrite's compiler 71.0% and 54.4%, these notes 71.9% and 57.9%; in the one-card formats the
+tale's 89.6% and 88.4%, the compiler's 70.0% and 54.0%, and by the bfp4 draft head 89.4% and 88.3%, 68.8% and 53.4%.
 
 ## Serving
 
