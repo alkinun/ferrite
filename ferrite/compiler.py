@@ -1746,10 +1746,13 @@ void kmain(volatile unsigned *a) {{
         unsigned j = q * 32 + c, v = 0, id = 0;
         if (s < n && j < {k}) v = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], id = {f"((volatile unsigned *)(LABELS + j * 64))[at(s, col[j] % 32) % 16]" if labels else f"p * {cols} + col[j]"};
         if (s < n && {k} * {parts} == 1) v = x[col[0] / 32 * 1024 + at(s, col[0] % 32)], id = {"((volatile unsigned *)LABELS)[at(s, col[0] % 32) % 16]" if labels else "col[0]"};  // (copies across)
-        for (unsigned row = rows == 1 ? 0 : r; row < (rows == 1 ? 32 : r + 1); row++) values[at(row, c)] = v, ids[at(row, c)] = id;
+        values[at(r, c)] = v, ids[at(r, c)] = id;
       }}
       unsigned o = (b * tr + i) * {parts * kt} + p * {kt} + q;  // the result tile
-      if (rows == 1) noc_write(VALUES, BANK(o), AT(a[2], o, {tb}), {tb}), noc_write(IDS, BANK(o), AT(a[3], o, 4096), 4096);  // (whole)
+      if (rows == 1) {{  // (whole, its row doubled down by copies inside L1)
+        row_down(VALUES, {item}), row_down(IDS, 4);
+        noc_write(VALUES, BANK(o), AT(a[2], o, {tb}), {tb}), noc_write(IDS, BANK(o), AT(a[3], o, 4096), 4096);
+      }}
       else for (unsigned h = 0; h < 2; h++) {{  // its left and right faces' runs, from the same places in L1
         unsigned d = face + h * 256;
         noc_write(VALUES + d * {item}, BANK(o), AT(a[2], o, {tb}) + d * {item}, {16 * item});
