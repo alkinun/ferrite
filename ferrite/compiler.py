@@ -1653,7 +1653,7 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   values' address, the indices', then x's address, tile strides for batch and row, tile offset, and rows, then the
   labels' address, tile strides and offset]. BRISC alone, a unit one row of a tile row of a part of x, 32 to a tile
   row, so a decode step's few rows go to as many workers: the part's tile row comes in (once for a worker's units of
-  it), and the row is scanned once (once for a worker's units of it too: one row of x is all 32 units'), run by run,
+  it), and the row is scanned once (one row of x: by the tile row's first unit, which writes the whole tiles), run by run,
   its k best so far a heap with the worst at its root (of equal values, the later column), which a better value
   replaces: once the worst is a float of no sign, a value is checked against it as a signed integer, else by its key
   (bf16 or fp32 as an unsigned integer once its sign orders it, negatives flipped, -0 as 0); then sorted, best first. parts: each row cut into so many parts of cols columns, whole tiles, each part's k
@@ -1702,6 +1702,7 @@ void kmain(volatile unsigned *a) {{
     unsigned first = b * a[5] + i * a[6] + p * {ct} + a[7];                                                    // tile row i, part p, matrix b
     unsigned n = rows == 1 ? 1 : rows - i * 32 < 32 ? rows - i * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here; the row r holds
     unsigned face = r / 16 * 512 + r % 16 * 16;  // the row's run in the left face, in datums
+    if (rows == 1 && r) continue;  // (one row of x: the tile row's first unit writes all its copies)
     if (s < n && t * 32 + s != done) {{
       done = t * 32 + s, kept = 0;
       if (t != held) {{
@@ -1735,10 +1736,11 @@ void kmain(volatile unsigned *a) {{
         unsigned j = q * 32 + c, v = 0, id = 0;
         if (s < n && j < {k}) v = x[col[j] / 32 * 1024 + at(s, col[j] % 32)], id = {f"((volatile unsigned *)(LABELS + j * 64))[at(s, col[j] % 32) % 16]" if labels else f"p * {cols} + col[j]"};
         if (s < n && {k} * {parts} == 1) v = x[col[0] / 32 * 1024 + at(s, col[0] % 32)], id = {"((volatile unsigned *)LABELS)[at(s, col[0] % 32) % 16]" if labels else "col[0]"};  // (copies across)
-        values[at(r, c)] = v, ids[at(r, c)] = id;
+        for (unsigned row = rows == 1 ? 0 : r; row < (rows == 1 ? 32 : r + 1); row++) values[at(row, c)] = v, ids[at(row, c)] = id;
       }}
       unsigned o = (b * tr + i) * {parts * kt} + p * {kt} + q;  // the result tile
-      for (unsigned h = 0; h < 2; h++) {{  // its left and right faces' runs, from the same places in L1
+      if (rows == 1) noc_write(VALUES, BANK(o), AT(a[2], o, {tb}), {tb}), noc_write(IDS, BANK(o), AT(a[3], o, 4096), 4096);  // (whole)
+      else for (unsigned h = 0; h < 2; h++) {{  // its left and right faces' runs, from the same places in L1
         unsigned d = face + h * 256;
         noc_write(VALUES + d * {item}, BANK(o), AT(a[2], o, {tb}) + d * {item}, {16 * item});
         noc_write(IDS + d * 4, BANK(o), AT(a[3], o, 4096) + d * 4, 64);

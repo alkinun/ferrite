@@ -37,11 +37,10 @@ def heads(logits, t=None, k=64):
   tiles = logits.cols // 32
   parts = next((p for p in range(1, 126) if tiles % p == 0 and tiles // p <= 96), None) if logits.cols % 32 == 0 else None
   if parts is None: return None
-  values, ids = logits.topk(-(-k // 32) * 32 if parts > 1 else k, parts)
-  if parts > 1: values, ids = values.topk(k, labels=ids)
+  best, ids = logits.topk(-(-k // 32) * 32 if parts > 1 else k, parts)
+  values, ids = best.topk(k, labels=ids) if parts > 1 else (best, ids)
   if t is None: return values.realize(), ids.realize()
-  x = logits.split(parts)
-  m = x.max(2)
+  x, m = logits.split(parts), best.split(parts).max(2).realize()  # (each part's largest, from its best: the row read once)
   lse = ((x - m) * t).exp().sum(2).log() + m * t  # each part's
   if parts > 1: top = lse.max(0); lse = (lse - top).exp().sum(0).log() + top
   return values.realize(), ids.realize(), lse.realize()
