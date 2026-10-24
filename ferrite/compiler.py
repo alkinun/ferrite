@@ -1426,16 +1426,22 @@ static void send(void) {{  // the results packed so far go home: an output's row
   }}
 }}
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
-// source src's row (the conv's 3 last inputs, from the states at A[c]; the tokens' own rows of x; the 4 taps): its run of
-// 16 channels from col on, in face f, into L1 at to
-static void get_run(unsigned src, unsigned s, unsigned c, unsigned col, unsigned f, unsigned to) {{
-  unsigned i = src < 3 ? c : src < {3 + m} ? {X} : {TAPS}, b = src < 3 ? src : src < {3 + m} ? 0 : src - {3 + m};
-  unsigned row = src < 3 ? s : src < {3 + m} ? s * {m} + src - 3 : 0, t = {tile('i', 'b', 'row / 32', 'col / 32')};
-  noc_get(BANK(t), AT(A[i], t, 4096) + {run_at('row')}, to, 64);
+// source src's row (the conv's 3 last inputs, from the states at A[c]; the tokens' own rows of x; the 4 taps): its runs of
+// the channels in n tiles from col on, both faces of each, into L1 at to (a tile's step bytes on, a face's half on)
+static void get_runs(unsigned src, unsigned s, unsigned c, unsigned col, unsigned n, unsigned to, unsigned step, unsigned half) {{
+  unsigned i = src < 3 ? c : src < {3 + m} ? {X} : {TAPS}, b = src < 3 ? src : src < {3 + m} ? 0 : src - {3 + m}, f = 0;
+  unsigned row = src < 3 ? s : src < {3 + m} ? s * {m} + src - 3 : 0, t = {tile('i', 'b', 'row / 32', 'col / 32')}, off = {run_at('row')};
+  for (unsigned j = 0; j < n; j++, t++, to += step) {{
+    noc_get(BANK(t), AT(A[i], t, 4096) + off, to, 64);
+    noc_get(BANK(t), AT(A[i], t, 4096) + off + 1024, to + half, 64);
+  }}
 }}
-static void put_run(unsigned at, unsigned d, unsigned s, unsigned col, unsigned f, unsigned from) {{  // into input d of the states at A[at]
-  unsigned t = {tile('at', 'd', 's / 32', 'col / 32')};
-  noc_put(from, BANK(t), AT(A[at], t, 4096) + {run_at('s')}, 64);
+static void put_runs(unsigned at, unsigned d, unsigned s, unsigned col, unsigned n, unsigned from, unsigned step, unsigned half) {{  // into
+  unsigned t = {tile('at', 'd', 's / 32', 'col / 32')}, f = 0, off = {run_at('s')};                                          // input d
+  for (unsigned j = 0; j < n; j++, t++, from += step) {{                                                                     // of the
+    noc_put(from, BANK(t), AT(A[at], t, 4096) + off, 64);                                                                    // states
+    noc_put(from + half, BANK(t), AT(A[at], t, 4096) + off + 1024, 64);                                                      // at A[at]
+  }}
 }}
 void kmain(volatile unsigned *args) {{
   A = (const unsigned *)args;
@@ -1451,14 +1457,11 @@ void kmain(volatile unsigned *args) {{
       unsigned t = (s * {vh} + hk * {rep} + e) * A[from + 1] + i * A[from + 2] + j + A[from + 3];
       noc_get(BANK(t), AT(A[from], t, 4096), SLOT({S_('e', 'i', 'j')}), 4096);
     }}
-    for (unsigned src = 0; src < {sources}; src++) for (unsigned g = 0; g < 2; g++) for (unsigned i = 0; i < {kt}; i++)
-      for (unsigned f = 0; f < 2; f++) get_run(src, s, c, (g ? ck : cq) + i * 32 + f * 16, f, {staged('src', 'g')} + (i * 2 + f) * 64);
-    for (unsigned e = 0; e < {rep}; e++) for (unsigned j = 0; j < {vt}; j++) for (unsigned f = 0; f < 2; f++) {{  // v's into rows 0-3:
-      unsigned col = cv + e * {vd} + j * 32 + f * 16;                                                              // each token's inputs,
-      for (unsigned r = 0; r < 4; r++) {{                                                                          // and the taps
-        for (unsigned t = 0; t < {m}; t++) get_run(t + r, s, c, col, f, SLOT({IV('t', 'e', 'j')}) + f * 1024 + r * 64);
-        get_run({3 + m} + r, s, c, col, f, SLOT({TV('e', 'j')}) + f * 1024 + r * 64);
-      }}
+    for (unsigned src = 0; src < {sources}; src++) for (unsigned g = 0; g < 2; g++)  // q's and k's, staged
+      get_runs(src, s, c, g ? ck : cq, {kt}, {staged('src', 'g')}, 128, 64);
+    for (unsigned r = 0; r < 4; r++) {{  // v's into rows 0-3 of their tiles: each token's inputs, and the taps
+      for (unsigned t = 0; t < {m}; t++) get_runs(t + r, s, c, cv, {rep * vt}, SLOT({IV('t', 0, 0)}) + r * 64, 4096, 1024);
+      get_runs({3 + m} + r, s, c, cv, {rep * vt}, SLOT({TV(0, 0)}) + r * 64, 4096, 1024);
     }}
     for (unsigned e = 0; e < {rep}; e++) {{
       unsigned h = hk * {rep} + e;
@@ -1469,11 +1472,16 @@ void kmain(volatile unsigned *args) {{
       }}
     }}
     noc_wait();
-    for (unsigned g = 0; g < 2; g++) for (unsigned i = 0; i < {kt}; i++) for (unsigned r = 0; r < 32; r++) {{  // q's and k's, a channel
-      unsigned at = (r / 16 * 2) * 256 + r % 16 * 16, o = (i * 2 + r / 16) * 16 + r % 16;  // a row: its place, and in a run      // a row
-      for (unsigned j = 0; j < 4; j++) {{
-        for (unsigned t = 0; t < {m}; t++) ((volatile unsigned *)SLOT(g ? {IK('t', 'i')} : {IQ('t', 'i')}))[at + j] = ((volatile unsigned *){staged('t + j', 'g')})[o];
-        ((volatile unsigned *)SLOT(g ? {TK('i')} : {TQ('i')}))[at + j] = ((volatile unsigned *){staged(f'{3 + m} + j', 'g')})[o];
+    for (unsigned g = 0; g < 2; g++) for (unsigned i = 0; i < {kt}; i++) {{  // q's and k's, a channel a row: input or tap j in column j
+      unsigned *taps = (unsigned *)SLOT(g ? {TK('i')} : {TQ('i')}), *ins[{m}];
+      const unsigned *from = (const unsigned *){staged(0, 'g')} + i * 32;  // (the runs of source 0, tile i; a source's {64 * kt} words on)
+      for (unsigned t = 0; t < {m}; t++) ins[t] = (unsigned *)SLOT(g ? {IK('t', 'i')} : {IQ('t', 'i')});
+      for (unsigned r = 0; r < 32; r++) {{
+        unsigned at = (r / 16 * 2) * 256 + r % 16 * 16, o = r / 16 * 16 + r % 16;  // its place in the tile, and in tile i's runs
+        for (unsigned j = 0; j < 4; j++) {{
+          taps[at + j] = from[({3 + m} + j) * {64 * kt} + o];
+          for (unsigned t = 0; t < {m}; t++) ins[t][at + j] = from[(t + j) * {64 * kt} + o];
+        }}
       }}
     }}
     for (unsigned e = 0; e < {rep}; e++) {{
@@ -1483,10 +1491,8 @@ void kmain(volatile unsigned *args) {{
     }}
     if (alive[unit % 4]) for (unsigned t = 0; t < {m}; t++) for (unsigned d = 0; d < 3; d++) {{  // the inputs token t leaves: sources
       unsigned at = t == {m - 1} ? {C} : {C2}, src = t + 1 + d, tv = src > 3 ? src - 3 : 0;      // t + 1 to t + 3
-      for (unsigned g = 0; g < 2; g++) for (unsigned i = 0; i < {kt}; i++) for (unsigned f = 0; f < 2; f++)
-        put_run(at, d, s, (g ? ck : cq) + i * 32 + f * 16, f, {staged('src', 'g')} + (i * 2 + f) * 64);
-      for (unsigned e = 0; e < {rep}; e++) for (unsigned j = 0; j < {vt}; j++) for (unsigned f = 0; f < 2; f++)  // (from token tv's tile)
-        put_run(at, d, s, cv + e * {vd} + j * 32 + f * 16, f, SLOT({IV('tv', 'e', 'j')}) + f * 1024 + (src - tv) * 64);
+      for (unsigned g = 0; g < 2; g++) put_runs(at, d, s, g ? ck : cq, {kt}, {staged('src', 'g')}, 128, 64);
+      put_runs(at, d, s, cv, {rep * vt}, SLOT({IV('tv', 0, 0)}) + (src - tv) * 64, 4096, 1024);  // (from token tv's tiles)
     }}
     l1_settle(SLOT(F0));
     ready(); frame_done[u & 1] = ++events;
